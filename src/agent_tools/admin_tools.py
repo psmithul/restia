@@ -564,7 +564,7 @@ async def do_manage_settings(content: str, owner: Optional[str] = None) -> Dict:
 
         _ENUMS = {
             "image_quality": ["low", "medium", "high"],
-            "reminder_channel": ["browser", "email", "ntfy", "webhook"],
+            "reminder_channel": ["browser", "email", "ntfy", "webhook", "telegram"],
         }
         def _coerce(value, default):
             if isinstance(default, bool):

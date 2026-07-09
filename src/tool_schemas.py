@@ -549,7 +549,7 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "manage_calendar",
-            "description": "Manage calendar events: list events in a date range, create, update, delete. Each event can carry a tag/category (event_type) and importance level. Resolve relative dates like today/tomorrow against the 'Current date and time' system context, then pass ISO 8601 datetimes in the user's local wall time; for all-day events set all_day=true and pass YYYY-MM-DD. For event reminders/alarms, pass reminder_minutes; the tool creates the Odysseus note reminder, so do not also call manage_notes for the same reminder. Do not set rrule for single-occurrence requests such as 'next Wednesday only'; use rrule only when the user explicitly wants recurrence.",
+            "description": "Manage calendar events: list events in a date range, create, update, delete. Each event can carry a tag/category (event_type) and importance level. Resolve relative dates like today/tomorrow against the 'Current date and time' system context, then pass ISO 8601 datetimes in the user's local wall time; for all-day events set all_day=true and pass YYYY-MM-DD. For event reminders/alarms, pass reminder_minutes; the tool creates the Restia note reminder, so do not also call manage_notes for the same reminder. Do not set rrule for single-occurrence requests such as 'next Wednesday only'; use rrule only when the user explicitly wants recurrence.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -569,7 +569,7 @@ FUNCTION_TOOL_SCHEMAS = [
                     "end": {"type": "string", "description": "list_events range end (ISO datetime). Use this for month/week requests after resolving the date range; defaults to +14 days only when no range is requested. Prefer end; backend also accepts end_time, end_date, range_end, to, dtend, until."},
                     "event_type": {"type": "string", "description": "Tag / category for the event. Common values: work, personal, health, travel, meal, social, admin, other. Aliases accepted: tag, category, type."},
                     "importance": {"type": "string", "enum": ["low", "normal", "high", "critical"], "description": "Priority level (defaults to 'normal')"},
-                    "reminder_minutes": {"type": "integer", "description": "For create_event: create an Odysseus reminder this many minutes before the event, e.g. 5 for 'reminder 5 min before'."},
+                    "reminder_minutes": {"type": "integer", "description": "For create_event: create an Restia reminder this many minutes before the event, e.g. 5 for 'reminder 5 min before'."},
                     "rrule": {"type": "string", "description": "Recurrence rule in iCalendar RRULE format, e.g. 'FREQ=WEEKLY;BYDAY=MO' for weekly on Monday. Use with create_event or update_event. For update_event, pass an explicit empty string to remove recurrence and make the event single-occurrence."}
                 },
                 "required": ["action"]
@@ -580,7 +580,7 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "manage_notes",
-            "description": "Manage notes and checklists (Google Keep-style): list, view, add, update, delete, toggle_item. Use list/search to find candidate notes, then view with the note id when you need the full body. IMPORTANT: For to-do lists / checklists, set note_type='checklist' and pass the items as the `checklist_items` array — do NOT serialize them into `content` as plain text. For freeform notes, use note_type='note' and put the body in `content`. `due_date` accepts natural language like 'tomorrow at 9am' (parsed in the user's timezone) and fires a notification — do not also create a calendar event for the same reminder.",
+            "description": "Manage the user's Notes and To-dos — two separate UI tabs backed by one store: list, search, view, add, update, delete, toggle_item. THE note_type DECIDES WHICH TAB THE ITEM APPEARS IN, so choose it deliberately. note_type='note' = freeform text the user wants to KEEP (ideas, info, drafts) — body goes in `content`, shows in the Notes tab. note_type='todo' = things the user wants to DO (tasks, shopping list, errands, 'add X to my todos') — items go in the `checklist_items` array (NEVER serialized into `content` as plain text), shows in the To-dos tab. note_type='goal' = a bigger objective tracked with step items and progress. Use list/search with the note_type filter to look in the right tab, then view with the note id for the full body. When updating, keep the item's existing type unless the user asks to convert it. `due_date` accepts natural language like 'tomorrow at 9am' (parsed in the user's timezone) and fires a notification — do not also create a calendar event for the same reminder.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -590,9 +590,9 @@ FUNCTION_TOOL_SCHEMAS = [
                     "id": {"type": "string", "description": "Note id (for update/delete/toggle_item); 8-char prefix is fine"},
                     "query": {"type": "string", "description": "Search text for action='search'"},
                     "title": {"type": "string", "description": "Note title (for add/update)"},
-                    "content": {"type": "string", "description": "Freeform body text. Use this for note_type='note'. Do NOT use this for checklists — pass `checklist_items` instead."},
-                    "note_type": {"type": "string", "enum": ["note", "checklist"],
-                                  "description": "'note' = freeform text in `content`. 'checklist' = structured to-do items in `checklist_items`. Defaults to 'checklist' if checklist_items is supplied, else 'note'."},
+                    "content": {"type": "string", "description": "Freeform body text. ONLY for note_type='note'. Do NOT use this for todos/goals — pass `checklist_items` instead."},
+                    "note_type": {"type": "string", "enum": ["note", "todo", "goal"],
+                                  "description": "'note' = freeform text in `content` (Notes tab — stuff to keep). 'todo' = actionable checkbox items in `checklist_items` (To-dos tab — stuff to do). 'goal' = objective with step items and progress tracking. Defaults to 'todo' if checklist_items is supplied, else 'note'. For list/search: filters to that tab."},
                     "checklist_items": {"type": "array",
                                         "items": {"type": "object",
                                                   "properties": {
@@ -600,12 +600,13 @@ FUNCTION_TOOL_SCHEMAS = [
                                                       "done": {"type": "boolean", "description": "Whether the item is checked off"}
                                                   },
                                                   "required": ["text"]},
-                                        "description": "Checklist items for note_type='checklist'. Each item is {text, done}. REQUIRED for checklists — leaving this empty produces a blank note."},
+                                        "description": "Checkbox items for note_type='todo' or 'goal'. Each item is {text, done}. REQUIRED for todos/goals — leaving this empty produces a blank card."},
                     "color": {"type": "string", "description": "Optional color label (e.g. 'yellow', 'blue', 'green')"},
                     "label": {"type": "string", "description": "Optional category label (also used as a list filter)"},
                     "pinned": {"type": "boolean", "description": "Pin the note to the top"},
                     "archived": {"type": "boolean", "description": "For update: archive/unarchive. For list: show archived notes when true."},
                     "due_date": {"type": "string", "description": "Reminder time. Accepts natural language ('tomorrow at 9am', '11pm today') or ISO 8601. Fires a notification at that time."},
+                    "repeat": {"type": "string", "description": "Recurrence for habit-style reminders: 'daily', 'weekly', 'monthly', 'yearly', or precise rules 'weekly:W' (W=0 Sun..6 Sat), 'monthly:day:D', 'monthly:nth:N:W', 'monthly:last:W'. Pair with due_date — after each firing the reminder rolls to the next occurrence and checklist items reset (habit). 'none' clears it."},
                     "index": {"type": "integer", "description": "Checklist item index (for toggle_item, 0-based)"}
                 },
                 "required": ["action"]
@@ -971,7 +972,7 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "app_api",
-            "description": "Generic loopback to allowed internal Odysseus endpoints. Use this when there's no named tool for what the user wants. Hits the same routes the UI buttons hit (cookbook, gallery, library/documents, memory, notes, calendar, tasks, settings, themes, research, compare, etc.). action='endpoints' returns the OpenAPI surface (use `filter` to narrow). action='call' (default) takes method+path+body. Sensitive auth/user/admin/shell paths and host-control Cookbook mutation routes are blocked for safety. Do not use for shell commands; use named command tooling instead. Do not use for package installs, engine rebuilds, PID signalling, or email account discovery; use list_email_accounts for email accounts because /api/email/accounts is owner-filtered in tool context.",
+            "description": "Generic loopback to allowed internal Restia endpoints. Use this when there's no named tool for what the user wants. Hits the same routes the UI buttons hit (cookbook, gallery, library/documents, memory, notes, calendar, tasks, settings, themes, research, compare, etc.). action='endpoints' returns the OpenAPI surface (use `filter` to narrow). action='call' (default) takes method+path+body. Sensitive auth/user/admin/shell paths and host-control Cookbook mutation routes are blocked for safety. Do not use for shell commands; use named command tooling instead. Do not use for package installs, engine rebuilds, PID signalling, or email account discovery; use list_email_accounts for email accounts because /api/email/accounts is owner-filtered in tool context.",
             "parameters": {
                 "type": "object",
                 "properties": {

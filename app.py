@@ -30,6 +30,10 @@ def register_static_mime_types() -> None:
 
 register_static_mime_types()
 
+
+def _env_alias(new_name: str, old_name: str, default: str = "") -> str:
+    return os.getenv(new_name) or os.getenv(old_name) or default
+
 # Windows: force HuggingFace/fastembed to COPY model files instead of symlinking.
 # On a network-share/UNC data dir Windows can't follow HF's symlinks ([WinError
 # 1463]), so the ONNX embedding model fails to load. huggingface_hub reads this
@@ -102,7 +106,7 @@ try:
     _log_file = os.path.join(_log_dir, "app.log")
 
     # RotatingFileHandler is not multi-process safe (e.g. if uvicorn is run with --workers N).
-    # Odysseus is single-process by convention, so this is acceptable, but be aware that
+    # Restia is single-process by convention, so this is acceptable, but be aware that
     # concurrent log rotation issues can arise if multiple workers are configured.
     _file_h = logging.handlers.RotatingFileHandler(
         _log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
@@ -138,8 +142,8 @@ app.add_middleware(
         "Content-Type",
         "X-API-Key",
         "X-Auth-Token",
-        "X-Odysseus-Internal-Token",
-        "X-Odysseus-Owner",
+        "X-Restia-Internal-Token",
+        "X-Restia-Owner",
         "X-Requested-With",
         "X-TZ-Offset",
     ],
@@ -226,7 +230,7 @@ class _SlowRequestLogMiddleware(_BaseHTTPMiddleware):
         finally:
             elapsed = time.perf_counter() - start
             try:
-                threshold = float(os.getenv("ODYSSEUS_SLOW_REQUEST_LOG_SECONDS", "0.75") or "0.75")
+                threshold = float(_env_alias("RESTIA_SLOW_REQUEST_LOG_SECONDS", "ODYSSEUS_SLOW_REQUEST_LOG_SECONDS", "0.75") or "0.75")
             except Exception:
                 threshold = 0.75
             if elapsed >= threshold:
@@ -279,6 +283,7 @@ if AUTH_ENABLED:
     import re as _re
     AUTH_EXEMPT_PATTERNS = [
         _re.compile(r"^/api/tasks/[^/]+/webhook/[^/]+/?$"),
+        _re.compile(r"^/api/telegram/webhook/?$"),
     ]
 
     def _is_auth_exempt(path: str) -> bool:
@@ -342,7 +347,7 @@ if AUTH_ENABLED:
         forwarding headers. A bare ``client.host in ('127.0.0.1','::1')`` check is
         unsafe behind a Cloudflare tunnel / reverse proxy: those connect from
         loopback, so a remote visitor would otherwise inherit local trust and
-        slip past LOCALHOST_BYPASS or spoof the internal-tool path. Odysseus's own
+        slip past LOCALHOST_BYPASS or spoof the internal-tool path. Restia's own
         in-process agent loopback calls carry none of these headers, so they still
         qualify."""
         host = request.client.host if request.client else None
@@ -376,10 +381,10 @@ if AUTH_ENABLED:
                 _hdr = request.headers.get(INTERNAL_TOOL_HEADER)
                 if _hdr and secrets.compare_digest(_hdr, _ITT) and _is_trusted_loopback(request):
                     # Impersonation: when the agent's loopback call sets
-                    # X-Odysseus-Owner, attribute the request to that user only
+                    # X-Restia-Owner, attribute the request to that user only
                     # if they exist. Authorization checks remain separate; this
                     # is just owner attribution for notes/calendar/etc.
-                    _impersonate = (request.headers.get("X-Odysseus-Owner") or "").strip()
+                    _impersonate = (request.headers.get("X-Restia-Owner") or "").strip()
                     _auth_mgr = getattr(request.app.state, "auth_manager", None) or auth_manager
                     if _impersonate and _impersonate in getattr(_auth_mgr, "users", {}):
                         request.state.current_user = _impersonate
@@ -818,6 +823,10 @@ logger.info("AI interaction tools initialized (session, memory, RAG, UI control)
 from routes.webhook_routes import setup_webhook_routes
 app.include_router(setup_webhook_routes(webhook_manager, auth_manager, session_manager, api_key_manager))
 
+# Telegram bot bridge
+from routes.telegram_routes import setup_telegram_routes
+app.include_router(setup_telegram_routes(session_manager, webhook_manager))
+
 # API Tokens
 from routes.api_token_routes import setup_api_token_routes
 app.include_router(setup_api_token_routes())
@@ -827,6 +836,15 @@ logger.info("Webhook & API token routes initialized")
 # Notes (Google Keep-style notes/todos)
 from routes.note_routes import setup_note_routes
 app.include_router(setup_note_routes(task_scheduler))
+
+# Notification command center (bell dropdown aggregating emails needing
+# reply, due todos, upcoming events, AI suggestions, finished jobs)
+from routes.notification_center_routes import setup_notification_center_routes
+app.include_router(setup_notification_center_routes(task_scheduler))
+
+# Planner (goal -> plan artifact + notes/todos/calendar updates)
+from routes.planner_routes import setup_planner_routes
+app.include_router(setup_planner_routes())
 
 # Email
 from routes.email_routes import setup_email_routes
@@ -1054,7 +1072,7 @@ async def _startup_event():
     # Startup warmups are opt-in. They make later requests a little warmer, but
     # they also compete with the first seconds of real UI use on slow or busy
     # machines. Default to clear/idle startup and let requests warm what they use.
-    _startup_warmups_enabled = str(os.getenv("ODYSSEUS_STARTUP_WARMUPS", "")).lower() in {"1", "true", "yes", "on"}
+    _startup_warmups_enabled = str(_env_alias("RESTIA_STARTUP_WARMUPS", "ODYSSEUS_STARTUP_WARMUPS")).lower() in {"1", "true", "yes", "on"}
     if _startup_warmups_enabled:
         async def _warmup_tool_index():
             try:
@@ -1087,12 +1105,12 @@ async def _startup_event():
 
         _startup_tasks.append(asyncio.create_task(_warmup_endpoints()))
     else:
-        logger.info("Startup warmups disabled (set ODYSSEUS_STARTUP_WARMUPS=1 to enable)")
+        logger.info("Startup warmups disabled (set RESTIA_STARTUP_WARMUPS=1 to enable)")
 
     # Keep-alive is opt-in. The ping path performs model discovery, and when
     # stale LAN endpoints are configured it can add periodic backend pressure
     # that delays unrelated UI requests such as Notes/Documents.
-    _keepalive_enabled = str(os.getenv("ODYSSEUS_MODEL_KEEPALIVE", "")).lower() in {"1", "true", "yes", "on"}
+    _keepalive_enabled = str(_env_alias("RESTIA_MODEL_KEEPALIVE", "ODYSSEUS_MODEL_KEEPALIVE")).lower() in {"1", "true", "yes", "on"}
     if _keepalive_enabled:
         async def _keepalive_loop():
             while True:
@@ -1176,13 +1194,13 @@ async def _startup_event():
 
     # Start scheduled task runner — skip when running under a cron-driven
     # deployment where an external worker drives task firing. Mirrors
-    # `ODYSSEUS_INPROCESS_POLLERS` from the email pollers.
-    _tasks_inprocess = os.environ.get("ODYSSEUS_INPROCESS_TASKS", "1").strip().lower()
+    # `RESTIA_INPROCESS_POLLERS` from the email pollers.
+    _tasks_inprocess = _env_alias("RESTIA_INPROCESS_TASKS", "ODYSSEUS_INPROCESS_TASKS", "1").strip().lower()
     if _tasks_inprocess not in ("0", "false", "no", "off", ""):
         await task_scheduler.start()
     else:
         logger.info(
-            "In-process task scheduler disabled (ODYSSEUS_INPROCESS_TASKS=0); "
+            "In-process task scheduler disabled (RESTIA_INPROCESS_TASKS=0); "
             "drive task firing externally (e.g. cron)."
         )
     # Periodic null-owner sweep — re-runs the legacy-owner assignment hourly

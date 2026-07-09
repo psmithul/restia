@@ -2390,6 +2390,8 @@ async function initReminderSettings() {
   const emailOpt = el('set-reminder-channel-email-opt');
   const ntfyOpt = el('set-reminder-channel-ntfy-opt');
   const webhookOpt = el('set-reminder-channel-webhook-opt');
+  const telegramOpt = el('set-reminder-channel-telegram-opt');
+  const telegramMirrorToggle = el('set-reminder-telegram-mirror');
   const hint = el('set-reminder-channel-hint');
   const llmToggle = el('set-reminder-llm-toggle');
   // "Integrations" link in the channel-hint copy. Jumps to the
@@ -2469,6 +2471,21 @@ async function initReminderSettings() {
     webhookOpt.textContent = 'Webhook (add an Integration first)';
   }
 
+  // Telegram: available when the Telegram bridge is enabled (settings toggle).
+  let telegramConfigured = false;
+  try {
+    const res = await fetch('/api/auth/settings', { credentials: 'same-origin' });
+    if (res.ok) {
+      const s = await res.json();
+      telegramConfigured = !!s.telegram_enabled
+        || s.reminder_channel === 'telegram' || !!s.reminder_telegram_mirror;
+    }
+  } catch (_) {}
+  if (!telegramConfigured && telegramOpt) {
+    telegramOpt.disabled = true;
+    telegramOpt.textContent = 'Telegram (enable the Telegram bridge first)';
+  }
+
   const emailFromRow = el('set-reminder-email-from-row');
   const emailAcctSel = el('set-reminder-email-account');
   const emailToRow = el('set-reminder-email-to-row');
@@ -2509,6 +2526,10 @@ async function initReminderSettings() {
     if (webhookOpt) {
       webhookOpt.disabled = !webhookConfigured;
       webhookOpt.textContent = webhookConfigured ? 'Webhook' : 'Webhook (add an Integration first)';
+    }
+    if (telegramOpt) {
+      telegramOpt.disabled = !telegramConfigured;
+      telegramOpt.textContent = telegramConfigured ? 'Telegram' : 'Telegram (enable the Telegram bridge first)';
     }
   }
 
@@ -2574,10 +2595,11 @@ async function initReminderSettings() {
   // regardless of channel). The hint should make that clear so
   // users don't think they have to choose between channels.
   const CHANNEL_HINTS = {
-    browser: 'Reminders appear as browser notifications inside Odysseus.',
+    browser: 'Reminders appear as browser notifications inside Restia.',
     email: 'Reminders are emailed and shown as a browser notification.',
     ntfy: 'Reminders are pushed via ntfy AND shown as a browser notification.',
     webhook: 'Reminders are POSTed to the selected integration AND shown as a browser notification. Use {{title}} and {{message}} in the payload template.',
+    telegram: 'Reminders are sent to your Telegram chat AND shown as a browser notification.',
   };
 
   applyReminderChannelAvailability();
@@ -2603,8 +2625,19 @@ async function initReminderSettings() {
     if (savedChannel === 'email' && !smtpConfigured) savedChannel = 'browser';
     if (savedChannel === 'ntfy' && !ntfyConfigured) savedChannel = 'browser';
     if (savedChannel === 'webhook' && !webhookConfigured) savedChannel = 'browser';
+    if (savedChannel === 'telegram' && !telegramConfigured) savedChannel = 'browser';
     channelSel.value = savedChannel;
     llmToggle.checked = !!s.reminder_llm_synthesis;
+    if (telegramMirrorToggle) {
+      telegramMirrorToggle.checked = !!s.reminder_telegram_mirror;
+      telegramMirrorToggle.disabled = !telegramConfigured;
+      if (!telegramMirrorToggle.dataset.wired) {
+        telegramMirrorToggle.dataset.wired = '1';
+        telegramMirrorToggle.addEventListener('change', () => {
+          save({ reminder_telegram_mirror: telegramMirrorToggle.checked });
+        });
+      }
+    }
     // Persona dropdown — populate from built-in PROMPT_TEMPLATES (characters)
     // plus any custom character preset. Selected value persists to
     // reminder_llm_persona (backend hook lives in src/notes.py once
@@ -2974,7 +3007,7 @@ async function initEmailAccountsSettings() {
     const eafProviderNotes = {
       outlook: {
         title: 'Outlook / Office 365 needs OAuth',
-        body: 'Microsoft disables normal password login for IMAP/SMTP in most Outlook and Microsoft 365 accounts. Odysseus does not support Microsoft OAuth/Graph mail yet, so this preset is only a placeholder for future support.',
+        body: 'Microsoft disables normal password login for IMAP/SMTP in most Outlook and Microsoft 365 accounts. Restia does not support Microsoft OAuth/Graph mail yet, so this preset is only a placeholder for future support.',
       },
     };
     const eafNoteEl = el('eaf-provider-note');
@@ -3742,6 +3775,10 @@ async function initUnifiedIntegrations() {
   }
 
   function showForm(type, editId) {
+    if (type === 'caldav_google') {
+      window.location.href = '/api/calendar/oauth/google/authorize?account_id=' + encodeURIComponent('cal-' + Date.now());
+      return;
+    }
     formEl.style.display = '';
     if (type === 'api') showApiForm(editId);
     else if (type === 'caldav') showCalDavForm(editId);
@@ -3892,7 +3929,7 @@ async function initUnifiedIntegrations() {
       if (ntfyHint) {
         ntfyHint.style.display = isNtfy ? 'block' : 'none';
         if (isNtfy) {
-          ntfyHint.innerHTML = 'Enter the ntfy server URL Odysseus can reach. Examples: <code>http://127.0.0.1:8091</code>, <code>http://100.x.y.z:8091</code>, or <code>https://ntfy.example.com</code>.';
+          ntfyHint.innerHTML = 'Enter the ntfy server URL Restia can reach. Examples: <code>http://127.0.0.1:8091</code>, <code>http://100.x.y.z:8091</code>, or <code>https://ntfy.example.com</code>.';
         }
       }
       if (url) {
@@ -3966,7 +4003,13 @@ async function initUnifiedIntegrations() {
           <div class="settings-row"><label class="settings-label">Label</label><input id="uf-caldav-label" class="settings-input" placeholder="e.g. Work, Personal"></div>
           <div class="settings-row"><label class="settings-label">Server URL</label><input id="uf-caldav-url" class="settings-input" placeholder="https://www.google.com/calendar/dav/you@gmail.com/user/"></div>
           <div class="settings-row"><label class="settings-label">Username</label><input id="uf-caldav-user" class="settings-input" placeholder="you@example.com"></div>
-          <div class="settings-row"><label class="settings-label">Password</label><input id="uf-caldav-pass" class="settings-input" type="password" placeholder="${isNew ? '' : 'Leave blank to keep existing'}"></div>
+          <div class="settings-row" id="uf-caldav-pass-row"><label class="settings-label">Password</label><input id="uf-caldav-pass" class="settings-input" type="password" placeholder="${isNew ? '' : 'Leave blank to keep existing'}"></div>
+
+          <div id="uf-caldav-google-ui" style="display:none;margin-top:10px;padding:12px;background:var(--bg);border-radius:6px;border:1px solid var(--border);">
+            <div style="font-size:12px;font-weight:600;margin-bottom:6px">Google OAuth2</div>
+            <div style="font-size:11px;opacity:0.7;margin-bottom:8px">This account is connected via Google OAuth.</div>
+            <button type="button" id="uf-caldav-reconnect" class="admin-btn-add" style="font-size:11px">Reconnect with Google</button>
+          </div>
           <div class="settings-row" style="margin-top:10px;align-items:center;justify-content:flex-end;gap:6px;">
             <span id="uf-caldav-msg" style="font-size:11px;flex:1;margin-right:8px"></span>
             <button class="admin-btn-add" id="uf-caldav-test" style="display:inline-flex;align-items:center;gap:5px;background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));">Test</button>
@@ -3985,6 +4028,14 @@ async function initUnifiedIntegrations() {
           el('uf-caldav-label').value = acc.label || '';
           el('uf-caldav-url').value = acc.url || '';
           el('uf-caldav-user').value = acc.username || '';
+
+          if (acc.oauth_provider === 'google') {
+            el('uf-caldav-pass-row').style.display = 'none';
+            el('uf-caldav-google-ui').style.display = 'block';
+            el('uf-caldav-reconnect').addEventListener('click', () => {
+              window.location.href = '/api/calendar/oauth/google/authorize?account_id=' + encodeURIComponent(acc.id);
+            });
+          }
         }
       } catch (_) {}
     }
@@ -4492,7 +4543,7 @@ async function initUnifiedIntegrations() {
       },
       outlook: {
         title: 'Outlook / Office 365 needs OAuth',
-        body: 'Microsoft disables normal password login for IMAP/SMTP in most Outlook and Microsoft 365 accounts. Odysseus does not support Microsoft OAuth/Graph mail yet, so this preset is only a placeholder for future support.',
+        body: 'Microsoft disables normal password login for IMAP/SMTP in most Outlook and Microsoft 365 accounts. Restia does not support Microsoft OAuth/Graph mail yet, so this preset is only a placeholder for future support.',
         url: 'https://learn.microsoft.com/exchange/clients-and-mobile-in-exchange-online/disable-basic-authentication-in-exchange-online',
         linkLabel: 'Read Microsoft note',
       },
@@ -5312,7 +5363,7 @@ async function initUnifiedIntegrations() {
               </button>
             </div>
             <div id="uf-codex-config-body" style="display:none;">
-              <div style="font-size:11px;opacity:0.62;margin:4px 0 6px;">Toggle which Odysseus tools this agent can use. New agents start with chat only.</div>
+              <div style="font-size:11px;opacity:0.62;margin:4px 0 6px;">Toggle which Restia tools this agent can use. New agents start with chat only.</div>
               <div id="uf-codex-inline-scopes"></div>
             </div>
           </div>
@@ -5641,6 +5692,7 @@ async function initUnifiedIntegrations() {
   if (addBtn) {
     const _typeOptions = [
       ['api', 'API Service'],
+      ['caldav_google', 'Google Calendar (OAuth)'],
       ['caldav', 'CalDAV Calendar'],
       ['claude', 'Claude Agent'],
       ['codex', 'Codex Agent'],
@@ -5649,7 +5701,7 @@ async function initUnifiedIntegrations() {
       ['email', 'Email (IMAP/SMTP)'],
       ['mcp', 'MCP Tool Server'],
     ];
-    const _iconFor = (k) => (INTG_TYPES[k]?.icon || '').replace(/width="14"/, 'width="16"').replace(/height="14"/, 'height="16"');
+    const _iconFor = (k) => ((k === 'caldav_google' ? INTG_TYPES['caldav'] : INTG_TYPES[k])?.icon || '').replace(/width="14"/, 'width="16"').replace(/height="14"/, 'height="16"');
     const _rowsHtml = _typeOptions.map(([k, label]) => `<button type="button" class="uf-type-option" data-value="${k}" style="display:flex;align-items:center;gap:10px;width:100%;padding:8px 10px;background:transparent;border:0;color:var(--fg);font:inherit;cursor:pointer;text-align:left;"><span style="display:inline-flex;color:var(--accent, var(--red));flex-shrink:0;">${_iconFor(k)}</span><span>${esc(label)}</span></button>`).join('');
 
     // Anchor wrapper so the absolutely-positioned menu lands directly under

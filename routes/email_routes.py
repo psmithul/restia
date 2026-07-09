@@ -585,6 +585,118 @@ def _email_index_search(owner: str, account_id: str | None, folder: str, query: 
     return emails, total, (total_row or [None, None])[1]
 
 
+def _email_index_page(
+    owner: str,
+    account_id: str | None,
+    folder: str,
+    filter_: str,
+    limit: int,
+    offset: int,
+    has_attachments_only: bool = False,
+) -> dict | None:
+    """Return a fast first paint from the local email index when it is usable."""
+    if folder == "__scheduled__":
+        return None
+    filter_name = (filter_ or "all").lower()
+    if filter_name.startswith("tag:") or filter_name == "reminders":
+        return None
+    try:
+        limit = max(1, min(int(limit or 50), 200))
+        offset = max(0, int(offset or 0))
+    except Exception:
+        return None
+
+    clauses = ["owner=?", "account_key=?", "folder=?"]
+    params: list = [owner or "", _account_cache_key(account_id, owner), folder]
+    if has_attachments_only:
+        clauses.append("has_attachments=1")
+    if filter_name == "unread":
+        clauses.append("(flags IS NULL OR instr(flags, '\\Seen') = 0)")
+    elif filter_name == "favorites":
+        clauses.append("instr(COALESCE(flags, ''), '\\Flagged') > 0")
+    elif filter_name == "unanswered":
+        clauses.append("(flags IS NULL OR instr(flags, '\\Seen') = 0)")
+        clauses.append("(flags IS NULL OR instr(flags, '\\Answered') = 0)")
+    elif filter_name == "undone":
+        clauses.append("(flags IS NULL OR instr(flags, '\\Answered') = 0)")
+    elif filter_name in {"pending_30d", "stale_30d"}:
+        clauses.append("(flags IS NULL OR instr(flags, '\\Answered') = 0)")
+        from datetime import timedelta as _td
+        cutoff = (datetime.utcnow() - _td(days=30)).timestamp()
+        if filter_name == "pending_30d":
+            clauses.append("date_epoch >= ?")
+        else:
+            clauses.append("date_epoch > 0 AND date_epoch < ?")
+        params.append(cutoff)
+    elif filter_name != "all":
+        return None
+
+    where = " AND ".join(clauses)
+    try:
+        conn = _sql3.connect(SCHEDULED_DB)
+        try:
+            total_row = conn.execute(
+                f"SELECT COUNT(*), MAX(updated_at) FROM email_message_index WHERE {where}",
+                params,
+            ).fetchone()
+            total = int((total_row or [0])[0] or 0)
+            if total <= 0:
+                return None
+            rows = conn.execute(
+                f"""
+                SELECT uid, message_id, subject, from_name, from_address, to_text, cc_text,
+                       date_iso, date_display, date_epoch, size, flags, has_attachments
+                FROM email_message_index
+                WHERE {where}
+                ORDER BY date_epoch DESC
+                LIMIT ? OFFSET ?
+                """,
+                [*params, limit, offset],
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        logger.debug("email index page lookup skipped", exc_info=True)
+        return None
+
+    emails: list[dict] = []
+    for row in rows:
+        uid, message_id, subject, from_name, from_address, to_text, cc_text, date_iso, date_display, date_epoch, size, flags, has_attachments = row
+        flags = flags or ""
+        emails.append({
+            "uid": str(uid),
+            "message_id": (message_id or "").strip(),
+            "subject": subject or "(no subject)",
+            "from_name": from_name or from_address or "",
+            "from_address": from_address or "",
+            "to": to_text or "",
+            "cc": cc_text or "",
+            "date": date_iso or "",
+            "date_display": date_display or "",
+            "date_epoch": float(date_epoch or 0),
+            "size": int(size or 0),
+            "is_read": "\\Seen" in flags,
+            "is_answered": "\\Answered" in flags,
+            "is_flagged": "\\Flagged" in flags,
+            "flags": flags,
+            "has_attachments": bool(has_attachments),
+        })
+    if not emails:
+        return None
+    return {
+        "emails": emails,
+        "total": total,
+        "folder": folder,
+        "offset": offset,
+        "sync": {
+            "source": "index",
+            "indexed": total,
+            "updated_at": (total_row or [None, None])[1],
+            "refreshing": True,
+        },
+    }
+
+
 def _email_search_terms(query: str) -> list[str]:
     q = (query or "").strip()
     if not q:
@@ -953,11 +1065,11 @@ def _move_email_message(conn, uid: str, dest: str, role: str = "") -> bool:
 
 
 def _apply_odysseus_headers(msg, kind: str | None = None, ref_id: str | None = None):
-    msg["X-Odysseus-Origin"] = ODYSSEUS_MAIL_ORIGIN
+    msg["X-Restia-Origin"] = ODYSSEUS_MAIL_ORIGIN
     if kind:
-        msg["X-Odysseus-Kind"] = re.sub(r"[^A-Za-z0-9_.-]", "-", kind)[:64]
+        msg["X-Restia-Kind"] = re.sub(r"[^A-Za-z0-9_.-]", "-", kind)[:64]
     if ref_id:
-        msg["X-Odysseus-Ref"] = re.sub(r"[^A-Za-z0-9_.:-]", "-", ref_id)[:128]
+        msg["X-Restia-Ref"] = re.sub(r"[^A-Za-z0-9_.:-]", "-", ref_id)[:128]
 
 
 def _normalize_addr_field(field: str) -> str:
@@ -1135,6 +1247,7 @@ def setup_email_routes():
     _READ_TTL = 30 * 60.0
     _IMAP_POOL = {}   # account_id → (conn, last_used_at)
     _IMAP_IDLE_MAX = 60.0
+    _LIST_REFRESHING = set()
     _WARMING_READS = set()
     _WARM_READ_LIMIT = 2
     _WARM_MAX_BYTES = 192 * 1024
@@ -1263,6 +1376,50 @@ def setup_email_routes():
                         changed = True
             if changed:
                 _LIST_CACHE[key] = (expires_at, value)
+
+    def _update_list_cache_answered(account_id, folder, uid, answered: bool):
+        uid_s = str(uid)
+        for key, (expires_at, value) in list(_LIST_CACHE.items()):
+            if key[0] != (account_id or "") or key[1] != folder:
+                continue
+            emails = list((value or {}).get("emails") or [])
+            changed = False
+            if answered and key[2] in {"unanswered", "undone"}:
+                kept = [e for e in emails if str((e or {}).get("uid") or "") != uid_s]
+                if len(kept) != len(emails):
+                    value = dict(value)
+                    value["emails"] = kept
+                    value["total"] = max(0, int(value.get("total") or 0) - (len(emails) - len(kept)))
+                    changed = True
+            else:
+                for e in emails:
+                    if str((e or {}).get("uid") or "") == uid_s:
+                        e["is_answered"] = bool(answered)
+                        changed = True
+            if changed:
+                _LIST_CACHE[key] = (expires_at, value)
+
+    def _mutate_email_flags_sync(uid: str, folder: str, account_id: str | None, owner: str, changes: list[tuple[str, bool]]):
+        try:
+            with _imap(account_id, owner=owner) as conn:
+                conn.select(_q(folder))
+                for flag, add in changes:
+                    if not _store_email_flag(conn, uid, flag, add=add):
+                        return {"success": False, "error": "Email not found"}
+            for flag, add in changes:
+                _email_index_update_flags(owner, account_id, folder, uid, flag, add)
+                if flag == "\\Seen":
+                    _update_list_cache_seen(account_id, folder, uid, add)
+                elif flag == "\\Answered":
+                    _update_list_cache_answered(account_id, folder, uid, add)
+                    if add:
+                        _clear_done_response_tags(owner, account_id, folder, uid)
+                else:
+                    _invalidate_list_cache(account_id, folder)
+            return {"success": True}
+        except Exception as e:
+            logger.error(f"Failed to mutate email flags uid={uid} folder={folder}: {e}")
+            return {"success": False, "error": "Mail operation failed"}
 
     def _read_cache_get(key):
         v = _READ_CACHE.get(key)
@@ -1472,12 +1629,12 @@ def setup_email_routes():
                 # All emails NOT marked as answered/done (read or unread).
                 status, data = _imap_uid_search(conn, f"(UNANSWERED{from_clause})")
             elif filter_ == "reminders":
-                # Prefer the Odysseus marker header, but include the subject
-                # fallback too. The fallback uses a distinct Odysseus prefix
+                # Prefer the Restia marker header, but include the subject
+                # fallback too. The fallback uses a distinct Restia prefix
                 # so ordinary emails containing "Reminder" don't get mixed in.
                 status, data = _imap_uid_search(
                     conn,
-                    f'(OR HEADER X-Odysseus-Kind "reminder" SUBJECT "Reminder (Odysseus):"{from_clause})',
+                    f'(OR HEADER X-Restia-Kind "reminder" SUBJECT "Reminder (Restia):"{from_clause})',
                 )
             elif filter_ == "pending_30d":
                 # "What's pending in the last month" — UNANSWERED + delivered
@@ -1940,6 +2097,13 @@ def setup_email_routes():
         # SECURITY: include `owner` in the cache key so two users with
         # different account scopes don't share a cached list.
         ck = _list_cache_key(account_id, folder, filter, limit, offset, from_addr or "") + (int(bool(has_attachments)), owner)
+        def _store_fresh_list(result):
+            if result and not result.get("error"):
+                if offset == 0 and not from_addr and not has_attachments and filter in ("all", "unread", "unanswered", "undone"):
+                    _record_email_received_events(owner, account_id, folder, result.get("emails") or [])
+                    _schedule_recent_email_warm(result.get("emails") or [], folder, account_id, owner)
+                _list_cache_put(ck, result)
+
         if not cache_bust:
             cached = _list_cache_get(ck)
             if cached is not None:
@@ -1955,15 +2119,34 @@ def setup_email_routes():
                         owner, account_id or "", folder, filter, limit, offset, elapsed_ms,
                     )
                 return cached
+            if offset == 0 and not from_addr:
+                indexed = _email_index_page(owner, account_id, folder, filter, limit, offset, bool(has_attachments))
+                if indexed is not None:
+                    if ck not in _LIST_REFRESHING:
+                        _LIST_REFRESHING.add(ck)
+
+                        async def _refresh_from_imap():
+                            try:
+                                fresh = await _asyncio.to_thread(
+                                    _list_emails_sync, folder, limit, offset, filter, account_id, from_addr,
+                                    bool(has_attachments), owner,
+                                )
+                                _store_fresh_list(fresh)
+                            except Exception as e:
+                                logger.debug(f"email list background refresh skipped: {e}")
+                            finally:
+                                _LIST_REFRESHING.discard(ck)
+
+                        try:
+                            _asyncio.create_task(_refresh_from_imap())
+                        except RuntimeError:
+                            _LIST_REFRESHING.discard(ck)
+                    return indexed
         result = await _asyncio.to_thread(
             _list_emails_sync, folder, limit, offset, filter, account_id, from_addr,
             bool(has_attachments), owner,
         )
-        if result and not result.get("error"):
-            if offset == 0 and not from_addr and not has_attachments and filter in ("all", "unread", "unanswered", "undone"):
-                _record_email_received_events(owner, account_id, folder, result.get("emails") or [])
-                _schedule_recent_email_warm(result.get("emails") or [], folder, account_id, owner)
-            _list_cache_put(ck, result)
+        _store_fresh_list(result)
         elapsed_ms = int((_time.monotonic() - started_at) * 1000)
         if elapsed_ms > 1500:
             logger.warning(
@@ -3016,49 +3199,21 @@ def setup_email_routes():
     @router.post("/mark-unread/{uid}")
     async def mark_unread(uid: str, folder: str = Query("INBOX"), account_id: str | None = Query(None), owner: str = Depends(require_owner)):
         """Mark an email as unread (clear \\Seen flag)."""
-        try:
-            with _imap(account_id, owner=owner) as conn:
-                conn.select(_q(folder))
-                if not _store_email_flag(conn, uid, "\\Seen", add=False):
-                    return {"success": False, "error": "Email not found"}
-            _email_index_update_flags(owner, account_id, folder, uid, "\\Seen", False)
-            _invalidate_list_cache(account_id, folder)
-            return {"success": True}
-        except Exception as e:
-            logger.error(f"Failed to mark unread {uid}: {e}")
-            return {"success": False, "error": "Mail operation failed"}
+        return await asyncio.to_thread(_mutate_email_flags_sync, uid, folder, account_id, owner, [("\\Seen", False)])
 
     @router.post("/flag/{uid}")
     async def flag_email(uid: str, folder: str = Query("INBOX"), account_id: str | None = Query(None),
                          on: bool = Query(True), owner: str = Depends(require_owner)):
         """Toggle the \\Flagged flag (a.k.a. favorite / star) on an email.
         Pass `on=true` to favorite, `on=false` to unfavorite."""
-        try:
-            with _imap(account_id, owner=owner) as conn:
-                conn.select(_q(folder))
-                if not _store_email_flag(conn, uid, "\\Flagged", add=bool(on)):
-                    return {"success": False, "error": "Email not found"}
-            _email_index_update_flags(owner, account_id, folder, uid, "\\Flagged", bool(on))
-            _invalidate_list_cache(account_id, folder)
-            return {"success": True, "flagged": bool(on)}
-        except Exception as e:
-            logger.error(f"Failed to flag {uid}: {e}")
-            return {"success": False, "error": "Mail operation failed"}
+        result = await asyncio.to_thread(_mutate_email_flags_sync, uid, folder, account_id, owner, [("\\Flagged", bool(on))])
+        result["flagged"] = bool(on)
+        return result
 
     @router.post("/mark-read/{uid}")
     async def mark_read(uid: str, folder: str = Query("INBOX"), account_id: str | None = Query(None), owner: str = Depends(require_owner)):
         """Mark an email as read (set \\Seen flag)."""
-        try:
-            with _imap(account_id, owner=owner) as conn:
-                conn.select(_q(folder))
-                if not _store_email_flag(conn, uid, "\\Seen", add=True):
-                    return {"success": False, "error": "Email not found"}
-            _email_index_update_flags(owner, account_id, folder, uid, "\\Seen", True)
-            _invalidate_list_cache(account_id, folder)
-            return {"success": True}
-        except Exception as e:
-            logger.error(f"Failed to mark read {uid}: {e}")
-            return {"success": False, "error": "Mail operation failed"}
+        return await asyncio.to_thread(_mutate_email_flags_sync, uid, folder, account_id, owner, [("\\Seen", True)])
 
     @router.post("/archive/{uid}")
     # Sync def: blocking IMAP I/O with no awaits — see search_emails above. Runs in a
@@ -3114,7 +3269,7 @@ def setup_email_routes():
         permanent: bool = Query(False),
         owner: str = Depends(require_owner),
     ):
-        """Delete email messages stamped as Odysseus reminders."""
+        """Delete email messages stamped as Restia reminders."""
         if account_id:
             _assert_owns_account(account_id, owner)
         deleted = 0
@@ -3152,12 +3307,12 @@ def setup_email_routes():
                         # Match the Reminders filter: new messages have the
                         # explicit kind header, and subject fallback catches
                         # clients/providers that stripped custom headers.
-                        uids.update(_search_uids(conn, f'(HEADER X-Odysseus-Kind {_search_quote("reminder")})'))
-                        uids.update(_search_uids(conn, f'(SUBJECT {_search_quote("Reminder (Odysseus):")})'))
+                        uids.update(_search_uids(conn, f'(HEADER X-Restia-Kind {_search_quote("reminder")})'))
+                        uids.update(_search_uids(conn, f'(SUBJECT {_search_quote("Reminder (Restia):")})'))
                         for addr in own_addrs:
                             addr_q = _search_quote(addr)
-                            uids.update(_search_uids(conn, f'(FROM {addr_q} SUBJECT {_search_quote("Reminder (Odysseus):")})'))
-                            # Legacy reminders created before the Odysseus
+                            uids.update(_search_uids(conn, f'(FROM {addr_q} SUBJECT {_search_quote("Reminder (Restia):")})'))
+                            # Legacy reminders created before the Restia
                             # prefix still came from this mailbox as
                             # "Reminder: ..."; include them in Clear without
                             # sweeping unrelated external reminder emails.
@@ -3230,33 +3385,24 @@ def setup_email_routes():
     @router.post("/mark-answered/{uid}")
     async def mark_answered(uid: str, folder: str = Query("INBOX"), account_id: str | None = Query(None), owner: str = Depends(require_owner)):
         """Mark an email as answered (set \\Answered flag)."""
-        try:
-            with _imap(account_id, owner=owner) as conn:
-                conn.select(_q(folder))
-                if not _store_email_flag(conn, uid, "\\Answered", add=True):
-                    return {"success": False, "error": "Email not found"}
-            _email_index_update_flags(owner, account_id, folder, uid, "\\Answered", True)
-            _clear_done_response_tags(owner, account_id, folder, uid)
-            _invalidate_list_cache(account_id, folder)
-            return {"success": True}
-        except Exception as e:
-            logger.error(f"Failed to mark answered {uid}: {e}")
-            return {"success": False, "error": "Mail operation failed"}
+        return await asyncio.to_thread(_mutate_email_flags_sync, uid, folder, account_id, owner, [("\\Answered", True)])
+
+    @router.post("/mark-done/{uid}")
+    async def mark_done(uid: str, folder: str = Query("INBOX"), account_id: str | None = Query(None), owner: str = Depends(require_owner)):
+        """Mark an email as answered and read using one IMAP connection."""
+        return await asyncio.to_thread(
+            _mutate_email_flags_sync,
+            uid,
+            folder,
+            account_id,
+            owner,
+            [("\\Answered", True), ("\\Seen", True)],
+        )
 
     @router.post("/clear-answered/{uid}")
     async def clear_answered(uid: str, folder: str = Query("INBOX"), account_id: str | None = Query(None), owner: str = Depends(require_owner)):
         """Clear the \\Answered flag from an email."""
-        try:
-            with _imap(account_id, owner=owner) as conn:
-                conn.select(_q(folder))
-                if not _store_email_flag(conn, uid, "\\Answered", add=False):
-                    return {"success": False, "error": "Email not found"}
-            _email_index_update_flags(owner, account_id, folder, uid, "\\Answered", False)
-            _invalidate_list_cache(account_id, folder)
-            return {"success": True}
-        except Exception as e:
-            logger.error(f"Failed to clear answered {uid}: {e}")
-            return {"success": False, "error": "Mail operation failed"}
+        return await asyncio.to_thread(_mutate_email_flags_sync, uid, folder, account_id, owner, [("\\Answered", False)])
 
     @router.post("/compose-upload")
     async def compose_upload(file: UploadFile = File(...), owner: str = Depends(require_owner)):
@@ -3356,7 +3502,7 @@ def setup_email_routes():
 
     @router.post("/compose-from-odysseus")
     async def compose_from_odysseus(data: dict, owner: str = Depends(require_owner)):
-        """Stage an Odysseus document or gallery image as a compose upload."""
+        """Stage an Restia document or gallery image as a compose upload."""
         kind = str(data.get("kind") or "").strip().lower()
         item_id = str(data.get("id") or "").strip()
         if kind not in {"document", "gallery"} or not item_id:
@@ -3375,12 +3521,12 @@ def setup_email_routes():
         except HTTPException:
             raise
         except Exception as e:
-            logger.error(f"Failed to stage Odysseus attachment {kind}/{item_id}: {e}")
+            logger.error(f"Failed to stage Restia attachment {kind}/{item_id}: {e}")
             return {"success": False, "error": "Mail operation failed"}
 
     @router.post("/compose-from-odysseus-zip")
     async def compose_from_odysseus_zip(data: dict, owner: str = Depends(require_owner)):
-        """Stage several Odysseus documents/gallery images as one zip attachment."""
+        """Stage several Restia documents/gallery images as one zip attachment."""
         raw_items = data.get("items") or []
         if not isinstance(raw_items, list) or not raw_items:
             raise HTTPException(status_code=400, detail="Expected items")
@@ -3427,7 +3573,7 @@ def setup_email_routes():
         except HTTPException:
             raise
         except Exception as e:
-            logger.error(f"Failed to stage Odysseus zip attachment: {e}")
+            logger.error(f"Failed to stage Restia zip attachment: {e}")
             return {"success": False, "error": "Mail operation failed"}
 
     @router.post("/compose-from-attachment/{uid}/{index}")

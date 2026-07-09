@@ -8,6 +8,7 @@ import os
 from .memory import MemoryManager
 from .memory_vector import MemoryVectorStore
 from src.memory_provider import MemoryRecord, NativeMemoryProvider
+from src.brain_memory import build_brain_memory_manager
 from src.constants import DATA_DIR
 
 
@@ -40,7 +41,7 @@ class MemoryService:
     """
 
     def __init__(self, data_dir: str = DATA_DIR):
-        self.manager = MemoryManager(data_dir)
+        self.manager = build_brain_memory_manager(data_dir) or MemoryManager(data_dir)
         self.vector_store = MemoryVectorStore(data_dir) if os.path.exists(
             os.path.join(data_dir, "memory_vectors")
         ) else None
@@ -110,7 +111,7 @@ class MemoryService:
 
     def get_all(self, limit: int = 100) -> List[Memory]:
         """Get all memories."""
-        records = self.manager.load_all()[:limit]
+        records = self.manager.load()[:limit]
         return [self._to_memory(m) for m in records]
 
     def delete(self, memory_id: str) -> bool:

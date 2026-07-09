@@ -189,7 +189,7 @@ async def dispatch_reminder(
                 # Treat those as browser-only dedupe so email reminders can be
                 # retried by the backend scanner after a failed frontend path.
                 should_skip = last_dt >= _dt.now(_tz.utc) - _td(minutes=25)
-                if should_skip and channel in ("email", "ntfy", "webhook"):
+                if should_skip and channel in ("email", "ntfy", "webhook", "telegram"):
                     should_skip = last_channel == channel
                 if should_skip:
                     return {
@@ -197,6 +197,7 @@ async def dispatch_reminder(
                         "email_sent": False,
                         "ntfy_sent": False,
                         "webhook_sent": False,
+                        "telegram_sent": False,
                         "browser_sent": True,
                         "skipped": True,
                     }
@@ -364,11 +365,11 @@ async def dispatch_reminder(
                 msg["To"] = recipient
                 _t = title or 'Note'
                 _t = _t[len('Reminder:'):].strip() if _t.lower().startswith('reminder:') else _t
-                msg["Subject"] = f"Reminder (Odysseus): {_t}"
+                msg["Subject"] = f"Reminder (Restia): {_t}"
                 msg["Date"] = _dt.utcnow().strftime("%a, %d %b %Y %H:%M:%S +0000")
-                msg["X-Odysseus-Origin"] = "odysseus-ui"
-                msg["X-Odysseus-Kind"] = "reminder"
-                msg["X-Odysseus-Ref"] = str(note_id)
+                msg["X-Restia-Origin"] = "odysseus-ui"
+                msg["X-Restia-Kind"] = "reminder"
+                msg["X-Restia-Ref"] = str(note_id)
                 # Body shape: synthesis (warm sentence) → blank line → bold
                 # title header → note details. The title was previously only
                 # in the subject line, so the email read like a faceless
@@ -505,6 +506,50 @@ async def dispatch_reminder(
             ntfy_error = str(e) or e.__class__.__name__
             logger.warning(f"Reminder ntfy send failed: {e}")
 
+    # Telegram — fires when it's the primary channel OR when the mirror flag
+    # is on (reminder_telegram_mirror), so the Telegram bridge doubles as a
+    # notification layer on top of whatever primary channel is configured.
+    telegram_sent = False
+    telegram_error = ""
+    _tg_mirror = str(settings.get("reminder_telegram_mirror", "")).strip().lower() in {"1", "true", "yes", "on"}
+    if channel == "telegram" or _tg_mirror:
+        try:
+            from src.telegram_bot import load_telegram_config, send_telegram_message
+            _tg = load_telegram_config()
+            if not (_tg.enabled and _tg.bot_token):
+                telegram_error = "Telegram bridge disabled or bot token missing"
+            else:
+                _explicit = str(settings.get("reminder_telegram_chat_id") or "").strip()
+                if _explicit:
+                    _tg_chats = [c.strip() for c in _explicit.replace(" ", ",").split(",") if c.strip()]
+                else:
+                    _tg_chats = sorted(set(_tg.allowed_chat_ids) | set(_tg.session_map.keys()))
+                if not _tg_chats:
+                    telegram_error = "No Telegram chat target (set reminder_telegram_chat_id or allow a chat)"
+                else:
+                    _tg_title = (title or "Reminder").strip()
+                    _tg_msg = "\n".join(
+                        part for part in (
+                            f"🔔 {_tg_title}",
+                            (synthesis or "").strip(),
+                            (note_body or "").strip(),
+                        ) if part
+                    )[:4000]
+                    _tg_ok = 0
+                    for _chat in _tg_chats:
+                        try:
+                            await send_telegram_message(_tg.bot_token, _chat, _tg_msg)
+                            _tg_ok += 1
+                        except Exception as _te:
+                            telegram_error = str(_te) or _te.__class__.__name__
+                            logger.warning("Reminder telegram send failed for chat %s: %s", _chat, _te)
+                    telegram_sent = _tg_ok > 0
+        except Exception as e:
+            telegram_error = str(e) or e.__class__.__name__
+            logger.warning(f"Reminder telegram send failed: {e}")
+        if telegram_error and not telegram_sent:
+            logger.warning("Reminder telegram not delivered: %s", telegram_error)
+
     # In-app browser notification ALWAYS fires (regardless of channel). The
     # frontend polls `/api/tasks/notifications` and turns any entry with a
     # `body` into a real `Notification(...)` — same surface as task-success
@@ -530,7 +575,7 @@ async def dispatch_reminder(
     # second send for the same note within 25 min. Without this, a note
     # whose due_date fires while the user has the app open got TWO emails
     # (frontend-fired here + background-fired by ping_notes 0–5 min later).
-    if (email_sent or ntfy_sent or webhook_sent or browser_sent or local_browser_sent) and note_id:
+    if (email_sent or ntfy_sent or webhook_sent or telegram_sent or browser_sent or local_browser_sent) and note_id:
         try:
             import json as _json
             from datetime import datetime as _dt, timezone as _tz
@@ -546,7 +591,7 @@ async def dispatch_reminder(
                 _cache = cache or (_json.loads(_STATE.read_text(encoding="utf-8")) if _STATE.exists() else {})
             except Exception:
                 _cache = {}
-            sent_channel = "email" if email_sent else "ntfy" if ntfy_sent else "webhook" if webhook_sent else "browser"
+            sent_channel = "email" if email_sent else "ntfy" if ntfy_sent else "webhook" if webhook_sent else "telegram" if telegram_sent else "browser"
             _cache[cache_key or str(note_id)] = {
                 "at": _dt.now(_tz.utc).isoformat(),
                 "channel": sent_channel,
@@ -564,6 +609,8 @@ async def dispatch_reminder(
         "ntfy_error": ntfy_error,
         "webhook_sent": webhook_sent,
         "webhook_error": webhook_error,
+        "telegram_sent": telegram_sent,
+        "telegram_error": telegram_error,
         "browser_sent": browser_sent or local_browser_sent,
     }
 
@@ -617,6 +664,7 @@ def setup_note_routes(task_scheduler=None):
         request: Request,
         archived: Optional[bool] = None,
         label: Optional[str] = None,
+        note_type: Optional[str] = None,
     ):
         user = _owner(request)
         db = SessionLocal()
@@ -630,6 +678,8 @@ def setup_note_routes(task_scheduler=None):
                 q = q.filter(Note.archived == False)
             if label:
                 q = q.filter(Note.label == label)
+            if note_type:
+                q = q.filter(Note.note_type == note_type)
             # Archived view: most recently archived first. Active view: pin + manual order.
             if archived is True:
                 notes = q.order_by(Note.updated_at.desc()).all()
@@ -717,7 +767,8 @@ def setup_note_routes(task_scheduler=None):
                 note.pinned = body.pinned
             if body.archived is not None:
                 note.archived = body.archived
-            if body.due_date is not None:
+            fields_set = getattr(body, "model_fields_set", getattr(body, "__fields_set__", set()))
+            if "due_date" in fields_set:
                 note.due_date = body.due_date
             if body.image_url is not None:
                 note.image_url = body.image_url

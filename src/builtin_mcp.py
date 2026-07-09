@@ -140,6 +140,32 @@ async def register_builtin_servers(mcp_manager):
             continue
         _spawn_bg(_connect_python_server(server_id, script_path, name))
 
+    async def _connect_mnemosyne_server():
+        """Connect to Mnemosyne MCP server via stdio (in-process CLI)."""
+        mnemosyne_bin = shutil.which("mnemosyne")
+        if not mnemosyne_bin:
+            logger.warning("Mnemosyne CLI not found — Mnemosyne MCP server unavailable")
+            return
+        try:
+            ok = await mcp_manager.connect_server(
+                server_id="mnemosyne",
+                name="Built-in: Mnemosyne",
+                transport="stdio",
+                command=mnemosyne_bin,
+                args=["mcp", "--transport", "stdio"],
+                env={"MNEMOSYNE_DATA_DIR": os.environ.get("MNEMOSYNE_DATA_DIR", os.path.join(base_dir, "data"))},
+            )
+            if ok:
+                logger.info("Built-in MCP server registered: Mnemosyne")
+            else:
+                logger.warning("Built-in MCP server failed to connect: Mnemosyne")
+        except asyncio.CancelledError:
+            raise
+        except BaseException as e:
+            logger.warning(f"Mnemosyne MCP server error: {type(e).__name__}: {e}")
+
+    _spawn_bg(_connect_mnemosyne_server())
+
     # Register NPX-based servers in the background (they take longer to start)
     npx_path = _find_npx()
     logger.info(f"NPX binary resolved to: {npx_path}")
@@ -166,7 +192,7 @@ async def register_builtin_servers(mcp_manager):
                     f"  Reason: npm package {pkg_spec!r} is not installed in the npx cache.\n"
                     f"  Impact: tools provided by this MCP server will be unavailable.\n"
                     f"  Fix:    {os.path.basename(npx_path)} -y {pkg_spec} --version\n"
-                    f"          (run once, then restart Odysseus)\n"
+                    f"          (run once, then restart Restia)\n"
                     f"  Notes:  this server is optional; see README.md "
                     f"'Built-in MCP servers' for details."
                 )

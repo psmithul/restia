@@ -30,6 +30,10 @@ def _settings(**extra):
         "reminder_channel": "ntfy",
         "reminder_llm_synthesis": False,
         "reminder_ntfy_topic": "reminders",
+        # Pin the Telegram mirror off: settings_override merges over the REAL
+        # settings file, so a deployment with the mirror enabled would
+        # otherwise fire the telegram branch inside these ntfy-only asserts.
+        "reminder_telegram_mirror": False,
         **extra,
     }
 

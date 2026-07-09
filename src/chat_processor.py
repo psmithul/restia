@@ -262,21 +262,39 @@ class ChatProcessor:
                     if m.get("id"):
                         _used_ids.append(m["id"])
 
+            relevant = []
             if extended:
                 relevant = self._hybrid_retrieve(message, extended, k=3)
-                if relevant:
-                    ext_text = "\n".join([f"- {m['text']}" for m in relevant])
-                    preface.append(untrusted_context_message(
-                        "saved memory: retrieved context",
-                        (
-                            "Memory context. Do not reference unless the user asks "
-                            f"about these topics.\n{ext_text}"
-                        ),
-                    ))
-                    for m in relevant:
-                        self._last_used_memories.append({"text": m["text"], "category": m.get("category", "fact"), "type": "recalled"})
-                        if m.get("id"):
-                            _used_ids.append(m["id"])
+            external_recall = getattr(self.memory_manager, "get_external_relevant_memories", None)
+            if callable(external_recall):
+                try:
+                    external = external_recall(message, owner=owner, max_items=3)
+                except Exception as e:
+                    logger.warning("External memory recall failed: %s", e)
+                    external = []
+                seen = {m.get("id") for m in relevant}
+                for memory in external:
+                    if not isinstance(memory, dict):
+                        continue
+                    memory_id = memory.get("id")
+                    if memory_id in seen:
+                        continue
+                    seen.add(memory_id)
+                    relevant.append(memory)
+
+            if relevant:
+                ext_text = "\n".join([self._format_memory_context_item(m) for m in relevant])
+                preface.append(untrusted_context_message(
+                    "saved memory: retrieved context",
+                    (
+                        "Memory context. Do not reference unless the user asks "
+                        f"about these topics.\n{ext_text}"
+                    ),
+                ))
+                for m in relevant:
+                    self._last_used_memories.append({"text": m["text"], "category": m.get("category", "fact"), "type": "recalled"})
+                    if m.get("id") and not str(m.get("id")).startswith("brain:"):
+                        _used_ids.append(m["id"])
 
             # Bump usage counters for the memories that were actually injected.
             if _used_ids and hasattr(self.memory_manager, "increment_uses"):
@@ -421,3 +439,12 @@ class ChatProcessor:
                 preface.append(untrusted_context_message("available skills index", "\n".join(lines)))
 
         return preface, rag_sources, web_sources
+
+    @staticmethod
+    def _format_memory_context_item(memory: Dict[str, Any]) -> str:
+        text = str(memory.get("text") or "")
+        metadata = memory.get("metadata") if isinstance(memory.get("metadata"), dict) else {}
+        citation = metadata.get("citation") if metadata else None
+        if memory.get("source") == "restia_brain" and citation:
+            return f"- {text} (brain: {citation})"
+        return f"- {text}"

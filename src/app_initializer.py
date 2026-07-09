@@ -8,6 +8,7 @@ from src.constants import (
     DATA_DIR, PERSONAL_DIR, RUNBOOK_DIR, UPLOAD_DIR,
     SESSIONS_FILE, DEFAULT_HOST, OPENAI_API_KEY
 )
+from src.brain_memory import build_brain_memory_manager
 from src.memory import MemoryManager
 from src.memory_provider import MemoryProviderRegistry, NativeMemoryProvider
 from services.memory.skills import SkillsManager
@@ -44,7 +45,7 @@ def initialize_managers(base_dir: str, rag_manager=None) -> Dict[str, Any]:
     create_directories()
 
     # Initialize core managers
-    memory_manager = MemoryManager(DATA_DIR)
+    memory_manager = build_brain_memory_manager(DATA_DIR) or MemoryManager(DATA_DIR)
     skills_manager = SkillsManager(DATA_DIR)
     session_manager = SessionManager(SESSIONS_FILE)
     set_session_manager(session_manager)  # Enable Session.add_message() persistence

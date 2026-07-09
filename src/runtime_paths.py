@@ -21,10 +21,13 @@ def get_default_data_dir() -> str:
     """Return the default path to the data directory.
 
     In normal runs, this is a 'data' subdirectory under the app root.
-    In frozen builds, it is a persistent user directory (~/.odysseus/data)
+    In frozen builds, it is a persistent user directory (~/.restia/data)
     to prevent SQLite databases and other persistent files from being
     written to the ephemeral, temporary extraction bundle directory.
     """
     if getattr(sys, "frozen", False):
-        return os.path.join(os.path.expanduser("~"), ".odysseus", "data")
+        legacy_dir = os.path.join(os.path.expanduser("~"), ".odysseus", "data")
+        if os.path.exists(legacy_dir):
+            return legacy_dir
+        return os.path.join(os.path.expanduser("~"), ".restia", "data")
     return os.path.join(get_app_root(), "data")

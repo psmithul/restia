@@ -71,7 +71,7 @@ repair_tree_ownership() {
 repair_app_tree_ownership() {
     if [ -d /app ]; then
         find /app -xdev \
-            \( -path /app/data -o -path /app/logs -o -path /app/.ssh -o -path /app/.cache -o -path /app/.local \) -prune \
+            \( -path /app/data -o -path /app/logs -o -path /app/.ssh -o -path /app/.cache -o -path /app/.local -o -path /app/.npm \) -prune \
             -o -not -uid "$PUID" -print0 2>/dev/null \
             | xargs -0 -r chown "$PUID:$PGID" 2>/dev/null || true
     fi
@@ -96,7 +96,7 @@ repair_bind_mount_ownership() {
 # Repair image-owned writable paths without walking into bind-mounted host
 # trees, then repair the app-owned mount roots separately.
 repair_app_tree_ownership
-for dir in /app/data /app/logs /app/.ssh /app/.cache/huggingface /app/.local; do
+for dir in /app/data /app/logs /app/.ssh /app/.cache/huggingface /app/.local /app/.npm; do
     repair_bind_mount_ownership "$dir"
 done
 

@@ -440,9 +440,16 @@ async def do_manage_memory(content: str, session_id: Optional[str] = None, owner
             vector_results = _memory_manager.get_relevant_memories(query, memories, threshold=0.05, max_items=20)
         else:
             vector_results = []
+        external_results = []
+        external_recall = getattr(_memory_manager, "get_external_relevant_memories", None)
+        if callable(external_recall):
+            try:
+                external_results = external_recall(query, owner=owner, max_items=20)
+            except Exception:
+                logger.warning("External memory search failed", exc_info=True)
         seen = set()
         results = []
-        for m in [*exact_results, *vector_results]:
+        for m in [*exact_results, *vector_results, *external_results]:
             mid = m.get("id")
             if mid in seen:
                 continue

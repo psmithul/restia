@@ -1,0 +1,206 @@
+"""Notification command-center API.
+
+Aggregates everything that previously lived behind scattered red dots into
+one feed the frontend bell dropdown renders:
+
+- emails needing reply   (email urgency scanner state, score >= 2, unread)
+- tasks due              (todo/checklist notes overdue or due in 24h)
+- calendar reminders     (events starting in the next 24h)
+- AI suggestions         (rule-based, each with a ready-to-send chat prompt)
+- long-running jobs      (recent task-scheduler completions)
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from fastapi import APIRouter, Depends
+
+from src.auth_helpers import require_user
+from src.constants import DATA_DIR
+
+logger = logging.getLogger(__name__)
+
+_scheduler_ref = None
+
+
+def _parse_due_local(value):
+    """Parse a note due_date (naive local / offset ISO / trailing Z) to a
+    naive server-local datetime, or None."""
+    if not value:
+        return None
+    try:
+        d = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if d.tzinfo is not None:
+        d = d.astimezone().replace(tzinfo=None)
+    return d
+
+
+def _emails_needing_reply(owner: str) -> list[dict]:
+    slug = "".join(c if (c.isalnum() or c in "-_.@") else "_" for c in (owner or "default"))
+    path = Path(DATA_DIR) / f"email_urgency_state_{slug}.json"
+    if not path.exists():
+        return []
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    out = []
+    for key, v in (state.get("per_uid") or {}).items():
+        if not isinstance(v, dict):
+            continue
+        if v.get("score", 0) < 2 or not v.get("unread"):
+            continue
+        uid = str(key).split(":", 1)[-1]
+        out.append({
+            "uid": uid,
+            "subject": (v.get("subject") or "(no subject)")[:160],
+            "from": (v.get("from") or "")[:120],
+            "score": v.get("score", 2),
+            "reason": (v.get("reason") or "")[:160],
+            "open_hash": f"#email=INBOX:{uid}",
+        })
+    out.sort(key=lambda e: -e["score"])
+    return out[:10]
+
+
+def _todos_due(owner: str) -> list[dict]:
+    from core.database import Note, SessionLocal
+    from src.auth_helpers import owner_filter
+
+    now = datetime.now()
+    horizon = now + timedelta(hours=24)
+    db = SessionLocal()
+    try:
+        q = db.query(Note).filter(Note.archived == False)  # noqa: E712
+        q = q.filter(Note.due_date.isnot(None), Note.due_date != "")
+        if owner:
+            q = owner_filter(q, Note, owner)
+        out = []
+        for n in q.limit(300).all():
+            due = _parse_due_local(n.due_date)
+            if not due or due > horizon:
+                continue
+            out.append({
+                "id": n.id,
+                "title": (n.title or n.content or "Untitled")[:120],
+                "due_date": n.due_date,
+                "due_label": due.strftime("%a %H:%M"),
+                "overdue": due < now,
+                "repeat": (n.repeat or "none"),
+                "note_type": n.note_type or "note",
+                "open_hash": f"#open=notes&note={n.id}",
+            })
+        out.sort(key=lambda t: t["due_date"])
+        return out[:10]
+    finally:
+        db.close()
+
+
+def _events_upcoming(owner: str) -> list[dict]:
+    from core.database import CalendarCal, CalendarEvent, SessionLocal
+
+    now = datetime.now()
+    horizon = now + timedelta(hours=24)
+    db = SessionLocal()
+    try:
+        q = (
+            db.query(CalendarEvent)
+            .join(CalendarCal, CalendarEvent.calendar_id == CalendarCal.id)
+            .filter(
+                CalendarEvent.dtstart >= now,
+                CalendarEvent.dtstart <= horizon,
+                CalendarEvent.status != "cancelled",
+            )
+        )
+        if owner:
+            q = q.filter(CalendarCal.owner == owner)
+        out = []
+        for ev in q.order_by(CalendarEvent.dtstart).limit(8).all():
+            start = ev.dtstart
+            # Import paths store some events as UTC instants (is_utc flag);
+            # render those in server-local wall time like the rest.
+            if start is not None and getattr(ev, "is_utc", False):
+                from datetime import timezone as _tzmod
+                start = start.replace(tzinfo=_tzmod.utc).astimezone().replace(tzinfo=None)
+            out.append({
+                "id": ev.uid,
+                "summary": (ev.summary or "Untitled event")[:120],
+                "start": start.isoformat() if start else "",
+                "start_label": "all day" if ev.all_day else (start.strftime("%a %H:%M") if start else ""),
+                "all_day": bool(ev.all_day),
+            })
+        return out
+    finally:
+        db.close()
+
+
+def _suggestions(emails: list, todos: list, events: list) -> list[dict]:
+    """Rule-based suggestions, each with a ready-to-send agent prompt."""
+    out = []
+    overdue = [t for t in todos if t.get("overdue")]
+    if overdue:
+        names = ", ".join(t["title"][:40] for t in overdue[:3])
+        out.append({
+            "id": "reschedule-overdue",
+            "text": f"{len(overdue)} to-do{'s' if len(overdue) != 1 else ''} overdue — want me to reschedule?",
+            "prompt": f"Reschedule my overdue to-dos ({names}) to a sensible time later today.",
+        })
+    if emails:
+        out.append({
+            "id": "draft-replies",
+            "text": f"{len(emails)} email{'s' if len(emails) != 1 else ''} likely need a reply — I can draft them.",
+            "prompt": "Draft replies to my urgent unread emails and show them to me before sending anything.",
+        })
+    soon = [e for e in events if not e.get("all_day")][:1]
+    if soon:
+        out.append({
+            "id": f"prep-{soon[0]['id']}",
+            "text": f"“{soon[0]['summary']}” is coming up {soon[0]['start_label']} — need prep?",
+            "prompt": f"Help me prepare for my upcoming event \"{soon[0]['summary']}\".",
+        })
+    return out[:4]
+
+
+def setup_notification_center_routes(task_scheduler=None) -> APIRouter:
+    global _scheduler_ref
+    _scheduler_ref = task_scheduler
+    router = APIRouter(prefix="/api/notifications", tags=["notifications"])
+
+    @router.get("/center")
+    async def notification_center(owner: str = Depends(require_user)):
+        emails, todos, events, jobs = [], [], [], []
+        try:
+            emails = _emails_needing_reply(owner)
+        except Exception:
+            logger.debug("notification center: email section failed", exc_info=True)
+        try:
+            todos = _todos_due(owner)
+        except Exception:
+            logger.debug("notification center: todos section failed", exc_info=True)
+        try:
+            events = _events_upcoming(owner)
+        except Exception:
+            logger.debug("notification center: events section failed", exc_info=True)
+        try:
+            if _scheduler_ref is not None and hasattr(_scheduler_ref, "recent_notifications"):
+                jobs = _scheduler_ref.recent_notifications(owner=owner)[:8]
+        except Exception:
+            logger.debug("notification center: jobs section failed", exc_info=True)
+        suggestions = _suggestions(emails, todos, events)
+        return {
+            "emails": emails,
+            "todos": todos,
+            "events": events,
+            "suggestions": suggestions,
+            "jobs": jobs,
+            "count": len(emails) + len(todos) + len(events) + len(jobs),
+            "generated_at": datetime.now().isoformat(),
+        }
+
+    return router

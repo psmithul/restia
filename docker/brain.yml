@@ -1,0 +1,11 @@
+services:
+  odysseus:
+    volumes:
+      - ${ODYSSEUS_BRAIN_HOST_DIR:-./data/restia-brain}:/app/brain:z
+    environment:
+      - ODYSSEUS_BRAIN_MEMORY_ENABLED=${ODYSSEUS_BRAIN_MEMORY_ENABLED:-true}
+      - ODYSSEUS_BRAIN_ROOT=${ODYSSEUS_BRAIN_ROOT:-/app/brain}
+      - ODYSSEUS_BRAIN_OWNER=${ODYSSEUS_BRAIN_OWNER:-admin}
+      - ODYSSEUS_BRAIN_SYNC_WRITES=${ODYSSEUS_BRAIN_SYNC_WRITES:-true}
+      - RESTIA_BRAIN_VAULT=${RESTIA_BRAIN_VAULT:-/app/brain/vault}
+      - RESTIA_BRAIN_DB=${RESTIA_BRAIN_DB:-/app/brain/data/brain.sqlite}

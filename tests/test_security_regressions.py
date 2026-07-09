@@ -657,6 +657,37 @@ def test_require_user_localhost_bypass_admits_loopback(monkeypatch):
     assert auth_helpers.require_user(_LoopReq()) == ""
 
 
+def test_effective_owner_localhost_bypass_uses_single_admin(monkeypatch):
+    """Localhost bypass requests still need a concrete owner for owner-scoped
+    runtime stores such as email MCP accounts."""
+    monkeypatch.setenv("AUTH_ENABLED", "true")
+    monkeypatch.setenv("LOCALHOST_BYPASS", "true")
+    sys.modules.pop("src.auth_helpers", None)
+    from src import auth_helpers  # noqa: WPS433
+
+    class _State:
+        current_user = None
+
+    class _AppState:
+        class _Mgr:
+            is_configured = True
+            users = {"admin": {"is_admin": True}}
+        auth_manager = _Mgr()
+
+    class _App:
+        state = _AppState()
+
+    class _LoopClient:
+        host = "127.0.0.1"
+
+    class _LoopReq:
+        state = _State()
+        app = _App()
+        client = _LoopClient()
+
+    assert auth_helpers.effective_owner(_LoopReq()) == "admin"
+
+
 def test_require_user_localhost_bypass_still_rejects_lan(monkeypatch):
     """LOCALHOST_BYPASS=true must not extend to non-loopback callers —
     a LAN visitor still needs to authenticate."""

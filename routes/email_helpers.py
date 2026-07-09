@@ -34,7 +34,7 @@ from fastapi import Query, HTTPException, Request
 from pydantic import BaseModel
 from typing import Optional, List
 
-from src.auth_helpers import _auth_disabled, get_current_user
+from src.auth_helpers import require_user as _shared_require_user
 from src.secret_storage import decrypt as _decrypt
 
 logger = logging.getLogger(__name__)
@@ -217,7 +217,7 @@ def _friendly_email_auth_error(protocol: str, host: str, error: object) -> str:
     if microsoft_basic_auth_failure:
         return (
             "Microsoft no longer accepts normal mailbox passwords for "
-            "Outlook/Office 365 IMAP/SMTP in most accounts. Odysseus "
+            "Outlook/Office 365 IMAP/SMTP in most accounts. Restia "
             "does not support Microsoft OAuth/Graph mail yet, so Outlook "
             "accounts cannot be added with this password form."
         )
@@ -298,21 +298,7 @@ def _require_auth(request: Request) -> str:
     unconfigured mode are only honoured if they're coming from
     localhost; everyone else gets 401.
     """
-    u = get_current_user(request)
-    if u:
-        return u
-    if _auth_disabled():
-        return ""
-    auth_mgr = getattr(request.app.state, "auth_manager", None)
-    if auth_mgr is not None and getattr(auth_mgr, "is_configured", False):
-        raise HTTPException(401, "Not authenticated")
-    # Unconfigured / first-run mode: only allow loopback callers. Public
-    # network traffic must authenticate even before auth is set up.
-    client = getattr(request, "client", None)
-    host = (client.host if client else "") or ""
-    if host in ("127.0.0.1", "::1", "localhost"):
-        return ""
-    raise HTTPException(401, "Not authenticated")
+    return _shared_require_user(request)
 
 
 def require_owner(request: Request, account_id: str | None = Query(None)) -> str:
@@ -1865,7 +1851,7 @@ class SendEmailRequest(BaseModel):
     # answered after successful delivery so it leaves undone/reply-soon views.
     source_uid: Optional[str] = None
     source_folder: Optional[str] = None
-    # Internal marker for Odysseus-generated mail (e.g. reminder, scheduled).
+    # Internal marker for Restia-generated mail (e.g. reminder, scheduled).
     odysseus_kind: Optional[str] = None
     # If true, /send waits for SMTP + Sent append and returns the sent UID.
     wait_for_delivery: bool = False

@@ -166,11 +166,17 @@ DEFAULT_SETTINGS = {
     # library can grow beyond this; cleanup/retirement is an explicit review flow.
     "skill_max_injected": 3,
     # Reminders
-    "reminder_channel": "browser",   # "browser" | "email" | "ntfy" | "webhook"
+    "reminder_channel": "browser",   # "browser" | "email" | "ntfy" | "webhook" | "telegram"
     "reminder_llm_synthesis": False,
     "reminder_llm_persona": "",
     "reminder_ntfy_topic": "Reminders",
     "reminder_email_to": "",
+    # Mirror every reminder to Telegram IN ADDITION to the primary channel —
+    # makes the Telegram bridge act as a notification layer.
+    "reminder_telegram_mirror": False,
+    # Explicit chat id(s) for reminder delivery (comma-separated). Empty =
+    # fall back to allowed_chat_ids + active session chats.
+    "reminder_telegram_chat_id": "",
     # Generic outbound webhook channel: pick any saved Integration as the
     # target and supply a JSON payload template. Use {{title}} and {{message}}
     # as placeholders — they are JSON-escaped before substitution, so the
@@ -178,6 +184,20 @@ DEFAULT_SETTINGS = {
     # ntfy (JSON mode), or any service that accepts a POST with a JSON body.
     "reminder_webhook_integration_id": "",
     "reminder_webhook_payload_template": "",
+    # Telegram bridge. Secrets can also be supplied via environment variables:
+    # TELEGRAM_ENABLED, TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET,
+    # TELEGRAM_ALLOWED_CHAT_IDS, TELEGRAM_ALLOW_ALL_CHATS, TELEGRAM_OWNER.
+    "telegram_enabled": False,
+    "telegram_bot_token": "",
+    "telegram_webhook_secret": "",
+    "telegram_allowed_chat_ids": [],
+    "telegram_allow_all_chats": False,
+    "telegram_owner": "",
+    "telegram_session_map": {},
+    # IANA timezone for Telegram conversations (e.g. "Asia/Kolkata"). Telegram
+    # has no browser headers to carry the user's clock, so chats resolve
+    # relative dates against this zone; empty = server-local time.
+    "telegram_timezone": "",
     # Email triage scanner rules. Running/paused state and schedule live in
     # Tasks via the built-in `check_email_urgency` task.
     "urgent_email_prompt": (

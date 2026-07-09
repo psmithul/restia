@@ -66,6 +66,26 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
         if memory.get("owner") != user:
             raise HTTPException(404, "Memory not found")
 
+    def _with_external_memory_list(memories: List[Dict[str, Any]], user: Optional[str]) -> List[Dict[str, Any]]:
+        external_list = getattr(memory_manager, "list_external_memories", None)
+        if not callable(external_list):
+            return memories
+        try:
+            seen = {m.get("id") for m in memories if isinstance(m, dict)}
+            merged = list(memories)
+            for memory in external_list(owner=user, max_items=100):
+                if not isinstance(memory, dict):
+                    continue
+                memory_id = memory.get("id")
+                if memory_id in seen:
+                    continue
+                seen.add(memory_id)
+                merged.append(memory)
+            return merged
+        except Exception:
+            logger.warning("External memory list failed", exc_info=True)
+            return memories
+
     @router.post("/debug")
     def debug_memory_relevance(request: Request, query: str = Form(...)):
         """Debug which memories would be triggered for a query"""
@@ -133,7 +153,10 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
     def api_get_memory(request: Request):
         """Return all memory entries with their metadata."""
         user = _owner(request)
-        return {"memory": memory_manager.load(owner=user)}
+        memories = memory_manager.load(owner=user)
+        ext = _with_external_memory_list(memories, user)
+        print(f"DEBUG api_get_memory user={user!r} ext_len={len(ext)}")
+        return {"memory": ext}
 
     @router.post("/search")
     def search_memories(request: Request, query: str = Form(...), session_id: str = Form(None), category: str = Form(None)):
@@ -148,6 +171,22 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
             memories = [m for m in memories if category in m.get("categories", [m.get("category", "")])]
 
         relevant = memory_manager.get_relevant_memories(query, memories, threshold=0.05, max_items=20)
+        external_recall = getattr(memory_manager, "get_external_relevant_memories", None)
+        if callable(external_recall):
+            try:
+                seen = {m.get("id") for m in relevant if isinstance(m, dict)}
+                for memory in external_recall(query, owner=user, max_items=20):
+                    if not isinstance(memory, dict):
+                        continue
+                    memory_id = memory.get("id")
+                    if memory_id in seen:
+                        continue
+                    seen.add(memory_id)
+                    relevant.append(memory)
+                    if len(relevant) >= 20:
+                        break
+            except Exception:
+                logger.warning("External memory search failed", exc_info=True)
 
         return {"memories": relevant, "total": len(relevant), "query": query}
 

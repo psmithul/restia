@@ -34,6 +34,7 @@ export function initSidebarLayout(Storage, opts) {
   // ── Icon rail + sidebar toggle ──
   const iconRail = document.getElementById('icon-rail');
   const hamburgerBtn = document.getElementById('hamburger-btn');
+  const sidebarToggleBtn = document.getElementById('sidebar-toggle-btn');
 
   function _syncRailSideCore() {
     const sidebar = document.getElementById('sidebar');
@@ -63,6 +64,12 @@ export function initSidebarLayout(Storage, opts) {
       document.body.classList.toggle('hamburger-only', sidebarHidden && railHidden);
       document.body.classList.toggle('sidebar-collapsed', sidebarHidden);
     }
+    [hamburgerBtn, sidebarToggleBtn].forEach((btn) => {
+      if (!btn) return;
+      btn.setAttribute('aria-expanded', sidebarHidden ? 'false' : 'true');
+      btn.setAttribute('aria-label', sidebarHidden ? 'Show sidebar' : 'Collapse sidebar');
+      btn.title = sidebarHidden ? 'Show sidebar' : 'Collapse sidebar';
+    });
     // Keep incognito button clear of hamburger
     const incogBtn = document.getElementById('incognito-btn');
     if (incogBtn) {
@@ -83,14 +90,6 @@ export function initSidebarLayout(Storage, opts) {
     document.getElementById('sidebar').classList.add('right-side');
   }
   syncRailSide();
-
-  // In-sidebar toggle button — same behavior as hamburger
-  const sidebarToggleBtn = document.getElementById('sidebar-toggle-btn');
-  if (sidebarToggleBtn) {
-    sidebarToggleBtn.addEventListener('click', (e) => {
-      if (hamburgerBtn) hamburgerBtn.click();
-    });
-  }
 
   // Header-only new-chat aliases. #sidebar-new-chat-btn is wired in app.js
   // because it needs the full default-model/pending-chat flow; wiring it here
@@ -138,10 +137,10 @@ export function initSidebarLayout(Storage, opts) {
     syncRailSide();
   };
 
-  if (hamburgerBtn) {
-    hamburgerBtn.addEventListener('click', (e) => {
+  function toggleSidebarFromControl(e) {
       e.stopPropagation();
       const sidebar = document.getElementById('sidebar');
+      if (!sidebar) return;
 
       _userToggledSidebar = true;
       const isSidebarVisible = !sidebar.classList.contains('hidden');
@@ -190,7 +189,13 @@ export function initSidebarLayout(Storage, opts) {
         sidebar.classList.remove('hidden');
       }
       syncRailSide();
-    });
+  }
+
+  if (hamburgerBtn) {
+    hamburgerBtn.addEventListener('click', toggleSidebarFromControl);
+  }
+  if (sidebarToggleBtn) {
+    sidebarToggleBtn.addEventListener('click', toggleSidebarFromControl);
   }
 
   // Icon rail section clicks — open sidebar and scroll to section
@@ -344,7 +349,7 @@ export function initSidebarLayout(Storage, opts) {
     // Ignore clicks on elements removed from DOM (e.g. session list re-render during folder toggle)
     if (!e.target.isConnected) return;
     // Ignore clicks on the sidebar, icon rail, or hamburger button itself
-    if (e.target.closest('#sidebar') || e.target.closest('#icon-rail') || e.target.closest('#hamburger-btn')) return;
+    if (e.target.closest('#sidebar') || e.target.closest('#icon-rail') || e.target.closest('#hamburger-btn') || e.target.closest('#sidebar-toggle-btn')) return;
     // Ignore clicks inside modals or the chat input area
     if (e.target.closest('.modal') || e.target.closest('.input-bar') || e.target.closest('#message')) return;
     // Ignore clicks on session/folder dropdowns and the styled prompt
@@ -449,9 +454,10 @@ export function initSidebarLayout(Storage, opts) {
       if (_railWasOpenBeforeTool && rail && !rail.classList.contains('mobile-mini')) {
         rail.classList.add('mobile-mini');
       }
+      const shouldSync = _sidebarWasOpenBeforeTool || _railWasOpenBeforeTool;
       _sidebarWasOpenBeforeTool = false;
       _railWasOpenBeforeTool = false;
-      if (_sidebarWasOpenBeforeTool || _railWasOpenBeforeTool) syncRailSide();
+      if (shouldSync) syncRailSide();
     };
     const _modalObs = new MutationObserver((muts) => {
       let triggered = false;

@@ -28,6 +28,8 @@ import { emailApiUrl } from './emailShared.js';
 import { bindMenuDismiss, dismissOrRemove } from './escMenuStack.js';
 
 const API_BASE = window.location.origin;
+const EMAIL_LIST_PAGE_SIZE = 40;
+const EMAIL_PREWARM_PAGE_SIZE = 30;
 let _emailUnreadChipClickWired = false;
 let _libLoadSeq = 0;
 let _libFolderSeq = 0;
@@ -36,6 +38,7 @@ let _libSearchHadResults = false;
 let _libSearchInFlight = false;
 let _activeEmailReaderForSelectAll = null;
 let _libAccountsLoadedAt = 0;
+let _libIndexRefreshTimer = null;
 const _LIB_ACCOUNTS_TTL_MS = 5 * 60 * 1000;
 
 function _isEmailTypingTarget(t) {
@@ -1066,7 +1069,7 @@ async function _prewarmEmailViews() {
       await fetch(emailApiUrl('/api/email/unread-state', { folder, account_id: accountId || undefined }), { credentials: 'same-origin' }).catch(() => null);
       const res = await fetch(emailApiUrl('/api/email/list', {
         folder,
-        limit: 100,
+        limit: EMAIL_PREWARM_PAGE_SIZE,
         offset: 0,
         filter,
         account_id: accountId || undefined,
@@ -1257,7 +1260,7 @@ export function openEmailLibrary(opts = {}) {
               <button class="memory-toolbar-btn email-filter-refresh-btn" id="email-lib-refresh-btn" title="Refresh">
                 <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;"><path d="M1 4v6h6"/><path d="M23 20v-6h-6"/><path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 0 1 3.51 15"/></svg>
               </button>
-              <button class="memory-toolbar-btn email-reminders-clear-btn hidden" id="email-reminders-clear-btn" title="Permanently delete Odysseus reminder emails">
+              <button class="memory-toolbar-btn email-reminders-clear-btn hidden" id="email-reminders-clear-btn" title="Permanently delete Restia reminder emails">
                 <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/></svg>
                 Clear
               </button>
@@ -1273,7 +1276,7 @@ export function openEmailLibrary(opts = {}) {
               <button class="memory-toolbar-btn email-undone-toggle email-undone-toggle-inline" id="email-undone-btn" title="Show only emails not marked as done (undone)">
                 <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
               </button>
-              <button class="memory-toolbar-btn email-reminder-toggle-inline hidden" id="email-reminder-btn" title="Show Odysseus reminder emails">
+              <button class="memory-toolbar-btn email-reminder-toggle-inline hidden" id="email-reminder-btn" title="Show Restia reminder emails">
                 <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.268 21a2 2 0 0 0 3.464 0"/><path d="M3.262 15.326A1 1 0 0 0 4 17h16a1 1 0 0 0 .74-1.673C19.41 13.956 18 12.499 18 8A6 6 0 0 0 6 8c0 4.499-1.411 5.956-2.738 7.326"/></svg>
               </button>
               <button class="memory-toolbar-btn email-attach-toggle email-attach-toggle-inline" id="email-attach-btn" title="Show only emails with attachments">
@@ -1444,7 +1447,7 @@ export function openEmailLibrary(opts = {}) {
     });
   }
   document.getElementById('email-reminders-clear-btn')?.addEventListener('click', async () => {
-    const ok = await styledConfirm('Permanently delete all Odysseus reminder emails?', {
+    const ok = await styledConfirm('Permanently delete all Restia reminder emails?', {
       confirmText: 'Delete',
       cancelText: 'Cancel',
       danger: true,
@@ -3298,7 +3301,7 @@ async function _loadEmails({ force = false, useCache = true } = {}) {
       // opens omit it so rapid close/reopen returns instantly; the
       // Refresh button passes `force: true` to add it back.
       const buster = force ? `&_=${Date.now()}` : '';
-      const res = await fetch(`${API_BASE}/api/email/list?folder=${encodeURIComponent(folderAtStart)}${accountQS}&limit=100&offset=${offsetAtStart}&filter=${filterAtStart}${attQS}${buster}`);
+      const res = await fetch(`${API_BASE}/api/email/list?folder=${encodeURIComponent(folderAtStart)}${accountQS}&limit=${EMAIL_LIST_PAGE_SIZE}&offset=${offsetAtStart}&filter=${filterAtStart}${attQS}${buster}`);
       const data = await res.json();
       if (seq !== _libLoadSeq || accountAtStart !== (state._libAccountId || '')) return;
       if (data.error) throw new Error(data.error);
@@ -3326,7 +3329,18 @@ async function _loadEmails({ force = false, useCache = true } = {}) {
         loading: false,
       });
       _refreshUnreadBadge();
-      if (cacheable) _libCachePut(ck, { emails: state._libEmails.slice(), total: state._libTotal, sync });
+      if (sync.source === 'index' && sync.refreshing && !force && cacheable) {
+        clearTimeout(_libIndexRefreshTimer);
+        _libIndexRefreshTimer = setTimeout(() => {
+          if (!state._libOpen) return;
+          if ((state._libAccountId || '') !== accountAtStart) return;
+          if (state._libFolder !== folderAtStart || state._libFilter !== filterAtStart) return;
+          if (state._libOffset !== offsetAtStart || state._libSearch !== searchAtStart) return;
+          if (state._libHasAttachments !== hasAttachmentsAtStart) return;
+          _loadEmails({ force: true, useCache: false });
+        }, 1200);
+      }
+      if (cacheable && sync.source !== 'index') _libCachePut(ck, { emails: state._libEmails.slice(), total: state._libTotal, sync });
     }
   } catch (e) {
     if (seq !== _libLoadSeq || accountAtStart !== (state._libAccountId || '')) return;
@@ -3701,8 +3715,7 @@ function _createCard(em) {
       }
       try {
         if (newState) {
-          await fetch(`${API_BASE}/api/email/mark-answered/${em.uid}?folder=${encodeURIComponent(cardFolder)}${_acct()}`, { method: 'POST' });
-          await fetch(`${API_BASE}/api/email/mark-read/${em.uid}?folder=${encodeURIComponent(cardFolder)}${_acct()}`, { method: 'POST' });
+          await fetch(`${API_BASE}/api/email/mark-done/${em.uid}?folder=${encodeURIComponent(cardFolder)}${_acct()}`, { method: 'POST' });
         } else {
           await fetch(`${API_BASE}/api/email/clear-answered/${em.uid}?folder=${encodeURIComponent(cardFolder)}${_acct()}`, { method: 'POST' });
         }
@@ -4325,10 +4338,21 @@ function _prepareEmailInlineImages(html) {
   const root = doc.body.firstElementChild;
   if (!root) return raw;
   root.querySelectorAll('img').forEach((img, idx) => {
-    const src = (img.getAttribute('src') || '').trim();
+    let src = (img.getAttribute('src') || '').trim();
     const alt = (img.getAttribute('alt') || img.getAttribute('title') || '').trim();
+    if (/^\/\//.test(src)) {
+      src = `https:${src}`;
+      img.setAttribute('src', src);
+    }
     const isHttp = /^https?:\/\//i.test(src);
     const isCid = /^cid:/i.test(src);
+    if (isHttp) {
+      img.classList.add('email-inline-image-loaded');
+      img.setAttribute('loading', 'eager');
+      img.setAttribute('decoding', 'async');
+      img.setAttribute('referrerpolicy', 'no-referrer');
+      return;
+    }
     const cid = isCid ? src.replace(/^cid:/i, '').replace(/^<|>$/g, '').trim() : '';
     const label = alt || (isCid ? 'Inline image' : 'Remote image');
     const ph = doc.createElement('span');
@@ -4345,10 +4369,9 @@ function _prepareEmailInlineImages(html) {
       </span>
       <span class="email-inline-image-info">
         <span class="email-inline-image-title">${_esc(label)}</span>
-        <span class="email-inline-image-sub">${isHttp ? 'Remote image blocked' : isCid ? 'Inline image hidden' : 'Image unavailable'}</span>
+        <span class="email-inline-image-sub">${isCid ? 'Inline image hidden' : 'Image unavailable'}</span>
       </span>
       <span class="email-inline-image-actions">
-        ${isHttp ? `<button type="button" class="email-inline-image-btn" data-email-img-load="${idx}">Load</button><a class="email-inline-image-btn email-inline-image-download-btn" href="${_esc(src)}" target="_blank" rel="noopener noreferrer" download title="Download" aria-label="Download"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg></a>` : ''}
         ${isCid ? `<button type="button" class="email-inline-image-btn" data-email-img-load="${idx}">Load</button><button type="button" class="email-inline-image-btn email-inline-image-download-btn" data-email-img-download="${idx}" title="Download" aria-label="Download"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg></button>` : ''}
       </span>
     `;
@@ -6769,8 +6792,7 @@ function _showReaderMoreMenu(em, card, reader, anchor) {
         }
         try {
           if (newState) {
-            await fetch(`${API_BASE}/api/email/mark-answered/${em.uid}?folder=${encodeURIComponent(state._libFolder)}${_acct()}`, { method: 'POST' });
-            await fetch(`${API_BASE}/api/email/mark-read/${em.uid}?folder=${encodeURIComponent(state._libFolder)}${_acct()}`, { method: 'POST' });
+            await fetch(`${API_BASE}/api/email/mark-done/${em.uid}?folder=${encodeURIComponent(state._libFolder)}${_acct()}`, { method: 'POST' });
           } else {
             await fetch(`${API_BASE}/api/email/clear-answered/${em.uid}?folder=${encodeURIComponent(state._libFolder)}${_acct()}`, { method: 'POST' });
           }
@@ -6979,8 +7001,7 @@ function _showCardMenu(em, anchor) {
         }
         try {
           if (newState) {
-            await fetch(`${API_BASE}/api/email/mark-answered/${em.uid}?folder=${encodeURIComponent(state._libFolder)}${_acct()}`, { method: 'POST' });
-            await fetch(`${API_BASE}/api/email/mark-read/${em.uid}?folder=${encodeURIComponent(state._libFolder)}${_acct()}`, { method: 'POST' });
+            await fetch(`${API_BASE}/api/email/mark-done/${em.uid}?folder=${encodeURIComponent(state._libFolder)}${_acct()}`, { method: 'POST' });
           } else {
             await fetch(`${API_BASE}/api/email/clear-answered/${em.uid}?folder=${encodeURIComponent(state._libFolder)}${_acct()}`, { method: 'POST' });
           }
@@ -7270,9 +7291,10 @@ async function _bulkAction(action) {
           em.is_read = true;
           _clearDoneResponseTagsLocal(em);
         }
-        const ansRes = await fetch(`${API_BASE}/api/email/mark-answered/${uid}?folder=${encodeURIComponent(state._libFolder)}${_acct()}`, { method: 'POST' });
-        const readRes = await fetch(`${API_BASE}/api/email/mark-read/${uid}?folder=${encodeURIComponent(state._libFolder)}${_acct()}`, { method: 'POST' });
-        if (!ansRes.ok || !readRes.ok) throw new Error(`mark-done HTTP ${ansRes.status}/${readRes.status}`);
+        const doneRes = await fetch(`${API_BASE}/api/email/mark-done/${uid}?folder=${encodeURIComponent(state._libFolder)}${_acct()}`, { method: 'POST' });
+        let doneData = null;
+        try { doneData = await doneRes.json(); } catch (_) {}
+        if (!doneRes.ok || doneData?.success === false) throw new Error(doneData?.error || `mark-done HTTP ${doneRes.status}`);
       } else if (action === 'read' || action === 'unread') {
         const endpoint = action === 'read' ? 'mark-read' : 'mark-unread';
         const res = await fetch(`${API_BASE}/api/email/${endpoint}/${uid}?folder=${encodeURIComponent(state._libFolder)}${_acct()}`, { method: 'POST' });

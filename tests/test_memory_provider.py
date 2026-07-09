@@ -73,6 +73,36 @@ def test_native_provider_recall_filters_vector_hits_by_owner(tmp_path):
     assert hits[0].score == 0.75
 
 
+def test_native_provider_recall_merges_external_brain_hits(tmp_path):
+    from src.memory import MemoryManager
+    from src.memory_provider import NativeMemoryProvider
+
+    class BrainAwareManager(MemoryManager):
+        def get_external_relevant_memories(self, query, owner=None, max_items=5):
+            return [
+                {
+                    "id": "brain:1",
+                    "text": "Restia Brain stores Markdown.",
+                    "source": "restia_brain",
+                    "category": "brain",
+                    "owner": owner,
+                    "metadata": {"score": 0.8},
+                }
+            ]
+
+    manager = BrainAwareManager(str(tmp_path))
+    vector = FakeVectorStore()
+    provider = NativeMemoryProvider(manager, vector)
+    native = run(provider.remember("Alice likes green tea", owner="alice"))
+    vector.results = [{"memory_id": native.id, "score": 0.99}]
+
+    hits = run(provider.recall("Restia Brain", owner="alice", top_k=5))
+
+    assert [hit.memory.id for hit in hits] == [native.id, "brain:1"]
+    assert hits[1].provider_id == "restia_brain"
+    assert hits[1].score == 0.8
+
+
 def test_native_provider_recall_accepts_legacy_vector_rows(tmp_path):
     from src.memory import MemoryManager
     from src.memory_provider import NativeMemoryProvider

@@ -15,7 +15,7 @@ from src.llm_core import normalize_model_id
 from src.endpoint_resolver import normalize_base
 from src.context_compactor import maybe_compact, trim_for_context
 from src.model_context import estimate_tokens
-from src.auth_helpers import effective_user
+from src.auth_helpers import effective_owner, effective_user
 from src.prompt_security import untrusted_context_message
 from routes.prefs_routes import _load_for_user as load_prefs_for_user
 
@@ -445,7 +445,7 @@ def fire_message_event(request, webhook_manager, session_id: str, sess, message:
             "session_id": session_id, "model": sess.model, "message": message[:2000],
         })
     from src.event_bus import fire_event
-    user = effective_user(request)
+    user = effective_owner(request)
     fire_event("message_sent", user)
 
 
@@ -673,7 +673,7 @@ async def build_chat_context(
 
     # Resolve owner-scoped prefs/context. Browser requests keep the cookie user;
     # bearer-token chat requests use the token owner instead of the "api" sentinel.
-    user = effective_user(request)
+    user = effective_owner(request)
     uprefs = load_prefs_for_user(user)
     uploaded_files = build_uploaded_file_manifest(
         att_ids or [],

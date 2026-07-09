@@ -20,6 +20,12 @@ from src.interactive_gate import wait_for_interactive_quiet
 logger = logging.getLogger(__name__)
 
 
+def _clean_line(text, fallback: str = "") -> str:
+    import re as _re
+    value = _re.sub(r"\s+", " ", str(text or "")).strip()
+    return value or fallback
+
+
 class TaskNoop(BaseException):
     """Raised by an action when it determined there's nothing to do.
 
@@ -79,9 +85,10 @@ async def action_consolidate_memory(owner: str, **kwargs) -> Tuple[str, bool]:
         import re
         from src.constants import DATA_DIR
         from src.llm_core import llm_call_async_with_fallback
+        from src.brain_memory import build_brain_memory_manager
         from src.memory import MemoryManager
 
-        manager = MemoryManager(DATA_DIR)
+        manager = build_brain_memory_manager(DATA_DIR) or MemoryManager(DATA_DIR)
         all_memories = manager.load_all()
 
         _owner_clean = (owner or "").strip()
@@ -345,6 +352,33 @@ async def action_run_local(owner: str, script: str = "", **kwargs) -> Tuple[str,
     if IS_WINDOWS and find_bash():
         return await _run_subprocess([find_bash(), "-c", script], timeout=300, label="Script")
     return await _run_subprocess(script, shell=True, timeout=300, label="Script")
+
+
+async def action_dream_memory(owner: str, **kwargs) -> Tuple[str, bool]:
+    """Trigger the nightly dream cycle on Mnemosyne."""
+    try:
+        from src.constants import DATA_DIR
+        from src.memory import MemoryManager
+        import logging
+
+        logger = logging.getLogger(__name__)
+        logger.info("Starting memory dream cycle for %s", owner or "all")
+
+        manager = MemoryManager(DATA_DIR)
+
+        if not hasattr(manager, 'mnemo'):
+            return "Mnemosyne is not enabled, skipping dream cycle.", False
+
+        # Trigger Mnemosyne compression/dream
+        res = manager.mnemo.sleep_all_sessions(force=True)
+
+        compressed = res.get("compressed_clusters", 0)
+        return f"Completed memory dream cycle. Compressed {compressed} clusters.", True
+    except Exception as e:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(f"dream_memory action failed: {e}", exc_info=True)
+        return f"Error: {e}", False
 
 
 async def action_tidy_research(owner: str, **kwargs) -> Tuple[str, bool]:
@@ -1386,7 +1420,7 @@ async def action_daily_brief(owner: str, **kwargs) -> Tuple[str, bool]:
         # Pull active todo items from notes
         todo_lines: list[str] = []
         for n in notes:
-            if n.note_type == "checklist" and n.items:
+            if n.note_type in ("todo", "goal", "checklist") and n.items:
                 try:
                     items = _json.loads(n.items)
                     pending = [it.get("text", "") for it in items if not it.get("done")]
@@ -1432,6 +1466,177 @@ async def action_daily_brief(owner: str, **kwargs) -> Tuple[str, bool]:
         return plain_body, True
     except Exception as e:
         logger.error(f"daily_brief action failed: {e}")
+        return str(e), False
+
+
+async def action_telegram_hourly_digest(owner: str, **kwargs) -> Tuple[str, bool]:
+    """Send a compact hourly "what needs doing" digest to Telegram.
+
+    Uses local caches/SQLite rows only for email so this task does not block on
+    IMAP while the foreground app is loading.
+    """
+    try:
+        import sqlite3 as _sqlite3
+        from datetime import datetime as _dt, timedelta as _td
+
+        from core.database import CalendarCal, CalendarEvent, Note, SessionLocal
+        from routes.email_helpers import SCHEDULED_DB, _email_cache_owner_clause, _init_scheduled_db
+        from src.telegram_bot import load_telegram_config, send_telegram_message
+
+        config = load_telegram_config()
+        if not config.enabled:
+            raise TaskNoop("telegram digest skipped: Telegram is disabled")
+        if not config.bot_token:
+            raise TaskNoop("telegram digest skipped: bot token is not configured")
+
+        chat_ids = list(config.allowed_chat_ids)
+        if config.allow_all_chats and config.session_map:
+            chat_ids = sorted(set(chat_ids) | set(config.session_map.keys()))
+        if not chat_ids:
+            raise TaskNoop("telegram digest skipped: no Telegram chat target configured")
+
+        now = _dt.now()
+        next_24h = now + _td(hours=24)
+
+        emails: list[str] = []
+        try:
+            _init_scheduled_db()
+            owner_clause, owner_params = _email_cache_owner_clause(owner)
+            conn = _sqlite3.connect(SCHEDULED_DB)
+            conn.row_factory = _sqlite3.Row
+            try:
+                rows = conn.execute(
+                    f"""
+                    SELECT uid, subject, from_name, from_address, date_display, flags
+                    FROM email_message_index
+                    WHERE {owner_clause}
+                      AND lower(folder) = 'inbox'
+                    ORDER BY date_epoch DESC
+                    LIMIT 50
+                    """,
+                    owner_params,
+                ).fetchall()
+                for row in rows:
+                    flags = str(row["flags"] or "")
+                    if "\\Seen" in flags and "\\Answered" in flags:
+                        continue
+                    sender = _clean_line(row["from_name"] or row["from_address"], "Unknown sender")
+                    subject = _clean_line(row["subject"], "(no subject)")
+                    marker = "reply" if "\\Answered" not in flags else "read"
+                    emails.append(f"{sender}: {subject} [{marker}]")
+                    if len(emails) >= 6:
+                        break
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.debug("telegram digest email scan failed: %s", exc)
+
+        notes_due: list[str] = []
+        todos: list[str] = []
+        events: list[str] = []
+
+        def _parse_due(value: str | None):
+            if not value:
+                return None
+            raw = str(value).strip()
+            try:
+                parsed = _dt.fromisoformat(raw.replace("Z", "+00:00"))
+            except Exception:
+                return None
+            # Due dates carry an explicit offset (parse_due_for_user output).
+            # Convert to server-local naive so comparisons against the naive
+            # `now`/`next_24h` don't raise and land in the right window.
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone().replace(tzinfo=None)
+            return parsed
+
+        db = SessionLocal()
+        try:
+            note_q = db.query(Note).filter(Note.archived == False)  # noqa: E712
+            if owner:
+                note_q = owner_filter(note_q, Note, owner, include_shared=False)
+            for note in note_q.order_by(Note.pinned.desc(), Note.updated_at.desc()).limit(80).all():
+                due = _parse_due(note.due_date)
+                if due and due <= next_24h:
+                    notes_due.append(note.title or note.content or "Untitled note")
+                if note.note_type in {"todo", "checklist", "goal"} and note.items:
+                    try:
+                        items = json.loads(note.items)
+                    except Exception:
+                        items = []
+                    for item in items:
+                        if not isinstance(item, dict) or item.get("done") or item.get("checked"):
+                            continue
+                        text = _clean_line(item.get("text"))
+                        if text:
+                            prefix = _clean_line(note.title, "Todo")
+                            todos.append(f"{prefix}: {text}")
+                        if len(todos) >= 10:
+                            break
+                if len(todos) >= 10 and len(notes_due) >= 6:
+                    break
+
+            event_q = (
+                db.query(CalendarEvent)
+                .join(CalendarCal, CalendarEvent.calendar_id == CalendarCal.id)
+                .filter(
+                    CalendarEvent.dtstart >= now,
+                    CalendarEvent.dtstart <= next_24h,
+                    CalendarEvent.status != "cancelled",
+                )
+            )
+            if owner:
+                event_q = event_q.filter(CalendarCal.owner == owner)
+            for ev in event_q.order_by(CalendarEvent.dtstart).limit(8).all():
+                when = ev.dtstart.strftime("%H:%M") if not ev.all_day else "all day"
+                events.append(f"{when} {ev.summary}")
+        finally:
+            db.close()
+
+        lines = [f"What needs doing - {now.strftime('%a %d %b, %H:%M')}", ""]
+        lines.append("Email:")
+        if emails:
+            lines.extend(f"- {item}" for item in emails)
+        else:
+            lines.append("- No unread or unanswered indexed inbox email")
+        lines.append("")
+        lines.append("To do:")
+        if todos:
+            lines.extend(f"- {item}" for item in todos[:10])
+        else:
+            lines.append("- No active todo items")
+        lines.append("")
+        lines.append("Notes due:")
+        if notes_due:
+            lines.extend(f"- {_clean_line(item, 'Untitled note')}" for item in notes_due[:6])
+        else:
+            lines.append("- No notes due in the next 24 hours")
+        lines.append("")
+        lines.append("Calendar:")
+        if events:
+            lines.extend(f"- {item}" for item in events)
+        else:
+            lines.append("- No events in the next 24 hours")
+
+        text = "\n".join(lines)
+        sent = 0
+        failed: list[str] = []
+        for chat_id in chat_ids:
+            try:
+                await send_telegram_message(config.bot_token, chat_id, text)
+                sent += 1
+            except Exception as exc:
+                logger.warning("telegram digest send failed for chat %s: %s", chat_id, exc)
+                failed.append(str(chat_id))
+        if sent == 0 and failed:
+            return "Telegram digest failed for all configured chats. Make sure the allowed chat has sent /start to the bot.", False
+        if failed:
+            return f"Telegram digest sent to {sent} chat(s); failed for {len(failed)} chat(s)", False
+        return f"Telegram digest sent to {sent} chat(s)", True
+    except TaskNoop:
+        raise
+    except Exception as e:
+        logger.exception("telegram hourly digest action failed")
         return str(e), False
 
 
@@ -1628,10 +1833,141 @@ async def action_audit_skills(owner: str, **kwargs) -> Tuple[str, bool]:
         return str(e), False
 
 
+def _advance_recurring_due(raw, repeat):
+    """Next FUTURE occurrence of a note's due_date for its repeat rule.
+
+    Mirrors the frontend `_advanceRecurring` grammar (static/js/notes.js):
+    none / daily / yearly / weekly:W / monthly:day:D / monthly:nth:N:W /
+    monthly:last:W, plus legacy bare names (weekly, monthly, …) resolved
+    against the original date. Weekdays use the JS convention 0=Sun..6=Sat.
+    Returns the new due string in the same style as `raw` (naive local or
+    offset-aware ISO), or None when the rule is unknown/unparseable.
+    """
+    import calendar
+    from datetime import datetime, timedelta, timezone as _tzmod
+
+    if not raw or not repeat or str(repeat).strip() == "none":
+        return None
+    s = str(raw).strip()
+    had_z = s.endswith("Z")
+    try:
+        d0 = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+    def js_wd(dt):
+        return (dt.weekday() + 1) % 7  # 0=Sun..6=Sat
+
+    rep = str(repeat).strip()
+    if rep in ("daily", "yearly") or rep.startswith(("weekly:", "monthly:")):
+        norm = rep
+    elif rep == "weekly":
+        norm = f"weekly:{js_wd(d0)}"
+    elif rep == "monthly":
+        norm = f"monthly:day:{d0.day}"
+    elif rep == "monthly_nth_weekday":
+        norm = f"monthly:nth:{(d0.day - 1) // 7 + 1}:{js_wd(d0)}"
+    elif rep == "monthly_last_weekday":
+        norm = f"monthly:last:{js_wd(d0)}"
+    else:
+        return None
+
+    hh, mm = d0.hour, d0.minute
+    tzinfo = d0.tzinfo
+
+    def _nth_weekday(year, month, target_wd, n):
+        first = datetime(year, month, 1, tzinfo=tzinfo)
+        day = 1 + (target_wd - js_wd(first)) % 7 + (n - 1) * 7
+        last = calendar.monthrange(year, month)[1]
+        while day > last:
+            day -= 7
+        return first.replace(day=day)
+
+    def _last_weekday(year, month, target_wd):
+        last = calendar.monthrange(year, month)[1]
+        dt = datetime(year, month, last, tzinfo=tzinfo)
+        return dt.replace(day=last - (js_wd(dt) - target_wd) % 7)
+
+    def _step(cur):
+        if norm == "daily":
+            return cur + timedelta(days=1)
+        if norm == "yearly":
+            try:
+                return cur.replace(year=cur.year + 1)
+            except ValueError:  # Feb 29
+                return cur.replace(year=cur.year + 1, day=28)
+        parts = norm.split(":")
+        if parts[0] == "weekly":
+            try:
+                target = int(parts[1])
+            except (ValueError, IndexError):
+                return None
+            delta = (target - js_wd(cur)) % 7 or 7
+            return (cur + timedelta(days=delta)).replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if parts[0] == "monthly":
+            ny = cur.year + (1 if cur.month == 12 else 0)
+            nm = 1 if cur.month == 12 else cur.month + 1
+            try:
+                if parts[1] == "day":
+                    want = int(parts[2])
+                    tgt = datetime(ny, nm, min(want, calendar.monthrange(ny, nm)[1]), tzinfo=tzinfo)
+                elif parts[1] == "nth":
+                    tgt = _nth_weekday(ny, nm, int(parts[3]), int(parts[2]))
+                elif parts[1] == "last":
+                    tgt = _last_weekday(ny, nm, int(parts[2]))
+                else:
+                    return None
+            except (ValueError, IndexError):
+                return None
+            return tgt.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        return None
+
+    now = datetime.now(tzinfo) if tzinfo else datetime.now()
+    d = _step(d0)
+    guard = 5000
+    while d is not None and d <= now:
+        guard -= 1
+        if guard <= 0:
+            return None
+        d = _step(d)
+    if d is None:
+        return None
+    if had_z:
+        return d.astimezone(_tzmod.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if tzinfo:
+        return d.isoformat()
+    return d.strftime("%Y-%m-%dT%H:%M")
+
+
+def _reset_note_items_json(items_json):
+    """Uncheck every checklist item (habit reset). Returns new JSON or None."""
+    import json as _json
+    if not items_json:
+        return None
+    try:
+        items = _json.loads(items_json)
+    except Exception:
+        return None
+    if not isinstance(items, list):
+        return None
+    changed = False
+    for it in items:
+        if isinstance(it, dict) and (it.get("done") or it.get("checked")):
+            it["done"] = False
+            it.pop("checked", None)
+            changed = True
+    return _json.dumps(items) if changed else None
+
+
 async def action_ping_notes(owner: str, **kwargs) -> Tuple[str, bool]:
     """Background note-due scanner. Fires a reminder for any note whose
     `due_date` falls in the current ±5-minute window and hasn't been pinged
     within the last 25 minutes. Mirrors `action_ping_events` for calendar.
+
+    Repeating notes (habits) are advanced server-side after firing: due_date
+    rolls to the next occurrence and checklist items reset to unchecked, so
+    habits keep working even when no browser tab is open. Overdue repeating
+    notes whose slot was missed entirely (app down) advance silently.
 
     State (`data/note_pings.json`): {note_id: iso_ts_of_last_ping}. Pruned
     on each run by dropping entries for notes that are gone/archived/replied.
@@ -1708,6 +2044,20 @@ async def action_ping_notes(owner: str, **kwargs) -> Tuple[str, bool]:
                     continue
                 # Inside the ±5min window?
                 if abs((due - now).total_seconds()) > window.total_seconds():
+                    # Missed repeating slot (server was down / overdue for a
+                    # while): silently roll to the next occurrence so the
+                    # habit fires again instead of dying in the past.
+                    if due < now and (n.repeat or "none") != "none":
+                        try:
+                            _next = _advance_recurring_due(n.due_date, n.repeat)
+                            if _next:
+                                n.due_date = _next
+                                _reset = _reset_note_items_json(n.items)
+                                if _reset is not None:
+                                    n.items = _reset
+                                db.commit()
+                        except Exception as _adv_e:
+                            logger.warning(f"ping_notes: silent repeat advance failed for {n.id}: {_adv_e}")
                     continue
                 # Recently pinged? Skip.
                 last = cache.get(n.id)
@@ -1749,6 +2099,19 @@ async def action_ping_notes(owner: str, **kwargs) -> Tuple[str, bool]:
                     )
                     cache[n.id] = now.isoformat()
                     sent.append(title)
+                    # Habit engine: roll a repeating note to its next
+                    # occurrence and reset its checklist after firing.
+                    if (n.repeat or "none") != "none":
+                        try:
+                            _next = _advance_recurring_due(n.due_date, n.repeat)
+                            if _next:
+                                n.due_date = _next
+                                _reset = _reset_note_items_json(n.items)
+                                if _reset is not None:
+                                    n.items = _reset
+                                db.commit()
+                        except Exception as _adv_e:
+                            logger.warning(f"ping_notes: repeat advance failed for {n.id}: {_adv_e}")
                 except Exception as e:
                     logger.warning(f"ping_notes: dispatch failed for {n.id}: {e}")
 
@@ -1813,7 +2176,10 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         AGE_CUTOFF = _dt.utcnow() - _td(days=7)
-        TRIAGE_VERSION = 10
+        # v11: LLM triage restored as primary (a hard-wired heuristic shortcut
+        # had made the LLM block unreachable, freezing keyword-guess tags).
+        # Bump forces re-classification of everything the heuristic mis-tagged.
+        TRIAGE_VERSION = 11
         CATEGORY_TAGS = {
             "bills", "receipt", "travel", "calendar", "action-needed",
         }
@@ -1887,7 +2253,7 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
             ))
             if bulkish or marketingish:
                 add_type("newsletter")
-            if _re.search(r"\b(receipt|order|注文|payment confirmation|delivery|shipment|tracking|お届け|購入)\b", blob):
+            if _re.search(r"\b(receipt|your order|order (?:confirmation|shipped|placed|#|no\.?|number)|注文|payment confirmation|delivery|shipment|tracking|お届け|購入)\b", blob):
                 add_type("receipt")
             if _re.search(r"\b(bill|billing|amount due|overdue|pay by|payment due|subscription could not be renewed)\b", blob):
                 add_type("bills")
@@ -1993,12 +2359,12 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
                             if not raw:
                                 continue
                             msg = _email_mod.message_from_bytes(raw)
-                            # Skip Odysseus-generated reminders so the scanner
+                            # Skip Restia-generated reminders so the scanner
                             # doesn't classify its own emails as urgent and
                             # trigger a feedback loop. Match on either the
                             # stamped headers OR the subject prefix.
-                            _ody_origin = (msg.get("X-Odysseus-Origin") or "").strip().lower()
-                            _ody_kind = (msg.get("X-Odysseus-Kind") or "").strip().lower()
+                            _ody_origin = (msg.get("X-Restia-Origin") or "").strip().lower()
+                            _ody_kind = (msg.get("X-Restia-Kind") or "").strip().lower()
                             _raw_subj = (msg.get("Subject") or "").lower()
                             # MCP path drops custom headers (email_server's
                             # schema doesn't accept them), so we ALSO match the
@@ -2071,12 +2437,18 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
                 # Skip uids we couldn't fetch (no subject/from/body).
                 if not item.get("subject") and not item.get("from"):
                     continue
-                verdict = _heuristic_email_verdict(item)
-                cache.setdefault("uids", {})[item["uid"]] = verdict
-                per_uid_scores[key] = verdict
-                saved_classifications += 1
-                continue
-                # ── LLM-classify. JSON-only response; bullet-proof parse.
+                # ── LLM-classify (primary). JSON-only response; bullet-proof
+                # parse. The keyword heuristic is only a FALLBACK when the LLM
+                # is unavailable or returns garbage — heuristic verdicts are
+                # cached with triage_version=0 so the next scan retries the
+                # LLM instead of freezing bad keyword tags forever.
+                def _heuristic_fallback(why: str):
+                    v = _heuristic_email_verdict(item)
+                    v["triage_version"] = 0
+                    v["reason"] = f"{v.get('reason', 'heuristic')} ({why})"
+                    cache.setdefault("uids", {})[item["uid"]] = v
+                    per_uid_scores[key] = v
+
                 llm_attempts += 1
                 prompt = (
                     "You are triaging ONE email. Return ONLY JSON: "
@@ -2119,6 +2491,7 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
                             "from": item.get("from") or "",
                             "reason": "model returned no JSON",
                         })
+                        _heuristic_fallback("LLM returned no JSON")
                         continue
                     obj = _json.loads(txt[s:e + 1])
                     score = int(obj.get("score", 0))
@@ -2191,6 +2564,7 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
                         "reason": str(e)[:120] or "classification failed",
                     })
                     logger.debug(f"urgency: LLM classify failed for {key}: {e}")
+                    _heuristic_fallback("LLM unavailable")
                     continue
 
             # ── Prune cache entries for UIDs that are no longer in the recent
@@ -2323,7 +2697,7 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
             # one — so the reminder email tells you which messages to act on,
             # not just "4 needing reply". Optional deep-link when the user has
             # `app_public_url` configured in Settings (so the email row links
-            # straight into the Odysseus Email tab).
+            # straight into the Restia Email tab).
             # Sort: highest-scored UIDs first; cap at 10 to keep the email tidy.
             sorted_urgent = sorted(
                 ((k, per_uid_scores[k]) for k in urgent_keys),
@@ -2367,6 +2741,11 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
                     delivered = bool(dispatch_result.get("ntfy_sent"))
                 elif channel == "webhook":
                     delivered = bool(dispatch_result.get("webhook_sent"))
+                elif channel == "telegram":
+                    delivered = bool(dispatch_result.get("telegram_sent"))
+                # The Telegram mirror reaching the user counts as delivery
+                # even when the primary channel path failed.
+                delivered = delivered or bool(dispatch_result.get("telegram_sent"))
                 if delivered:
                     newly_notified.update(new_urgent)
                 else:
@@ -2735,15 +3114,15 @@ BUILTIN_ACTIONS = {
     "tidy_sessions": action_tidy_sessions,
     "tidy_documents": action_tidy_documents,
     "consolidate_memory": action_consolidate_memory,
+    "dream_memory": action_dream_memory,
     "tidy_research": action_tidy_research,
     "summarize_emails": action_summarize_emails,
     "draft_email_replies": action_draft_email_replies,
     "email_auto_translate": action_email_auto_translate,
     "extract_email_events": action_extract_email_events,
     "classify_events": action_classify_events,
-    # ping_events removed from the user-facing registry. Calendar reminders
-    # are represented as Notes, so note pings are the single dispatch path.
     "daily_brief": action_daily_brief,
+    "telegram_hourly_digest": action_telegram_hourly_digest,
     "learn_sender_signatures": action_learn_sender_signatures,
     "ssh_command": action_ssh_command,
     "run_script": action_run_script,
@@ -2752,7 +3131,6 @@ BUILTIN_ACTIONS = {
     "audit_skills": action_audit_skills,
     "check_email_urgency": action_check_email_urgency,
     "cookbook_serve": action_cookbook_serve,
-    # ping_notes removed from the registry — runs only inside `_note_pings_loop`.
 }
 
 # Descriptions for the UI/API
@@ -2760,6 +3138,7 @@ BUILTIN_ACTION_INFO = {
     "tidy_sessions": "Clean up empty chat sessions and auto-sort into folders",
     "tidy_documents": "Remove junk/empty documents",
     "consolidate_memory": "Remove duplicate memories",
+    "dream_memory": "Dream and compress episodic memories nightly",
     "tidy_research": "Remove orphaned research files (sessions that were deleted)",
     "summarize_emails": "Pre-generate AI summaries for new inbox emails",
     "draft_email_replies": "Pre-draft AI reply suggestions for new inbox emails",
@@ -2767,6 +3146,7 @@ BUILTIN_ACTION_INFO = {
     "extract_email_events": "Scan emails for booking/meeting confirmations and auto-add to calendar",
     "classify_events": "Tag upcoming events with importance (low/normal/high/critical) and type (work/health/travel/etc.); colors them too",
     "daily_brief": "Build a morning digest: today's calendar, unread email count + top senders, active todos",
+    "telegram_hourly_digest": "Send an hourly Telegram digest of indexed email, active todos, due notes, and upcoming calendar events.",
     "learn_sender_signatures": "LLM learns each sender's signature from 3+ of their recent emails; cached per address so future renders fold sigs reliably without heuristics",
     "ssh_command": "Run a shell command on a local or remote host",
     "run_script": "Run a script locally or on ODYSSEUS_SCRIPT_HOST",

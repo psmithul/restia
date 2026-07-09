@@ -300,6 +300,12 @@ class GlobTool:
         pattern = str(args.get("pattern", "")).strip()
         if not pattern:
             return {"error": "glob: pattern is required", "exit_code": 1}
+        norm_pat = pattern.replace("\\", "/")
+        unsafe_pattern = (
+            os.path.isabs(pattern)
+            or bool(re.match(r"^[A-Za-z]:", norm_pat))
+            or any(part == ".." for part in norm_pat.split("/"))
+        )
         try:
             root = _resolve_search_root(str(args.get("path", "")))
         except ValueError as e:
@@ -310,7 +316,6 @@ class GlobTool:
             if not os.path.isdir(base):
                 return None, f"glob: {root}: not a directory"
             rbase = os.path.realpath(base)
-            norm_pat = pattern.replace("\\", "/")
             # Fast path: literal pattern (no wildcards) → direct path lookup.
             if not any(c in norm_pat for c in "*?["):
                 cand = os.path.realpath(os.path.join(base, norm_pat))
@@ -374,6 +379,8 @@ class GlobTool:
         if err:
             return {"error": err, "exit_code": 1}
         if not paths:
+            if unsafe_pattern:
+                return {"output": f"No files found under {root}", "exit_code": 0}
             return {"output": f"No files matching {pattern!r} under {root}", "exit_code": 0}
         out = "\n".join(paths)
         if len(paths) >= _CODENAV_MAX_HITS:

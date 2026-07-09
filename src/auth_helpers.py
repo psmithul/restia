@@ -7,7 +7,7 @@ from fastapi import Request, HTTPException
 
 def get_current_user(request: Request) -> Optional[str]:
     """Get current username from request state (set by auth middleware)."""
-    return getattr(request.state, 'current_user', None)
+    return getattr(getattr(request, "state", None), "current_user", None)
 
 
 def effective_user(request: Request) -> Optional[str]:
@@ -27,16 +27,78 @@ def effective_user(request: Request) -> Optional[str]:
     owner falls back to :func:`get_current_user` (the "api" pseudo-user), so it
     never escalates.
     """
-    if getattr(request.state, "api_token", False):
-        owner = getattr(request.state, "api_token_owner", None)
+    state = getattr(request, "state", None)
+    if getattr(state, "api_token", False):
+        owner = getattr(state, "api_token_owner", None)
         if owner:
             return owner
     return get_current_user(request)
 
 
+def _loopback_request(request: Request) -> bool:
+    client = getattr(request, "client", None)
+    host = (client.host if client else "") or ""
+    return host in ("127.0.0.1", "::1", "localhost")
+
+
+def configured_single_user_owner(request: Request | None = None) -> Optional[str]:
+    """Return the only configured real user/admin when the install is single-user.
+
+    This does not authenticate a request by itself. It is for code paths that
+    have already admitted a single-user/local operator request, but still need a
+    concrete owner for owner-scoped stores such as email MCP accounts.
+    """
+    auth_mgr = getattr(getattr(getattr(request, "app", None), "state", None), "auth_manager", None)
+    managers = [auth_mgr] if auth_mgr is not None else []
+    try:
+        from core.auth import AuthManager
+
+        managers.append(AuthManager())
+    except Exception:
+        pass
+
+    for mgr in managers:
+        users = getattr(mgr, "users", None)
+        if not isinstance(users, dict) or not users:
+            continue
+        cleaned = {
+            str(name or "").strip().lower(): data
+            for name, data in users.items()
+            if str(name or "").strip()
+        }
+        if len(cleaned) == 1:
+            return next(iter(cleaned))
+        admins = [
+            name
+            for name, data in cleaned.items()
+            if isinstance(data, dict) and data.get("is_admin")
+        ]
+        if len(admins) == 1:
+            return admins[0]
+    return None
+
+
+def effective_owner(request: Request) -> Optional[str]:
+    """Resolve the owner to use for owner-scoped runtime data.
+
+    Authenticated requests keep their real user. Auth-disabled installs and
+    loopback localhost-bypass requests may not have a cookie user, but on a
+    single-user install they still need a concrete owner so owner-scoped tools
+    (notably email MCP) can see the operator's data.
+    """
+    user = effective_user(request)
+    if user:
+        return user
+    if _auth_disabled():
+        return configured_single_user_owner(request)
+    if _loopback_request(request) and os.getenv("LOCALHOST_BYPASS", "false").lower() == "true":
+        return configured_single_user_owner(request)
+    return None
+
+
 def _is_api_token_request(request: Request) -> bool:
     """Return True when middleware authenticated a bearer API token."""
-    return bool(getattr(request.state, "api_token", False))
+    return bool(getattr(getattr(request, "state", None), "api_token", False))
 
 
 def require_authenticated_request(request: Request) -> str:
@@ -93,18 +155,15 @@ def require_user(request: Request) -> str:
     if _auth_disabled():
         return ""
     auth_mgr = getattr(request.app.state, "auth_manager", None)
-    client = getattr(request, "client", None)
-    host = (client.host if client else "") or ""
-    is_loopback = host in ("127.0.0.1", "::1", "localhost")
     # LOCALHOST_BYPASS=true is the dev-only "I'm on loopback, skip auth"
     # switch. Mirror the middleware so routes don't 401 the same caller
     # the middleware just let through.
-    if is_loopback and os.getenv("LOCALHOST_BYPASS", "false").lower() == "true":
+    if _loopback_request(request) and os.getenv("LOCALHOST_BYPASS", "false").lower() == "true":
         return ""
     if auth_mgr is not None and getattr(auth_mgr, "is_configured", False):
         raise HTTPException(401, "Not authenticated")
     # Unconfigured / first-run mode: only allow loopback callers.
-    if is_loopback:
+    if _loopback_request(request):
         return ""
     raise HTTPException(401, "Not authenticated")
 

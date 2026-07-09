@@ -141,6 +141,8 @@ KNOWN_CONTEXT_WINDOWS = {
     'o4-mini': 200000,
 
     # --- DeepSeek ---
+    'deepseek-v4-flash': 1000000,
+    'deepseek-v4': 1000000,
     'deepseek-chat': 64000,
     'deepseek-coder': 64000,
     'deepseek-reasoner': 64000,

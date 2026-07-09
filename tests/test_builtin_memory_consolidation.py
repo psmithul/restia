@@ -23,7 +23,9 @@ def _write_memories(tmp_path, memories):
 
 
 def _read_memories(data_dir):
-    return json.loads((data_dir / "memory.json").read_text(encoding="utf-8"))
+    from src.memory import MemoryManager
+
+    return MemoryManager(str(data_dir)).load_all()
 
 
 @pytest.mark.asyncio
@@ -32,6 +34,7 @@ async def test_consolidate_memory_empty_owner_treats_each_owner_separately(monke
     from src import llm_core
     from src import task_endpoint
     action_consolidate_memory = _import_consolidate_action()
+    monkeypatch.setenv("BACKGROUND_TASK_FOREGROUND_GATE", "false")
 
     long_alice_text = "Alice private project context. " + ("A" * 2200)
     data_dir = _write_memories(
@@ -93,6 +96,7 @@ async def test_consolidate_memory_specific_owner_does_not_absorb_ownerless_rows(
     from src import constants
     from src import endpoint_resolver
     action_consolidate_memory = _import_consolidate_action()
+    monkeypatch.setenv("BACKGROUND_TASK_FOREGROUND_GATE", "false")
 
     data_dir = _write_memories(
         tmp_path,
@@ -112,5 +116,5 @@ async def test_consolidate_memory_specific_owner_does_not_absorb_ownerless_rows(
     assert "Removed 1 duplicate" in message
     saved = {m["id"]: m for m in _read_memories(data_dir)}
     assert set(saved) == {"alice-1", "legacy", "bob-1"}
-    assert "owner" not in saved["legacy"]
+    assert saved["legacy"].get("owner") is None
     assert saved["bob-1"]["owner"] == "bob"

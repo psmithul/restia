@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Odysseus — first-time setup script.
+"""Restia — first-time setup script.
 
 Creates data directories, initializes the database, and sets up an
 initial admin user. Safe to re-run (skips what already exists).
@@ -33,6 +33,10 @@ DIRS = [
     MEMORY_VECTORS_DIR,
     os.path.join(BASE_DIR, "logs"),
 ]
+
+
+def _env_alias(new_name: str, old_name: str, default: str = "") -> str:
+    return os.getenv(new_name) or os.getenv(old_name) or default
 
 
 def create_dirs():
@@ -98,18 +102,18 @@ def create_default_admin():
         import json
 
         # Priority: env vars > interactive prompt > random password
-        username = os.getenv("ODYSSEUS_ADMIN_USER", "").strip().lower()
-        password = os.getenv("ODYSSEUS_ADMIN_PASSWORD", "").strip()
+        username = _env_alias("RESTIA_ADMIN_USER", "ODYSSEUS_ADMIN_USER").strip().lower()
+        password = _env_alias("RESTIA_ADMIN_PASSWORD", "ODYSSEUS_ADMIN_PASSWORD").strip()
 
         if username and password:
             # Both provided via env — validate before using
             if username in RESERVED_USERNAMES:
-                print(f"  [error] ODYSSEUS_ADMIN_USER '{username}' is a reserved username")
+                print(f"  [error] RESTIA_ADMIN_USER '{username}' is a reserved username")
                 return "failed"
             if len(password) < PASSWORD_MIN_LENGTH:
-                print(f"  [error] ODYSSEUS_ADMIN_PASSWORD must be at least {PASSWORD_MIN_LENGTH} characters")
+                print(f"  [error] RESTIA_ADMIN_PASSWORD must be at least {PASSWORD_MIN_LENGTH} characters")
                 return "failed"
-        elif sys.stdin.isatty() and not os.getenv("ODYSSEUS_SKIP_ADMIN_PROMPT"):
+        elif sys.stdin.isatty() and not _env_alias("RESTIA_SKIP_ADMIN_PROMPT", "ODYSSEUS_SKIP_ADMIN_PROMPT"):
             # Interactive terminal — ask the user
             username, password = _prompt_admin_credentials()
         else:
@@ -130,13 +134,13 @@ def create_default_admin():
         with open(auth_path, "w", encoding="utf-8") as f:
             json.dump(auth_data, f, indent=2)
 
-        if sys.stdin.isatty() and not os.getenv("ODYSSEUS_ADMIN_PASSWORD"):
+        if sys.stdin.isatty() and not _env_alias("RESTIA_ADMIN_PASSWORD", "ODYSSEUS_ADMIN_PASSWORD"):
             print(f"  [ok] Admin account created ({username})")
         else:
             print(f"  [ok] Initial admin user created ({username})")
-            if not os.getenv("ODYSSEUS_ADMIN_PASSWORD"):
+            if not _env_alias("RESTIA_ADMIN_PASSWORD", "ODYSSEUS_ADMIN_PASSWORD"):
                 print(f"        Temporary password: {password}")
-                print(f"        ** Change it after first login. Set ODYSSEUS_ADMIN_PASSWORD to choose your own. **")
+                print(f"        ** Change it after first login. Set RESTIA_ADMIN_PASSWORD to choose your own. **")
         return "created"
     except ImportError as e:
         if "incompatible architecture" in str(e).lower():
@@ -237,9 +241,9 @@ def check_arch():
 
 
 def main():
-    print("\n=== Odysseus Setup ===\n")
+    print("\n=== Restia Setup ===\n")
 
-    # Load .env so pre-seeded ODYSSEUS_ADMIN_USER / ODYSSEUS_ADMIN_PASSWORD (and
+    # Load .env so pre-seeded RESTIA_ADMIN_USER / RESTIA_ADMIN_PASSWORD (and
     # other deployment vars) are honored on native installs, not just when they
     # are exported in the shell. Mirrors app.py: encoding="utf-8-sig" tolerates a
     # UTF-8 BOM in a Notepad-saved .env. load_dotenv does not override already
@@ -281,7 +285,7 @@ def main():
     print("\n=== Setup complete ===")
     # start-macos.sh launches the server itself (on its own port) right after
     # this, so suppress the manual hint there to avoid a contradictory URL.
-    if not os.getenv("ODYSSEUS_SKIP_RUN_HINT"):
+    if not _env_alias("RESTIA_SKIP_RUN_HINT", "ODYSSEUS_SKIP_RUN_HINT"):
         print(f"\nStart the server with:")
         print(f"  python -m uvicorn app:app --host 127.0.0.1 --port 7000")
         print(f"\nThen open http://localhost:7000")

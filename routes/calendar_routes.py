@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, date, timedelta
 from typing import Optional, List
 
-from fastapi import APIRouter, HTTPException, Request, UploadFile, File
+from fastapi import APIRouter, HTTPException, Request, UploadFile, File, Query, Depends
 from pydantic import BaseModel
 from sqlalchemy import or_, and_
 from dateutil.rrule import rrulestr
@@ -56,12 +56,18 @@ def _ensure_positive_duration(start_dt, end_dt, all_day):
 # Single-user fallback identity. Used only when:
 #   1. The app is configured for single-user (no auth middleware), AND
 #   2. The request didn't resolve to an authenticated user.
-# Override at deploy time via `ODYSSEUS_FALLBACK_OWNER` env var. In a real
-# multi-user install set `ODYSSEUS_SINGLE_USER=0` so unauthenticated requests
+# Override at deploy time via `RESTIA_FALLBACK_OWNER` env var. In a real
+# multi-user install set `RESTIA_SINGLE_USER=0` so unauthenticated requests
 # are rejected instead of silently writing to this address.
 import os as _os
-FALLBACK_OWNER = _os.environ.get("ODYSSEUS_FALLBACK_OWNER", "owner@localhost")
-_SINGLE_USER_MODE = _os.environ.get("ODYSSEUS_SINGLE_USER", "1") != "0"
+
+
+def _env_alias(new_name: str, old_name: str, default: str = "") -> str:
+    return _os.environ.get(new_name) or _os.environ.get(old_name) or default
+
+
+FALLBACK_OWNER = _env_alias("RESTIA_FALLBACK_OWNER", "ODYSSEUS_FALLBACK_OWNER", "owner@localhost")
+_SINGLE_USER_MODE = _env_alias("RESTIA_SINGLE_USER", "ODYSSEUS_SINGLE_USER", "1") != "0"
 
 
 def _require_user(request: Request) -> str:
@@ -713,6 +719,114 @@ def setup_calendar_routes() -> APIRouter:
         prefs.pop("caldav", None)
         _save_for_user(owner, prefs)
 
+    # ── Google OAuth Routes ──────────────────────────────────────────────────
+
+    @router.get("/oauth/google/authorize")
+    async def google_oauth_authorize(account_id: str = Query(...), request: Request = None, owner: str = Depends(_require_user)):
+        import urllib.parse
+        import os
+        from routes.email_helpers import make_oauth_state
+        client_id = os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "")
+        if not client_id:
+            raise HTTPException(400, "GOOGLE_OAUTH_CLIENT_ID not set — add it to .env")
+        redirect_uri = (
+            os.environ.get("GOOGLE_OAUTH_REDIRECT_URI_CALENDAR")
+            or f"http://{request.headers.get('host', 'localhost:7000')}/api/calendar/oauth/google/callback"
+        )
+        state = make_oauth_state(account_id, owner)
+        params = urllib.parse.urlencode({
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "response_type": "code",
+            "scope": "https://www.googleapis.com/auth/calendar email",
+            "access_type": "offline",
+            "prompt": "consent",
+            "state": state,
+        })
+        from fastapi.responses import RedirectResponse as _RR
+        return _RR(f"https://accounts.google.com/o/oauth2/v2/auth?{params}")
+
+    @router.get("/oauth/google/callback")
+    async def google_oauth_callback(
+        code: str = Query(None),
+        state: str = Query(None),
+        error: str = Query(None),
+        request: Request = None,
+    ):
+        import time
+        import os
+        from fastapi.responses import RedirectResponse as _RR
+        from routes.email_helpers import verify_oauth_state
+
+        if error:
+            return _RR("/?section=integrations&calendar_oauth_error=google_error")
+        if not code or not state:
+            return _RR("/?section=integrations&calendar_oauth_error=missing_code")
+        state_data = verify_oauth_state(state)
+        if not state_data:
+            return _RR("/?section=integrations&calendar_oauth_error=invalid_state")
+
+        account_id = state_data.get("a", "")
+        owner = state_data.get("o", "")
+        client_id = os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "")
+        client_secret = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET", "")
+        redirect_uri = (
+            os.environ.get("GOOGLE_OAUTH_REDIRECT_URI_CALENDAR")
+            or f"http://{request.headers.get('host', 'localhost:7000')}/api/calendar/oauth/google/callback"
+        )
+        import httpx as _httpx
+        try:
+            resp = _httpx.post("https://oauth2.googleapis.com/token", data={
+                "code": code,
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "redirect_uri": redirect_uri,
+                "grant_type": "authorization_code",
+            }, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception:
+            logger.warning("Google Calendar token exchange failed")
+            return _RR("/?section=integrations&calendar_oauth_error=token_exchange_failed")
+
+        access_token = data.get("access_token", "")
+        refresh_token = data.get("refresh_token", "")
+        expiry = str(int(time.time()) + data.get("expires_in", 3600))
+
+        email_addr = ""
+        try:
+            ui = _httpx.get("https://www.googleapis.com/oauth2/v1/userinfo",
+                            headers={"Authorization": f"Bearer {access_token}"}, timeout=10)
+            if ui.is_success:
+                email_addr = ui.json().get("email", "")
+        except Exception:
+            pass
+
+        if not email_addr:
+            return _RR("/?section=integrations&calendar_oauth_error=no_email")
+
+        from src.secret_storage import encrypt as _enc
+        accounts = _get_caldav_accounts(owner)
+
+        # See if account exists, otherwise create it
+        acc = next((a for a in accounts if a.get("id") == account_id), None)
+        if not acc:
+            acc = {"id": account_id}
+            accounts.append(acc)
+
+        acc["label"] = acc.get("label") or f"Google ({email_addr})"
+        acc["url"] = f"https://apidata.googleusercontent.com/caldav/v2/{email_addr}/events"
+        acc["username"] = email_addr
+        acc["password"] = ""
+        acc["oauth_provider"] = "google"
+        acc["oauth_access_token"] = _enc(access_token)
+        if refresh_token:
+            acc["oauth_refresh_token"] = _enc(refresh_token)
+        acc["oauth_token_expiry"] = expiry
+
+        _save_caldav_accounts(owner, accounts)
+        return _RR("/?section=integrations")
+
     # ── CalDAV config routes (backward-compat single-account API) ────────────
 
     @router.get("/config")
@@ -793,6 +907,8 @@ def setup_calendar_routes() -> APIRouter:
                 "url": acc.get("url", "") or "",
                 "username": acc.get("username", "") or "",
                 "has_password": has_pw,
+                "oauth_provider": acc.get("oauth_provider", "") or "",
+                "oauth_connected": bool(acc.get("oauth_provider") and acc.get("oauth_access_token")),
             })
         return {"accounts": safe}
 
@@ -880,6 +996,8 @@ def setup_calendar_routes() -> APIRouter:
         url = (body.get("url") or "").strip()
         user = (body.get("username") or "").strip()
         pw = body.get("password") or ""
+        access_token = ""
+        saved_oauth_provider = ""
         if not (url and user and pw):
             # Look up a saved account: by id if supplied, else first account.
             accounts = _get_caldav_accounts(owner)
@@ -891,6 +1009,10 @@ def setup_calendar_routes() -> APIRouter:
             if acc:
                 url = url or (acc.get("url") or "")
                 user = user or (acc.get("username") or "")
+                saved_oauth_provider = acc.get("oauth_provider") or ""
+                if saved_oauth_provider == "google":
+                    from src.caldav_sync import _ensure_google_calendar_token
+                    access_token = _ensure_google_calendar_token(acc, owner) or ""
                 if not pw:
                     pw = acc.get("password") or ""
                     if pw:
@@ -899,8 +1021,8 @@ def setup_calendar_routes() -> APIRouter:
                             pw = decrypt(pw)
                         except Exception:
                             pass
-        if not (url and user and pw):
-            return {"ok": False, "error": "Missing URL, username, or password"}
+        if not (url and user and (pw or access_token)):
+            return {"ok": False, "error": "Missing URL, username, or password/token"}
         from src.caldav_sync import validate_caldav_url
         try:
             url = validate_caldav_url(url)
@@ -914,10 +1036,13 @@ def setup_calendar_routes() -> APIRouter:
         )
         try:
             async with httpx.AsyncClient(timeout=8.0, follow_redirects=False, trust_env=False) as cx:
+                headers = {"Depth": "0", "Content-Type": "application/xml"}
+                if access_token:
+                    headers["Authorization"] = f"Bearer {access_token}"
                 r = await cx.request(
                     "PROPFIND", url,
-                    auth=(user, pw),
-                    headers={"Depth": "0", "Content-Type": "application/xml"},
+                    auth=None if access_token else (user, pw),
+                    headers=headers,
                     content=propfind_body,
                 )
                 # If the server demands Digest (Baïkal default, SabreDAV-based
@@ -925,11 +1050,11 @@ def setup_calendar_routes() -> APIRouter:
                 # 401s. Retry once with httpx.DigestAuth so this test matches
                 # what the real sync does via caldav.DAVClient in
                 # src/caldav_sync.py (which negotiates the scheme).
-                if r.status_code == 401 and "digest" in r.headers.get("www-authenticate", "").lower():
+                if (not access_token) and r.status_code == 401 and "digest" in r.headers.get("www-authenticate", "").lower():
                     r = await cx.request(
                         "PROPFIND", url,
                         auth=httpx.DigestAuth(user, pw),
-                        headers={"Depth": "0", "Content-Type": "application/xml"},
+                        headers=headers,
                         content=propfind_body,
                     )
             # 207 = Multi-Status — standard CalDAV success. 200 also
@@ -1436,7 +1561,7 @@ def setup_calendar_routes() -> APIRouter:
             lines = [
                 "BEGIN:VCALENDAR",
                 "VERSION:2.0",
-                "PRODID:-//Odysseus//Calendar//EN",
+                "PRODID:-//Restia//Calendar//EN",
                 f"X-WR-CALNAME:{_ics_escape(cal.name)}",
             ]
             for ev in events:
@@ -1544,7 +1669,8 @@ def setup_calendar_routes() -> APIRouter:
               '  "description": "",\n'
               '  "confidence": <0.0-1.0>\n'
               "}\n"
-              "For all-day events use \"YYYY-MM-DD\" (no time) for both fields."
+              "For all-day events use \"YYYY-MM-DD\" (no time) for both fields.\n"
+              "CRITICAL: DO NOT OUTPUT ANY CONVERSATIONAL TEXT, GREETINGS, OR NOTES. OUTPUT ONLY THE JSON BLOCK STARTING WITH {."
         )
 
         try:
@@ -1552,12 +1678,11 @@ def setup_calendar_routes() -> APIRouter:
                 url=url, model=model,
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": text},
+                    {"role": "user", "content": f"Parse this event into JSON:\n\n{text}"},
                 ],
                 headers=headers,
                 temperature=0.0,
-                max_tokens=512,
-                timeout=20,
+                timeout=300,
             )
         except Exception as e:
             return {"ok": False, "error": f"LLM call failed: {e}"}

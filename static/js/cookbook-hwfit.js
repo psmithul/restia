@@ -648,7 +648,6 @@ export async function _hwfitFetch(fresh = false, opts = {}) {
   const hw = document.getElementById('hwfit-hw');
   if (!list) return;
   const hasManualOrDismissed = !!_manualHwState() || _dismissedHwChips.size > 0;
-  if (hasManualOrDismissed) fresh = true;
   // Instant paint from the persisted cache (skipped on a forced Rescan), so a
   // reload shows the last result with no spinner. We still fetch fresh below and
   // swap it in. If there's no cache hit, fall back to the spinner.
@@ -673,28 +672,22 @@ export async function _hwfitFetch(fresh = false, opts = {}) {
     if (canKeepPrevious) {
       try { wp.destroy(); } catch {}
     } else if (!allowNetwork) {
+      try { wp.destroy(); } catch {}
       _hwfitCache = null;
       _hwfitRenderHw(hw, null);
       const loadingDiv = document.createElement('div');
       loadingDiv.className = 'hwfit-loading';
       loadingDiv.style.cssText = 'flex-direction:column;gap:6px;text-align:center;';
-      loadingDiv.appendChild(wp.element);
       const loadingTitle = document.createElement('div');
       loadingTitle.textContent = 'No cached scan yet';
       loadingTitle.style.cssText = 'font-size:12px;opacity:0.7;';
       const loadingLbl = document.createElement('div');
-      loadingLbl.textContent = 'Loading model list…';
+      loadingLbl.textContent = 'Click Rescan when you need fresh model recommendations.';
       loadingLbl.style.cssText = 'font-size:11px;opacity:0.55;max-width:420px;line-height:1.4;';
       loadingDiv.appendChild(loadingTitle);
       loadingDiv.appendChild(loadingLbl);
       list.innerHTML = '';
       list.appendChild(loadingDiv);
-      setTimeout(() => {
-        if (_tk === _hwfitFetchToken) {
-          _resetGpuToggleState();
-          _hwfitFetch(true, { autoFromEmpty: true });
-        }
-      }, 60);
       return;
     }
     if (!canKeepPrevious) {
@@ -1002,7 +995,7 @@ function _renderHwVisibilityWarning(sys) {
   box.querySelector('[data-hw-action="copy"]')?.addEventListener('click', () => {
     // Keep diagnostics copy/paste friendly for GitHub issues and Docker support.
     const text = [
-      'Odysseus Cookbook hardware diagnostics',
+      'Restia Cookbook hardware diagnostics',
       `probe_scope=${sys?.probe_scope || ''}`,
       `containerized=${sys?.containerized === true}`,
       `backend=${sys?.backend || ''}`,

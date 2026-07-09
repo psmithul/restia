@@ -27,6 +27,7 @@ def _setup(monkeypatch, store, user="alice"):
 
     mem = MagicMock()
     mem.load_all.return_value = list(store)
+    mem.load.side_effect = lambda owner=None: [e for e in store if e.get("owner") == owner]
     saved = {}
     mem.save.side_effect = lambda entries: saved.__setitem__("entries", entries)
 

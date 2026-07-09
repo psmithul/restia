@@ -228,7 +228,68 @@ def _open_url_as_calendar(client, url: str):
     return client.calendar(url=target)
 
 
-def _build_dav_client(url: str, username: str, password: str):
+def _save_caldav_accounts(owner: str, accounts: list) -> None:
+    from routes.prefs_routes import _load_for_user, _save_for_user
+
+    prefs = _load_for_user(owner) or {}
+    prefs["caldav_accounts"] = accounts
+    prefs.pop("caldav", None)
+    _save_for_user(owner, prefs)
+
+
+def _ensure_google_calendar_token(acc: dict, owner: str) -> str | None:
+    if acc.get("oauth_provider") != "google":
+        return None
+
+    import time
+    from src.secret_storage import decrypt as _dec, encrypt as _enc
+
+    access_token = _dec(acc.get("oauth_access_token") or "")
+    try:
+        expiry = int(acc.get("oauth_token_expiry") or 0)
+    except (TypeError, ValueError):
+        expiry = 0
+
+    if expiry > time.time() + 300 and access_token:
+        return access_token
+
+    refresh_token = _dec(acc.get("oauth_refresh_token") or "")
+    if not refresh_token:
+        return access_token
+
+    import os, httpx
+    client_id = os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "")
+    client_secret = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET", "")
+    if not client_id or not client_secret:
+        logger.warning("Google Calendar token refresh skipped: OAuth client id/secret not configured")
+        return access_token
+
+    try:
+        resp = httpx.post("https://oauth2.googleapis.com/token", data={
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+        }, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        new_access = data["access_token"]
+        acc["oauth_access_token"] = _enc(new_access)
+        acc["oauth_token_expiry"] = str(int(time.time()) + data.get("expires_in", 3600))
+
+        accounts = _load_caldav_accounts(owner)
+        for a in accounts:
+            if a.get("id") == acc.get("id"):
+                a["oauth_access_token"] = acc["oauth_access_token"]
+                a["oauth_token_expiry"] = acc["oauth_token_expiry"]
+        _save_caldav_accounts(owner, accounts)
+        return new_access
+    except Exception as e:
+        logger.warning(f"Google Calendar token refresh failed: {e}")
+        return access_token
+
+
+def _build_dav_client(url: str, username: str, password: str, oauth_access_token: str = None):
     """Construct a CalDAV client with automatic redirects disabled.
 
     ``validate_caldav_url`` resolves and vets the *initial* host, but caldav's
@@ -245,7 +306,16 @@ def _build_dav_client(url: str, username: str, password: str):
     """
     import caldav
 
-    client = caldav.DAVClient(url=url, username=username, password=password)
+    client = caldav.DAVClient(
+        url=url,
+        username="" if oauth_access_token else username,
+        password="" if oauth_access_token else password,
+    )
+    if oauth_access_token:
+        if not hasattr(client.session, "headers") or client.session.headers is None:
+            client.session.headers = {}
+        client.session.headers["Authorization"] = f"Bearer {oauth_access_token}"
+
     # Unconditional: a redirect-disable that only sometimes applies is not a
     # control. The session exists right after __init__ on every real client;
     # test_build_dav_client_disables_redirects asserts it against installed
@@ -268,7 +338,7 @@ def _should_prune_window(seen_uids: set, parse_failed: bool) -> bool:
     return not parse_failed
 
 
-def _sync_blocking(owner: str, url: str, username: str, password: str, account_id: str = "") -> dict:
+def _sync_blocking(owner: str, url: str, username: str, password: str, account_id: str = "", oauth_access_token: str = None) -> dict:
     """The actual sync — synchronous, intended to run in a threadpool.
     Returns counts: {calendars, events, deleted, errors}."""
     # Lazy imports so a missing `caldav` dep doesn't break app startup —
@@ -279,7 +349,7 @@ def _sync_blocking(owner: str, url: str, username: str, password: str, account_i
 
     result = {"calendars": 0, "events": 0, "deleted": 0, "errors": []}
 
-    client = _build_dav_client(url, username, password)
+    client = _build_dav_client(url, username, password, oauth_access_token)
 
     # Discovery: try principal → calendars first; if the server doesn't
     # support discovery (or the URL points directly at a calendar), fall
@@ -635,12 +705,17 @@ async def sync_caldav(owner: str) -> dict:
             pw = decrypt(pw)
         except Exception:
             pass
-        if not (url and user and pw):
-            totals["errors"].append(f"{label}: missing URL, username, or password")
+
+        access_token = None
+        if acc.get("oauth_provider") == "google":
+            access_token = _ensure_google_calendar_token(acc, owner)
+
+        if not (url and user and (pw or access_token)):
+            totals["errors"].append(f"{label}: missing URL, username, or password/token")
             continue
         try:
             url = validate_caldav_url(url)
-            result = await asyncio.to_thread(_sync_blocking, owner, url, user, pw, account_id)
+            result = await asyncio.to_thread(_sync_blocking, owner, url, user, pw, account_id, access_token)
         except ValueError as e:
             result = {"calendars": 0, "events": 0, "deleted": 0, "errors": [str(e)]}
         except Exception as e:

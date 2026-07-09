@@ -200,12 +200,13 @@ async function _fetchCalendars() {
   }
 }
 
-// Trigger a CalDAV pull. `interactive=true` waits for the result and
-// refreshes the UI; false fires-and-forgets (used on first open). Both
-// no-op silently if CalDAV isn't configured.
-async function _syncCaldav(interactive) {
+// Trigger CalDAV sync. Background first-open sync only pulls. Interactive
+// "Sync now" pushes pending local edits first, then pulls remote state.
+// Both paths no-op silently if CalDAV isn't configured.
+async function _syncCaldav(interactive, direction = 'pull') {
   try {
-    const res = await fetch(`${API_BASE}/api/calendar/sync`, {
+    const qs = direction && direction !== 'pull' ? `?direction=${encodeURIComponent(direction)}` : '';
+    const res = await fetch(`${API_BASE}/api/calendar/sync${qs}`, {
       method: 'POST', credentials: 'same-origin',
     });
     const data = await res.json().catch(() => ({}));
@@ -2733,13 +2734,17 @@ async function _showCalSettings() {
     const status = overlay.querySelector('#cal-settings-sync-status');
     btn.disabled = true;
     status.textContent = 'Syncing…';
-    const data = await _syncCaldav(true) || {};
-    if (data.errors && data.errors.length) {
-      status.textContent = `Sync failed: ${data.errors[0]}`;
+    const data = await _syncCaldav(true, 'both') || {};
+    const pull = data.pull || data;
+    const push = data.push || null;
+    const errors = [...(push?.errors || []), ...(pull.errors || data.errors || [])];
+    if (errors.length) {
+      status.textContent = `Sync failed: ${errors[0]}`;
     } else {
       const parts = [];
-      if (data.events) parts.push(`${data.events} events`);
-      if (data.deleted) parts.push(`${data.deleted} removed`);
+      if (push?.events) parts.push(`${push.events} pushed`);
+      if (pull.events) parts.push(`${pull.events} pulled`);
+      if (pull.deleted) parts.push(`${pull.deleted} removed`);
       status.textContent = parts.length ? `Synced — ${parts.join(', ')}` : 'Synced — no changes';
       _allEvents = {}; _fetchedRanges = [];
       try { localStorage.removeItem(LS_KEY); } catch (_) {}

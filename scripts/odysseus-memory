@@ -29,6 +29,8 @@ import argparse, json, logging, os, sys
 from pathlib import Path
 
 try:
+    sys.path.insert(0, str(_REPO_ROOT))
+    from src.brain_memory import build_brain_memory_manager
     from services.memory.memory import MemoryManager
     quiet_logs()
 except ModuleNotFoundError as e:
@@ -43,7 +45,7 @@ _mgr: MemoryManager | None = None
 def _manager() -> MemoryManager:
     global _mgr
     if _mgr is None:
-        _mgr = MemoryManager(_DATA_DIR)
+        _mgr = build_brain_memory_manager(_DATA_DIR) or MemoryManager(_DATA_DIR)
     return _mgr
 
 
@@ -51,14 +53,23 @@ def _memory_entries(entries):
     return [e for e in entries or [] if isinstance(e, dict)]
 
 
+def _is_readonly_memory(entry):
+    return bool(
+        entry
+        and (
+            entry.get("readonly")
+            or entry.get("source") == "restia_brain"
+            or str(entry.get("id") or "").startswith("brain:")
+        )
+    )
+
+
 def cmd_list(args):
-    entries = _memory_entries(_manager().load_all())
+    entries = _memory_entries(_manager().load(owner=args.owner))
     if args.category:
         entries = [e for e in entries if (e.get("category") or "fact") == args.category]
     if args.source:
         entries = [e for e in entries if (e.get("source") or "user") == args.source]
-    if args.owner:
-        entries = [e for e in entries if (e.get("owner") or "") == args.owner]
     # Newest first
     entries = sorted(entries, key=lambda e: e.get("timestamp", 0), reverse=True)
     emit(entries[: args.limit], args)
@@ -66,14 +77,14 @@ def cmd_list(args):
 
 def cmd_search(args):
     q = args.query.lower()
-    entries = _memory_entries(_manager().load_all())
+    entries = _memory_entries(_manager().load())
     matches = [e for e in entries if q in (e.get("text") or "").lower()]
     matches = sorted(matches, key=lambda e: e.get("timestamp", 0), reverse=True)
     emit(matches[: args.limit], args)
 
 
 def cmd_show(args):
-    for e in _memory_entries(_manager().load_all()):
+    for e in _memory_entries(_manager().load()):
         if e.get("id") == args.id:
             emit(e, args)
             return
@@ -97,6 +108,9 @@ def cmd_add(args):
 
 
 def cmd_delete(args):
+    visible_target = next((e for e in _memory_entries(_manager().load()) if e.get("id") == args.id), None)
+    if _is_readonly_memory(visible_target):
+        fail(f"memory {args.id!r} is read-only in Brain")
     entries = _memory_entries(_manager().load_all())
     target = next((e for e in entries if e.get("id") == args.id), None)
     if not target:
@@ -108,7 +122,7 @@ def cmd_delete(args):
 
 def cmd_categories(args):
     counts: dict[str, int] = {}
-    for e in _memory_entries(_manager().load_all()):
+    for e in _memory_entries(_manager().load()):
         cat = e.get("category") or "fact"
         counts[cat] = counts.get(cat, 0) + 1
     rows = sorted(counts.items(), key=lambda kv: -kv[1])

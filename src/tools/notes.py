@@ -40,6 +40,53 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
     action = _NOTE_ACTION_ALIASES.get(action, action)
     db = SessionLocal()
 
+    # The UI splits notes into tabs by exact note_type: 'note' (freeform,
+    # Notes tab) vs 'todo'/'goal' (checkbox items, To-dos tab). 'checklist'
+    # is a legacy synonym for 'todo' that no tab matches — normalize it and
+    # the other names models emit so agent-created items are always visible.
+    _TODO_LIKE = {"todo", "goal", "checklist"}
+    _NOTE_TYPE_ALIASES = {
+        "checklist": "todo",
+        "todos": "todo",
+        "task": "todo",
+        "tasks": "todo",
+        "to_do": "todo",
+        "to-do": "todo",
+        "reminder": "todo",
+        "notes": "note",
+        "text": "note",
+    }
+
+    def _norm_note_type(value) -> Optional[str]:
+        text = str(value or "").strip().lower()
+        if not text:
+            return None
+        text = _NOTE_TYPE_ALIASES.get(text, text)
+        return text if text in ("note", "todo", "goal") else None
+
+    def _norm_repeat(value) -> Optional[str]:
+        """Normalize a repeat rule to the grammar the reminder engine knows:
+        none/daily/yearly/weekly[:W]/monthly:day:D etc. Natural phrases like
+        'every day' map to their canonical form; unknown values are rejected
+        so a bad rule can't silently create a reminder that never repeats."""
+        text = str(value or "").strip().lower().replace("every ", "")
+        if not text:
+            return None
+        aliases = {
+            "day": "daily", "daily": "daily",
+            "week": "weekly", "weekly": "weekly",
+            "month": "monthly", "monthly": "monthly",
+            "year": "yearly", "yearly": "yearly", "annually": "yearly",
+            "none": "none", "off": "none", "never": "none",
+        }
+        if text in aliases:
+            return aliases[text]
+        if re.fullmatch(r"weekly:[0-6]", text):
+            return text
+        if re.fullmatch(r"monthly:day:\d{1,2}|monthly:nth:[1-4]:[0-6]|monthly:last:[0-6]", text):
+            return text
+        return None
+
     def _norm_note_title(value: str) -> str:
         text = (value or "").strip().lower()
         text = re.sub(r"^\s*reminder\s*:\s*", "", text)
@@ -65,11 +112,11 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
         lines = []
         for n in notes:
             pin = " [PINNED]" if n.pinned else ""
-            typ = " [checklist]" if n.note_type == "checklist" else ""
+            typ = f" [{n.note_type}]" if n.note_type in _TODO_LIKE else ""
             lbl = f" #{n.label}" if n.label else ""
             title = n.title or "(untitled)"
             lines.append(f"- [{n.id[:8]}] **{title}**{pin}{typ}{lbl}")
-            if n.note_type == "checklist" and n.items:
+            if n.note_type in _TODO_LIKE and n.items:
                 try:
                     items = json.loads(n.items)
                     for i, item in enumerate(items):
@@ -90,6 +137,13 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
             label_filter = str(args.get("label") or "").strip()
             if label_filter and label_filter.lower() != "default":
                 q = q.filter(Note.label == label_filter)
+            type_filter = _norm_note_type(args.get("note_type"))
+            if type_filter == "todo":
+                # Include legacy 'checklist' rows under the todo umbrella so
+                # older data doesn't silently vanish from filtered listings.
+                q = q.filter(Note.note_type.in_(["todo", "checklist"]))
+            elif type_filter:
+                q = q.filter(Note.note_type == type_filter)
             show_archived = args.get("archived", False)
             q = q.filter(Note.archived == show_archived)
             notes = q.order_by(Note.pinned.desc(), Note.updated_at.desc()).all()
@@ -143,8 +197,29 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
             items_raw = args.get("checklist_items")
             if items_raw is None:
                 items_raw = args.get("items")
+            # Models sometimes pass checklist items as plain strings instead of
+            # {text, done} objects — accept both.
+            if isinstance(items_raw, list):
+                items_raw = [
+                    it if isinstance(it, dict) else {"text": str(it), "done": False}
+                    for it in items_raw
+                ]
+            note_type = _norm_note_type(args.get("note_type"))
+            if note_type is None:
+                note_type = "todo" if items_raw else "note"
+            # Reconcile type with payload so nothing renders blank in the UI:
+            # a todo/goal card shows only its checkbox items, a note card shows
+            # only its content text.
+            if note_type == "note" and items_raw:
+                note_type = "todo"
+            if note_type in ("todo", "goal") and not items_raw and content_raw:
+                items_raw = [
+                    {"text": line.strip().lstrip("-*•").strip(), "done": False}
+                    for line in str(content_raw).splitlines()
+                    if line.strip().lstrip("-*•").strip()
+                ]
+                content_raw = None
             items_json = json.dumps(items_raw) if items_raw is not None else None
-            note_type = args.get("note_type", "checklist" if items_raw else "note")
             # Accept natural-language due_date ("tomorrow at 1pm") in
             # addition to ISO. Use the user-tz-aware parser so the LLM's
             # naive times ("today at 9pm") are anchored to the USER's clock,
@@ -198,6 +273,7 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
                             "duplicate": True,
                             "exit_code": 0,
                         }
+            repeat_norm = _norm_repeat(args.get("repeat"))
             note = Note(
                 id=str(_uuid.uuid4()),
                 owner=owner,
@@ -209,6 +285,7 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
                 label=args.get("label"),
                 pinned=args.get("pinned", False),
                 due_date=due_iso,
+                repeat=repeat_norm or "none",
                 source="agent",
                 session_id=args.get("session_id"),
             )
@@ -221,7 +298,7 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
             # link with no target, leaving the user with a click that
             # did nothing and uncertainty about whether the note was made.
             return {
-                "response": f"{'Reminder' if due_iso else 'Note'} created: \"{title or '(untitled)'}\" (id: {note.id[:8]})",
+                "response": f"{'Reminder' if due_iso else {'todo': 'To-do', 'goal': 'Goal'}.get(note_type, 'Note')} created: \"{title or '(untitled)'}\" (id: {note.id[:8]})",
                 "note_id": note.id,
                 "note_title": title or "",
                 "open_url": f"/#open=notes&note={note.id}",
@@ -235,9 +312,17 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
                 return {"error": f"Note '{note_id}' not found", "exit_code": 1}
             if not _note_visible_to_owner(note, owner):
                 return {"error": "Note not found", "exit_code": 1}
-            for field in ("title", "content", "note_type", "color", "label"):
+            for field in ("title", "content", "color", "label"):
                 if field in args and args[field] is not None:
                     setattr(note, field, args[field])
+            if args.get("note_type") is not None:
+                new_type = _norm_note_type(args["note_type"])
+                if new_type:
+                    note.note_type = new_type
+            if args.get("repeat") is not None:
+                new_repeat = _norm_repeat(args["repeat"])
+                if new_repeat:
+                    note.repeat = new_repeat
             # Parse due_date the same way the `add` action does. The schema
             # advertises natural language ("tomorrow at 9am"), and naive ISO
             # strings need the user's tz offset attached so the frontend's

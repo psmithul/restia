@@ -33,6 +33,13 @@ function _memorySortIcon(value) {
   return _MEMORY_SORT_ICONS[value] || _MEMORY_SORT_ICONS.newest;
 }
 
+function isReadOnlyMemory(memory) {
+  return !!(
+    memory &&
+    (memory.readonly || memory.source === 'restia_brain' || String(memory.id || '').startsWith('brain:'))
+  );
+}
+
 function _renderMemorySortPickerCurrent() {
   const sel = document.getElementById('memory-sort');
   const btn = document.getElementById('memory-sort-btn');
@@ -458,7 +465,7 @@ function toggleSelectAll() {
   if (selectAllEl.checked) {
     // Select all currently visible/filtered items
     const visible = getFilteredMemories();
-    visible.forEach(m => selectedIds.add(m.id));
+    visible.filter(m => !isReadOnlyMemory(m)).forEach(m => selectedIds.add(m.id));
   } else {
     selectedIds.clear();
   }
@@ -474,6 +481,8 @@ async function bulkDelete() {
   let deleted = 0;
   const deletedIds = [];
   for (const id of selectedIds) {
+    const memory = memories.find(m => m.id === id);
+    if (isReadOnlyMemory(memory)) continue;
     try {
       const res = await fetch(`${window.location.origin}/api/memory/${id}`, { method: 'DELETE' });
       if (res.ok) {
@@ -709,15 +718,21 @@ export function renderMemoryList() {
   }
 
   const selectBtn = document.getElementById('memory-select-btn');
-  if (selectBtn) selectBtn.disabled = false;
+  const hasMutableMemories = filtered.some(m => !isReadOnlyMemory(m));
+  if (selectMode && !hasMutableMemories) {
+    exitSelectMode();
+    return;
+  }
+  if (selectBtn) selectBtn.disabled = !hasMutableMemories;
 
   filtered.forEach(memory => {
+    const readOnly = isReadOnlyMemory(memory);
     const item = document.createElement('div');
     item.className = 'memory-item';
     item.dataset.memoryId = String(memory.id);
 
     // Checkbox for select mode
-    if (selectMode) {
+    if (selectMode && !readOnly) {
       const cb = document.createElement('input');
       cb.type = 'checkbox';
       cb.className = 'memory-select-cb';
@@ -725,7 +740,10 @@ export function renderMemoryList() {
       cb.addEventListener('change', () => {
         toggleSelectItem(memory.id);
         const selectAllEl = document.getElementById('memory-select-all');
-        if (selectAllEl) selectAllEl.checked = filtered.every(m => selectedIds.has(m.id));
+        if (selectAllEl) {
+          const mutable = filtered.filter(m => !isReadOnlyMemory(m));
+          selectAllEl.checked = mutable.length > 0 && mutable.every(m => selectedIds.has(m.id));
+        }
       });
       item.appendChild(cb);
       item.style.cursor = 'pointer';
@@ -762,8 +780,15 @@ export function renderMemoryList() {
 
     const srcSpan = document.createElement('span');
     srcSpan.className = 'memory-item-source';
-    srcSpan.textContent = memory.source === 'auto' ? 'auto' : 'manual';
+    srcSpan.textContent = memory.source === 'restia_brain' ? 'brain' : (memory.source === 'auto' ? 'auto' : 'manual');
     meta.appendChild(srcSpan);
+
+    if (readOnly) {
+      const readOnlySpan = document.createElement('span');
+      readOnlySpan.className = 'memory-item-source';
+      readOnlySpan.textContent = 'read-only';
+      meta.appendChild(readOnlySpan);
+    }
 
     const uses = Number(memory.uses || 0);
     if (uses > 0) {
@@ -790,7 +815,7 @@ export function renderMemoryList() {
     item.appendChild(content);
 
     // Double-click text to edit (not in select mode)
-    if (!selectMode) {
+    if (!selectMode && !readOnly) {
       textSpan.addEventListener('dblclick', (e) => {
         e.stopPropagation();
         startInlineEdit(item, memory);
@@ -799,7 +824,7 @@ export function renderMemoryList() {
     }
 
     // Menu button (hidden in select mode)
-    if (!selectMode) {
+    if (!selectMode && !readOnly) {
       const menuBtn = document.createElement('button');
       menuBtn.className = 'memory-menu-btn';
       menuBtn.innerHTML = '\u22EE';
@@ -1033,6 +1058,11 @@ async function saveInlineEdit(id, newText, newCategory) {
   if (!newText) return;
 
   const memory = memories.find(m => m.id === id);
+  if (isReadOnlyMemory(memory)) {
+    showError('Brain memories are read-only here');
+    renderMemoryList();
+    return;
+  }
   const catChanged = newCategory && newCategory !== (memory?.category || 'fact');
   if (!memory || (newText === memory.text && !catChanged)) {
     renderMemoryList();
@@ -1133,6 +1163,11 @@ export async function editMemory(id) {
 }
 
 async function togglePin(id, pinned) {
+  const memory = memories.find(m => m.id === id);
+  if (isReadOnlyMemory(memory)) {
+    showError('Brain memories are read-only here');
+    return;
+  }
   try {
     const res = await fetch(`${window.location.origin}/api/memory/${id}/pin`, {
       method: 'POST',
@@ -1153,6 +1188,10 @@ async function togglePin(id, pinned) {
 export async function deleteMemory(id) {
   const memory = memories.find(m => m.id === id);
   if (!memory) return;
+  if (isReadOnlyMemory(memory)) {
+    showError('Brain memories are read-only here');
+    return;
+  }
 
   if (!await uiModule.styledConfirm(`Delete this memory?\n"${memory.text}"`, { confirmText: 'Delete', danger: true })) return;
 

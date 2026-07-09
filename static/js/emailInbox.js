@@ -13,6 +13,7 @@ import { emailApiUrl, emailAccountQuery } from './emailShared.js';
 import { bindMenuDismiss, dismissOrRemove } from './escMenuStack.js';
 
 const API_BASE = window.location.origin;
+const EMAIL_SIDEBAR_PAGE_SIZE = 30;
 const _acct = () => emailAccountQuery('&');
 
 const _emailSetupHint = () => '<div style="margin-top:6px;opacity:0.72;font-size:11px;">Setup: <span style="color:var(--accent,var(--red));">Settings &rsaquo; Integrations</span></div>';
@@ -163,6 +164,7 @@ let _listSpinner = null;
 let _senderFilter = null;       // email address (lowercased) to filter by, or null
 let _senderFilterLabel = null;  // display label for the active filter chip
 let _showEmailTags = localStorage.getItem('odysseus.email.showTags') !== '0';
+let _indexRefreshTimer = null;
 
 export function init(documentModule) {
   _docModule = documentModule;
@@ -291,7 +293,7 @@ function _bindEvents() {
     });
   }
 
-  // Delay the lightweight unread badge check so opening Odysseus doesn't
+  // Delay the lightweight unread badge check so opening Restia doesn't
   // compete with the initial chat/session paint. The full email list now loads
   // only when the inbox is actually opened.
   setTimeout(_refreshUnreadCount, 8000);
@@ -387,9 +389,10 @@ export function markInboxAsSeen() {
   } catch (e) {}
 }
 
-export async function loadEmails(append = false) {
+export async function loadEmails(append = false, opts = {}) {
   if (_loading) return;
   _loading = true;
+  const force = !!opts.force;
 
   const list = document.getElementById('email-list');
   if (!list) { _loading = false; return; }
@@ -405,12 +408,23 @@ export async function loadEmails(append = false) {
 
   try {
     const fromQS = _senderFilter ? `&from=${encodeURIComponent(_senderFilter)}` : '';
-    const res = await fetch(`${API_BASE}/api/email/list?folder=${encodeURIComponent(_currentFolder)}&limit=50&offset=${_offset}${fromQS}${_acct()}`);
+    const folderAtStart = _currentFolder;
+    const offsetAtStart = _offset;
+    const fromAtStart = _senderFilter;
+    const buster = force ? `&_=${Date.now()}` : '';
+    const res = await fetch(`${API_BASE}/api/email/list?folder=${encodeURIComponent(folderAtStart)}&limit=${EMAIL_SIDEBAR_PAGE_SIZE}&offset=${offsetAtStart}${fromQS}${_acct()}${buster}`);
     const data = await res.json();
     if (data.error) throw new Error(data.error);
 
     if (!append) _emails = [];
-    _emails.push(...(data.emails || []));
+    const newEmails = data.emails || [];
+    // Sort descending by date so newest emails are at the top
+    newEmails.sort((a, b) => {
+      const tA = a.date ? new Date(a.date).getTime() : 0;
+      const tB = b.date ? new Date(b.date).getTime() : 0;
+      return tB - tA;
+    });
+    _emails.push(...newEmails);
     _total = data.total || 0;
 
     // Remove spinner
@@ -421,6 +435,15 @@ export async function loadEmails(append = false) {
     const unreadCount = _emails.filter(e => !e.is_read).length;
     const dot = document.getElementById('email-unread-dot');
     if (dot) dot.style.display = unreadCount > 0 ? '' : 'none';
+    const sync = data.sync || {};
+    if (!append && !force && sync.source === 'index' && sync.refreshing) {
+      clearTimeout(_indexRefreshTimer);
+      _indexRefreshTimer = setTimeout(() => {
+        if (_loading) return;
+        if (_currentFolder !== folderAtStart || _offset !== offsetAtStart || _senderFilter !== fromAtStart) return;
+        loadEmails(false, { force: true });
+      }, 1200);
+    }
   } catch (e) {
     console.error('Failed to load emails:', e);
     if (_listSpinner) { _listSpinner.destroy(); _listSpinner = null; }
@@ -532,7 +555,34 @@ function _renderList() {
     return;
   }
 
+  let lastDateGroup = null;
+  const now = new Date();
+
   for (const em of _emails) {
+    if (em.date) {
+      try {
+        const d = new Date(em.date);
+        let group = '';
+        if (d.toDateString() === now.toDateString()) {
+          group = 'Today';
+        } else {
+          const yesterday = new Date(now);
+          yesterday.setDate(yesterday.getDate() - 1);
+          if (d.toDateString() === yesterday.toDateString()) {
+            group = 'Yesterday';
+          } else {
+            group = d.toLocaleDateString([], { month: 'short', day: 'numeric', year: d.getFullYear() !== now.getFullYear() ? 'numeric' : undefined });
+          }
+        }
+        if (group !== lastDateGroup) {
+          lastDateGroup = group;
+          const div = document.createElement('div');
+          div.className = 'email-list-date-divider';
+          div.textContent = group;
+          list.appendChild(div);
+        }
+      } catch (_) {}
+    }
     list.appendChild(_createEmailItem(em));
   }
 
@@ -558,7 +608,7 @@ function _clearSenderFilter() {
 
 function _createEmailItem(em) {
   const item = document.createElement('div');
-  item.className = 'list-item email-item' + (em.is_spam_verdict ? ' email-item-spam' : '');
+  item.className = 'email-item' + (em.is_spam_verdict ? ' email-item-spam' : '');
   item.setAttribute('role', 'option');
   item.setAttribute('data-uid', em.uid);
 
@@ -617,6 +667,9 @@ function _createEmailItem(em) {
     : '';
 
   const senderAddr = (em.from_address || '').toLowerCase();
+
+  const bodySnippet = em.snippet ? `<div class="email-snippet">${_esc(em.snippet)}</div>` : '';
+
   item.innerHTML = `
     <span class="email-avatar" style="background:${color}">${initial}</span>
     <div class="email-item-content">
@@ -625,6 +678,7 @@ function _createEmailItem(em) {
         <span class="email-date">${_esc(dateStr)}</span>
       </div>
       <div class="email-subject">${_esc(em.subject)}${unreadIcon}${attachIcon}${tagPills}${spamTag}</div>
+      ${bodySnippet}
     </div>
   `;
 
@@ -1245,8 +1299,7 @@ async function _toggleDone(em, itemEl) {
   }
   try {
     if (newState) {
-      await fetch(`${API_BASE}/api/email/mark-answered/${em.uid}?folder=${encodeURIComponent(_currentFolder)}${_acct()}`, { method: 'POST' });
-      await fetch(`${API_BASE}/api/email/mark-read/${em.uid}?folder=${encodeURIComponent(_currentFolder)}${_acct()}`, { method: 'POST' });
+      await fetch(`${API_BASE}/api/email/mark-done/${em.uid}?folder=${encodeURIComponent(_currentFolder)}${_acct()}`, { method: 'POST' });
     } else {
       await fetch(`${API_BASE}/api/email/clear-answered/${em.uid}?folder=${encodeURIComponent(_currentFolder)}${_acct()}`, { method: 'POST' });
     }

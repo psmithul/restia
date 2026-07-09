@@ -9,12 +9,13 @@ import * as Modals from './modalManager.js';
 import { attachColorPicker } from './colorPicker.js';
 import { makeWindowDraggable } from './windowDrag.js';
 import { snapModalToZone } from './tileManager.js';
-import { applyEdgeDock, clearDockSide } from './modalSnap.js';
+import { clearDockSide } from './modalSnap.js';
 import { topToolWindowZ, topPortalZ } from './toolWindowZOrder.js';
 import { bindMenuDismiss, dismissOrRemove } from './escMenuStack.js';
 
 const API_BASE = window.location.origin;
 let _open = false;
+let _panelMode = 'note'; // 'note' or 'list'
 let _notes = [];
 let _editingId = null;
 let _selectedIds = new Set();
@@ -198,8 +199,9 @@ function _clearNotesSnapStyles(pane) {
 function _restoreNotesSidebarDock(pane) {
   if (!pane || window.innerWidth <= 768) return;
   _clearNotesSnapStyles(pane);
-  if (!pane.isConnected) return;
-  applyEdgeDock(pane, 'right');
+  // With snap styles cleared the backdrop flex-centers the pane, so Notes /
+  // To Do opens as a floating popup window like the other tool windows.
+  // Dragging it to a screen edge still docks it (enableDock/enableLeftDock).
 }
 
 // Notes is not a `.modal`; its backdrop is the top-level stacking surface.
@@ -419,7 +421,9 @@ function _undoArchive(note, prevIdx) {
 async function _fetchNotes() {
   _loading = true;
   try {
-    const url = `${API_BASE}/api/notes${_showingArchived ? '?archived=true' : ''}`;
+    const apiNoteType = _panelMode === 'list' ? 'todo' : 'note';
+    let url = `${API_BASE}/api/notes?note_type=${apiNoteType}`;
+    if (_showingArchived) url += '&archived=true';
     const res = await fetch(url, { credentials: 'same-origin' });
     if (!res.ok) { _notes = []; return; }
     const data = await res.json();
@@ -1112,13 +1116,30 @@ export async function refreshDueBadge(opts = {}) {
   _updateRailBadge();
 }
 
+// ---- Helpers ----
+
+function _updateHeaderTitle() {
+  const headerTitle = document.getElementById('notes-header-title');
+  if (headerTitle) {
+    headerTitle.innerHTML = _panelMode === 'list'
+      ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2.5px;margin-right:6px"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>To Do'
+      : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2.5px;margin-right:6px"><path d="M5 3h10l4 4v14H5z"/><path d="M15 3v5h5"/><path d="M8 17.5 15.5 10l2.5 2.5L10.5 20H8z"/></svg>Notes';
+  }
+}
+
 // ---- Panel ----
 
-export function openPanel() {
+function openPanel(mode = 'note') {
   if (_open) {
     _bringNotesToFront();
+    if (_panelMode !== mode) {
+      _panelMode = mode;
+      _updateHeaderTitle();
+      _fetchNotes().then(() => _renderNotesPane());
+    }
     return;
   }
+  _panelMode = mode;
   _open = true;
   _editingId = null;
   _searchQuery = '';
@@ -1155,7 +1176,11 @@ export function openPanel() {
   pane.innerHTML = `
     <div class="notes-mobile-grabber" id="notes-mobile-grabber" aria-hidden="true"></div>
     <div class="notes-pane-header">
-      <h4 class="notes-pane-title"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2.5px;margin-right:6px"><path d="M5 3h10l4 4v14H5z"/><path d="M15 3v5h5"/><path d="M8 17.5 15.5 10l2.5 2.5L10.5 20H8z"/></svg>Notes</h4>
+      <h4 class="notes-pane-title" id="notes-header-title">
+        ${_panelMode === 'list'
+          ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2.5px;margin-right:6px"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>To Do'
+          : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2.5px;margin-right:6px"><path d="M5 3h10l4 4v14H5z"/><path d="M15 3v5h5"/><path d="M8 17.5 15.5 10l2.5 2.5L10.5 20H8z"/></svg>Notes'}
+      </h4>
       <span style="flex:1"></span>
       <button id="notes-archive-toggle" class="doc-action-icon-btn notes-header-text-btn" title="View archive" style="opacity:0.8;gap:5px;">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="5" rx="1"/><path d="M4 8v11a2 2 0 002 2h12a2 2 0 002-2V8"/><path d="M10 12h4"/></svg>
@@ -1201,7 +1226,7 @@ export function openPanel() {
   }
 
   // Mount on body so Notes can behave like the other draggable windows. On
-  // desktop it is immediately docked to the right by _restoreNotesSidebarDock.
+  // desktop it opens as a centered floating popup; drag to an edge to dock.
   const backdrop = document.createElement('div');
   backdrop.className = 'notes-pane-backdrop';
   backdrop.id = 'notes-pane-backdrop';
@@ -1600,7 +1625,7 @@ function _ensureNotesChipRegistered() {
 // `direction === 'down'` (mobile swipe-down) MINIMIZES the panel to a
 // dock chip instead of fully closing — tapping the chip reopens it.
 // Any other call (close button, programmatic) is a full close.
-export function closePanel(direction) {
+function closePanel(direction) {
   if (!_open) return;
   _open = false;
   _editingId = null;
@@ -1662,12 +1687,22 @@ export function closePanel(direction) {
   if (_minimize) { try { Modals.minimize('notes-panel'); } catch {} }
 }
 
-export function togglePanel() {
-  if (_open) closePanel();
-  else openPanel();
+function toggleNotesPanel() {
+  if (_open && _panelMode === 'note') closePanel();
+  else openPanel('note');
 }
 
-export function isPanelOpen() { return _open; }
+function toggleTodosPanel() {
+  if (_open && _panelMode === 'list') closePanel();
+  else openPanel('list');
+}
+
+export function togglePanel() {
+  if (_open) closePanel();
+  else openPanel('note');
+}
+
+function isPanelOpen() { return _open; }
 
 // ---- Render ----
 
@@ -1864,6 +1899,14 @@ function _renderNotes() {
       : '';
     const noteTags = _visibleNoteTags(note);
     const dueBadge = dueFmt && !_hasTimeComponent(note.due_date) ? `<span class="note-due-inline${overdue ? ' note-due-overdue' : ''}">${dueFmt}</span>` : '';
+    // Repeat chip — the reminder tag below already shows the repeat for
+    // timed reminders; this covers date-only and undated repeating todos so
+    // a habit is always visibly a habit.
+    const repeatBadge = (note.repeat && note.repeat !== 'none' && !(note.due_date && _hasTimeComponent(note.due_date)))
+      ? `<span class="note-repeat-inline" title="Repeats">
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>
+          ${_esc(_formatRepeatLabel(note.repeat, note.due_date ? new Date(note.due_date) : new Date()))}</span>`
+      : '';
     const colorDots = COLORS.map(c => `<span class="note-card-color-dot${_dotIsActive(c.value, note.color) ? ' active' : ''}" data-color="${c.value}" style="background:${_dotBg(c.value, note.color)}" title="${c.name || 'default'}"></span>`).join('');
     const goalClass = note.note_type === 'goal' ? ' note-card-goal' : '';
     const reminderGlowClass = activeReminderHighlights.has(note.id) && _hasActiveReminder(note) ? ' note-card-reminder-fired-sticky' : '';
@@ -1894,7 +1937,7 @@ function _renderNotes() {
           </button>` : ''}`}
       <div class="note-card-header">
         <div class="note-card-title${note.title ? '' : ' empty'}" data-action="edit">${_esc(note.title || '')}</div>
-        ${dueBadge}
+        ${dueBadge}${repeatBadge}
       </div>
       ${_safeImgSrc(note.image_url) ? `<img class="note-card-image" src="${_esc(_safeImgSrc(note.image_url))}" alt="" draggable="false" />` : ''}
       ${contentHtml}
@@ -2091,7 +2134,7 @@ function _renderQuickAdd(body) {
 
   const input = wrap.querySelector('.notes-quick-input');
   const seg = wrap.querySelector('.notes-quick-type-seg');
-  let currentType = 'todo';
+  let currentType = _panelMode === 'list' ? 'todo' : 'note';
   const setType = (t) => {
     if (t !== 'note' && t !== 'todo') return;
     currentType = t;
@@ -2104,6 +2147,7 @@ function _renderQuickAdd(body) {
     });
     input.placeholder = t === 'note' ? 'Add a note…' : 'Add a to-do…';
   };
+  setType(currentType);
   seg.querySelectorAll('.notes-quick-type-pill').forEach(p => {
     p.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -2332,6 +2376,28 @@ function _bindCardEvents(body) {
       if (card) {
         const r = card.getBoundingClientRect();
         spawnConfetti(r.left + r.width / 2, r.top + r.height / 2, 80);
+      }
+      // Habit: completing a repeating todo rolls it to the next occurrence
+      // (checklist reset, card stays) instead of archiving it forever.
+      const habit = _notes[idx];
+      if (habit.repeat && habit.repeat !== 'none' && habit.due_date) {
+        const next = _advanceRecurring(habit.due_date, habit.repeat);
+        if (next) {
+          const prevDue = habit.due_date;
+          const prevItems = Array.isArray(habit.items) ? habit.items.map(it => ({ ...it })) : habit.items;
+          habit.due_date = next;
+          if (Array.isArray(habit.items)) habit.items.forEach(it => { it.done = false; });
+          _renderNotes();
+          _patchNote(id, { due_date: next, items: habit.items }).then(() => {
+            uiModule.showToast(`Done for now — next ${_formatReminderTag(next)}`, { duration: 5000 });
+          }).catch(() => {
+            habit.due_date = prevDue;
+            habit.items = prevItems;
+            _renderNotes();
+            uiModule.showError('Failed to advance repeat');
+          });
+          return;
+        }
       }
       const removed = _notes.splice(idx, 1)[0];
       const undo = () => _undoArchive(removed, idx);
@@ -5362,9 +5428,9 @@ async function openNote(noteId) {
   setTimeout(tryNext, 120);
 }
 
-const notesModule = { openPanel, closePanel, togglePanel, isPanelOpen, openNote, openNotes: openPanel, closeNotes: closePanel, isNotesOpen: isPanelOpen, refreshDueBadge };
+const notesModule = { openPanel, closePanel, togglePanel, toggleNotesPanel, toggleTodosPanel, isPanelOpen, openNote, openNotes: openPanel, closeNotes: closePanel, isNotesOpen: isPanelOpen, refreshDueBadge };
 export default notesModule;
-export { openPanel as openNotes, closePanel as closeNotes, isPanelOpen as isNotesOpen, openNote };
+export { openPanel as openNotes, closePanel as closeNotes, isPanelOpen as isNotesOpen, openNote, toggleNotesPanel, toggleTodosPanel };
 window.notesModule = notesModule;
 
 // Start reminder loop on module load (after a short delay so app loads first)

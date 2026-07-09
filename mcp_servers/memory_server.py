@@ -2,7 +2,7 @@
 memory_server.py
 
 MCP server exposing memory management (list, add, edit, delete, search).
-Imports MemoryManager and MemoryVectorStore from the Odysseus codebase.
+Imports MemoryManager and MemoryVectorStore from the Restia codebase.
 """
 
 import asyncio
@@ -51,6 +51,14 @@ def _owner_scoped_store(entries: list[dict]) -> bool:
     return any(_entry_owner(entry) for entry in entries if isinstance(entry, dict))
 
 
+def _is_readonly_memory(entry: dict) -> bool:
+    return bool(
+        entry.get("readonly")
+        or entry.get("source") == "restia_brain"
+        or str(entry.get("id") or "").startswith("brain:")
+    )
+
+
 def _scope_entries() -> tuple[str | None, list[dict], list[dict], str | None]:
     """Return configured owner, all entries, visible entries, and optional error."""
     entries = _memory_manager.load_all()
@@ -58,15 +66,9 @@ def _scope_entries() -> tuple[str | None, list[dict], list[dict], str | None]:
     if owner is None and _owner_scoped_store(entries):
         return None, entries, [], _OWNER_SCOPE_ERROR
     if owner is None:
-        visible = [
-            entry for entry in entries
-            if isinstance(entry, dict) and _entry_owner(entry) is None
-        ]
+        visible = _memory_manager.load(owner=None)
     else:
-        visible = [
-            entry for entry in entries
-            if isinstance(entry, dict) and _entry_owner(entry) == owner
-        ]
+        visible = _memory_manager.load(owner=owner)
     return owner, entries, visible, None
 
 
@@ -81,9 +83,10 @@ def _ensure_init():
         return
     _initialized = True
 
+    from src.brain_memory import build_brain_memory_manager
     from src.constants import DATA_DIR
     from src.memory import MemoryManager
-    _memory_manager = MemoryManager(DATA_DIR)
+    _memory_manager = build_brain_memory_manager(DATA_DIR) or MemoryManager(DATA_DIR)
 
     try:
         from src.memory_vector import MemoryVectorStore
@@ -185,6 +188,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         full_id = None
         for m in visible:
             if m.get("id", "").startswith(memory_id):
+                if _is_readonly_memory(m):
+                    return _text_result(f"Error: Memory '{memory_id}' is read-only in Brain")
                 full_id = m["id"]
                 break
         if not full_id:
@@ -215,6 +220,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         deleted_category = ""
         for m in visible:
             if m.get("id", "").startswith(memory_id):
+                if _is_readonly_memory(m):
+                    return _text_result(f"Error: Memory '{memory_id}' is read-only in Brain")
                 full_id = m["id"]
                 deleted_text = m.get("text", "")
                 deleted_category = m.get("category", "")

@@ -1,7 +1,7 @@
 """CalDAV write-back: push local create/update/delete out to the remote (#800).
 
 ``src/caldav_sync.py`` is a one-way pull (remote → local). So events created,
-edited, or deleted in Odysseus on a CalDAV-backed calendar only changed the local
+edited, or deleted in Restia on a CalDAV-backed calendar only changed the local
 SQLite copy and never reached the server (iCloud/Nextcloud/Radicale/Fastmail) —
 they'd silently disappear on the next pull and never show on the user's phone.
 
@@ -41,7 +41,7 @@ def build_event_ical(ev: dict) -> str:
     from icalendar.prop import vRecur
 
     cal = Calendar()
-    cal.add("prodid", "-//Odysseus//CalDAV write-back//EN")
+    cal.add("prodid", "-//Restia//CalDAV write-back//EN")
     cal.add("version", "2.0")
 
     ve = iEvent()
@@ -187,11 +187,11 @@ def _discover_calendars(client):
 
 
 def _writeback_blocking(local_cal_id, ev, delete, url, username, password,
-                        owner="", account_id="") -> dict:
+                        owner="", account_id="", oauth_access_token=None) -> dict:
     from src.caldav_sync import _build_dav_client
     # Redirects disabled here too: the write-back path opens its own DAVClient,
     # so it needs the same SSRF-via-redirect protection as the pull path.
-    client = _build_dav_client(url, username, password)
+    client = _build_dav_client(url, username, password, oauth_access_token)
     calendars = _discover_calendars(client)
     if not calendars:
         return {"ok": False, "error": "no remote calendars discovered"}
@@ -285,7 +285,13 @@ async def writeback_event(owner: str, calendar_source: str, calendar_id: str,
         url = (acc.get("url") or "").strip()
         user = (acc.get("username") or "").strip()
         pw = decrypt(acc.get("password") or "")
-        if not (url and user and pw):
+
+        access_token = None
+        if acc.get("oauth_provider") == "google":
+            from src.caldav_sync import _ensure_google_calendar_token
+            access_token = _ensure_google_calendar_token(acc, owner)
+
+        if not (url and user and (pw or access_token)):
             return {"skipped": "caldav account credentials incomplete"}
         from src.caldav_sync import validate_caldav_url
         try:
@@ -295,7 +301,7 @@ async def writeback_event(owner: str, calendar_source: str, calendar_id: str,
             return {"ok": False, "error": str(e)[:200]}
         acc_id = acc.get("id") or ""
         result = await asyncio.to_thread(
-            _writeback_blocking, calendar_id, ev, delete, url, user, pw, owner, acc_id
+            _writeback_blocking, calendar_id, ev, delete, url, user, pw, owner, acc_id, access_token
         )
         _persist_writeback_result(owner, calendar_id, (ev or {}).get("uid", ""), result, delete=delete)
         if not result.get("ok"):

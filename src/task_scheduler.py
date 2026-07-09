@@ -240,6 +240,7 @@ HOUSEKEEPING_DEFAULTS = {
     "tidy_sessions":        {"name": "Chat Sessions Tidy",       "trigger_type": "event", "trigger_event": "session_created", "trigger_count": 5, "schedule": None, "scheduled_time": None, "cron_expression": None, "legacy_names": ["Tidy Chat Sessions"]},
     "tidy_documents":       {"name": "Documents Tidy",           "trigger_type": "event", "trigger_event": "document_created", "trigger_count": 5, "schedule": None, "scheduled_time": None, "cron_expression": None, "legacy_names": ["Tidy Documents"]},
     "consolidate_memory":   {"name": "Memory Tidy",              "trigger_type": "event", "trigger_event": "memory_added", "trigger_count": 5, "schedule": None, "scheduled_time": None, "cron_expression": None, "legacy_names": ["Tidy Memory"]},
+    "dream_memory":         {"name": "Memory Dream",             "schedule": "cron",      "scheduled_time": None, "cron_expression": "0 3 * * *", "legacy_names": ["Nightly Memory Dream"]},
     "tidy_research":        {"name": "Research Tidy",            "trigger_type": "event", "trigger_event": "research_completed", "trigger_count": 5, "schedule": None, "scheduled_time": None, "cron_expression": None, "legacy_names": ["Tidy Research"]},
     "summarize_emails":     {"name": "Email (Summary)",          "schedule": "cron",  "scheduled_time": None,    "cron_expression": "0 */2 * * *", "ship_paused": True, "legacy_names": ["Tidy Email (Summary)"]},
     "draft_email_replies":  {"name": "Email AI Auto Reply",      "schedule": "cron",  "scheduled_time": None,    "cron_expression": "0 */2 * * *", "ship_paused": True, "legacy_names": ["Tidy Email (Replies)", "AI Auto Reply"]},
@@ -247,6 +248,7 @@ HOUSEKEEPING_DEFAULTS = {
     "extract_email_events": {"name": "Email Calendar Events",    "schedule": "cron",  "scheduled_time": None,    "cron_expression": "0 */1 * * *", "ship_paused": True, "legacy_names": ["Email → Calendar Events"]},
     "classify_events":      {"name": "Calendar Classify Events", "schedule": "cron",  "scheduled_time": None,    "cron_expression": "0 6,18 * * *", "ship_paused": True, "legacy_names": ["Classify Calendar Events"]},
     "check_email_urgency":   {"name": "Email Tags",               "schedule": "cron",  "scheduled_time": None,    "cron_expression": "0 * * * *", "ship_paused": True, "old_cron_expressions": ["*/15 * * * *"], "legacy_names": ["Email Triage", "Urgent Email"]},
+    "telegram_hourly_digest": {"name": "Telegram Hourly Digest",  "schedule": "cron",  "scheduled_time": None,    "cron_expression": "0 * * * *", "legacy_names": ["Telegram Digest"]},
     "audit_skills":          {"name": "Skills Audit",             "trigger_type": "event", "trigger_event": "skill_added", "trigger_count": 5, "schedule": None, "scheduled_time": None, "cron_expression": None, "legacy_names": ["Audit Skills"]},
 }
 
@@ -342,6 +344,10 @@ class TaskScheduler:
         # tasks could be double-dispatched.
         self._executing_lock = asyncio.Lock()
         self._pending_notifications = []  # completed task notifications
+        # Non-destructive copy of recent notifications for the notification
+        # command center (pop_notifications drains the pending queue for the
+        # popup poller, so history must live separately).
+        self._notification_history = []
         self._task_defer_counts = {}
         # Strict serial execution — exactly one task runs at a time. Anything
         # else (manual trigger, scheduled dispatch, task chain) waits behind
@@ -414,6 +420,20 @@ class TaskScheduler:
         # Cap at 50 to avoid unbounded growth
         if len(self._pending_notifications) > 50:
             self._pending_notifications = self._pending_notifications[-50:]
+        if not isinstance(getattr(self, "_notification_history", None), list):
+            self._notification_history = []
+        self._notification_history.append(self._pending_notifications[-1])
+        if len(self._notification_history) > 50:
+            self._notification_history = self._notification_history[-50:]
+
+    def recent_notifications(self, owner: str = None) -> list:
+        """Recent completed-task notifications, newest first, WITHOUT draining
+        the popup queue (pop_notifications empties `_pending_notifications`
+        for the toast poller; the notification center needs history)."""
+        items = self._notification_history
+        if owner is not None:
+            items = [n for n in items if n.get("owner") == owner]
+        return list(reversed(items))
 
     def pop_notifications(self, owner: str = None) -> list:
         """Return and clear pending notifications.
@@ -850,7 +870,7 @@ class TaskScheduler:
             if gate_foreground:
                 waiting = db.query(TaskRun).filter(TaskRun.id == run_id).first()
                 if waiting and waiting.status == "queued":
-                    waiting.result = "Queued — waiting for Odysseus to be idle…"
+                    waiting.result = "Queued — waiting for Restia to be idle…"
                     db.commit()
                 from src.interactive_gate import wait_for_interactive_quiet
                 await wait_for_interactive_quiet(f"scheduled task {task.name}")
@@ -900,7 +920,7 @@ class TaskScheduler:
                         await asyncio.sleep(0.25)
                         if has_foreground_activity():
                             foreground_cancel["hit"] = True
-                            logger.info("Task '%s' interrupted because Odysseus became active", task.name)
+                            logger.info("Task '%s' interrupted because Restia became active", task.name)
                             if current_task:
                                 current_task.cancel()
                             return
@@ -946,7 +966,7 @@ class TaskScheduler:
                 return
             except asyncio.CancelledError:
                 msg = (
-                    "Paused because Odysseus became active"
+                    "Paused because Restia became active"
                     if foreground_cancel.get("hit")
                     else "Stopped by user"
                 )
@@ -1174,9 +1194,11 @@ class TaskScheduler:
         "email_auto_translate",
         "extract_email_events",
         "classify_events",
+        "telegram_hourly_digest",
         "tidy_sessions",
         "tidy_documents",
         "consolidate_memory",
+        "dream_memory",
         "tidy_research",
         "test_skills",
         "audit_skills",
@@ -1193,6 +1215,7 @@ class TaskScheduler:
         "test_skills",
         "audit_skills",
         "consolidate_memory",
+        "dream_memory",
     })
 
     def _task_needs_model_slot(self, task_id: str) -> bool:
@@ -1833,9 +1856,9 @@ class TaskScheduler:
             msg["From"] = from_addr
             msg["To"] = to_addr
             msg["Subject"] = f"[Task] {task.name}"
-            msg["X-Odysseus-Origin"] = "odysseus-ui"
-            msg["X-Odysseus-Kind"] = "task"
-            msg["X-Odysseus-Ref"] = str(task.id)
+            msg["X-Restia-Origin"] = "odysseus-ui"
+            msg["X-Restia-Kind"] = "task"
+            msg["X-Restia-Ref"] = str(task.id)
             msg.set_content(result or "")
             _send_smtp_message(cfg, from_addr, [to_addr], msg.as_string(), timeout=30)
             logger.info("Task %s emailed result (recipient_set=%s, %sb)", task.id, bool(to_addr), len(result or ""))
@@ -2174,9 +2197,9 @@ class TaskScheduler:
             "subject": f"[Task] {task.name}",
             "body": result,
             "headers": {
-                "X-Odysseus-Origin": "odysseus-ui",
-                "X-Odysseus-Kind": "task",
-                "X-Odysseus-Ref": str(task.id),
+                "X-Restia-Origin": "odysseus-ui",
+                "X-Restia-Kind": "task",
+                "X-Restia-Ref": str(task.id),
             },
         }
         if recipient:
@@ -2240,11 +2263,11 @@ class TaskScheduler:
         stopped = self._mark_run_aborted(task_id) or stopped
         return stopped
 
-    async def stop_background_tasks_for_foreground(self, *, reason: str = "Odysseus became active") -> int:
+    async def stop_background_tasks_for_foreground(self, *, reason: str = "Restia became active") -> int:
         """Cancel all in-process scheduler tasks because the user is active.
 
         This is intentionally blunt for scheduled/background work: when the
-        user opens or uses Odysseus, foreground interaction wins immediately.
+        user opens or uses Restia, foreground interaction wins immediately.
         Manual force-runs can be restarted by the user; automatic jobs will be
         deferred by their cancellation path instead of stealing the app.
         """

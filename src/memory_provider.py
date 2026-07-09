@@ -31,7 +31,7 @@ class MemorySearchHit:
 
 
 class MemoryProvider(ABC):
-    """Base contract for Odysseus memory providers.
+    """Base contract for Restia memory providers.
 
     The native memory provider should always be available. External providers
     can add recall/write behavior and their own tools without replacing the
@@ -94,10 +94,10 @@ class MemoryProvider(ABC):
 
 
 class NativeMemoryProvider(MemoryProvider):
-    """Provider adapter for Odysseus' built-in memory manager and vector store."""
+    """Provider adapter for Restia' built-in memory manager and vector store."""
 
     provider_id = "native"
-    display_name = "Odysseus native memory"
+    display_name = "Restia native memory"
 
     _CORE_FIELDS = {
         "id",
@@ -175,9 +175,10 @@ class NativeMemoryProvider(MemoryProvider):
     ) -> List[MemorySearchHit]:
         memories = self.memory_manager.load(owner=owner)
         by_id = {m.get("id"): m for m in memories}
+        hits: List[MemorySearchHit] = []
+        seen: set[str] = set()
 
         if self._vector_available():
-            hits: List[MemorySearchHit] = []
             for result in self.memory_vector.search(query, k=top_k):
                 if not isinstance(result, dict):
                     continue
@@ -187,6 +188,9 @@ class NativeMemoryProvider(MemoryProvider):
                     continue
                 if owner is not None and entry.get("owner") != owner:
                     continue
+                if entry.get("id") in seen:
+                    continue
+                seen.add(entry.get("id"))
                 hits.append(
                     MemorySearchHit(
                         memory=self._to_record(entry),
@@ -194,8 +198,31 @@ class NativeMemoryProvider(MemoryProvider):
                         score=result.get("score"),
                     )
                 )
-            if hits:
-                return hits
+
+        if len(hits) >= top_k:
+            return hits[:top_k]
+
+        external_recall = getattr(self.memory_manager, "get_external_relevant_memories", None)
+        if callable(external_recall):
+            for entry in external_recall(query, owner=owner, max_items=top_k):
+                if len(hits) >= top_k:
+                    break
+                if not isinstance(entry, dict):
+                    continue
+                memory_id = entry.get("id")
+                if memory_id in seen:
+                    continue
+                seen.add(memory_id)
+                hits.append(
+                    MemorySearchHit(
+                        memory=self._to_record(entry),
+                        provider_id=entry.get("source") or self.provider_id,
+                        score=(entry.get("metadata") or {}).get("score"),
+                    )
+                )
+
+        if hits:
+            return hits[:top_k]
 
         fallback = self.memory_manager.get_relevant_memories(
             query,

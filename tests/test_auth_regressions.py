@@ -16,6 +16,7 @@ import asyncio
 import pytest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+from tests.helpers.import_state import preserve_import_state
 
 # Stub `core.database` / `core.auth` before the route modules import them.
 # (Same trick as test_null_owner_gates.py — the real modules instantiate
@@ -67,26 +68,27 @@ def _ensure_stub(name: str, **attrs):
     return mod
 
 @pytest.fixture(autouse=True)
-def _auth_regressions_stubs(monkeypatch):
-    db = _ensure_stub("core.database",
-        SessionLocal=MagicMock(), ScheduledTask=MagicMock(), TaskRun=MagicMock(),
-        ModelEndpoint=MagicMock(), Session=MagicMock(), ChatMessage=MagicMock(),
-        CalendarCal=MagicMock(), CalendarEvent=MagicMock(),
-        Document=MagicMock(), DocumentVersion=MagicMock(),
-        GalleryImage=MagicMock(), GalleryAlbum=MagicMock(), Note=MagicMock(),
-        McpServer=MagicMock(),
-    )
-    auth = _ensure_stub("core.auth", AuthManager=MagicMock())
-    ep = _ensure_stub("src.endpoint_resolver",
-        resolve_endpoint=MagicMock(return_value=("", "", {})),
-        normalize_base=MagicMock(),
-        build_chat_url=MagicMock(),
-        build_models_url=MagicMock(),
-        build_headers=MagicMock(),
-    )
-    monkeypatch.setitem(sys.modules, "core.database", db)
-    monkeypatch.setitem(sys.modules, "core.auth", auth)
-    monkeypatch.setitem(sys.modules, "src.endpoint_resolver", ep)
+def _auth_regressions_stubs():
+    with preserve_import_state("core", "src", "core.database", "core.auth", "src.endpoint_resolver"):
+        _ensure_stub(
+            "core.database",
+            SessionLocal=MagicMock(), ScheduledTask=MagicMock(), TaskRun=MagicMock(),
+            ModelEndpoint=MagicMock(), Session=MagicMock(), ChatMessage=MagicMock(),
+            CalendarCal=MagicMock(), CalendarEvent=MagicMock(),
+            Document=MagicMock(), DocumentVersion=MagicMock(),
+            GalleryImage=MagicMock(), GalleryAlbum=MagicMock(), Note=MagicMock(),
+            McpServer=MagicMock(),
+        )
+        _ensure_stub("core.auth", AuthManager=MagicMock())
+        _ensure_stub(
+            "src.endpoint_resolver",
+            resolve_endpoint=MagicMock(return_value=("", "", {})),
+            normalize_base=MagicMock(),
+            build_chat_url=MagicMock(),
+            build_models_url=MagicMock(),
+            build_headers=MagicMock(),
+        )
+        yield
 
 from fastapi import HTTPException
 
@@ -302,7 +304,7 @@ def test_pop_notifications_owner_filtered():
     import sys, types
     from unittest.mock import MagicMock as _MM
     # `task_scheduler` pulls in lots of helpers — stub the ones it uses.
-    for s in ["src.builtin_actions", "src.ai_interaction", "src.endpoint_resolver",
+    for s in ["src.builtin_actions", "src.ai_interaction",
               "src.agent_loop", "src.session_manager"]:
         if s not in sys.modules:
             mod = types.ModuleType(s)

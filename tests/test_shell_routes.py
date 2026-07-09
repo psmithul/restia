@@ -7,6 +7,7 @@ import json
 import os
 import socket
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -28,6 +29,10 @@ from routes.shell_routes import (
     _venv_activate_prefix,
     DOCKER_IN_CONTAINER_HINT,
 )
+
+
+def _short_socket_path() -> Path:
+    return Path(tempfile.mkdtemp(prefix="rst-", dir="/tmp")) / "d.sock"
 
 
 def test_shell_routes_import_without_posix_pty_modules(monkeypatch):
@@ -126,7 +131,7 @@ class TestFindLineBreak:
 
 
 class TestRunningInContainer:
-    """Detect whether the Odysseus process itself runs inside a container."""
+    """Detect whether the Restia process itself runs inside a container."""
 
     def test_dockerenv_marker_present(self, tmp_path):
         marker = tmp_path / ".dockerenv"
@@ -284,7 +289,7 @@ class TestHostDockerAccess:
         assert _host_docker_access_enabled(str(tmp_path / "missing.sock")) is False
 
     def test_regular_file_is_not_accepted(self, monkeypatch, tmp_path):
-        socket_path = tmp_path / "docker.sock"
+        socket_path = _short_socket_path()
         socket_path.touch()
         monkeypatch.setenv("ODYSSEUS_ENABLE_HOST_DOCKER", "true")
 
@@ -297,7 +302,7 @@ class TestHostDockerAccess:
         tmp_path,
         flag,
     ):
-        socket_path = tmp_path / "docker.sock"
+        socket_path = _short_socket_path()
         with socket.socket(socket.AF_UNIX) as unix_socket:
             unix_socket.bind(str(socket_path))
             if flag is None:
@@ -312,7 +317,7 @@ class TestHostDockerAccess:
         monkeypatch,
         tmp_path,
     ):
-        socket_path = tmp_path / "docker.sock"
+        socket_path = _short_socket_path()
         with socket.socket(socket.AF_UNIX) as unix_socket:
             unix_socket.bind(str(socket_path))
             monkeypatch.setenv("ODYSSEUS_ENABLE_HOST_DOCKER", "true")
@@ -367,7 +372,7 @@ class TestPackageProbeStatus:
 
         assert _package_installed_from_probe("vllm", probe) is True
         assert status.available is False
-        assert "outside Odysseus" in status.note
+        assert "outside Restia" in status.note
 
     def test_llama_cpp_is_installed_when_native_llama_server_exists(self):
         probe = {
@@ -391,7 +396,7 @@ class TestPackageProbeStatus:
         )
 
         assert status.available is False
-        assert "Update this system dependency outside Odysseus." not in status.note
+        assert "Update this system dependency outside Restia." not in status.note
 
     def test_diffusers_requires_torch_too(self):
         missing_torch = {

@@ -388,6 +388,7 @@ async def extract_and_store(
         _owner = getattr(session, 'owner', None)
 
         existing = memory_manager.load_all()
+        visible_existing = memory_manager.load(owner=_owner)
         added = 0
 
         for fact in facts:
@@ -429,7 +430,10 @@ async def extract_and_store(
                         continue
 
             # Text dedup fallback: exact match + fuzzy similarity
-            user_existing = [e for e in existing if e.get("owner") == _owner or e.get("owner") is None] if _owner else existing
+            user_existing = (
+                [e for e in visible_existing if e.get("owner") == _owner or e.get("owner") is None]
+                if _owner else visible_existing
+            )
             if memory_manager.find_duplicates(fact_text, user_existing):
                 continue
             # Fuzzy text similarity check (catches rephrased duplicates when vector index is unavailable)
@@ -505,7 +509,11 @@ async def audit_memories(
     try:
         from src.llm_core import llm_call_async
 
-        existing = memory_manager.load(owner=owner)
+        all_native_entries = memory_manager.load_all()
+        existing = (
+            [m for m in all_native_entries if m.get("owner") == owner]
+            if owner else list(all_native_entries)
+        )
         if not existing:
             logger.info("Memory audit: nothing to audit")
             return {"before": 0, "after": 0}

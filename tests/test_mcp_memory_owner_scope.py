@@ -136,7 +136,7 @@ def test_mcp_memory_preserves_ownerless_local_behavior(monkeypatch, tmp_path):
         entry for entry in manager.load_all()
         if entry["text"] == "Another local memory"
     )
-    assert "owner" not in added
+    assert added.get("owner") is None
 
     assert _tool_text({
         "action": "edit",
@@ -148,3 +148,33 @@ def test_mcp_memory_preserves_ownerless_local_behavior(monkeypatch, tmp_path):
     delete_text = _tool_text({"action": "delete", "memory_id": legacy["id"][:8]})
     assert delete_text.startswith("Memory deleted:")
     assert all(entry["id"] != legacy["id"] for entry in manager.load_all())
+
+
+def test_mcp_memory_lists_brain_rows_but_keeps_them_readonly(monkeypatch, tmp_path):
+    class BrainManager(MemoryManager):
+        def load(self, owner=None):
+            return [
+                {
+                    "id": "brain:12345678",
+                    "text": "Restia Brain fact",
+                    "source": "restia_brain",
+                    "readonly": True,
+                    "owner": owner,
+                    "category": "brain",
+                }
+            ]
+
+    manager = BrainManager(str(tmp_path))
+    _configure_server(monkeypatch, manager, FakeVector())
+    monkeypatch.setenv("ODYSSEUS_MCP_MEMORY_OWNER", "alice")
+
+    assert "Restia Brain fact" in _tool_text({"action": "list"})
+    assert _tool_text({
+        "action": "edit",
+        "memory_id": "brain:12",
+        "text": "changed",
+    }) == "Error: Memory 'brain:12' is read-only in Brain"
+    assert _tool_text({
+        "action": "delete",
+        "memory_id": "brain:12",
+    }) == "Error: Memory 'brain:12' is read-only in Brain"

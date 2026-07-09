@@ -77,6 +77,39 @@ def test_webhook_trigger_path_is_in_exempt_patterns():
         )
 
 
+def test_telegram_webhook_path_is_auth_exempt_but_narrow():
+    src = _read_app_source()
+    start = src.find("AUTH_EXEMPT_PATTERNS")
+    assert start != -1, "AUTH_EXEMPT_PATTERNS not declared in app.py"
+    lb = src.find("[", start)
+    assert lb != -1
+    depth = 0
+    end = -1
+    for i in range(lb, len(src)):
+        ch = src[i]
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    assert end != -1, "could not find closing bracket for AUTH_EXEMPT_PATTERNS"
+    body = src[lb + 1 : end]
+    patterns = re.findall(r'_re\.compile\(\s*r"([^"]+)"\s*\)', body)
+    compiled = [re.compile(p) for p in patterns]
+
+    assert any(c.match("/api/telegram/webhook") for c in compiled)
+    for not_public in (
+        "/api/telegram/status",
+        "/api/telegram/webhook-extra",
+        "/api/telegram/webhook/anything",
+    ):
+        assert not any(c.match(not_public) for c in compiled), (
+            f"{not_public!r} must NOT be auth-exempt"
+        )
+
+
 def test_webhook_trigger_handler_still_validates_token():
     """The exemption is only safe because the route handler in
     routes/task_routes.py still checks the token against the row and

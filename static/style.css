@@ -1,5 +1,5 @@
 /* ============================================ */
-/* Odysseus UI — Consolidated Stylesheet        */
+/* Restia UI — Consolidated Stylesheet        */
 /* ============================================ */
 
 
@@ -576,7 +576,32 @@ body.bg-pattern-sparkles {
       background: var(--sidebar-bg, var(--panel));
     }
     .sidebar-hamburger {
-      display: none !important; /* external #hamburger-btn is the only toggle */
+      position: absolute;
+      top: 10px;
+      left: 8px;
+      width: 30px;
+      height: 30px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: none;
+      border: none;
+      color: var(--hamburger-color, var(--fg));
+      cursor: pointer;
+      opacity: 0.5;
+      -webkit-tap-highlight-color: transparent;
+      outline: none;
+      transition: opacity 0.15s;
+      padding: 0;
+      border-radius: 6px;
+      z-index: 4;
+    }
+    .sidebar-hamburger:hover {
+      opacity: 1;
+    }
+    .sidebar.right-side .sidebar-hamburger {
+      left: auto;
+      right: 8px;
     }
     .sidebar-inner {
       flex: 1;
@@ -671,6 +696,9 @@ body.bg-pattern-sparkles {
     }
     .hamburger-btn:hover {
       opacity: 1;
+    }
+    body:not(.sidebar-collapsed) .hamburger-btn {
+      display: none;
     }
     /* Icon rail — mini sidebar that replaces the wide .sidebar when it's
        hidden (mutually exclusive — see sidebar-layout.js:57). Fullscreen
@@ -23413,7 +23441,7 @@ body.gallery-selecting .gallery-dl-btn,
 
 /* Welcome name — left-to-right wipe with a touch of horizontal stretch.
    Fires on initial render via the .welcome-name rule; restarts on Nobody⇄
-   Odysseus toggle via JS reflow trick. */
+   Restia toggle via JS reflow trick. */
 .welcome-name {
   transform-origin: left center;
   animation: welcome-name-reveal 0.55s cubic-bezier(0.34, 1.32, 0.55, 1) both;
@@ -29710,10 +29738,16 @@ button .spinner-whirlpool {
 }
 .email-list { overflow-y: auto; max-height: 400px; }
 .email-item {
-  display: flex; align-items: flex-start; gap: 8px; padding: 8px 12px;
-  cursor: pointer; border-bottom: 1px solid var(--border); position: relative; transition: background 0.1s;
+  display: flex; align-items: flex-start; gap: 12px; padding: 12px 14px;
+  cursor: pointer; position: relative; transition: all 0.15s ease-out;
+  background: var(--bg); margin: 0 4px 6px; border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+  box-shadow: 0 1px 3px color-mix(in srgb, var(--fg) 2%, transparent);
 }
-.email-item:hover { background: var(--hover-bg, rgba(255,255,255,0.03)); }
+.email-item:hover {
+  background: var(--hover-bg, rgba(0,0,0,0.02));
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--border));
+}
 .email-item:hover .email-menu-btn { opacity: 0.5; }
 .email-item-spam { opacity: 0.4; }
 .email-item-spam:hover { opacity: 0.75; }
@@ -31908,9 +31942,9 @@ body.doc-find-active mark.doc-find-mark.current {
   color: #fff; display: flex; align-items: center; justify-content: center;
   font-size: 12px; font-weight: 600; flex-shrink: 0; margin-top: 1px;
 }
-.email-item-content { flex: 1; min-width: 0; overflow: hidden; }
-.email-item-top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
-.email-sender { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.email-item-content { flex: 1; min-width: 0; overflow: hidden; display: flex; flex-direction: column; gap: 2px; }
+.email-item-top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 2px; }
+.email-sender { font-size: 13px; font-weight: 600; color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .email-sender-clickable { cursor: pointer; }
 .email-sender-clickable:hover { text-decoration: underline; }
 .email-filter-chip {
@@ -31938,8 +31972,10 @@ body.doc-find-active mark.doc-find-mark.current {
   opacity: 0.6;
 }
 .email-filter-chip-clear:hover { opacity: 1; }
-.email-date { font-size: 10px; opacity: 0.5; white-space: nowrap; flex-shrink: 0; }
-.email-subject { font-size: 11px; opacity: 0.6; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; }
+.email-date { font-size: 11px; opacity: 0.5; white-space: nowrap; flex-shrink: 0; }
+.email-subject { font-size: 13px; opacity: 0.85; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.email-snippet { font-size: 12px; opacity: 0.5; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px; }
+.email-list-date-divider { padding: 12px 16px 4px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; opacity: 0.5; position: sticky; top: 0; background: var(--bg); z-index: 10; margin-top: 8px; }
 .email-sent-chip,
 .email-folder-chip {
   display: inline-flex;
@@ -33949,22 +33985,33 @@ body.notes-drag-mode .note-card-pin svg {
   background: color-mix(in srgb, var(--fg) 8%, transparent);
 }
 .note-checkbox-agent {
+  /* Overlaid like -edit/-rm (see below) so hidden buttons don't reserve
+     row width and squeeze the item text. */
+  position: absolute;
+  top: 50%;
+  right: 42px;
+  transform: translateY(-50%);
   display: inline-flex;
   align-items: center;
   justify-content: center;
   width: 14px;
   height: 14px;
   padding: 0;
-  margin: 0 1px;
+  margin: 0;
   border: 0;
   background: transparent;
   color: var(--accent, var(--red));
   box-shadow: none;
   cursor: pointer;
   opacity: 0;
+  pointer-events: none;
   transition: opacity 0.12s, color 0.12s;
 }
-.note-checkbox:hover .note-checkbox-agent { opacity: 0.55; }
+.note-checkbox:hover .note-checkbox-agent {
+  opacity: 0.55;
+  pointer-events: auto;
+  background: color-mix(in srgb, var(--fg) 7%, var(--panel));
+}
 .note-checkbox-agent:hover {
   background: transparent;
   opacity: 1 !important;
@@ -33972,6 +34019,7 @@ body.notes-drag-mode .note-card-pin svg {
 .note-checkbox-agent.is-agent-stream-complete {
   color: #50fa7b;
   opacity: 0.9;
+  pointer-events: auto;
 }
 .note-checkbox-agent svg {
   display: block;
@@ -35226,7 +35274,9 @@ body.notes-mobile-mode.notes-drag-mode .note-card-pin.active {
    vertically without the jumpy rebalancing of CSS columns. */
 .notes-pane.notes-view-grid .notes-pane-body {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  /* 240px floor: at 180px a card's fixed pieces (dot, padding, gutter)
+     left item text only a few words wide — unreadable. */
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
   grid-auto-rows: 4px;
   grid-auto-flow: dense;
   gap: 0 8px;
@@ -35239,8 +35289,9 @@ body.notes-mobile-mode.notes-drag-mode .note-card-pin.active {
   margin: 0 0 8px;
   min-width: 0;
   max-width: 100%;
-  overflow-wrap: anywhere;
-  word-break: break-word;
+  /* break-word (not anywhere): only break inside a word when it truly
+     can't fit — 'anywhere' was shredding normal words mid-syllable. */
+  overflow-wrap: break-word;
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -35766,6 +35817,127 @@ body.notes-mobile-mode.notes-drag-mode .note-card-pin.active {
   flex-shrink: 0;
   align-self: center;
 }
+/* ── Notification command center (bell dropdown) ─────────────────── */
+.notif-center-panel {
+  position: fixed;
+  z-index: 400;
+  width: min(360px, calc(100vw - 16px));
+  max-height: min(70vh, 640px);
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 10px 36px rgba(0, 0, 0, 0.4);
+  overflow: hidden;
+  animation: notes-pane-enter 160ms cubic-bezier(0.22, 0.61, 0.36, 1) both;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+.notif-center-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  font-weight: 600;
+}
+.notif-center-refresh {
+  background: transparent;
+  border: none;
+  color: var(--fg);
+  opacity: 0.6;
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 4px;
+  display: flex;
+}
+.notif-center-refresh:hover { opacity: 1; background: color-mix(in srgb, var(--fg) 8%, transparent); }
+.notif-center-body {
+  overflow-y: auto;
+  padding: 6px 0 8px;
+}
+.notif-center-empty {
+  padding: 22px 16px;
+  font-size: 12px;
+  opacity: 0.55;
+  text-align: center;
+}
+.notif-center-section { padding: 4px 0; }
+.notif-center-section + .notif-center-section {
+  border-top: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+}
+.notif-center-section-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px 3px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  opacity: 0.55;
+}
+.notif-center-section-count {
+  margin-left: auto;
+  font-weight: 600;
+  opacity: 0.7;
+}
+.notif-center-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  width: 100%;
+  padding: 6px 12px;
+  background: transparent;
+  border: none;
+  color: var(--fg);
+  text-align: left;
+  cursor: pointer;
+  font-family: inherit;
+}
+.notif-center-item:hover { background: color-mix(in srgb, var(--fg) 6%, transparent); }
+.notif-center-item-main {
+  font-size: 12px;
+  line-height: 1.35;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.notif-center-item-main.overdue { color: var(--red); }
+.notif-center-item-sub {
+  font-size: 10.5px;
+  opacity: 0.55;
+  line-height: 1.3;
+}
+.notif-center-suggestion .notif-center-item-main {
+  color: color-mix(in srgb, var(--accent, var(--blue)) 85%, var(--fg));
+}
+.notif-center-job-status {
+  font-size: 9px;
+  padding: 0 5px;
+  border-radius: 6px;
+  line-height: 14px;
+}
+.notif-center-job-status.ok { background: color-mix(in srgb, #50fa7b 18%, transparent); color: #50fa7b; }
+.notif-center-job-status.err { background: color-mix(in srgb, var(--red) 18%, transparent); color: var(--red); }
+
+.note-repeat-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 9px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--accent, var(--blue)) 12%, transparent);
+  color: color-mix(in srgb, var(--accent, var(--blue)) 80%, var(--fg));
+  opacity: 0.85;
+  white-space: nowrap;
+  flex-shrink: 0;
+  align-self: center;
+  margin-left: 4px;
+}
 .note-due-inline.note-due-overdue {
   background: color-mix(in srgb, var(--red) 18%, transparent);
   color: var(--red);
@@ -35885,9 +36057,9 @@ body.notes-mobile-mode.notes-drag-mode .note-card-pin.active {
   max-height: none;
 }
 .note-checklist-preview:empty::before {
-  content: 'No todos';
-  font-size: 10px;
-  opacity: 0.3;
+  content: 'No items yet — hover and use “+ Add item”';
+  font-size: 11px;
+  opacity: 0.35;
   font-style: italic;
 }
 .note-cl-quickadd {
@@ -35925,16 +36097,17 @@ body.notes-mobile-mode.notes-drag-mode .note-card-pin.active {
 .note-cl-quickadd-input:focus { opacity: 1; border-top-color: var(--border); }
 .note-card-selectmode .note-cl-quickadd { display: none !important; }
 .note-checkbox {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 11px;
+  font-size: 12px;
   cursor: pointer;
-  /* Vertical padding stays 0 so short single-line rows pack tightly.
-     Left padding bumped so the dot's hover-scale (1.15x) doesn't clip
-     against the card edge. */
-  padding: 0 4px 0 8px;
-  line-height: 1.25;
+  /* Small vertical padding so multi-line items breathe without breaking
+     the tight packing of short single-line rows. Left padding bumped so
+     the dot's hover-scale (1.15x) doesn't clip against the card edge. */
+  padding: 1px 4px 1px 8px;
+  line-height: 1.35;
   border-radius: 4px;
   user-select: none;
   -webkit-tap-highlight-color: transparent;
@@ -35950,24 +36123,33 @@ body.notes-mobile-mode.notes-drag-mode .note-card-pin.active {
 }
 .note-link:hover { opacity: 0.8; }
 .note-checkbox-edit, .note-checkbox-rm {
-  flex: 0 0 auto;
+  /* Overlaid on the row's right edge instead of participating in the flex
+     row — hidden buttons used to reserve ~55px of width on EVERY row,
+     squeezing item text to a sliver in narrow grid columns. */
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
   background: transparent;
   border: none;
   color: var(--fg);
   opacity: 0;
+  pointer-events: none;
   cursor: pointer;
   padding: 2px;
   border-radius: 3px;
   display: flex;
   align-items: center;
   justify-content: center;
-  margin-left: 2px;
   transition: opacity 0.12s, background 0.12s, color 0.12s;
 }
-.note-checkbox-rm { margin-left: auto; }
-.note-checkbox-edit { margin-left: auto; }
+.note-checkbox-rm { right: 2px; }
+.note-checkbox-edit { right: 22px; }
 .note-checkbox:hover .note-checkbox-edit,
-.note-checkbox:hover .note-checkbox-rm { opacity: 0.55; }
+.note-checkbox:hover .note-checkbox-rm {
+  opacity: 0.6;
+  pointer-events: auto;
+  background: color-mix(in srgb, var(--fg) 7%, var(--panel));
+}
 .note-checkbox-rm:hover { opacity: 1 !important; color: var(--red); background: color-mix(in srgb, var(--red) 12%, transparent); }
 .note-checkbox-edit:hover { opacity: 1 !important; color: var(--accent, var(--blue)); background: color-mix(in srgb, var(--accent, var(--blue)) 12%, transparent); }
 .note-card-selectmode .note-checkbox-edit,
