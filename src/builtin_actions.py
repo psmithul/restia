@@ -355,8 +355,15 @@ async def action_run_local(owner: str, script: str = "", **kwargs) -> Tuple[str,
 
 
 async def action_dream_memory(owner: str, **kwargs) -> Tuple[str, bool]:
-    """Trigger the nightly dream cycle on Mnemosyne."""
+    """Trigger the nightly dream cycle on Mnemosyne without blocking HTTP.
+
+    ``sleep_all_sessions`` is synchronous and may download/load an embedding
+    model before it can compress anything.  Running it directly in this async
+    scheduled action blocks uvicorn's only event-loop thread, which makes every
+    route (including health, sessions, and chat) hang for the duration.
+    """
     try:
+        import asyncio
         from src.constants import DATA_DIR
         from src.memory import MemoryManager
         import logging
@@ -369,8 +376,10 @@ async def action_dream_memory(owner: str, **kwargs) -> Tuple[str, bool]:
         if not hasattr(manager, 'mnemo'):
             return "Mnemosyne is not enabled, skipping dream cycle.", False
 
-        # Trigger Mnemosyne compression/dream
-        res = manager.mnemo.sleep_all_sessions(force=True)
+        # Trigger Mnemosyne compression/dream in a worker thread.  This can be
+        # CPU/network heavy and is implemented as a synchronous library call;
+        # it must never monopolize the web server's event loop.
+        res = await asyncio.to_thread(manager.mnemo.sleep_all_sessions, force=True)
 
         compressed = res.get("compressed_clusters", 0)
         return f"Completed memory dream cycle. Compressed {compressed} clusters.", True

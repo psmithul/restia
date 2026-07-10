@@ -29,7 +29,7 @@ from src.endpoint_resolver import (
     build_models_url,
     build_headers,
 )
-from src.auth_helpers import _auth_disabled, effective_user, owner_filter
+from src.auth_helpers import _auth_disabled, _loopback_request, effective_user, owner_filter
 
 logger = logging.getLogger(__name__)
 
@@ -1472,9 +1472,16 @@ def setup_model_routes(model_discovery):
             owner = effective_user(request) or ""
 
             # Reject anonymous in configured deployments — no leaking the model
-            # list to unauthenticated callers.
+            # list to unauthenticated callers. LOCALHOST_BYPASS loopback callers
+            # are the operator's own dev browser (require_user admits them as
+            # ""), so they must not 401 here either — this fetch runs on every
+            # page load and a 401 sends the SPA into a /login redirect loop.
+            _bypass_loopback = (
+                _loopback_request(request)
+                and os.getenv("LOCALHOST_BYPASS", "false").lower() == "true"
+            )
             auth_mgr = getattr(request.app.state, "auth_manager", None)
-            if not owner and not _auth_disabled() and auth_mgr is not None and getattr(auth_mgr, "is_configured", False):
+            if not owner and not _auth_disabled() and not _bypass_loopback and auth_mgr is not None and getattr(auth_mgr, "is_configured", False):
                 raise HTTPException(401, "Not authenticated")
         except HTTPException:
             raise

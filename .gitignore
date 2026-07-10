@@ -102,3 +102,9 @@ compound.config.json
 *.error.log
 _scratch/
 /odysseus/
+
+# Local scratch artifacts (session debris, not part of the app)
+docker_logs.txt
+test_mem.db*
+scratchpad_test_*.py
+graphify-out/

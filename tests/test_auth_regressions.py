@@ -188,12 +188,22 @@ def _build_research_router():
 
 
 def _fake_request(user=None):
-    """Cheap stand-in for fastapi.Request — only `request.state.current_user`
-    matters to `get_current_user`."""
+    """Cheap stand-in for fastapi.Request with just enough surface for the
+    shared `require_user`: request.state.current_user, a configured
+    auth_manager on request.app.state, and a client peer.
+
+    The peer is deliberately NON-loopback: require_user admits loopback
+    callers under LOCALHOST_BYPASS / unconfigured first-run, and app.py's
+    load_dotenv (run by any test that imports the app) can leave
+    LOCALHOST_BYPASS=true in the process env. A public-looking peer keeps
+    every rejects-anonymous assertion below about the configured-auth path
+    rather than an accidental loopback fall-through."""
     req = SimpleNamespace()
     req.state = SimpleNamespace(current_user=user)
-    # Some endpoints touch .client too — provide a benign default.
-    req.client = SimpleNamespace(host="127.0.0.1")
+    req.client = SimpleNamespace(host="203.0.113.7")
+    req.app = SimpleNamespace(
+        state=SimpleNamespace(auth_manager=SimpleNamespace(is_configured=True))
+    )
     return req
 
 

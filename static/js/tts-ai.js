@@ -244,6 +244,7 @@ class AITTSManager {
             this.currentAudio = null;
             this.isPlaying = false;
         }
+        window.dispatchEvent(new CustomEvent('odysseus:tts-idle'));
     }
 
     /**
@@ -260,6 +261,7 @@ class AITTSManager {
     async _processQueue() {
         if (this._processing) return;
         this._processing = true;
+        window.dispatchEvent(new CustomEvent('odysseus:tts-active'));
 
         while (this._queue.length > 0) {
             const item = this._queue[0];
@@ -271,10 +273,12 @@ class AITTSManager {
             if (this._queue.length > 0 && this._queue[0] === item) {
                 this._queue.shift();
             }
+            // stop() cleared the queue mid-item — it dispatched tts-idle
             if (!this._processing) return;
         }
 
         this._processing = false;
+        window.dispatchEvent(new CustomEvent('odysseus:tts-idle'));
     }
 
     async _playQueueItem(item) {

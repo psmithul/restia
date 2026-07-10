@@ -20,6 +20,8 @@ import chatRenderer from './js/chatRenderer.js';
 import sessionModule from './js/sessions.js';
 import memoryModule from './js/memory.js';
 import voiceRecorderModule from './js/voiceRecorder.js';
+import voiceModeModule from './js/voiceMode.js';
+import messagingModule from './js/messaging.js';
 import censorModule from './js/censor.js';
 import galleryModule from './js/gallery.js';
 import tasksModule from './js/tasks.js?v=20260630tasksactivity';
@@ -1084,6 +1086,14 @@ function initializeEventListeners() {
         if (calendarModule.isCalendarOpen()) calendarModule.closeCalendar();
         else calendarModule.openCalendar();
       }
+    });
+  }
+
+  // Messages (account-to-account DMs) tool button
+  const toolMessagesBtn = el('tool-messages-btn');
+  if (toolMessagesBtn) {
+    toolMessagesBtn.addEventListener('click', () => {
+      if (messagingModule) messagingModule.toggle();
     });
   }
 
@@ -3675,6 +3685,7 @@ function startRestiaApp() {
     'rail-archive':   'tool-library-btn',
     'rail-gallery':   'tool-gallery-btn',
     'rail-tasks':     'tool-tasks-btn',
+    'rail-messages':  'tool-messages-btn',
     'rail-calendar':  'tool-calendar-btn',
     'rail-notes':     'tool-notes-btn',
     'rail-todos':     'tool-todos-btn',
@@ -4280,6 +4291,8 @@ function startRestiaApp() {
 
   // Ensure proper initial state
   voiceRecorderModule.init();
+  voiceModeModule.init();
+  if (messagingModule) messagingModule.init();
   if (censorModule) censorModule.init();
 
   // Auto-focus message input on load

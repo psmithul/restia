@@ -13,6 +13,7 @@ from pathlib import Path
 
 from core.atomic_io import atomic_write_json, atomic_write_text
 from core.auth import AuthManager, RESERVED_USERNAMES, SetAdminResult, TOKEN_TTL
+from routes.link_routes import GUEST_SUFFIX
 from src.constants import DEEP_RESEARCH_DIR, MEMORY_FILE, PASSWORD_MIN_LENGTH, SKILLS_DIR
 from src.rate_limiter import RateLimiter
 from src.settings_scrub import scrub_settings
@@ -84,6 +85,15 @@ class SetOpenRegistrationRequest(BaseModel):
 SESSION_COOKIE = "odysseus_session"
 
 
+def username_reserved(name: str) -> bool:
+    """Names no local account may take: the static reserved set, plus the
+    '@remote' namespace that Home Link guests appear under in DMs — a local
+    account named 'alice@remote' could impersonate a remote guest
+    (see routes/link_routes.py)."""
+    key = (name or "").strip().lower()
+    return key in RESERVED_USERNAMES or key.endswith(GUEST_SUFFIX)
+
+
 def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
     router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -106,7 +116,7 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
             raise HTTPException(400, f"Password must be at least {PASSWORD_MIN_LENGTH} characters")
         if len(body.username.strip()) < 1:
             raise HTTPException(400, "Username is required")
-        if body.username.lower() in RESERVED_USERNAMES:
+        if username_reserved(body.username):
             raise HTTPException(403, "Username is reserved")
         ok = await asyncio.to_thread(auth_manager.setup, body.username, body.password)
         if not ok:
@@ -126,7 +136,7 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
             raise HTTPException(400, f"Password must be at least {PASSWORD_MIN_LENGTH} characters")
         if len(body.username.strip()) < 1:
             raise HTTPException(400, "Username is required")
-        if body.username.lower() in RESERVED_USERNAMES:
+        if username_reserved(body.username):
             raise HTTPException(403, "Username is reserved")
         ok = await asyncio.to_thread(auth_manager.create_user, body.username, body.password, is_admin=False)
         if not ok:
@@ -285,7 +295,7 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
             raise HTTPException(400, f"Password must be at least {PASSWORD_MIN_LENGTH} characters")
         if len(body.username.strip()) < 1:
             raise HTTPException(400, "Username is required")
-        if body.username.lower() in RESERVED_USERNAMES:
+        if username_reserved(body.username):
             raise HTTPException(403, "Username is reserved")
         ok = auth_manager.create_user(body.username, body.password, body.is_admin)
         if not ok:
@@ -318,6 +328,8 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
             raise HTTPException(404, "User not found")
         if new_username in auth_manager.users:
             raise HTTPException(409, "Username already taken")
+        if username_reserved(new_username):
+            raise HTTPException(403, "Username is reserved")
 
         # Gate on auth first. Every mutation below is contingent on this
         # succeeding — doing it last meant a rejected rename (e.g. reserved

@@ -544,6 +544,60 @@ class UserToolData(Base):
     )
 
 
+class DirectMessage(Base):
+    """A one-to-one message between two user accounts (WhatsApp-style DMs).
+
+    A "conversation" is derived from the unordered {sender, recipient} pair —
+    there is no separate conversations table. Bodies are encrypted at rest
+    (EncryptedText) since private user-to-user messages are sensitive, matching
+    how email passwords / signatures / endpoint keys are stored. Ownership is
+    strict: a row is only ever visible to its sender or recipient, enforced in
+    routes/messaging_routes.py."""
+    __tablename__ = "direct_messages"
+
+    id         = Column(Integer, primary_key=True, autoincrement=True)
+    sender     = Column(String, nullable=False, index=True)   # username who sent it
+    recipient  = Column(String, nullable=False, index=True)   # username it's addressed to
+    body       = Column(EncryptedText, nullable=False)
+    created_at = Column(DateTime, default=utcnow_naive, nullable=False, index=True)
+    read_at    = Column(DateTime, nullable=True)              # NULL = unread by recipient
+
+    __table_args__ = (
+        # Pull one conversation's messages in order.
+        Index('ix_dm_pair', 'sender', 'recipient', 'created_at'),
+        # Fast unread-count / inbox scans for a recipient.
+        Index('ix_dm_unread', 'recipient', 'read_at'),
+    )
+
+
+class LinkGuest(Base):
+    """A Home Link guest — someone running their own instance who registered
+    with this hub to DM its owner (routes/link_routes.py). Only the SHA-256 of
+    the guest's bearer token is stored; the plaintext token lives on the
+    guest's instance. Guests appear in direct_messages as '<handle>@remote'."""
+    __tablename__ = "link_guests"
+
+    id         = Column(Integer, primary_key=True, autoincrement=True)
+    handle     = Column(String, nullable=False, unique=True, index=True)
+    token_hash = Column(String, nullable=False, unique=True, index=True)
+    created_at = Column(DateTime, default=utcnow_naive, nullable=False)
+    last_seen  = Column(DateTime, nullable=True)
+
+
+class HomeLink(Base):
+    """This instance's registration with its home server — the credential
+    behind the 'chat with the developer' contact (routes/link_routes.py).
+    Single row (id=1); the bearer token is encrypted at rest like DM bodies."""
+    __tablename__ = "home_link"
+
+    id         = Column(Integer, primary_key=True)              # always 1
+    home_url   = Column(String, nullable=False)
+    handle     = Column(String, nullable=False)
+    owner      = Column(String, nullable=True)                  # hub owner's username
+    token      = Column(EncryptedText, nullable=False)
+    created_at = Column(DateTime, default=utcnow_naive, nullable=False)
+
+
 class CrewMember(TimestampMixin, Base):
     """A custom AI persona ('crew member') with its own personality, model, tools, and memory scope."""
     __tablename__ = "crew_members"

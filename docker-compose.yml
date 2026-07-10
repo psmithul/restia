@@ -77,6 +77,12 @@ services:
       - TAVILY_API_KEY=${TAVILY_API_KEY:-}
       - SERPER_API_KEY=${SERPER_API_KEY:-}
       - MNEMOSYNE_DATA_DIR=/app/data
+      # Home Link (chat with the developer). No-colon default on
+      # RESTIA_HOME_SERVER is deliberate: set-but-empty in .env must
+      # disable the contact, not fall back to the default hub.
+      - RESTIA_HOME_SERVER=${RESTIA_HOME_SERVER-https://app.restia.dev}
+      - LINK_HUB_ENABLED=${LINK_HUB_ENABLED:-false}
+      - LINK_OWNER=${LINK_OWNER:-}
       # PUID / PGID — the user/group the container drops to before
       # running uvicorn (entrypoint also chowns /app/data + /app/logs
       # to match, so bind-mounted files stay editable from the host).

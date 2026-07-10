@@ -1,10 +1,12 @@
 // Notification command center — a bell in the icon rail with a dropdown
 // aggregating everything that used to hide behind scattered red dots:
-// emails needing reply, due to-dos, upcoming calendar events, AI
+// emails needing reply, direct messages, due to-dos, calendar events, AI
 // suggestions, and finished long-running jobs. Data comes from
 // GET /api/notifications/center (routes/notification_center_routes.py).
 
 import uiModule from './ui.js';
+import messagingModule from './messaging.js';
+import { calculateNotificationPanelHorizontalPosition } from './notificationPanelPosition.js';
 
 const API_BASE = '';
 const POLL_MS = 90 * 1000;
@@ -21,6 +23,7 @@ const _esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => (
 const _ICONS = {
   bell: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>',
   email: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/></svg>',
+  message: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
   todo: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>',
   event: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>',
   spark: '<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0L14.59 8.41L23 12L14.59 15.59L12 24L9.41 15.59L1 12L9.41 8.41Z"/></svg>',
@@ -65,8 +68,8 @@ function _section(title, icon, items, renderItem) {
 
 function _render() {
   if (!_panel) return;
-  const d = _data || { emails: [], todos: [], events: [], suggestions: [], jobs: [], count: 0 };
-  const empty = !d.emails.length && !d.todos.length && !d.events.length && !d.suggestions.length && !d.jobs.length;
+  const d = _data || { emails: [], messages: [], todos: [], events: [], suggestions: [], jobs: [], count: 0 };
+  const empty = !d.emails.length && !(d.messages || []).length && !d.todos.length && !d.events.length && !d.suggestions.length && !d.jobs.length;
   _panel.querySelector('.notif-center-body').innerHTML = empty
     ? '<div class="notif-center-empty">All clear — nothing needs you right now.</div>'
     : (
@@ -74,6 +77,11 @@ function _render() {
         <button class="notif-center-item" data-kind="email" data-hash="${_esc(e.open_hash)}">
           <span class="notif-center-item-main">${_esc(e.subject)}</span>
           <span class="notif-center-item-sub">${_esc(e.from)}${e.reason ? ' · ' + _esc(e.reason) : ''}</span>
+        </button>`)
+      + _section('Messages', _ICONS.message, d.messages || [], (m) => `
+        <button class="notif-center-item" data-kind="message" data-user="${_esc(m.sender)}">
+          <span class="notif-center-item-main">${_esc(m.sender)}${m.unread > 1 ? ` <span class="notif-center-section-count">${m.unread}</span>` : ''}</span>
+          <span class="notif-center-item-sub">${_esc(m.preview || 'New message')}</span>
         </button>`)
       + _section('To-dos due', _ICONS.todo, d.todos, (t) => `
         <button class="notif-center-item" data-kind="todo" data-hash="${_esc(t.open_hash)}">
@@ -101,7 +109,11 @@ function _render() {
     item.addEventListener('click', () => {
       const kind = item.dataset.kind;
       _closePanel();
-      if (kind === 'email' || kind === 'todo') {
+      if (kind === 'message') {
+        const username = item.dataset.user || '';
+        messagingModule.open();
+        if (username) messagingModule.openConversation(username);
+      } else if (kind === 'email' || kind === 'todo') {
         const hash = item.dataset.hash || '';
         if (hash) {
           // Re-assigning the same hash doesn't fire hashchange — clear first.
@@ -159,11 +171,15 @@ async function _openPanel(anchorBtn) {
     <div class="notif-center-body"><div class="notif-center-empty">Loading…</div></div>
   `;
   document.body.appendChild(_panel);
-  // Anchor next to the rail button (rail is the left edge on desktop; on
-  // narrow screens fall back to a near-fullwidth sheet).
+  // Anchor beside the trigger. The icon rail can live on either viewport edge,
+  // so opening the panel to its right would put it off-screen when the sidebar
+  // is collapsed on the right.
   const r = anchorBtn.getBoundingClientRect();
   if (window.innerWidth > 640) {
-    _panel.style.left = `${Math.round(r.right + 8)}px`;
+    const panelWidth = _panel.getBoundingClientRect().width;
+    const position = calculateNotificationPanelHorizontalPosition(r, window.innerWidth, panelWidth);
+    _panel.style.left = position.left;
+    _panel.style.right = position.right;
     _panel.style.top = `${Math.max(8, Math.round(r.top - 4))}px`;
   } else {
     _panel.style.left = '8px';

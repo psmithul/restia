@@ -284,6 +284,11 @@ if AUTH_ENABLED:
     AUTH_EXEMPT_PATTERNS = [
         _re.compile(r"^/api/tasks/[^/]+/webhook/[^/]+/?$"),
         _re.compile(r"^/api/telegram/webhook/?$"),
+        # Home Link hub API: callers are REMOTE instances with no session
+        # cookie. routes/link_routes.py does its own auth — register is
+        # rate-limited and everything else requires the guest bearer token —
+        # and the whole prefix 404s unless LINK_HUB_ENABLED=true.
+        _re.compile(r"^/api/link/(register|messages|summary)/?$"),
     ]
 
     def _is_auth_exempt(path: str) -> bool:
@@ -400,6 +405,16 @@ if AUTH_ENABLED:
             # Cloudflare tunnel / reverse proxy. Keep LOCALHOST_BYPASS=false for
             # network-exposed deployments regardless.
             if LOCALHOST_BYPASS and _is_trusted_loopback(request):
+                # The bypass admits the request, but a logged-in operator still
+                # deserves attribution: without stamping current_user here, a
+                # valid session cookie is IGNORED on loopback, route guards see
+                # an anonymous caller, and stricter routes 401 — which the
+                # frontend fetch wrapper escalates into a redirect-to-login
+                # loop even though the user just logged in.
+                _tok = request.cookies.get(SESSION_COOKIE)
+                if _tok and auth_manager.validate_token(_tok):
+                    request.state.current_user = auth_manager.get_username_for_token(_tok)
+                    request.state.api_token = False
                 return await call_next(request)
             if not auth_manager.is_configured:
                 # No users yet — redirect to login for first-time setup
@@ -746,6 +761,15 @@ app.include_router(document_router)
 # Signatures (reusable image stamps)
 from routes.signature_routes import setup_signature_routes
 app.include_router(setup_signature_routes())
+
+# Direct messages (account-to-account DMs)
+from routes.messaging_routes import setup_messaging_routes
+app.include_router(setup_messaging_routes())
+
+# Home Link (chat with the developer from a self-hosted instance)
+from routes.link_routes import setup_link_hub_routes, setup_home_link_routes
+app.include_router(setup_link_hub_routes())
+app.include_router(setup_home_link_routes())
 
 # Gallery (image library)
 from routes.gallery.gallery_routes import setup_gallery_routes

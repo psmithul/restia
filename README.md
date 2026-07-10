@@ -25,11 +25,11 @@
 
 ## Quick Start
 
-> `dev` is the default branch and gets the newest changes first. Use [`main`](https://github.com/pewdiepie-archdaemon/odysseus/tree/main) if you want the more curated branch.
+> `dev` is the default branch and gets the newest changes first. Use [`main`](https://github.com/psmithul/restia/tree/main) if you want the more curated branch.
 
 ```bash
-git clone https://github.com/pewdiepie-archdaemon/odysseus.git
-cd odysseus
+git clone https://github.com/psmithul/restia.git
+cd restia
 cp .env.example .env
 docker compose up -d --build
 ```
@@ -48,6 +48,22 @@ Native installs, GPU notes, Windows/macOS instructions, HTTPS, and configuration
 - **Email** — IMAP/SMTP inbox with triage, tags, summaries, reminders, and reply drafts.
 - **Notes, Tasks + Calendar** — reminders, todos, scheduled agent tasks, and CalDAV sync.
 - **Extras** — gallery/image editor, themes, uploads, web search, presets, sessions, and 2FA.
+
+## Chat with the developer
+
+Every Restia install ships with **Home Link**: once you've built the app and
+logged in, open **Messages** (the sidebar icon) → **✎ New message** → pick the
+contact tagged `dev`. Choose a handle the first time, then chat with the
+developer directly from your own instance — replies land back in the same
+thread. No account on any other server is needed; your instance registers
+itself with the home server (`app.restia.dev`) and stores its token locally,
+encrypted.
+
+Privacy notes: nothing is sent anywhere until you pick a handle and hit
+Connect, and only the messages you type in that one thread leave your
+instance. Set `RESTIA_HOME_SERVER=` (empty) in `.env` to remove the contact
+entirely, or point it at a friend's instance that has `LINK_HUB_ENABLED=true`
+to chat with them instead.
 
 ## Demo
 

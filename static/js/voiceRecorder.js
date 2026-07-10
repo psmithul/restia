@@ -67,6 +67,9 @@ function _resetRecordingUI() {
   if (window._updateSendBtnIcon) {
     setTimeout(window._updateSendBtnIcon, 50);
   }
+  // Recorder is fully reset — voiceMode.js sends any pending transcription
+  // only after this (clicking send while isRecording would stop, not send)
+  window.dispatchEvent(new CustomEvent('odysseus:stt-ended'));
 }
 
 /**
@@ -143,6 +146,7 @@ function insertTranscription(text, showToast) {
   input.focus();
 
   if (showToast) showToast('Transcribed');
+  window.dispatchEvent(new CustomEvent('odysseus:stt-result', { detail: { text } }));
 }
 
 /**
@@ -218,6 +222,7 @@ export function startRecording(onFileCreated, showToast, showError) {
       mediaRecorder.start();
       isRecording = true;
       recordingStartTime = new Date();
+      window.dispatchEvent(new CustomEvent('odysseus:stt-started'));
 
       // Start browser STT if that's the provider
       if (_sttProvider === 'browser') {

@@ -14,7 +14,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from core.middleware import INTERNAL_TOOL_USER
 from src.endpoint_resolver import resolve_endpoint
-from src.auth_helpers import _auth_disabled, get_current_user
+from src.auth_helpers import require_user
 from core.auth import RESERVED_USERNAMES
 from src.constants import DEEP_RESEARCH_DIR
 
@@ -213,13 +213,13 @@ def setup_research_routes(research_handler, session_manager=None) -> APIRouter:
         """All research endpoints require an authenticated user. Research
         data isn't owner-scoped in the on-disk JSON yet, so we at least
         block anonymous access. Multi-tenant deploys should additionally
-        verify the session belongs to this user."""
-        user = get_current_user(request)
-        if not user:
-            if _auth_disabled():
-                return ""
-            raise HTTPException(401, "Not authenticated")
-        return user
+        verify the session belongs to this user.
+
+        Delegates to the shared require_user so the anonymous single-user
+        modes (AUTH_ENABLED=false, LOCALHOST_BYPASS on loopback, unconfigured
+        first-run) resolve to "" here exactly like every other route instead
+        of 401-ing and bouncing the SPA to /login on page load."""
+        return require_user(request)
 
     def _owns_in_memory(session_id: str, user: str) -> bool:
         """Ownership check for an in-flight (in-memory) research task.

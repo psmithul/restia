@@ -6,6 +6,7 @@ one feed the frontend bell dropdown renders:
 - emails needing reply   (email urgency scanner state, score >= 2, unread)
 - tasks due              (todo/checklist notes overdue or due in 24h)
 - calendar reminders     (events starting in the next 24h)
+- unread direct messages (grouped by sender)
 - AI suggestions         (rule-based, each with a ready-to-send chat prompt)
 - long-running jobs      (recent task-scheduler completions)
 """
@@ -140,6 +141,41 @@ def _events_upcoming(owner: str) -> list[dict]:
         db.close()
 
 
+def _messages_unread(owner: str) -> list[dict]:
+    """Unread direct messages grouped by sender, newest conversation first."""
+    if not owner:
+        return []
+    from core.database import DirectMessage, SessionLocal
+
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(DirectMessage)
+            .filter(
+                DirectMessage.recipient == owner,
+                DirectMessage.read_at.is_(None),
+            )
+            .order_by(DirectMessage.created_at.desc())
+            .limit(200)
+            .all()
+        )
+        by_sender: dict[str, dict] = {}
+        for msg in rows:
+            item = by_sender.get(msg.sender)
+            if item is None:
+                item = {
+                    "sender": msg.sender,
+                    "preview": (msg.body or "")[:160],
+                    "last_at": msg.created_at.isoformat() + "Z" if msg.created_at else None,
+                    "unread": 0,
+                }
+                by_sender[msg.sender] = item
+            item["unread"] += 1
+        return list(by_sender.values())[:20]
+    finally:
+        db.close()
+
+
 def _suggestions(emails: list, todos: list, events: list) -> list[dict]:
     """Rule-based suggestions, each with a ready-to-send agent prompt."""
     out = []
@@ -174,7 +210,7 @@ def setup_notification_center_routes(task_scheduler=None) -> APIRouter:
 
     @router.get("/center")
     async def notification_center(owner: str = Depends(require_user)):
-        emails, todos, events, jobs = [], [], [], []
+        emails, todos, events, messages, jobs = [], [], [], [], []
         try:
             emails = _emails_needing_reply(owner)
         except Exception:
@@ -188,18 +224,24 @@ def setup_notification_center_routes(task_scheduler=None) -> APIRouter:
         except Exception:
             logger.debug("notification center: events section failed", exc_info=True)
         try:
+            messages = _messages_unread(owner)
+        except Exception:
+            logger.debug("notification center: messages section failed", exc_info=True)
+        try:
             if _scheduler_ref is not None and hasattr(_scheduler_ref, "recent_notifications"):
                 jobs = _scheduler_ref.recent_notifications(owner=owner)[:8]
         except Exception:
             logger.debug("notification center: jobs section failed", exc_info=True)
         suggestions = _suggestions(emails, todos, events)
+        unread_message_count = sum(int(m.get("unread") or 0) for m in messages)
         return {
             "emails": emails,
             "todos": todos,
             "events": events,
+            "messages": messages,
             "suggestions": suggestions,
             "jobs": jobs,
-            "count": len(emails) + len(todos) + len(events) + len(jobs),
+            "count": len(emails) + len(todos) + len(events) + len(jobs) + unread_message_count,
             "generated_at": datetime.now().isoformat(),
         }
 
