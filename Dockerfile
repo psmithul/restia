@@ -93,6 +93,10 @@ RUN pip install --no-cache-dir --no-deps /tmp/odysseus-wheels/*.whl \
 # Copy app code
 COPY . .
 
+# Bake in the commit hash for the update checker
+ARG BUILD_COMMIT="unknown"
+ENV BUILD_COMMIT=$BUILD_COMMIT
+
 # Create data directory (mount a volume here for persistence)
 RUN mkdir -p data logs services/cache/search
 

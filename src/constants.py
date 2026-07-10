@@ -6,6 +6,33 @@ from src.runtime_paths import get_app_root, get_default_data_dir
 
 APP_VERSION = "1.0.1"
 
+# Git commit SHA baked in at Docker build time (via BUILD_COMMIT build arg).
+# Falls back to reading .git/HEAD at startup for non-Docker installs. Used by
+# /api/version and /api/update-check to tell users when a newer version exists.
+def _resolve_build_commit() -> str:
+    """Return the short git commit hash for this build."""
+    from_env = os.getenv("BUILD_COMMIT", "").strip()
+    if from_env:
+        return from_env[:12]
+    # Non-Docker: try reading .git/HEAD directly (no subprocess)
+    try:
+        git_dir = os.path.join(get_app_root(), ".git")
+        with open(os.path.join(git_dir, "HEAD"), "r") as f:
+            head = f.read().strip()
+        if head.startswith("ref:"):
+            ref_path = os.path.join(git_dir, head.split("ref:", 1)[1].strip())
+            with open(ref_path, "r") as f:
+                return f.read().strip()[:12]
+        return head[:12]
+    except Exception:
+        return "unknown"
+
+BUILD_COMMIT = _resolve_build_commit()
+
+# GitHub repo used for update checks. The /api/update-check endpoint compares
+# BUILD_COMMIT against the latest commit on the default branch of this repo.
+UPDATE_REPO = os.getenv("UPDATE_REPO", "psmithul/restia")
+
 
 def _env_alias(new_name: str, old_name: str, default=None):
     value = os.getenv(new_name)

@@ -269,6 +269,7 @@ if AUTH_ENABLED:
         "/api/auth/integrations/presets",
         "/api/health",
         "/api/version",
+        "/api/update-check",
         "/login",
     }
     AUTH_EXEMPT_PREFIXES = ["/static"]
@@ -962,8 +963,62 @@ async def serve_login(request: Request):
 
 @app.get("/api/version")
 async def get_version():
-    from core.constants import APP_VERSION
-    return {"version": APP_VERSION}
+    from core.constants import APP_VERSION, BUILD_COMMIT
+    return {"version": APP_VERSION, "commit": BUILD_COMMIT}
+
+# --- Update checker -----------------------------------------------------------
+# Compares this build's commit against the latest on the upstream repo.
+# Caches the result for 30 min so we don't hammer the GitHub API.
+
+_update_cache: Dict[str, object] = {"result": None, "ts": 0.0}
+_UPDATE_CACHE_TTL = 1800  # 30 minutes
+
+@app.get("/api/update-check")
+async def update_check():
+    import httpx
+    from core.constants import APP_VERSION, BUILD_COMMIT, UPDATE_REPO
+
+    now = time.time()
+    if _update_cache["result"] and (now - _update_cache["ts"]) < _UPDATE_CACHE_TTL:
+        return _update_cache["result"]
+
+    if BUILD_COMMIT == "unknown" or not UPDATE_REPO:
+        return {"update_available": False, "current_commit": BUILD_COMMIT,
+                "current_version": APP_VERSION, "error": "no_commit_info"}
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            # Get the latest commit on the default branch
+            resp = await client.get(
+                f"https://api.github.com/repos/{UPDATE_REPO}/commits/dev",
+                headers={"Accept": "application/vnd.github.v3+json",
+                         "User-Agent": "Restia-Update-Check"},
+            )
+            if resp.status_code != 200:
+                return {"update_available": False, "current_commit": BUILD_COMMIT,
+                        "current_version": APP_VERSION, "error": "github_api_error"}
+            data = resp.json()
+
+        remote_sha = data.get("sha", "")[:12]
+        remote_msg = (data.get("commit", {}).get("message", "") or "").split("\n")[0][:120]
+        remote_date = data.get("commit", {}).get("committer", {}).get("date", "")
+
+        has_update = remote_sha != BUILD_COMMIT[:12]
+        result = {
+            "update_available": has_update,
+            "current_version": APP_VERSION,
+            "current_commit": BUILD_COMMIT,
+            "latest_commit": remote_sha,
+            "latest_message": remote_msg,
+            "latest_date": remote_date,
+            "repo": UPDATE_REPO,
+        }
+        _update_cache["result"] = result
+        _update_cache["ts"] = now
+        return result
+    except Exception:
+        return {"update_available": False, "current_commit": BUILD_COMMIT,
+                "current_version": APP_VERSION, "error": "check_failed"}
 
 @app.get("/api/health")
 async def health_check() -> Dict[str, str]:

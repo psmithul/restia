@@ -41195,3 +41195,70 @@ body.theme-frosted .modal {
   /* The thread's own header carries the close affordance via Back; keep the
      list header close button reachable when the list is showing. */
 }
+
+/* --- Update Banner --- */
+.update-banner {
+  background: var(--brand-accent, #2563eb);
+  color: #fff;
+  font-size: 0.85rem;
+  padding: 8px 16px;
+  position: sticky;
+  top: 0;
+  z-index: 10000;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+  transform: translateY(-100%);
+  transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.update-banner-visible {
+  transform: translateY(0);
+}
+.update-banner-hiding {
+  transform: translateY(-100%);
+}
+.update-banner-content {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 1200px;
+  width: 100%;
+}
+.update-banner-text {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.update-banner-text code {
+  background: rgba(255,255,255,0.2);
+  padding: 2px 4px;
+  border-radius: 4px;
+  font-family: var(--font-mono, monospace);
+  font-size: 0.8em;
+}
+.update-banner-link {
+  color: #fff;
+  text-decoration: underline;
+  font-weight: 500;
+  margin-right: 8px;
+}
+.update-banner-link:hover {
+  text-decoration: none;
+}
+.update-banner-close {
+  background: none;
+  border: none;
+  color: rgba(255,255,255,0.7);
+  cursor: pointer;
+  padding: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+}
+.update-banner-close:hover {
+  color: #fff;
+  background: rgba(255,255,255,0.1);
+}
