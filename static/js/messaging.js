@@ -32,9 +32,9 @@ let _linkRequests = [];            // pending Home Link requests (hub admins)
 let _pendingCheckTimer = null;     // re-poll while the "waiting" card is up
 let _sending = false;
 
-const THREAD_POLL_MS = 3000;
-const LIST_POLL_MS = 6000;
-const BADGE_POLL_MS = 20000;
+const THREAD_POLL_MS = 1000;
+const LIST_POLL_MS = 3000;
+const BADGE_POLL_MS = 10000;
 
 // ── Small helpers ──────────────────────────────────────────────────────────
 

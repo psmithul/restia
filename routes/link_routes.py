@@ -67,7 +67,7 @@ DEFAULT_HOME_SERVER = "https://app.restia.dev"
 HANDLE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,31}$")
 MAX_BODY_LEN = 8000            # keep in sync with routes/messaging_routes.py
 MESSAGES_PAGE_LIMIT = 200
-SUMMARY_CACHE_TTL = 15         # seconds between hub round-trips for badge/list polls
+SUMMARY_CACHE_TTL = 1          # seconds between hub round-trips for badge/list polls
 MAX_HUB_RESPONSE_BYTES = 2 * 1024 * 1024  # refuse absurd payloads from a hub
 
 GUEST_PENDING = "pending"
