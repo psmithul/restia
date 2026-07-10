@@ -514,16 +514,20 @@ async def dispatch_reminder(
     _tg_mirror = str(settings.get("reminder_telegram_mirror", "")).strip().lower() in {"1", "true", "yes", "on"}
     if channel == "telegram" or _tg_mirror:
         try:
-            from src.telegram_bot import load_telegram_config, send_telegram_message
+            from src.telegram_bot import load_telegram_config, send_telegram_message, telegram_chat_ids_for_owner
             _tg = load_telegram_config()
             if not (_tg.enabled and _tg.bot_token):
                 telegram_error = "Telegram bridge disabled or bot token missing"
             else:
                 _explicit = str(settings.get("reminder_telegram_chat_id") or "").strip()
                 if _explicit:
-                    _tg_chats = [c.strip() for c in _explicit.replace(" ", ",").split(",") if c.strip()]
+                    _owner_chats = set(telegram_chat_ids_for_owner(_tg, owner))
+                    _tg_chats = [
+                        c.strip() for c in _explicit.replace(" ", ",").split(",")
+                        if c.strip() and c.strip() in _owner_chats
+                    ]
                 else:
-                    _tg_chats = sorted(set(_tg.allowed_chat_ids) | set(_tg.session_map.keys()))
+                    _tg_chats = telegram_chat_ids_for_owner(_tg, owner)
                 if not _tg_chats:
                     telegram_error = "No Telegram chat target (set reminder_telegram_chat_id or allow a chat)"
                 else:

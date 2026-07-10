@@ -9,13 +9,6 @@ echo Updating Restia Docker deployment
 echo =========================================
 echo.
 
-where git >nul 2>nul
-if errorlevel 1 (
-  echo [!] Git was not found on PATH.
-  echo     Install Git for Windows, then run this script again.
-  goto :fail
-)
-
 where docker >nul 2>nul
 if errorlevel 1 (
   echo [!] Docker was not found on PATH.
@@ -30,13 +23,14 @@ if errorlevel 1 (
   goto :fail
 )
 
-echo [+] Pulling latest code...
-git pull --ff-only
+if "%RESTIA_IMAGE%"=="" set "RESTIA_IMAGE=ghcr.io/psmithul/restia:latest"
+echo [+] Pulling %RESTIA_IMAGE%...
+docker compose pull odysseus
 if errorlevel 1 goto :fail
 
 echo.
-echo [+] Rebuilding and restarting containers...
-docker compose up -d --build
+echo [+] Restarting Restia while preserving data and logs...
+docker compose up -d --no-build odysseus
 if errorlevel 1 goto :fail
 
 echo.

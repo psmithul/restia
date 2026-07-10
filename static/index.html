@@ -2023,6 +2023,22 @@
         <!-- ═══ REMINDERS TAB ═══ -->
         <div data-settings-panel="reminders" class="hidden">
           <div class="admin-card">
+            <h2><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px;opacity:0.6"><path d="M21.2 4.2 2.9 11.3c-1.2.5-1.2 1.2-.2 1.5l4.7 1.5 1.8 5.5c.2.6.1.8.8.8.5 0 .8-.2 1-.4l2.3-2.2 4.8 3.5c.9.5 1.5.2 1.7-.8l3.1-14.7c.3-1.3-.5-1.9-1.7-1.4Z"/></svg>Telegram</h2>
+            <div class="admin-toggle-sub" style="margin-bottom:8px">Link this Restia account to a Telegram chat. Each user gets a separate chat and separate conversation history.</div>
+            <div class="settings-col">
+              <div class="settings-row" style="align-items:center;gap:8px">
+                <span id="set-telegram-link-status" style="font-size:11px;flex:1">Checking Telegram…</span>
+                <button class="admin-btn-add" id="set-telegram-link-btn">Generate link code</button>
+                <button class="admin-btn-sm" id="set-telegram-unlink-btn" style="display:none">Disconnect</button>
+              </div>
+              <div id="set-telegram-link-command-row" style="display:none;font-size:11px;line-height:1.5">
+                Send this command to your Restia bot within 10 minutes:
+                <code id="set-telegram-link-command" style="display:block;margin-top:5px;padding:6px 8px;background:var(--bg);border:1px solid var(--border);border-radius:4px;user-select:all"></code>
+              </div>
+              <div id="set-telegram-link-msg" style="font-size:11px"></div>
+            </div>
+          </div>
+          <div class="admin-card">
             <h2 style="display:flex;align-items:center;gap:8px;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px;opacity:0.6"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>How you're reminded<span style="flex:1"></span><span id="set-reminder-test-msg" style="font-size:11px;font-weight:normal;"></span><button class="admin-btn-sm" id="set-reminder-test-btn" style="font-size:11px;font-weight:normal;display:inline-flex;align-items:center;gap:4px;"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>Test</button></h2>
             <div class="admin-toggle-sub" style="margin-bottom:8px">Controls how fired note reminders are delivered.</div>
             <div class="settings-col">

@@ -4,10 +4,14 @@ from fastapi import BackgroundTasks
 from src.telegram_bot import (
     TELEGRAM_SECRET_HEADER,
     TelegramConfig,
+    consume_telegram_link_code,
+    create_telegram_link_code,
     extract_telegram_message,
     format_telegram_html,
     is_chat_allowed,
     send_telegram_message,
+    telegram_chat_ids_for_owner,
+    telegram_owner_for_chat,
     verify_telegram_secret,
 )
 
@@ -49,6 +53,46 @@ def test_telegram_secret_and_chat_allowlist():
     assert is_chat_allowed(config, "111") is True
     assert is_chat_allowed(config, "222") is False
     assert is_chat_allowed(_config(allow_all_chats=True), "222") is True
+
+
+def test_per_user_chat_ownership_is_scoped():
+    config = _config(
+        owner="admin",
+        allowed_chat_ids=frozenset({"111", "222", "333"}),
+        session_map={"111": "legacy", "222": "bob-session", "333": "alice-session"},
+        chat_owners={"222": "bob", "333": "alice"},
+    )
+
+    assert telegram_owner_for_chat(config, "222") == "bob"
+    assert telegram_owner_for_chat(config, "111") == "admin"
+    assert telegram_chat_ids_for_owner(config, "bob") == ["222"]
+    assert telegram_chat_ids_for_owner(config, "alice") == ["333"]
+    assert telegram_chat_ids_for_owner(config, "admin") == ["111"]
+
+
+def test_one_time_link_code_claims_chat_without_storing_plain_code(monkeypatch):
+    state = {
+        "telegram_allowed_chat_ids": [],
+        "telegram_session_map": {},
+        "telegram_chat_owners": {},
+        "telegram_link_codes": {},
+    }
+
+    monkeypatch.setattr("src.telegram_bot.load_settings", lambda: dict(state))
+
+    def save(updated):
+        state.clear()
+        state.update(updated)
+
+    monkeypatch.setattr("src.telegram_bot.save_settings", save)
+
+    code, expires_at = create_telegram_link_code("Alice", ttl_seconds=600)
+    assert expires_at > 0
+    assert code not in str(state["telegram_link_codes"])
+    assert consume_telegram_link_code(code, "987") == "alice"
+    assert state["telegram_chat_owners"] == {"987": "alice"}
+    assert state["telegram_allowed_chat_ids"] == ["987"]
+    assert consume_telegram_link_code(code, "987") is None
 
 
 def test_telegram_html_formatter_escapes_before_adding_tags():
@@ -154,6 +198,20 @@ async def test_telegram_webhook_schedules_authorized_message(monkeypatch):
 
     response = await endpoint(
         _Request({"message": {"message_id": 7, "chat": {"id": 111}, "text": "hi"}}),
+        tasks,
+    )
+
+    assert response == {"ok": True}
+    assert len(tasks.tasks) == 1
+
+
+@pytest.mark.asyncio
+async def test_telegram_webhook_allows_link_command_from_unlisted_chat(monkeypatch):
+    endpoint = _webhook_endpoint(monkeypatch, _config())
+    tasks = BackgroundTasks()
+
+    response = await endpoint(
+        _Request({"message": {"message_id": 8, "chat": {"id": 222}, "text": "/link ABCD1234"}}),
         tasks,
     )
 

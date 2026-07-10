@@ -2,7 +2,11 @@
 # Generated from docker-compose.yml + docker/gpu.amd.yml; keep those files as the source of truth.
 services:
   odysseus:
-    build: .
+    image: ${RESTIA_IMAGE:-ghcr.io/psmithul/restia:latest}
+    build:
+      context: .
+      args:
+        BUILD_COMMIT: ${BUILD_COMMIT:-unknown}
     ports:
     - ${APP_BIND:-127.0.0.1}:${APP_PORT:-7000}:7000
     volumes:

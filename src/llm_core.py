@@ -950,7 +950,7 @@ def _provider_headers(provider: str, headers: Optional[Dict] = None) -> Dict[str
     if isinstance(headers, dict):
         h.update(headers)
     if provider == "openrouter":
-        h.setdefault("HTTP-Referer", "https://github.com/pewdiepie-archdaemon/odysseus")
+        h.setdefault("HTTP-Referer", "https://github.com/psmithul/restia")
         h.setdefault("X-OpenRouter-Title", "Restia")
     if provider == "copilot":
         # Ensure the Copilot-required headers are present even when the caller

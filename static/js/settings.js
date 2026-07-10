@@ -2392,6 +2392,12 @@ async function initReminderSettings() {
   const webhookOpt = el('set-reminder-channel-webhook-opt');
   const telegramOpt = el('set-reminder-channel-telegram-opt');
   const telegramMirrorToggle = el('set-reminder-telegram-mirror');
+  const telegramLinkStatus = el('set-telegram-link-status');
+  const telegramLinkBtn = el('set-telegram-link-btn');
+  const telegramUnlinkBtn = el('set-telegram-unlink-btn');
+  const telegramLinkCommandRow = el('set-telegram-link-command-row');
+  const telegramLinkCommand = el('set-telegram-link-command');
+  const telegramLinkMsg = el('set-telegram-link-msg');
   const hint = el('set-reminder-channel-hint');
   const llmToggle = el('set-reminder-llm-toggle');
   // "Integrations" link in the channel-hint copy. Jumps to the
@@ -2471,19 +2477,81 @@ async function initReminderSettings() {
     webhookOpt.textContent = 'Webhook (add an Integration first)';
   }
 
-  // Telegram: available when the Telegram bridge is enabled (settings toggle).
+  // Telegram: the bot is configured globally, but every local account links
+  // its own Telegram chat with a short-lived one-time code.
   let telegramConfigured = false;
-  try {
-    const res = await fetch('/api/auth/settings', { credentials: 'same-origin' });
-    if (res.ok) {
-      const s = await res.json();
-      telegramConfigured = !!s.telegram_enabled
-        || s.reminder_channel === 'telegram' || !!s.reminder_telegram_mirror;
+  let telegramLinked = false;
+  async function refreshTelegramLinkStatus() {
+    try {
+      const res = await fetch('/api/telegram/me', { credentials: 'same-origin' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || data.error || 'Telegram status failed');
+      telegramConfigured = !!data.enabled && !!data.bot_token_configured;
+      telegramLinked = !!data.linked;
+      if (telegramLinkStatus) {
+        telegramLinkStatus.textContent = !telegramConfigured
+          ? 'Telegram is not configured for this Restia instance. The administrator must register a bot first.'
+          : telegramLinked
+            ? `Connected to ${data.linked_chat_count || 1} Telegram chat${(data.linked_chat_count || 1) === 1 ? '' : 's'}.`
+            : 'Bot ready. Generate a one-time code to connect your Telegram chat.';
+      }
+      if (telegramLinkBtn) {
+        telegramLinkBtn.disabled = !telegramConfigured;
+        telegramLinkBtn.style.display = telegramLinked ? 'none' : '';
+      }
+      if (telegramUnlinkBtn) telegramUnlinkBtn.style.display = telegramLinked ? '' : 'none';
+      if (telegramOpt) {
+        telegramOpt.disabled = !telegramConfigured || !telegramLinked;
+        telegramOpt.textContent = !telegramConfigured ? 'Telegram (administrator setup required)'
+          : telegramLinked ? 'Telegram' : 'Telegram (link your chat first)';
+      }
+      if (telegramMirrorToggle) telegramMirrorToggle.disabled = !telegramConfigured || !telegramLinked;
+      return data;
+    } catch (e) {
+      telegramConfigured = false;
+      telegramLinked = false;
+      if (telegramLinkStatus) telegramLinkStatus.textContent = 'Telegram status unavailable.';
+      if (telegramLinkBtn) telegramLinkBtn.disabled = true;
+      return null;
     }
-  } catch (_) {}
-  if (!telegramConfigured && telegramOpt) {
-    telegramOpt.disabled = true;
-    telegramOpt.textContent = 'Telegram (enable the Telegram bridge first)';
+  }
+  await refreshTelegramLinkStatus();
+  if (telegramLinkBtn && !telegramLinkBtn.dataset.wired) {
+    telegramLinkBtn.dataset.wired = '1';
+    telegramLinkBtn.addEventListener('click', async () => {
+      telegramLinkBtn.disabled = true;
+      if (telegramLinkMsg) telegramLinkMsg.textContent = 'Generating code…';
+      try {
+        const res = await fetch('/api/telegram/link-code', { method: 'POST', credentials: 'same-origin' });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || data.error || 'Could not generate link code');
+        if (telegramLinkCommand) telegramLinkCommand.textContent = data.command;
+        if (telegramLinkCommandRow) telegramLinkCommandRow.style.display = 'block';
+        if (telegramLinkMsg) { telegramLinkMsg.textContent = 'Code ready. It expires in 10 minutes.'; telegramLinkMsg.style.color = 'var(--green,#50fa7b)'; }
+      } catch (e) {
+        if (telegramLinkMsg) { telegramLinkMsg.textContent = e.message; telegramLinkMsg.style.color = 'var(--red)'; }
+      } finally {
+        telegramLinkBtn.disabled = false;
+      }
+    });
+  }
+  if (telegramUnlinkBtn && !telegramUnlinkBtn.dataset.wired) {
+    telegramUnlinkBtn.dataset.wired = '1';
+    telegramUnlinkBtn.addEventListener('click', async () => {
+      telegramUnlinkBtn.disabled = true;
+      try {
+        const res = await fetch('/api/telegram/link', { method: 'DELETE', credentials: 'same-origin' });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || data.error || 'Could not disconnect Telegram');
+        if (telegramLinkCommandRow) telegramLinkCommandRow.style.display = 'none';
+        if (telegramLinkMsg) telegramLinkMsg.textContent = 'Telegram disconnected.';
+        await refreshTelegramLinkStatus();
+      } catch (e) {
+        if (telegramLinkMsg) { telegramLinkMsg.textContent = e.message; telegramLinkMsg.style.color = 'var(--red)'; }
+      } finally {
+        telegramUnlinkBtn.disabled = false;
+      }
+    });
   }
 
   const emailFromRow = el('set-reminder-email-from-row');
@@ -2528,8 +2596,9 @@ async function initReminderSettings() {
       webhookOpt.textContent = webhookConfigured ? 'Webhook' : 'Webhook (add an Integration first)';
     }
     if (telegramOpt) {
-      telegramOpt.disabled = !telegramConfigured;
-      telegramOpt.textContent = telegramConfigured ? 'Telegram' : 'Telegram (enable the Telegram bridge first)';
+      telegramOpt.disabled = !telegramConfigured || !telegramLinked;
+      telegramOpt.textContent = !telegramConfigured ? 'Telegram (administrator setup required)'
+        : telegramLinked ? 'Telegram' : 'Telegram (link your chat first)';
     }
   }
 
@@ -2630,7 +2699,7 @@ async function initReminderSettings() {
     llmToggle.checked = !!s.reminder_llm_synthesis;
     if (telegramMirrorToggle) {
       telegramMirrorToggle.checked = !!s.reminder_telegram_mirror;
-      telegramMirrorToggle.disabled = !telegramConfigured;
+      telegramMirrorToggle.disabled = !telegramConfigured || !telegramLinked;
       if (!telegramMirrorToggle.dataset.wired) {
         telegramMirrorToggle.dataset.wired = '1';
         telegramMirrorToggle.addEventListener('change', () => {

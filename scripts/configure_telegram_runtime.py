@@ -9,7 +9,9 @@ chat. Output is deliberately sanitized.
 from __future__ import annotations
 
 import json
+import argparse
 import getpass
+import os
 import re
 import secrets
 import sys
@@ -23,36 +25,39 @@ from src.settings import load_settings, save_settings
 
 
 TOKEN_RE = re.compile(r"^\d{6,}:[A-Za-z0-9_-]{20,}$")
-DEFAULT_PUBLIC_URL = "https://rest-editorial-guestbook-bizrate.trycloudflare.com"
-DEFAULT_CHAT_ID = "6284351149"
-DEFAULT_OWNER = "admin"
-
-
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Configure a Restia Telegram bot webhook")
+    parser.add_argument("--public-url", default=os.getenv("RESTIA_PUBLIC_URL", ""), help="Public HTTPS URL for this Restia instance")
+    parser.add_argument("--owner", default="", help="Optional legacy single-user owner")
+    parser.add_argument("--chat-id", default="", help="Optional chat ID for a silent delivery test")
+    args = parser.parse_args()
     token = _read_token()
     if not TOKEN_RE.fullmatch(token):
         print({"ok": False, "error": "invalid_token_shape"})
         return 2
 
     settings = load_settings()
+    public_url = str(args.public_url or settings.get("app_public_url") or "").strip().rstrip("/")
+    if not public_url.startswith("https://"):
+        print({"ok": False, "error": "public_https_url_required"})
+        return 2
     settings["telegram_enabled"] = True
     settings["telegram_bot_token"] = token
-    settings["telegram_allowed_chat_ids"] = [DEFAULT_CHAT_ID]
     settings["telegram_allow_all_chats"] = False
-    settings["telegram_owner"] = DEFAULT_OWNER
-    settings["app_public_url"] = str(settings.get("app_public_url") or DEFAULT_PUBLIC_URL).strip()
+    if args.owner:
+        settings["telegram_owner"] = args.owner.strip().lower()
+    settings["app_public_url"] = public_url
     if not str(settings.get("telegram_webhook_secret") or "").strip():
         settings["telegram_webhook_secret"] = secrets.token_urlsafe(32)
     save_settings(settings)
 
-    public_url = str(settings["app_public_url"]).rstrip("/")
     webhook_url = f"{public_url}/api/telegram/webhook"
     base = f"https://api.telegram.org/bot{token}"
     summary: dict[str, object] = {
         "token_saved_to_runtime_settings": True,
         "webhook_url_host": public_url.replace("https://", "").replace("http://", ""),
-        "allowed_chat_ids_count": 1,
-        "owner": DEFAULT_OWNER,
+        "allowed_chat_ids_count": len(settings.get("telegram_allowed_chat_ids") or []),
+        "legacy_owner_configured": bool(args.owner),
     }
 
     with httpx.Client(timeout=30) as client:
@@ -88,19 +93,20 @@ def main() -> int:
         if last_error:
             summary["last_error_message_prefix"] = last_error[:80]
 
-        send_resp = client.post(
-            f"{base}/sendMessage",
-            json={
-                "chat_id": DEFAULT_CHAT_ID,
-                "text": "Restia Telegram bridge is online.",
-                "disable_notification": True,
-            },
-        )
-        send_data = _json_or_empty(send_resp)
-        summary["send_test_ok"] = bool(send_resp.status_code == 200 and send_data.get("ok"))
-        if not summary["send_test_ok"]:
-            summary["send_test_error_code"] = send_data.get("error_code") or send_resp.status_code
-            summary["send_test_error_prefix"] = str(send_data.get("description") or "")[:80]
+        if args.chat_id:
+            send_resp = client.post(
+                f"{base}/sendMessage",
+                json={
+                    "chat_id": args.chat_id.strip(),
+                    "text": "Restia Telegram bridge is online.",
+                    "disable_notification": True,
+                },
+            )
+            send_data = _json_or_empty(send_resp)
+            summary["send_test_ok"] = bool(send_resp.status_code == 200 and send_data.get("ok"))
+            if not summary["send_test_ok"]:
+                summary["send_test_error_code"] = send_data.get("error_code") or send_resp.status_code
+                summary["send_test_error_prefix"] = str(send_data.get("description") or "")[:80]
 
     print(summary)
     return 0 if summary.get("get_me_ok") and summary.get("set_webhook_ok") else 1

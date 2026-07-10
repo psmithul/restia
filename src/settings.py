@@ -194,6 +194,10 @@ DEFAULT_SETTINGS = {
     "telegram_allow_all_chats": False,
     "telegram_owner": "",
     "telegram_session_map": {},
+    # Multi-user Telegram routing. Chats are linked to local accounts through
+    # short-lived one-time codes; code records contain only a hash + expiry.
+    "telegram_chat_owners": {},
+    "telegram_link_codes": {},
     # IANA timezone for Telegram conversations (e.g. "Asia/Kolkata"). Telegram
     # has no browser headers to carry the user's clock, so chats resolve
     # relative dates against this zone; empty = server-local time.

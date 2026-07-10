@@ -35,8 +35,9 @@ function _dismiss(commit) {
 
 function _showBanner(data) {
   // Don't show if already dismissed for this commit
+  const updateId = data.latest_commit || data.latest_version || 'latest';
   try {
-    if (sessionStorage.getItem(DISMISS_KEY) === data.latest_commit) return;
+    if (sessionStorage.getItem(DISMISS_KEY) === updateId) return;
   } catch {}
 
   // Remove any existing banner
@@ -45,7 +46,10 @@ function _showBanner(data) {
   const ago = _timeSince(data.latest_date);
   const msg = _esc(data.latest_message || 'New update');
   const commit = _esc(data.latest_commit || '');
+  const latestVersion = _esc(data.latest_version || '');
   const repo = _esc(data.repo || '');
+  const releaseUrl = _esc(data.release_url || `https://github.com/${repo}/releases/latest`);
+  const updateLabel = data.channel === 'release' && latestVersion ? `v${latestVersion}` : commit.slice(0, 7);
 
   const el = document.createElement('div');
   el.className = 'update-banner';
@@ -58,12 +62,13 @@ function _showBanner(data) {
         <line x1="12" y1="15" x2="12" y2="3"/>
       </svg>
       <span class="update-banner-text">
-        Update available <code>${commit.slice(0, 7)}</code>${ago ? ' · ' + ago : ''}
+        Update available <code>${updateLabel}</code>${ago ? ' · ' + ago : ''}
         — ${msg}
       </span>
-      <a class="update-banner-link" href="https://github.com/${repo}" target="_blank" rel="noopener">
-        View
+      <a class="update-banner-link" href="${releaseUrl}" target="_blank" rel="noopener">
+        Release
       </a>
+      <button class="update-banner-link update-banner-copy" type="button" title="Copy the safe update command">Copy update command</button>
       <button class="update-banner-close" title="Dismiss" aria-label="Dismiss update notification">
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
           <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
@@ -71,7 +76,17 @@ function _showBanner(data) {
       </button>
     </div>`;
 
-  el.querySelector('.update-banner-close').addEventListener('click', () => _dismiss(data.latest_commit));
+  el.querySelector('.update-banner-close').addEventListener('click', () => _dismiss(updateId));
+  el.querySelector('.update-banner-copy').addEventListener('click', async () => {
+    const button = el.querySelector('.update-banner-copy');
+    try {
+      await navigator.clipboard.writeText(data.update_command || './update.sh');
+      button.textContent = 'Copied';
+      setTimeout(() => { button.textContent = 'Copy update command'; }, 1800);
+    } catch {
+      button.textContent = data.update_command || './update.sh';
+    }
+  });
 
   // Insert at the very top of <body>
   document.body.prepend(el);

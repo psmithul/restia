@@ -31,12 +31,18 @@
 git clone https://github.com/psmithul/restia.git
 cd restia
 cp .env.example .env
-docker compose up -d --build
+docker compose pull
+docker compose up -d --no-build
 ```
 
 Open `http://localhost:7000` when the containers are healthy. The first admin password is printed in `docker compose logs odysseus`.
 
 Native installs, GPU notes, Windows/macOS instructions, HTTPS, and configuration live in the [setup guide](docs/setup.md).
+
+Updates preserve `data/` and `logs/`: run `./update.sh` on Linux/macOS or
+`update_windows.bat` on Windows. Each published GitHub Release produces
+`ghcr.io/psmithul/restia:latest` plus a versioned image tag, so users pull the
+same verified multi-architecture image instead of rebuilding stale source.
 
 ## Features
 

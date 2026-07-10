@@ -1490,7 +1490,7 @@ async def action_telegram_hourly_digest(owner: str, **kwargs) -> Tuple[str, bool
 
         from core.database import CalendarCal, CalendarEvent, Note, SessionLocal
         from routes.email_helpers import SCHEDULED_DB, _email_cache_owner_clause, _init_scheduled_db
-        from src.telegram_bot import load_telegram_config, send_telegram_message
+        from src.telegram_bot import load_telegram_config, send_telegram_message, telegram_chat_ids_for_owner
 
         config = load_telegram_config()
         if not config.enabled:
@@ -1498,9 +1498,7 @@ async def action_telegram_hourly_digest(owner: str, **kwargs) -> Tuple[str, bool
         if not config.bot_token:
             raise TaskNoop("telegram digest skipped: bot token is not configured")
 
-        chat_ids = list(config.allowed_chat_ids)
-        if config.allow_all_chats and config.session_map:
-            chat_ids = sorted(set(chat_ids) | set(config.session_map.keys()))
+        chat_ids = telegram_chat_ids_for_owner(config, owner)
         if not chat_ids:
             raise TaskNoop("telegram digest skipped: no Telegram chat target configured")
 

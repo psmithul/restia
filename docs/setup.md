@@ -4,7 +4,7 @@ This page keeps the detailed install, deployment, troubleshooting, and configura
 
 ## Quick Start
 
-> **Branch note:** `dev` is the default branch and contains the latest development changes, but it may be unstable. For the more stable curated branch, use [`main`](https://github.com/pewdiepie-archdaemon/odysseus/tree/main).
+> **Branch note:** `dev` is the default branch and contains the latest development changes, but it may be unstable. For the more stable curated branch, use [`main`](https://github.com/psmithul/restia/tree/main).
 
 Defaults work out of the box: clone, run, then configure models/search/email
 inside **Settings**. Only edit `.env` for deployment-level overrides like
@@ -20,10 +20,11 @@ pull request guidelines.
 
 ### Docker (recommended)
 ```bash
-git clone https://github.com/pewdiepie-archdaemon/odysseus.git
-cd odysseus
+git clone https://github.com/psmithul/restia.git
+cd restia
 cp .env.example .env       # optional, but recommended for explicit defaults
-docker compose up -d --build
+docker compose pull
+docker compose up -d --no-build
 ```
 To include optional extras in the image (PDF viewer, Office extraction; includes AGPL PyMuPDF), build with `docker compose build --build-arg INSTALL_OPTIONAL=true` before `up`.
 
@@ -32,14 +33,44 @@ binds the web UI to `127.0.0.1` by default. If the port is taken, set
 `APP_PORT=7001` in `.env` and recreate the container. Set `APP_BIND=0.0.0.0`
 only when you intentionally want LAN/reverse-proxy access.
 
+### Updating Docker installs
+
+Published GitHub Releases build the public multi-architecture image
+`ghcr.io/psmithul/restia:latest`. Update without replacing your local
+`data/` or `logs/` directories:
+
+```bash
+./update.sh
+```
+
+On Windows, run `update_windows.bat`. Developers who intentionally want to
+build the current checkout can still run `docker compose up -d --build`.
+
+### Telegram for multiple users
+
+Create a bot with Telegram's `@BotFather`, expose Restia through HTTPS, then
+register the bot token and webhook without printing the token:
+
+```bash
+docker compose exec -T odysseus python scripts/configure_telegram_runtime.py \
+  --public-url https://your-restia.example
+```
+
+The command reads the bot token from standard input. After the administrator
+configures the bot once, every account opens **Settings → Reminders →
+Telegram**, generates a one-time code, and sends `/link CODE` to the bot.
+Chats, conversations, digests, and reminders are routed only to that linked
+Restia account. Existing single-user `TELEGRAM_OWNER` configurations remain
+supported.
+
 > **On Apple Silicon (M-series) Macs:** Docker can't reach the Metal GPU, so
 > Cookbook serves local models on CPU only. For GPU-accelerated model serving,
 > run natively instead — see [Apple Silicon](#apple-silicon) below.
 
 ### Native Linux / macOS
 ```bash
-git clone https://github.com/pewdiepie-archdaemon/odysseus.git
-cd odysseus
+git clone https://github.com/psmithul/restia.git
+cd restia
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
@@ -56,8 +87,8 @@ Docker on macOS cannot use the Metal GPU. For GPU-accelerated Cookbook on an
 M-series Mac, run Restia natively:
 
 ```bash
-git clone https://github.com/pewdiepie-archdaemon/odysseus.git
-cd odysseus
+git clone https://github.com/psmithul/restia.git
+cd restia
 ./start-macos.sh
 ```
 
@@ -257,16 +288,16 @@ do not run on macOS. MLX-only models are not served by Restia.
 server; safe to re-run):
 
 ```powershell
-git clone https://github.com/pewdiepie-archdaemon/odysseus.git
-cd odysseus
+git clone https://github.com/psmithul/restia.git
+cd restia
 powershell -ExecutionPolicy Bypass -File .\launch-windows.ps1
 ```
 
 Or do it by hand:
 
 ```powershell
-git clone https://github.com/pewdiepie-archdaemon/odysseus.git
-cd odysseus
+git clone https://github.com/psmithul/restia.git
+cd restia
 py -3.11 -m venv venv
 venv\Scripts\Activate.ps1
 pip install -r requirements.txt

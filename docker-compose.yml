@@ -1,5 +1,8 @@
 services:
   odysseus:
+    # Normal installs pull the public GHCR image. Developers can still run
+    # `docker compose up -d --build` to build this checkout locally.
+    image: ${RESTIA_IMAGE:-ghcr.io/psmithul/restia:latest}
     build:
       context: .
       args:

@@ -979,42 +979,42 @@ _UPDATE_CACHE_TTL = 1800  # 30 minutes
 async def update_check():
     import httpx
     from core.constants import APP_VERSION, BUILD_COMMIT, UPDATE_REPO
+    from src.update_checker import build_update_result
 
     now = time.time()
     if _update_cache["result"] and (now - _update_cache["ts"]) < _UPDATE_CACHE_TTL:
         return _update_cache["result"]
 
-    if BUILD_COMMIT == "unknown" or not UPDATE_REPO:
+    if not UPDATE_REPO:
         return {"update_available": False, "current_commit": BUILD_COMMIT,
                 "current_version": APP_VERSION, "error": "no_commit_info"}
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            # Get the latest commit on the default branch
-            resp = await client.get(
+            release_resp = await client.get(
+                f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest",
+                headers={"Accept": "application/vnd.github.v3+json",
+                         "User-Agent": "Restia-Update-Check"},
+            )
+            release = release_resp.json() if release_resp.status_code == 200 else None
+            # Keep dev-channel source installs informed between releases.
+            commit_resp = await client.get(
                 f"https://api.github.com/repos/{UPDATE_REPO}/commits/dev",
                 headers={"Accept": "application/vnd.github.v3+json",
                          "User-Agent": "Restia-Update-Check"},
             )
-            if resp.status_code != 200:
+            if release is None and commit_resp.status_code != 200:
                 return {"update_available": False, "current_commit": BUILD_COMMIT,
                         "current_version": APP_VERSION, "error": "github_api_error"}
-            data = resp.json()
+            branch_commit = commit_resp.json() if commit_resp.status_code == 200 else None
 
-        remote_sha = data.get("sha", "")[:12]
-        remote_msg = (data.get("commit", {}).get("message", "") or "").split("\n")[0][:120]
-        remote_date = data.get("commit", {}).get("committer", {}).get("date", "")
-
-        has_update = remote_sha != BUILD_COMMIT[:12]
-        result = {
-            "update_available": has_update,
-            "current_version": APP_VERSION,
-            "current_commit": BUILD_COMMIT,
-            "latest_commit": remote_sha,
-            "latest_message": remote_msg,
-            "latest_date": remote_date,
-            "repo": UPDATE_REPO,
-        }
+        result = build_update_result(
+            repo=UPDATE_REPO,
+            current_version=APP_VERSION,
+            current_commit=BUILD_COMMIT,
+            release=release,
+            branch_commit=branch_commit,
+        )
         _update_cache["result"] = result
         _update_cache["ts"] = now
         return result

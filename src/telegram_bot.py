@@ -6,8 +6,11 @@ import logging
 import os
 import re
 import secrets
+import hashlib
+import threading
+import time
 from html import escape as _html_escape
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
 
 import httpx
@@ -41,6 +44,7 @@ class TelegramConfig:
     allow_all_chats: bool
     owner: Optional[str]
     session_map: dict[str, str]
+    chat_owners: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -90,6 +94,9 @@ def load_telegram_config() -> TelegramConfig:
     session_map = settings.get("telegram_session_map") or {}
     if not isinstance(session_map, dict):
         session_map = {}
+    chat_owners = settings.get("telegram_chat_owners") or {}
+    if not isinstance(chat_owners, dict):
+        chat_owners = {}
     return TelegramConfig(
         enabled=enabled,
         bot_token=bot_token,
@@ -98,6 +105,7 @@ def load_telegram_config() -> TelegramConfig:
         allow_all_chats=allow_all,
         owner=owner,
         session_map={str(k): str(v) for k, v in session_map.items() if str(k).strip() and str(v).strip()},
+        chat_owners={str(k): str(v).strip().lower() for k, v in chat_owners.items() if str(k).strip() and str(v).strip()},
     )
 
 
@@ -109,7 +117,129 @@ def verify_telegram_secret(config: TelegramConfig, provided_secret: Optional[str
 
 
 def is_chat_allowed(config: TelegramConfig, chat_id: str) -> bool:
-    return config.allow_all_chats or str(chat_id) in config.allowed_chat_ids
+    chat_key = str(chat_id)
+    return config.allow_all_chats or chat_key in config.allowed_chat_ids or chat_key in config.chat_owners
+
+
+def telegram_owner_for_chat(config: TelegramConfig, chat_id: str) -> Optional[str]:
+    """Return the local Restia account linked to a Telegram chat.
+
+    ``telegram_owner`` remains a backwards-compatible fallback for existing
+    single-user installations. New multi-user links always win.
+    """
+    return config.chat_owners.get(str(chat_id)) or config.owner
+
+
+def telegram_chat_ids_for_owner(config: TelegramConfig, owner: str) -> list[str]:
+    """Return only Telegram chats belonging to ``owner``.
+
+    Legacy single-owner installations keep their old allowlist/session-map
+    behavior. Once per-chat ownership exists, cross-user delivery is refused.
+    """
+    owner_key = str(owner or "").strip().lower()
+    linked = {chat_id for chat_id, linked_owner in config.chat_owners.items() if linked_owner == owner_key}
+    legacy = (set(config.allowed_chat_ids) | set(config.session_map.keys())) - set(config.chat_owners)
+    if config.owner and config.owner.strip().lower() == owner_key:
+        linked |= legacy
+    elif not config.chat_owners and not config.owner:
+        linked |= legacy
+    return sorted(linked)
+
+
+_TELEGRAM_LINK_TTL_SECONDS = 10 * 60
+_telegram_link_lock = threading.RLock()
+
+
+def _link_code_digest(code: str) -> str:
+    return hashlib.sha256(str(code or "").strip().upper().encode("utf-8")).hexdigest()
+
+
+def create_telegram_link_code(owner: str, *, ttl_seconds: int = _TELEGRAM_LINK_TTL_SECONDS) -> tuple[str, int]:
+    """Create a short-lived, one-time code that links a Telegram chat."""
+    owner_key = str(owner or "").strip().lower()
+    if not owner_key:
+        raise ValueError("A Restia user is required")
+    ttl = max(60, min(int(ttl_seconds), 3600))
+    now = int(time.time())
+    code = secrets.token_hex(4).upper()
+    with _telegram_link_lock:
+        settings = load_settings()
+        raw_codes = settings.get("telegram_link_codes") or {}
+        codes = raw_codes if isinstance(raw_codes, dict) else {}
+        codes = {
+            str(digest): record
+            for digest, record in codes.items()
+            if isinstance(record, dict) and int(record.get("expires_at") or 0) > now
+        }
+        # A user needs at most one active code. Reissuing invalidates the old one.
+        codes = {digest: record for digest, record in codes.items() if str(record.get("owner") or "").lower() != owner_key}
+        codes[_link_code_digest(code)] = {"owner": owner_key, "expires_at": now + ttl}
+        settings["telegram_link_codes"] = codes
+        save_settings(settings)
+    return code, now + ttl
+
+
+def consume_telegram_link_code(code: str, chat_id: str) -> Optional[str]:
+    """Consume a one-time link code and return the linked Restia username."""
+    digest = _link_code_digest(code)
+    chat_key = str(chat_id or "").strip()
+    if not chat_key or not str(code or "").strip():
+        return None
+    now = int(time.time())
+    with _telegram_link_lock:
+        settings = load_settings()
+        raw_codes = settings.get("telegram_link_codes") or {}
+        codes = raw_codes if isinstance(raw_codes, dict) else {}
+        record = codes.get(digest)
+        if not isinstance(record, dict) or int(record.get("expires_at") or 0) <= now:
+            return None
+        owner = str(record.get("owner") or "").strip().lower()
+        if not owner:
+            return None
+        codes.pop(digest, None)
+        codes = {
+            str(key): value
+            for key, value in codes.items()
+            if isinstance(value, dict) and int(value.get("expires_at") or 0) > now
+        }
+        chat_owners = settings.get("telegram_chat_owners") or {}
+        if not isinstance(chat_owners, dict):
+            chat_owners = {}
+        previous_owner = str(chat_owners.get(chat_key) or "").strip().lower()
+        chat_owners[chat_key] = owner
+        allowed = set(_chat_ids(settings.get("telegram_allowed_chat_ids")))
+        allowed.add(chat_key)
+        if previous_owner and previous_owner != owner:
+            session_map = settings.get("telegram_session_map") or {}
+            if isinstance(session_map, dict):
+                session_map.pop(chat_key, None)
+                settings["telegram_session_map"] = session_map
+        settings["telegram_link_codes"] = codes
+        settings["telegram_chat_owners"] = chat_owners
+        settings["telegram_allowed_chat_ids"] = sorted(allowed)
+        save_settings(settings)
+        return owner
+
+
+def unlink_telegram_owner(owner: str) -> int:
+    """Remove every Telegram chat linked to a local user."""
+    owner_key = str(owner or "").strip().lower()
+    if not owner_key:
+        return 0
+    with _telegram_link_lock:
+        settings = load_settings()
+        raw_owners = settings.get("telegram_chat_owners") or {}
+        chat_owners = raw_owners if isinstance(raw_owners, dict) else {}
+        removed = {chat_id for chat_id, linked_owner in chat_owners.items() if str(linked_owner).strip().lower() == owner_key}
+        if not removed:
+            return 0
+        settings["telegram_chat_owners"] = {chat_id: linked_owner for chat_id, linked_owner in chat_owners.items() if chat_id not in removed}
+        settings["telegram_allowed_chat_ids"] = sorted(set(_chat_ids(settings.get("telegram_allowed_chat_ids"))) - removed)
+        session_map = settings.get("telegram_session_map") or {}
+        if isinstance(session_map, dict):
+            settings["telegram_session_map"] = {chat_id: session_id for chat_id, session_id in session_map.items() if chat_id not in removed}
+        save_settings(settings)
+        return len(removed)
 
 
 def extract_telegram_message(update: dict[str, Any]) -> Optional[TelegramIncomingMessage]:
@@ -168,6 +298,8 @@ def telegram_status_payload(config: TelegramConfig) -> dict[str, Any]:
         "allow_all_chats": config.allow_all_chats,
         "owner": config.owner or "",
         "active_chats": len(config.session_map),
+        "linked_chats": len(config.chat_owners),
+        "linked_users": len(set(config.chat_owners.values())),
         "webhook_path": "/api/telegram/webhook",
     }
 
