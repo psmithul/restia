@@ -83,6 +83,8 @@ services:
       - RESTIA_HOME_SERVER=${RESTIA_HOME_SERVER-https://app.restia.dev}
       - LINK_HUB_ENABLED=${LINK_HUB_ENABLED:-false}
       - LINK_OWNER=${LINK_OWNER:-}
+      - LINK_MAX_PENDING=${LINK_MAX_PENDING:-25}
+      - LINK_MAX_GUESTS=${LINK_MAX_GUESTS:-500}
       # PUID / PGID — the user/group the container drops to before
       # running uvicorn (entrypoint also chowns /app/data + /app/logs
       # to match, so bind-mounted files stay editable from the host).

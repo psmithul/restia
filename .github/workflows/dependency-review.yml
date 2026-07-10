@@ -68,4 +68,8 @@ jobs:
         run: |
           set -euo pipefail
           pip install pip-audit==2.10.0
-          pip-audit -r requirements.txt -r requirements-optional.txt --strict
+          # Filter out git-sourced deps — pip-audit can't look them up on PyPI
+          # and --strict treats "not found" as a fatal error.
+          grep -v '^git+' requirements.txt > /tmp/req.txt || true
+          grep -v '^git+' requirements-optional.txt > /tmp/req-opt.txt || true
+          pip-audit -r /tmp/req.txt -r /tmp/req-opt.txt --strict

@@ -1,14 +1,18 @@
-"""Home Link routes: hub registration/auth, guest DMs landing in the owner's
-inbox, owner replies resolving '@remote' names, and the client-side proxy.
+"""Home Link routes: hub registration/approval/auth, guest DMs landing in the
+owner's inbox, owner replies resolving '@remote' names, and the client proxy.
 
 Pins the security guarantees of routes/link_routes.py:
   - Hub endpoints 404 unless LINK_HUB_ENABLED=true.
-  - Handles are validated, first-come-first-served, and may not shadow a
-    local account (either as 'handle' or 'handle@remote').
+  - Registration is approval-gated: a pending (or blocked) guest can't send
+    or read anything — both states answer with the same 'link_pending' 403.
+  - The register response never reveals the owner's username.
+  - Handles are validated, first-come-first-served, capped, and may not
+    shadow a local account or a reserved name.
   - Guest endpoints require the bearer token issued at registration.
+  - Admin guest management requires an admin session.
   - Local signups can never take an '@remote' name (impersonation guard).
-  - The client proxy surfaces 'link_not_connected' instead of 401 so the
-    front-end fetch wrapper never redirects to /login.
+  - The client proxy is scoped per local user, surfaces sentinels instead of
+    raw 401s, and sanitizes everything a (possibly hostile) hub returns.
 """
 import asyncio
 import itertools
@@ -44,6 +48,8 @@ _host_counter = itertools.count(1)
 
 
 class _FakeAuth:
+    is_configured = True
+
     def __init__(self, users):
         self._users = users
 
@@ -70,8 +76,11 @@ def _fresh(monkeypatch):
     monkeypatch.setattr(lr, "SessionLocal", _TS)
     monkeypatch.setattr(mr, "SessionLocal", _TS)
     monkeypatch.setenv("LINK_HUB_ENABLED", "true")
+    monkeypatch.setenv("AUTH_ENABLED", "true")
     monkeypatch.delenv("LINK_OWNER", raising=False)
     monkeypatch.delenv("RESTIA_HOME_SERVER", raising=False)
+    monkeypatch.delenv("LINK_MAX_PENDING", raising=False)
+    monkeypatch.delenv("LINK_MAX_GUESTS", raising=False)
     lr._reset_summary_cache()
     with _ENGINE.begin() as conn:
         conn.exec_driver_sql("DELETE FROM direct_messages")
@@ -102,21 +111,69 @@ def _register(handle="guest1"):
     return _run(reg(lr.RegisterRequest(handle=handle), _req()))
 
 
-# ── Hub: registration ───────────────────────────────────────────────────────
+def _admin_action(handle, action, username="mika"):
+    act = HUB[("POST", "/api/link/admin/guests/{handle}")]
+    return _run(act(handle, lr.GuestActionRequest(action=action), _req(username)))
 
-def test_register_returns_token_and_owner():
+
+def _register_approved(handle="guest1"):
+    out = _register(handle)
+    _admin_action(handle, "approve")
+    return out
+
+
+# ── Hub: registration + approval gate ───────────────────────────────────────
+
+def test_register_is_pending_and_reveals_no_owner():
     out = _register("visitor")
     assert out["ok"] is True
     assert out["guest"] == "visitor@remote"
-    assert out["owner"] == "mika"          # first admin
+    assert out["status"] == "pending"
     assert len(out["token"]) > 30
+    assert "owner" not in out
 
 
-def test_register_rejects_bad_handles():
+def test_pending_guest_cannot_do_anything():
+    token = _register("visitor")["token"]
+    with pytest.raises(HTTPException) as e:
+        _run(HUB[("POST", "/api/link/messages")](
+            lr.LinkSendRequest(body="let me in"), _req(bearer=token)))
+    assert (e.value.status_code, e.value.detail) == (403, "link_pending")
+    with pytest.raises(HTTPException) as e:
+        _run(HUB[("GET", "/api/link/messages")](_req(bearer=token), after_id=0))
+    assert (e.value.status_code, e.value.detail) == (403, "link_pending")
+    with pytest.raises(HTTPException) as e:
+        _run(HUB[("GET", "/api/link/summary")](_req(bearer=token)))
+    assert (e.value.status_code, e.value.detail) == (403, "link_pending")
+
+
+def test_blocked_guest_reads_identically_to_pending():
+    token = _register_approved("visitor")["token"]
+    _admin_action("visitor", "block")
+    with pytest.raises(HTTPException) as e:
+        _run(HUB[("POST", "/api/link/messages")](
+            lr.LinkSendRequest(body="hi"), _req(bearer=token)))
+    assert (e.value.status_code, e.value.detail) == (403, "link_pending")
+    # Blocked keeps the handle reserved.
+    with pytest.raises(HTTPException) as e:
+        _register("visitor")
+    assert e.value.status_code == 409
+
+
+def test_delete_frees_the_handle():
+    _register("visitor")
+    _admin_action("visitor", "delete")
+    assert _register("visitor")["status"] == "pending"
+
+
+def test_register_rejects_bad_and_reserved_handles():
     for bad in ("", "UPPER!", "has space", "-leading", "x" * 40):
         with pytest.raises(HTTPException) as e:
             _register(bad)
         assert e.value.status_code == 400
+    with pytest.raises(HTTPException) as e:
+        _register("api")           # RESERVED_USERNAMES
+    assert e.value.status_code == 409
 
 
 def test_register_handle_is_first_come_first_served():
@@ -132,6 +189,15 @@ def test_register_cannot_shadow_local_account():
     assert e.value.status_code == 409
 
 
+def test_pending_cap_blocks_registration_floods(monkeypatch):
+    monkeypatch.setenv("LINK_MAX_PENDING", "2")
+    _register("bot1")
+    _register("bot2")
+    with pytest.raises(HTTPException) as e:
+        _register("bot3")
+    assert e.value.status_code == 429
+
+
 def test_hub_disabled_is_a_404(monkeypatch):
     monkeypatch.setenv("LINK_HUB_ENABLED", "false")
     with pytest.raises(HTTPException) as e:
@@ -139,15 +205,43 @@ def test_hub_disabled_is_a_404(monkeypatch):
     assert e.value.status_code == 404
 
 
-def test_link_owner_env_override(monkeypatch):
-    monkeypatch.setenv("LINK_OWNER", "alice")
-    assert _register("visitor")["owner"] == "alice"
+# ── Hub: admin gating ───────────────────────────────────────────────────────
+
+def test_guest_admin_requires_admin():
+    _register("visitor")
+    with pytest.raises(HTTPException) as e:
+        _admin_action("visitor", "approve", username="alice")
+    assert e.value.status_code == 403
+    with pytest.raises(HTTPException) as e:
+        _run(HUB[("GET", "/api/link/admin/guests")](_req("alice")))
+    assert e.value.status_code == 403
+    guests = _run(HUB[("GET", "/api/link/admin/guests")](_req("mika")))["guests"]
+    assert guests[0]["handle"] == "visitor" and guests[0]["status"] == "pending"
 
 
-# ── Hub: messaging round-trip ───────────────────────────────────────────────
+def test_admin_action_validates_input():
+    _register("visitor")
+    with pytest.raises(HTTPException) as e:
+        _admin_action("visitor", "promote")
+    assert e.value.status_code == 400
+    with pytest.raises(HTTPException) as e:
+        _admin_action("nobody", "approve")
+    assert e.value.status_code == 404
+
+
+def test_pending_requests_surface_to_admin_conversation_list():
+    _register("visitor")
+    out = _run(MSG[("GET", "/api/messages/conversations")](_req("mika")))
+    assert [r["guest"] for r in out["link_requests"]] == ["visitor@remote"]
+    # Non-admins don't get the queue.
+    out = _run(MSG[("GET", "/api/messages/conversations")](_req("alice")))
+    assert "link_requests" not in out
+
+
+# ── Hub: messaging round-trip (approved) ────────────────────────────────────
 
 def test_guest_and_owner_roundtrip():
-    token = _register("visitor")["token"]
+    token = _register_approved("visitor")["token"]
     hub_send = HUB[("POST", "/api/link/messages")]
     hub_fetch = HUB[("GET", "/api/link/messages")]
     hub_summary = HUB[("GET", "/api/link/summary")]
@@ -176,15 +270,27 @@ def test_guest_and_owner_roundtrip():
     assert _run(hub_summary(_req(bearer=token)))["unread"] == 0
 
 
-def test_owner_cannot_message_unregistered_remote_name():
-    with pytest.raises(HTTPException) as e:
-        _run(MSG[("POST", "/api/messages/conversations/{other}")](
-            "ghost@remote", mr.SendMessageRequest(body="hi"), _req("mika")))
-    assert e.value.status_code == 404
+def test_owner_cannot_message_pending_or_unknown_remote_names():
+    _register("visitor")   # pending — no conversation may exist yet
+    for name in ("visitor@remote", "ghost@remote"):
+        with pytest.raises(HTTPException) as e:
+            _run(MSG[("POST", "/api/messages/conversations/{other}")](
+                name, mr.SendMessageRequest(body="hi"), _req("mika")))
+        assert e.value.status_code == 404
+
+
+def test_owner_can_still_read_blocked_guest_history():
+    token = _register_approved("visitor")["token"]
+    _run(HUB[("POST", "/api/link/messages")](
+        lr.LinkSendRequest(body="before the block"), _req(bearer=token)))
+    _admin_action("visitor", "block")
+    conv = _run(MSG[("GET", "/api/messages/conversations/{other}")](
+        "visitor@remote", _req("mika"), after_id=0))
+    assert [m["body"] for m in conv["messages"]] == ["before the block"]
 
 
 def test_guest_endpoints_require_valid_token():
-    _register("visitor")
+    _register_approved("visitor")
     for path, args in (
         (("GET", "/api/link/messages"), {"after_id": 0}),
         (("GET", "/api/link/summary"), {}),
@@ -199,7 +305,7 @@ def test_guest_endpoints_require_valid_token():
 
 
 def test_guest_message_body_is_validated():
-    token = _register("visitor")["token"]
+    token = _register_approved("visitor")["token"]
     send = HUB[("POST", "/api/link/messages")]
     with pytest.raises(HTTPException) as e:
         _run(send(lr.LinkSendRequest(body="  "), _req(bearer=token)))
@@ -220,13 +326,17 @@ def test_local_accounts_cannot_take_remote_names():
 # ── Client side (proxy) ─────────────────────────────────────────────────────
 
 def _fake_hub(monkeypatch, responses):
-    """Replace the HTTP seam with canned responses keyed by (method, path)."""
+    """Replace the HTTP seam with canned responses keyed by (method, path).
+    A value that is an Exception is raised instead."""
     calls = []
 
     async def fake(method, path, *, token=None, json_body=None, params=None):
         calls.append({"method": method, "path": path, "token": token,
                       "json": json_body, "params": params})
-        return responses[(method, path)]
+        r = responses[(method, path)]
+        if isinstance(r, Exception):
+            raise r
+        return r
 
     monkeypatch.setattr(lr, "_hub_call", fake)
     return calls
@@ -241,59 +351,108 @@ def test_home_contact_requires_connect_first(monkeypatch):
     assert e.value.detail == lr.NOT_CONNECTED
 
 
-def test_connect_stores_link_and_proxy_flows(monkeypatch):
+def test_home_link_is_scoped_per_local_user(monkeypatch):
+    monkeypatch.setenv("RESTIA_HOME_SERVER", "https://hub.example")
+    _fake_hub(monkeypatch, {
+        ("POST", "/api/link/register"): {
+            "ok": True, "handle": "alice", "status": "pending", "token": "tok-alice-123456789012"},
+    })
+    _run(HL[("POST", "/api/homelink/connect")](
+        lr.ConnectRequest(handle="alice"), _req("alice")))
+    # Alice is connected; another local account is not, and can't ride along.
+    assert _run(HL[("GET", "/api/homelink/status")](_req("alice")))["connected"] is True
+    assert _run(HL[("GET", "/api/homelink/status")](_req("mika")))["connected"] is False
+    with pytest.raises(HTTPException) as e:
+        _run(MSG[("GET", "/api/messages/conversations/{other}")](
+            "hub.example", _req("mika"), after_id=0))
+    assert e.value.detail == lr.NOT_CONNECTED
+
+
+def test_pending_sentinel_reaches_the_local_ui(monkeypatch):
+    monkeypatch.setenv("RESTIA_HOME_SERVER", "https://hub.example")
+    _fake_hub(monkeypatch, {
+        ("POST", "/api/link/register"): {
+            "ok": True, "handle": "alice", "status": "pending", "token": "tok-alice-123456789012"},
+        ("GET", "/api/link/messages"): HTTPException(403, lr.PENDING),
+    })
+    out = _run(HL[("POST", "/api/homelink/connect")](
+        lr.ConnectRequest(handle="alice"), _req("alice")))
+    assert out["status"] == "pending"
+    with pytest.raises(HTTPException) as e:
+        _run(MSG[("GET", "/api/messages/conversations/{other}")](
+            "hub.example", _req("alice"), after_id=0))
+    assert (e.value.status_code, e.value.detail) == (403, lr.PENDING)
+
+
+def test_connect_rejects_malformed_hub_token(monkeypatch):
+    monkeypatch.setenv("RESTIA_HOME_SERVER", "https://hub.example")
+    _fake_hub(monkeypatch, {
+        ("POST", "/api/link/register"): {"ok": True, "handle": "alice", "token": {"evil": 1}},
+    })
+    with pytest.raises(HTTPException) as e:
+        _run(HL[("POST", "/api/homelink/connect")](
+            lr.ConnectRequest(handle="alice"), _req("alice")))
+    assert e.value.status_code == 502
+
+
+def test_proxy_flows_and_hostile_hub_sanitization(monkeypatch):
     monkeypatch.setenv("RESTIA_HOME_SERVER", "https://hub.example")
     calls = _fake_hub(monkeypatch, {
         ("POST", "/api/link/register"): {
-            "ok": True, "handle": "alice", "owner": "mika", "token": "tok123"},
+            "ok": True, "handle": "alice", "status": "pending", "token": "tok123456789012345678"},
         ("GET", "/api/link/messages"): {
-            "messages": [{"id": 1, "body": "hi", "mine": True,
-                          "created_at": None, "read": False}],
+            "messages": [
+                {"id": 1, "body": "hi", "mine": True, "created_at": None, "read": False},
+                {"id": "NaN", "body": "x" * 20000, "mine": "yes", "created_at": 12345, "read": 1},
+                {"body": {"nested": "junk"}},          # dropped: non-string body
+                "not-a-dict",                           # dropped
+            ],
             "owner": "mika", "me": "alice@remote"},
         ("POST", "/api/link/messages"): {
-            "message": {"id": 2, "body": "yo", "mine": True,
-                        "created_at": None, "read": False}},
+            "message": {"id": 2, "body": "yo", "mine": True, "created_at": None, "read": False}},
         ("GET", "/api/link/summary"): {
-            "owner": "mika", "unread": 3, "last_body": "yo",
+            "owner": "mika", "unread": "7", "last_body": "yo",
             "last_at": "2026-07-10T00:00:00Z", "last_mine": True},
     })
 
-    out = _run(HL[("POST", "/api/homelink/connect")](
+    _run(HL[("POST", "/api/homelink/connect")](
         lr.ConnectRequest(handle="alice"), _req("alice")))
-    assert out["ok"] is True and out["owner"] == "mika"
-
-    st = _run(HL[("GET", "/api/homelink/status")](_req("alice")))
-    assert st["connected"] is True and st["handle"] == "alice"
-    assert st["contact"] == "hub.example"
 
     conv = _run(MSG[("GET", "/api/messages/conversations/{other}")](
         "hub.example", _req("alice"), after_id=0))
     assert conv["other"]["home"] is True
-    assert conv["messages"][0]["body"] == "hi"
+    bodies = [m["body"] for m in conv["messages"]]
+    assert bodies[0] == "hi"
+    assert len(bodies) == 2                       # junk entries dropped
+    assert len(bodies[1]) == lr.MAX_BODY_LEN      # oversize body truncated
+    assert conv["messages"][1]["created_at"] is None   # non-string timestamp dropped
 
     sent = _run(MSG[("POST", "/api/messages/conversations/{other}")](
         "hub.example", mr.SendMessageRequest(body="yo"), _req("alice")))
     assert sent["message"]["body"] == "yo"
 
     # The stored token authenticates every proxied call after connect.
-    assert all(c["token"] == "tok123" for c in calls[1:])
+    assert all(c["token"] == "tok123456789012345678" for c in calls[1:])
 
-    # Home conversation is merged into the list + unread endpoints.
+    # Home conversation is merged into the list + unread endpoints, with the
+    # hub's stringly-typed unread coerced to an int.
     convos = _run(MSG[("GET", "/api/messages/conversations")](_req("alice")))["conversations"]
     home = [c for c in convos if c.get("home")]
-    assert home and home[0]["username"] == "hub.example" and home[0]["unread"] == 3
+    assert home and home[0]["username"] == "hub.example" and home[0]["unread"] == 7
 
     unread = _run(MSG[("GET", "/api/messages/unread")](_req("alice")))
-    assert unread["by_user"].get("hub.example") == 3
+    assert unread["by_user"].get("hub.example") == 7
 
 
-def test_users_picker_includes_home_contact_and_guests(monkeypatch):
+def test_users_picker_includes_home_contact_and_approved_guests_only(monkeypatch):
     monkeypatch.setenv("RESTIA_HOME_SERVER", "https://hub.example")
-    _register("visitor")
+    _register_approved("friend")
+    _register("stranger")   # pending — must not appear
     users = _run(MSG[("GET", "/api/messages/users")](_req("mika")))["users"]
     by_name = {u["username"]: u for u in users}
     assert by_name["hub.example"]["home"] is True
-    assert by_name["visitor@remote"]["remote"] is True
+    assert by_name["friend@remote"]["remote"] is True
+    assert "stranger@remote" not in by_name
     assert "alice" in by_name
 
 
@@ -301,7 +460,7 @@ def test_disconnect_forgets_link(monkeypatch):
     monkeypatch.setenv("RESTIA_HOME_SERVER", "https://hub.example")
     _fake_hub(monkeypatch, {
         ("POST", "/api/link/register"): {
-            "ok": True, "handle": "alice", "owner": "mika", "token": "tok123"},
+            "ok": True, "handle": "alice", "status": "pending", "token": "tok123456789012345678"},
     })
     _run(HL[("POST", "/api/homelink/connect")](
         lr.ConnectRequest(handle="alice"), _req("alice")))

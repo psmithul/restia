@@ -574,12 +574,19 @@ class LinkGuest(Base):
     """A Home Link guest — someone running their own instance who registered
     with this hub to DM its owner (routes/link_routes.py). Only the SHA-256 of
     the guest's bearer token is stored; the plaintext token lives on the
-    guest's instance. Guests appear in direct_messages as '<handle>@remote'."""
+    guest's instance. Guests appear in direct_messages as '<handle>@remote'.
+
+    A guest is never a user account: no login, no privileges, no data access —
+    the token only unlocks the one guest↔owner conversation, and only once the
+    owner has approved the request (status 'approved'). New registrations
+    start 'pending' and can't send or read anything; 'blocked' keeps the
+    handle reserved so a spammer can't re-register it."""
     __tablename__ = "link_guests"
 
     id         = Column(Integer, primary_key=True, autoincrement=True)
     handle     = Column(String, nullable=False, unique=True, index=True)
     token_hash = Column(String, nullable=False, unique=True, index=True)
+    status     = Column(String, nullable=False, default="pending", index=True)
     created_at = Column(DateTime, default=utcnow_naive, nullable=False)
     last_seen  = Column(DateTime, nullable=True)
 
@@ -587,10 +594,13 @@ class LinkGuest(Base):
 class HomeLink(Base):
     """This instance's registration with its home server — the credential
     behind the 'chat with the developer' contact (routes/link_routes.py).
-    Single row (id=1); the bearer token is encrypted at rest like DM bodies."""
+    One row per local account (local_user), so users of a shared instance
+    can't read or write each other's conversation with the developer. The
+    bearer token is encrypted at rest like DM bodies."""
     __tablename__ = "home_link"
 
-    id         = Column(Integer, primary_key=True)              # always 1
+    id         = Column(Integer, primary_key=True, autoincrement=True)
+    local_user = Column(String, nullable=False, default="", unique=True, index=True)
     home_url   = Column(String, nullable=False)
     handle     = Column(String, nullable=False)
     owner      = Column(String, nullable=True)                  # hub owner's username
@@ -759,6 +769,35 @@ class Memory(Base):
         Index('ix_memories_lookup', 'category', 'timestamp'),  # Composite for category-based queries
         Index('ix_memories_session', 'session_id', 'timestamp'),  # Composite for session-based queries
     )
+
+def _migrate_add_link_columns():
+    """Add the Home Link approval/scoping columns for databases created by
+    the short-lived first cut of the feature (link_guests without `status`,
+    home_link without `local_user`). Idempotent; new installs get the full
+    schema from create_all. Pre-existing guests are left 'pending' so nobody
+    silently gains access when the operator upgrades into the approval gate."""
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cols = [row[1] for row in conn.execute("PRAGMA table_info(link_guests)").fetchall()]
+        if cols and "status" not in cols:
+            conn.execute("ALTER TABLE link_guests ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'")
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_link_guests_status ON link_guests(status)")
+        cols = [row[1] for row in conn.execute("PRAGMA table_info(home_link)").fetchall()]
+        if cols and "local_user" not in cols:
+            conn.execute("ALTER TABLE home_link ADD COLUMN local_user TEXT NOT NULL DEFAULT ''")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ix_home_link_local_user ON home_link(local_user)")
+        conn.commit()
+    except Exception as e:
+        logging.getLogger(__name__).warning("Home Link column migration failed: %s", e)
+    finally:
+        if conn:
+            conn.close()
+
 
 def _migrate_add_last_message_at_column():
     """Add last_message_at to sessions + backfill from the latest message
@@ -1886,6 +1925,7 @@ def init_db():
     _migrate_add_owner_column()
     _migrate_add_document_archived_column()
     _migrate_add_last_message_at_column()
+    _migrate_add_link_columns()
     _migrate_add_folder_column()
     _migrate_add_token_columns()
     _migrate_add_mode_column()

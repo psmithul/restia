@@ -127,7 +127,7 @@ def setup_messaging_routes():
                 "username": link_routes.home_contact_name(),
                 "is_admin": False,
                 "home": True,
-                "connected": link_routes.home_connected(),
+                "connected": link_routes.home_connected(me),
             })
         return {"users": out, "me": me}
 
@@ -166,7 +166,7 @@ def setup_messaging_routes():
                 c["last_at"] = (m.created_at.isoformat() + "Z") if m.created_at else None
                 if m.recipient == me and m.read_at is None:
                     c["unread"] += 1
-            home = await link_routes.home_conversation_entry()
+            home = await link_routes.home_conversation_entry(me)
             if home:
                 convos[home["username"]] = home
             ordered = sorted(
@@ -174,7 +174,12 @@ def setup_messaging_routes():
                 key=lambda c: c["last_at"] or "",
                 reverse=True,
             )
-            return {"conversations": ordered, "me": me}
+            out = {"conversations": ordered, "me": me}
+            # Hub admins also get the queue of pending Home Link requests so
+            # they can approve/block right from the Messages UI.
+            if link_routes.hub_enabled() and _is_admin(request, me):
+                out["link_requests"] = link_routes.pending_requests()
+            return out
         finally:
             db.close()
 
@@ -192,7 +197,7 @@ def setup_messaging_routes():
             by_user: dict = {}
             for (sender,) in rows:
                 by_user[sender] = by_user.get(sender, 0) + 1
-            home_unread = await link_routes.home_unread()
+            home_unread = await link_routes.home_unread(me)
             if home_unread:
                 by_user[link_routes.home_contact_name()] = home_unread
             return {"total": sum(by_user.values()), "by_user": by_user}
@@ -255,7 +260,7 @@ def setup_messaging_routes():
         if len(body) > MAX_BODY_LEN:
             raise HTTPException(400, f"Message too long (max {MAX_BODY_LEN} characters)")
         if link_routes.is_home_contact(other):
-            return await link_routes.home_send_message(body)
+            return await link_routes.home_send_message(me, body)
         other_key = _resolve_other(request, other)
         if other_key == me:
             raise HTTPException(400, "Cannot send a message to yourself")

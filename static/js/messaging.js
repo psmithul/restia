@@ -28,6 +28,8 @@ let _listPollTimer = null;
 let _badgePollTimer = null;
 let _escHandler = null;
 let _conversations = [];           // cached list for re-render
+let _linkRequests = [];            // pending Home Link requests (hub admins)
+let _pendingCheckTimer = null;     // re-poll while the "waiting" card is up
 let _sending = false;
 
 const THREAD_POLL_MS = 3000;
@@ -127,17 +129,48 @@ async function _loadConversations() {
   const data = await _api('/api/messages/conversations');
   _me = data.me;
   _conversations = data.conversations || [];
+  _linkRequests = data.link_requests || [];
   _renderConversationList();
+}
+
+// Approve / block a pending Home Link request (hub admins only — the
+// endpoint itself re-checks admin server-side).
+async function _actOnLinkRequest(handle, action) {
+  try {
+    await _api(`/api/link/admin/guests/${encodeURIComponent(handle)}`, {
+      method: 'POST',
+      body: JSON.stringify({ action }),
+    });
+  } catch (e) {
+    uiModule.showError && uiModule.showError(`Could not ${action} ${handle}: ${e.message}`);
+  }
+  _loadConversations().catch(() => {});
+}
+
+function _linkRequestsHtml() {
+  if (!_linkRequests.length) return '';
+  const rows = _linkRequests.map(r => `
+    <div class="msg-link-req" data-handle="${esc(r.handle)}">
+      ${_avatarHtml(r.guest, '')}
+      <div class="msg-link-req-mid">
+        <span class="msg-link-req-name">${esc(r.guest)}</span>
+        <span class="msg-link-req-hint">wants to chat</span>
+      </div>
+      <button type="button" class="msg-req-btn msg-req-approve" title="Approve">✓</button>
+      <button type="button" class="msg-req-btn msg-req-block" title="Block">✕</button>
+    </div>`).join('');
+  return `<div class="msg-link-reqs"><div class="msg-link-reqs-title">Chat requests</div>${rows}</div>`;
 }
 
 function _renderConversationList() {
   const list = document.getElementById('msg-convo-list');
   if (!list) return;
-  if (!_conversations.length) {
+  const reqs = _linkRequestsHtml();
+  if (!_conversations.length && !reqs) {
     list.innerHTML = `<div class="msg-empty-list">No conversations yet.<br><span>Start one with the ✎ button.</span></div>`;
     return;
   }
-  list.innerHTML = _conversations.map(c => {
+  list.innerHTML = reqs + _conversations.map(c => {
     const active = c.username === _activeOther ? ' active' : '';
     const unread = c.unread > 0
       ? `<span class="msg-convo-unread">${c.unread > 99 ? '99+' : c.unread}</span>` : '';
@@ -161,6 +194,11 @@ function _renderConversationList() {
     el.addEventListener('click', open);
     el.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
   });
+  list.querySelectorAll('.msg-link-req').forEach(el => {
+    const handle = el.dataset.handle;
+    el.querySelector('.msg-req-approve')?.addEventListener('click', () => _actOnLinkRequest(handle, 'approve'));
+    el.querySelector('.msg-req-block')?.addEventListener('click', () => _actOnLinkRequest(handle, 'block'));
+  });
 }
 
 // ── Active thread ───────────────────────────────────────────────────────────
@@ -169,6 +207,7 @@ export async function openConversation(other) {
   if (!other) return;
   _activeOther = other;
   _lastMsgId = 0;
+  _stopPendingCheck();
   const modal = document.getElementById('messages-modal');
   if (modal) modal.classList.add('msg-thread-view'); // mobile: show thread pane
   _renderThreadHeader(other);
@@ -189,6 +228,10 @@ export async function openConversation(other) {
   } catch (e) {
     if (e.status === 409 && e.message === 'link_not_connected') {
       _renderConnectCard(other);
+      return;
+    }
+    if (e.status === 403 && e.message === 'link_pending') {
+      _renderPendingCard(other);
       return;
     }
     if (body) body.innerHTML = `<div class="msg-thread-loading">${esc(e.message)}</div>`;
@@ -215,6 +258,7 @@ function _renderThreadHeader(other, meta) {
 function _closeThread() {
   _activeOther = null;
   _stopThreadPolling();
+  _stopPendingCheck();
   const modal = document.getElementById('messages-modal');
   if (modal) modal.classList.remove('msg-thread-view');
   _renderConversationList();
@@ -301,6 +345,35 @@ function _renderConnectCard(other, errText) {
   btn.addEventListener('click', go);
   input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); go(); } });
   setTimeout(() => input.focus(), 50);
+}
+
+// Registered but not yet approved by the hub owner. Re-checks quietly every
+// few seconds so the thread comes alive the moment the owner approves.
+function _renderPendingCard(other) {
+  const body = document.getElementById('msg-thread-body');
+  if (!body) return;
+  body.innerHTML = `
+    <div class="msg-connect-card">
+      <div class="msg-connect-icon">⏳</div>
+      <h4>Waiting for approval</h4>
+      <p>Your request to chat with <strong>${esc(other)}</strong> has been sent.
+         The conversation will open automatically once the developer accepts.</p>
+    </div>`;
+  _stopPendingCheck();
+  _pendingCheckTimer = setInterval(async () => {
+    if (!_open || _activeOther !== other) { _stopPendingCheck(); return; }
+    try {
+      // Silent probe — only rebuild the thread once we're approved, so the
+      // waiting card doesn't flicker through a loading state every tick.
+      await _api(`/api/messages/conversations/${encodeURIComponent(other)}?after_id=0`);
+      _stopPendingCheck();
+      openConversation(other);
+    } catch (_) { /* still pending / offline — keep waiting */ }
+  }, 8000);
+}
+
+function _stopPendingCheck() {
+  if (_pendingCheckTimer) { clearInterval(_pendingCheckTimer); _pendingCheckTimer = null; }
 }
 
 async function _pollThread() {
@@ -501,6 +574,7 @@ export function close() {
   if (!_open) return;
   _open = false;
   _stopThreadPolling();
+  _stopPendingCheck();
   if (_listPollTimer) { clearInterval(_listPollTimer); _listPollTimer = null; }
   _activeOther = null;
   if (_escHandler) { document.removeEventListener('keydown', _escHandler); _escHandler = null; }

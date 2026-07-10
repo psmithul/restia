@@ -53,17 +53,20 @@ Native installs, GPU notes, Windows/macOS instructions, HTTPS, and configuration
 
 Every Restia install ships with **Home Link**: once you've built the app and
 logged in, open **Messages** (the sidebar icon) → **✎ New message** → pick the
-contact tagged `dev`. Choose a handle the first time, then chat with the
-developer directly from your own instance — replies land back in the same
-thread. No account on any other server is needed; your instance registers
-itself with the home server (`app.restia.dev`) and stores its token locally,
-encrypted.
+contact tagged `dev`. Choose a handle, send the request, and once the
+developer approves it the thread opens — chat directly from your own
+instance, with replies landing back in the same thread. You never get (or
+need) an account on the developer's server: your instance registers with the
+home server (`app.restia.dev`), stores its token locally encrypted, and that
+token unlocks exactly one conversation — nothing else.
 
 Privacy notes: nothing is sent anywhere until you pick a handle and hit
 Connect, and only the messages you type in that one thread leave your
-instance. Set `RESTIA_HOME_SERVER=` (empty) in `.env` to remove the contact
-entirely, or point it at a friend's instance that has `LINK_HUB_ENABLED=true`
-to chat with them instead.
+instance — your accounts, keys, and data stay on your device. Set
+`RESTIA_HOME_SERVER=` (empty) in `.env` to remove the contact entirely, or
+point it at a friend's instance that has `LINK_HUB_ENABLED=true` to chat with
+them instead; as a hub you approve or block each request from the Messages
+UI.
 
 ## Demo
 

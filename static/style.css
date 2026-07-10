@@ -41107,6 +41107,50 @@ body.theme-frosted .modal {
   color: var(--red, #e5484d);
 }
 
+/* Pending Home Link chat requests (hub admins) */
+.msg-link-reqs {
+  border-bottom: 1px solid var(--border);
+  padding: 6px 0;
+}
+.msg-link-reqs-title {
+  font-size: 0.68rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  opacity: 0.55;
+  padding: 4px 14px;
+}
+.msg-link-req {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 14px;
+}
+.msg-link-req-mid { flex: 1; min-width: 0; }
+.msg-link-req-name {
+  display: block;
+  font-weight: 600;
+  font-size: 0.86rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.msg-link-req-hint { font-size: 0.72rem; opacity: 0.55; }
+.msg-req-btn {
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: transparent;
+  color: inherit;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+.msg-req-approve { color: var(--green); border-color: color-mix(in srgb, var(--green) 55%, transparent); }
+.msg-req-block { color: var(--red, #e5484d); border-color: color-mix(in srgb, var(--red, #e5484d) 45%, transparent); }
+.msg-req-btn:hover { background: color-mix(in srgb, var(--fg) 8%, transparent); }
+
 /* ── Sidebar/rail unread badge ── */
 .msg-nav-badge {
   margin-left: auto;
