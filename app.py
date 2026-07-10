@@ -271,6 +271,7 @@ if AUTH_ENABLED:
         "/api/version",
         "/api/update-check",
         "/login",
+        "/setup",
     }
     AUTH_EXEMPT_PREFIXES = ["/static"]
     # Dynamic paths whose own handler proves identity via a path-embedded
@@ -956,6 +957,7 @@ async def serve_backgrounds(request: Request):
     return serve_html_with_nonce(request, abs_join(BASE_DIR, "static/backgrounds.html"))
 
 @app.get("/login")
+@app.get("/setup")
 async def serve_login(request: Request):
     if not AUTH_ENABLED:
         return RedirectResponse(url="/", status_code=302)
