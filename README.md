@@ -52,7 +52,7 @@ same verified multi-architecture image instead of rebuilding stale source.
 - **Deep Research** — multi-step web research with source reading and report generation.
 - **Compare** — blind side-by-side model testing and synthesis.
 - **Documents** — writing-first editor with AI edits, suggestions, Markdown, HTML, CSV, and syntax highlighting.
-- **Messages** — WhatsApp-style direct messages between accounts with real-time delivery (SSE), typing indicators, read receipts, emoji reactions, replies, and message editing/deletion — plus Home Link developer chat and Telegram.
+- **Messages** — WhatsApp-style direct messages with real-time delivery (SSE), typing indicators, read receipts, emoji reactions, replies, and editing/deletion; optional **end-to-end encryption** (per-account keys, the server stores only ciphertext); **voice/video calls** (WebRTC, peer-to-peer); **Moments** (BeReal-style status photos shared with your contacts); cross-instance chat via **invite codes**; plus Home Link developer chat and Telegram.
 - **Email** — IMAP/SMTP inbox with triage, tags, summaries, reminders, and reply drafts.
 - **Notes, Tasks + Calendar** — reminders, todos, scheduled agent tasks, and CalDAV sync.
 - **Extras** — gallery/image editor, themes, uploads, web search, presets, sessions, update checker, and 2FA.
@@ -75,6 +75,18 @@ instance — your accounts, keys, and data stay on your device. Set
 point it at a friend's instance that has `LINK_HUB_ENABLED=true` to chat with
 them instead; as a hub you approve or block each request from the Messages
 UI.
+
+**Invite codes.** As a hub you can also hand someone an invite code
+(Messages → chat requests) instead of approving them by hand: they enter it
+with their handle when connecting and are approved on the spot, then can
+message anyone on your instance who hasn't opted out of remote contact. Codes
+expire, are use-capped, and are revocable, so a leaked code has a bounded
+blast radius.
+
+**Calls.** Voice and video calls are peer-to-peer (WebRTC). Because most home
+networks need a relay to connect, calling turns on once you configure a TURN
+server — set `TURN_URL` (and `TURN_USERNAME` / `TURN_CREDENTIAL`) in `.env`.
+The server only relays signaling; it never sees your audio or video.
 
 ## Demo
 
