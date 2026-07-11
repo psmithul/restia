@@ -55,6 +55,7 @@ same verified multi-architecture image instead of rebuilding stale source.
 - **Messages** — WhatsApp-style direct messages with real-time delivery (SSE), typing indicators, read receipts, emoji reactions, replies, and editing/deletion; optional **end-to-end encryption** (per-account keys, the server stores only ciphertext); **voice/video calls** (WebRTC, peer-to-peer); **Moments** (BeReal-style status photos shared with your contacts); cross-instance chat via **invite codes**; plus Home Link developer chat and Telegram.
 - **Email** — IMAP/SMTP inbox with triage, tags, summaries, reminders, and reply drafts.
 - **Notes, Tasks + Calendar** — reminders, todos, scheduled agent tasks, and CalDAV sync.
+- **Command palette** — a keyboard-first launcher (⌘K / Ctrl+K): fuzzy-jump to any tool, jump straight to a conversation, or Quick Capture a note/todo without leaving what you're doing.
 - **Extras** — gallery/image editor, themes, uploads, web search, presets, sessions, update checker, and 2FA.
 
 ## Chat with the developer
