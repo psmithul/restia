@@ -101,6 +101,16 @@ services:
       # Find yours with:  id -u  /  id -g
       - PUID=${PUID:-1000}
       - PGID=${PGID:-1000}
+      # WebRTC calling. Media is peer-to-peer; the app only relays signaling.
+      # STUN is enough on the same LAN / with public IPs; a TURN relay is
+      # required to connect across most home routers, so calling only turns on
+      # once TURN_URL is set (e.g. a coturn server):
+      #   TURN_URL=turn:turn.example.com:3478
+      #   TURN_USERNAME=... / TURN_CREDENTIAL=...
+      - STUN_URL=${STUN_URL:-stun:stun.l.google.com:19302}
+      - TURN_URL=${TURN_URL:-}
+      - TURN_USERNAME=${TURN_USERNAME:-}
+      - TURN_CREDENTIAL=${TURN_CREDENTIAL:-}
     depends_on:
       searxng:
         condition: service_healthy

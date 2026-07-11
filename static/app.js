@@ -22,6 +22,7 @@ import memoryModule from './js/memory.js';
 import voiceRecorderModule from './js/voiceRecorder.js';
 import voiceModeModule from './js/voiceMode.js';
 import messagingModule from './js/messaging.js';
+import callModule from './js/call.js';
 import censorModule from './js/censor.js';
 import galleryModule from './js/gallery.js';
 import tasksModule from './js/tasks.js?v=20260630tasksactivity';
@@ -4293,6 +4294,7 @@ function startRestiaApp() {
   voiceRecorderModule.init();
   voiceModeModule.init();
   if (messagingModule) messagingModule.init();
+  if (callModule) { try { callModule.init(); } catch (e) { console.warn('call init failed', e); } }
   if (censorModule) censorModule.init();
 
   // Auto-focus message input on load

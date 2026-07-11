@@ -783,6 +783,10 @@ app.include_router(setup_e2ee_routes())
 from routes.status_routes import setup_status_routes
 app.include_router(setup_status_routes())
 
+# WebRTC calling (signaling relay only; media is peer-to-peer)
+from routes.call_routes import setup_call_routes
+app.include_router(setup_call_routes())
+
 # Gallery (image library)
 from routes.gallery.gallery_routes import setup_gallery_routes
 app.include_router(setup_gallery_routes())

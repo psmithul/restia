@@ -26,6 +26,7 @@ import { bindMenuDismiss } from './escMenuStack.js';
 import { topPortalZ } from './toolWindowZOrder.js';
 import { _escLinkify } from './emailLibrary/utils.js';
 import e2ee from './e2ee.js';
+import callModule from './call.js';
 
 const API = '';
 const esc = uiModule.esc;
@@ -588,11 +589,29 @@ function _renderThreadHeader(other, meta) {
     <div class="msg-thread-who">
       <span class="msg-thread-name">${esc(other)}${meta && meta.home ? ' <span class="msg-admin-tag msg-dev-tag">dev</span>' : (meta && meta.is_admin ? ' <span class="msg-admin-tag">admin</span>' : '')}</span>
     </div>
+    ${_callBtnsHtml(meta)}
     ${_lockBtnHtml(meta)}`;
   const back = document.getElementById('msg-back-btn');
   if (back) back.addEventListener('click', _closeThread);
   const lb = document.getElementById('msg-lock-btn');
   if (lb) lb.addEventListener('click', () => { _e2eeEnsure(); });
+  document.getElementById('msg-call-voice')?.addEventListener('click', () => callModule.startCall(other, false));
+  document.getElementById('msg-call-video')?.addEventListener('click', () => callModule.startCall(other, true));
+}
+
+// Voice/video call buttons — local threads only (calling shares the local
+// signaling bus; federated calling is a later step). Hidden unless the
+// instance has calling configured (a TURN server).
+function _callBtnsHtml(meta) {
+  const eligible = meta && !meta.home && !meta.remote && callModule.isEnabled && callModule.isEnabled();
+  if (!eligible) return '';
+  return `
+    <button type="button" class="msg-call-btn" id="msg-call-voice" title="Voice call" aria-label="Voice call">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.9.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
+    </button>
+    <button type="button" class="msg-call-btn" id="msg-call-video" title="Video call" aria-label="Video call">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
+    </button>`;
 }
 
 // Header encryption control. Only local threads are E2EE-eligible for now.

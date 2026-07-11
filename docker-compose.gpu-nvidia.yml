@@ -79,6 +79,10 @@ services:
     - LINK_MAX_GUESTS=${LINK_MAX_GUESTS:-500}
     - PUID=${PUID:-1000}
     - PGID=${PGID:-1000}
+    - STUN_URL=${STUN_URL:-stun:stun.l.google.com:19302}
+    - TURN_URL=${TURN_URL:-}
+    - TURN_USERNAME=${TURN_USERNAME:-}
+    - TURN_CREDENTIAL=${TURN_CREDENTIAL:-}
     - NVIDIA_VISIBLE_DEVICES=all
     - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     depends_on:

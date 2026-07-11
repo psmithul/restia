@@ -41161,6 +41161,73 @@ body.theme-frosted .modal {
 .msg-sv-prev { left: 6px; }
 .msg-sv-next { right: 6px; }
 
+/* ── Calling ── */
+.msg-call-btn {
+  background: none; border: none; cursor: pointer; color: inherit;
+  padding: 6px; border-radius: 8px; opacity: 0.75;
+  display: inline-flex; align-items: center;
+  transition: opacity 0.15s ease, background 0.15s ease;
+}
+.msg-call-btn:hover { opacity: 1; background: var(--hover-bg, rgba(127,127,127,0.14)); }
+
+.call-incoming {
+  position: fixed; inset: 0;   /* z-index set from JS via topPortalZ() */
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(0,0,0,0.55);
+}
+.call-incoming-card {
+  background: var(--modal-bg, #16181c);
+  border-radius: 16px; padding: 28px 32px; text-align: center;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.5); min-width: 260px;
+}
+.call-incoming-icon { font-size: 2.4rem; }
+.call-incoming-name { font-size: 1.3rem; font-weight: 600; margin-top: 8px; }
+.call-incoming-sub { opacity: 0.7; margin-top: 4px; }
+.call-incoming-actions { display: flex; gap: 28px; justify-content: center; margin-top: 22px; }
+.call-btn {
+  width: 58px; height: 58px; border-radius: 50%; border: none; cursor: pointer;
+  font-size: 1.4rem; color: #fff;
+}
+.call-accept { background: #2ecc71; }
+.call-decline, .call-hangup { background: #e74c3c; }
+
+.call-overlay {
+  position: fixed; inset: 0;   /* z-index set from JS via topPortalZ() */
+  background: #0b0d10;
+  display: flex; align-items: center; justify-content: center;
+}
+.call-remote {
+  width: 100%; height: 100%; object-fit: contain; background: #000;
+}
+.call-local {
+  position: absolute; right: 16px; bottom: 96px;
+  width: 150px; max-width: 34vw; border-radius: 10px;
+  border: 2px solid rgba(255,255,255,0.2); background: #000; object-fit: cover;
+  transform: scaleX(-1);   /* mirror own preview */
+}
+.call-head {
+  position: absolute; top: 0; left: 0; right: 0;
+  padding: 16px 20px; color: #fff;
+  display: flex; gap: 10px; align-items: baseline;
+  background: linear-gradient(rgba(0,0,0,0.5), transparent);
+}
+.call-peer { font-weight: 600; font-size: 1.1rem; }
+.call-status { opacity: 0.75; font-size: 0.85rem; }
+.call-controls {
+  position: absolute; bottom: 24px; left: 0; right: 0;
+  display: flex; gap: 18px; justify-content: center;
+}
+.call-ctl {
+  width: 54px; height: 54px; border-radius: 50%; border: none; cursor: pointer;
+  font-size: 1.3rem; background: rgba(255,255,255,0.16); color: #fff;
+}
+.call-ctl:hover { background: rgba(255,255,255,0.26); }
+.call-ctl.off { background: rgba(255,255,255,0.5); color: #111; }
+.call-ctl.call-hangup { background: #e74c3c; }
+@media (max-width: 768px) {
+  .call-local { bottom: 110px; width: 110px; }
+}
+
 /* ── Day separators ── */
 .msg-day-sep { display: flex; justify-content: center; margin: 12px 0 4px; }
 .msg-day-sep span {
