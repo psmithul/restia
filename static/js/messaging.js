@@ -1270,6 +1270,172 @@ async function _openNewChatPicker() {
   }
 }
 
+// ── Status photos ("Moments") ───────────────────────────────────────────────
+// A strip of contacts' latest "what I'm doing" photos above the chat list.
+// Backend: routes/status_routes.py (visible only to your DM contacts).
+
+let _moments = [];
+let _statusPollTimer = null;
+let _viewer = null;                    // {author, posts, idx, mine} while open
+const STATUS_POLL_MS = 30000;
+const STATUS_MAX_BYTES = 8 * 1024 * 1024;
+
+async function _loadMoments() {
+  try {
+    const data = await _api('/api/status/feed');
+    _moments = data.statuses || [];
+    _renderMoments();
+  } catch (_) { /* not available — hide the strip */ }
+}
+
+function _renderMoments() {
+  const host = document.getElementById('msg-moments');
+  if (!host) return;
+  const add = `<button type="button" class="msg-moment msg-moment-add" id="msg-moment-add"
+      title="Share a moment" aria-label="Share a moment">
+      <span class="msg-moment-plus">＋</span><span class="msg-moment-name">Add</span></button>`;
+  const tiles = _moments.map(a => {
+    const ring = a.mine ? 'mine' : (a.has_unseen ? 'unseen' : 'seen');
+    const cnt = a.posts.length > 1 ? `<span class="msg-moment-count">${a.posts.length}</span>` : '';
+    return `<button type="button" class="msg-moment ${ring}" data-author="${esc(a.author)}" title="${esc(a.author)}">
+        <span class="msg-moment-ring">${_avatarHtml(a.author, 'msg-avatar-lg')}</span>
+        <span class="msg-moment-name">${a.mine ? 'You' : esc(a.author)}</span>${cnt}
+      </button>`;
+  }).join('');
+  host.innerHTML = add + tiles;
+  document.getElementById('msg-moment-add')?.addEventListener('click', _openStatusComposer);
+  host.querySelectorAll('.msg-moment[data-author]').forEach(el =>
+    el.addEventListener('click', () => _openStatusViewer(el.dataset.author)));
+}
+
+function _readDataUrl(file) {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(r.result);
+    r.onerror = () => rej(new Error('read failed'));
+    r.readAsDataURL(file);
+  });
+}
+
+function _openStatusComposer() {
+  let inp = document.getElementById('msg-status-file');
+  if (!inp) {
+    inp = document.createElement('input');
+    inp.type = 'file'; inp.accept = 'image/png,image/jpeg,image/webp,image/gif';
+    inp.capture = 'environment'; inp.id = 'msg-status-file'; inp.style.display = 'none';
+    document.body.appendChild(inp);
+    inp.addEventListener('change', async () => {
+      const f = inp.files && inp.files[0];
+      inp.value = '';
+      if (!f) return;
+      if (f.size > STATUS_MAX_BYTES) {
+        uiModule.showError && uiModule.showError('Image too large (max 8 MB)');
+        return;
+      }
+      let dataUrl;
+      try { dataUrl = await _readDataUrl(f); } catch (_) { return; }
+      const caption = await uiModule.styledPrompt(
+        'Add a caption — what are you up to? (optional)',
+        { title: 'Share a moment', placeholder: 'caption', confirmText: 'Share', maxLength: 280 });
+      if (caption === null) return;   // cancelled the whole post
+      try {
+        await _api('/api/status/post', { method: 'POST',
+          body: JSON.stringify({ image: dataUrl, caption }) });
+        uiModule.showToast && uiModule.showToast('Moment shared');
+        _loadMoments();
+      } catch (e) {
+        uiModule.showError && uiModule.showError('Could not share: ' + e.message);
+      }
+    });
+  }
+  inp.click();
+}
+
+function _openStatusViewer(author) {
+  const a = _moments.find(x => x.author === author);
+  if (!a || !a.posts.length) return;
+  _viewer = { author, posts: a.posts.slice(), idx: 0, mine: a.mine };
+  _renderStatusViewer();
+}
+
+async function _renderStatusViewer() {
+  const s = _viewer;
+  if (!s) return;
+  let ov = document.getElementById('msg-status-viewer');
+  if (!ov) {
+    ov = document.createElement('div');
+    ov.id = 'msg-status-viewer';
+    ov.className = 'msg-status-viewer';
+    document.body.appendChild(ov);
+  }
+  ov.style.zIndex = String(topPortalZ());
+  const post = s.posts[s.idx];
+  ov.innerHTML = `
+    <div class="msg-sv-backdrop"></div>
+    <div class="msg-sv-card">
+      <div class="msg-sv-progress">${s.posts.map((p, i) =>
+        `<span class="${i < s.idx ? 'done' : (i === s.idx ? 'on' : '')}"></span>`).join('')}</div>
+      <div class="msg-sv-head">
+        ${_avatarHtml(s.author, '')}
+        <span class="msg-sv-author">${s.mine ? 'You' : esc(s.author)}</span>
+        <span class="msg-sv-time">${esc(_fmtTime(post.created_at))}</span>
+        <span style="flex:1"></span>
+        ${s.mine ? '<button type="button" class="msg-sv-del" title="Delete">🗑</button>' : ''}
+        <button type="button" class="msg-sv-close" title="Close" aria-label="Close">✕</button>
+      </div>
+      <div class="msg-sv-imgwrap">
+        <div class="msg-sv-loading">Loading…</div>
+        <img class="msg-sv-img" alt="" style="display:none" />
+      </div>
+      ${post.caption ? `<div class="msg-sv-caption">${esc(post.caption)}</div>` : ''}
+      <button type="button" class="msg-sv-nav msg-sv-prev" aria-label="Previous">‹</button>
+      <button type="button" class="msg-sv-nav msg-sv-next" aria-label="Next">›</button>
+    </div>`;
+  ov.querySelector('.msg-sv-close')?.addEventListener('click', _closeStatusViewer);
+  ov.querySelector('.msg-sv-backdrop')?.addEventListener('click', _closeStatusViewer);
+  ov.querySelector('.msg-sv-prev')?.addEventListener('click', () => _stepViewer(-1));
+  ov.querySelector('.msg-sv-next')?.addEventListener('click', () => _stepViewer(1));
+  ov.querySelector('.msg-sv-del')?.addEventListener('click', () => _deleteStatus(post.id));
+
+  try {
+    const data = await _api(`/api/status/${post.id}/image`);
+    // Ignore if the viewer moved on while we were fetching.
+    if (!_viewer || _viewer.posts[_viewer.idx].id !== post.id) return;
+    const img = ov.querySelector('.msg-sv-img');
+    if (img) { img.src = data.image; img.style.display = ''; ov.querySelector('.msg-sv-loading')?.remove(); }
+  } catch (_) {
+    const l = ov.querySelector('.msg-sv-loading');
+    if (l) l.textContent = 'Could not load';
+  }
+  if (!s.mine) {
+    _api(`/api/status/${post.id}/seen`, { method: 'POST' })
+      .then(() => { post.seen = true; }).catch(() => {});
+  }
+}
+
+function _stepViewer(d) {
+  const s = _viewer;
+  if (!s) return;
+  const n = s.idx + d;
+  if (n < 0) { _closeStatusViewer(); return; }
+  if (n >= s.posts.length) { _closeStatusViewer(); return; }
+  s.idx = n;
+  _renderStatusViewer();
+}
+
+function _closeStatusViewer() {
+  _viewer = null;
+  document.getElementById('msg-status-viewer')?.remove();
+  _loadMoments();   // refresh unseen rings
+}
+
+async function _deleteStatus(id) {
+  const ok = await uiModule.styledConfirm('Delete this moment?', { confirmText: 'Delete', danger: true });
+  if (!ok) return;
+  try { await _api(`/api/status/${id}`, { method: 'DELETE' }); } catch (_) {}
+  _closeStatusViewer();
+}
+
 // ── Modal lifecycle ─────────────────────────────────────────────────────────
 
 function _buildModal() {
@@ -1288,6 +1454,7 @@ function _buildModal() {
             </button>
             <button type="button" class="close-btn msg-list-close" id="messages-close" title="Close">✖</button>
           </div>
+          <div class="msg-moments" id="msg-moments"></div>
           <div class="msg-list-search-wrap">
             <input type="text" id="msg-list-search" placeholder="Search chats…" autocomplete="off" aria-label="Search conversations" />
           </div>
@@ -1437,6 +1604,7 @@ function _buildModal() {
     // consumes them before this handler runs; the re-checks here keep the
     // order intact when the event reaches us directly (the arbiter defers
     // to focused text inputs, i.e. exactly when the composer has focus).
+    if (_viewer) { _closeStatusViewer(); return; }
     if (_menuEl) { _closeMessageMenu(); return; }
     if (_editingId != null || _replyTo) { _cancelComposerState(); return; }
     const overlay = document.getElementById('msg-newchat-overlay');
@@ -1473,6 +1641,10 @@ export function open() {
   // Polling starts in fallback mode and stands down when the stream opens.
   _reconfigurePolling();
   _connectSSE();
+  // Status photos strip: load now, refresh slowly (they're ephemeral, not live).
+  _loadMoments();
+  if (_statusPollTimer) clearInterval(_statusPollTimer);
+  _statusPollTimer = setInterval(() => { if (_open && !_viewer) _loadMoments(); }, STATUS_POLL_MS);
 }
 
 export function close() {
@@ -1486,6 +1658,9 @@ export function close() {
   if (_threadPollTimer) { clearInterval(_threadPollTimer); _threadPollTimer = null; }
   if (_listPollTimer) { clearInterval(_listPollTimer); _listPollTimer = null; }
   if (_listRefreshTimer) { clearTimeout(_listRefreshTimer); _listRefreshTimer = null; }
+  if (_statusPollTimer) { clearInterval(_statusPollTimer); _statusPollTimer = null; }
+  _viewer = null;
+  document.getElementById('msg-status-viewer')?.remove();
   _typingPeers.clear();
   _messages.clear();
   _lastRenderedMsg = null;

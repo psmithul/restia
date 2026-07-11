@@ -41034,6 +41034,133 @@ body.theme-frosted .modal {
 .msg-lock-btn:hover { opacity: 1; background: var(--hover-bg, rgba(127,127,127,0.14)); }
 .msg-lock-btn.on { opacity: 1; }
 
+/* ── Status photos ("Moments") strip ── */
+.msg-moments {
+  display: flex;
+  gap: 10px;
+  padding: 10px 12px 6px;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--border-color, rgba(127,127,127,0.18));
+  scrollbar-width: thin;
+}
+.msg-moments:empty { display: none; }
+.msg-moment {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  width: 62px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 2px;
+  position: relative;
+  color: inherit;
+}
+.msg-moment-ring {
+  display: inline-flex;
+  padding: 2px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+}
+.msg-moment.unseen .msg-moment-ring { border-color: var(--accent, #34b7f1); }
+.msg-moment.seen .msg-moment-ring { border-color: var(--border-color, rgba(127,127,127,0.35)); }
+.msg-moment.mine .msg-moment-ring { border-color: var(--accent-soft, #8ad); border-style: dashed; }
+.msg-moment-name {
+  font-size: 0.72rem;
+  max-width: 60px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.85;
+}
+.msg-moment-add .msg-moment-plus {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 46px;
+  height: 46px;
+  border-radius: 50%;
+  border: 2px dashed var(--border-color, rgba(127,127,127,0.4));
+  font-size: 1.4rem;
+  line-height: 1;
+}
+.msg-moment-count {
+  position: absolute;
+  top: 0;
+  right: 6px;
+  background: var(--accent, #34b7f1);
+  color: #fff;
+  border-radius: 9px;
+  font-size: 0.62rem;
+  padding: 0 5px;
+  line-height: 15px;
+}
+
+/* ── Status viewer (full-screen story) ── */
+.msg-status-viewer {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.msg-sv-backdrop { position: absolute; inset: 0; background: rgba(0,0,0,0.82); }
+.msg-sv-card {
+  position: relative;
+  width: min(440px, 94vw);
+  max-height: 92vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--modal-bg, #16181c);
+  border-radius: 14px;
+  overflow: hidden;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+}
+.msg-sv-progress { display: flex; gap: 4px; padding: 8px 10px 0; }
+.msg-sv-progress span {
+  flex: 1;
+  height: 3px;
+  border-radius: 2px;
+  background: rgba(127,127,127,0.35);
+}
+.msg-sv-progress span.on { background: var(--accent, #34b7f1); }
+.msg-sv-progress span.done { background: rgba(127,127,127,0.7); }
+.msg-sv-head { display: flex; align-items: center; gap: 8px; padding: 10px 12px; }
+.msg-sv-author { font-weight: 600; }
+.msg-sv-time { font-size: 0.78rem; opacity: 0.6; }
+.msg-sv-close, .msg-sv-del {
+  background: none; border: none; cursor: pointer; color: inherit;
+  font-size: 1rem; padding: 4px 6px; border-radius: 6px; opacity: 0.8;
+}
+.msg-sv-close:hover, .msg-sv-del:hover { opacity: 1; background: rgba(127,127,127,0.16); }
+.msg-sv-imgwrap {
+  position: relative;
+  display: flex; align-items: center; justify-content: center;
+  background: #000;
+  min-height: 220px;
+}
+.msg-sv-img { max-width: 100%; max-height: 68vh; display: block; }
+.msg-sv-loading { position: absolute; opacity: 0.7; font-size: 0.85rem; }
+.msg-sv-caption { padding: 10px 14px; font-size: 0.92rem; line-height: 1.4; }
+.msg-sv-nav {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  background: rgba(0,0,0,0.35);
+  color: #fff;
+  border: none;
+  cursor: pointer;
+  font-size: 1.6rem;
+  width: 38px; height: 38px;
+  border-radius: 50%;
+  opacity: 0.7;
+}
+.msg-sv-nav:hover { opacity: 1; }
+.msg-sv-prev { left: 6px; }
+.msg-sv-next { right: 6px; }
+
 /* ── Day separators ── */
 .msg-day-sep { display: flex; justify-content: center; margin: 12px 0 4px; }
 .msg-day-sep span {

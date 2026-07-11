@@ -779,6 +779,10 @@ app.include_router(setup_home_link_routes())
 from routes.e2ee_routes import setup_e2ee_routes
 app.include_router(setup_e2ee_routes())
 
+# Status photos ("what I'm doing" — BeReal-style, shared with chat contacts)
+from routes.status_routes import setup_status_routes
+app.include_router(setup_status_routes())
+
 # Gallery (image library)
 from routes.gallery.gallery_routes import setup_gallery_routes
 app.include_router(setup_gallery_routes())

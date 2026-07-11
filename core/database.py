@@ -691,6 +691,38 @@ class UserKey(Base):
     updated_at      = Column(DateTime, default=utcnow_naive, nullable=False)
 
 
+class StatusPost(Base):
+    """A BeReal-style 'what I'm doing' photo shared with your chat contacts.
+
+    Ephemeral by design: every post carries an expiry (default 24h) and is only
+    visible to accounts you've exchanged direct messages with, plus yourself.
+    The image (a base64 data URL) and caption are Fernet-encrypted at rest like
+    DM bodies, so a stolen database doesn't leak the pictures."""
+    __tablename__ = "status_posts"
+
+    id         = Column(Integer, primary_key=True, autoincrement=True)
+    author     = Column(String, nullable=False, index=True)
+    image      = Column(EncryptedText, nullable=False)     # base64 data URL, encrypted at rest
+    caption    = Column(EncryptedText, nullable=True)
+    created_at = Column(DateTime, default=utcnow_naive, nullable=False, index=True)
+    expires_at = Column(DateTime, nullable=False, index=True)
+
+
+class StatusView(Base):
+    """Records that `viewer` has seen a status post — powers the 'unseen ring'
+    around a contact's avatar and the seen-by list for the author."""
+    __tablename__ = "status_views"
+
+    id         = Column(Integer, primary_key=True, autoincrement=True)
+    status_id  = Column(Integer, nullable=False, index=True)
+    viewer     = Column(String, nullable=False, index=True)
+    created_at = Column(DateTime, default=utcnow_naive, nullable=False)
+
+    __table_args__ = (
+        Index('ix_status_view_pair', 'status_id', 'viewer', unique=True),
+    )
+
+
 class CrewMember(TimestampMixin, Base):
     """A custom AI persona ('crew member') with its own personality, model, tools, and memory scope."""
     __tablename__ = "crew_members"
