@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/odysseus-wordmark.png" alt="Restia" width="238">
+  <img src="docs/restia-wordmark.png" alt="Restia" width="238">
 </p>
 
 <p align="center">
@@ -9,16 +9,14 @@
 <p align="center">
   <a href="#quick-start">Quick Start</a> ·
   <a href="docs/setup.md">Setup Guide</a> ·
+  <a href="#features">Features</a> ·
   <a href="CONTRIBUTING.md">Contributing</a> ·
-  <a href="ROADMAP.md">Roadmap</a>
+  <a href="ROADMAP.md">Roadmap</a> ·
+  <a href="SECURITY.md">Security</a>
 </p>
 
 <p align="center">
-  <a href="https://repology.org/project/odysseus-ai/versions"><img src="https://repology.org/badge/vertical-allrepos/odysseus-ai.svg" alt="Packaging status"></a>
-</p>
-
-<p align="center">
-  <img src="docs/odysseus-browser.jpg" alt="Restia interface">
+  <img src="docs/restia-browser.jpg" alt="Restia interface">
 </p>
 
 ---
@@ -35,13 +33,16 @@ docker compose pull
 docker compose up -d --no-build
 ```
 
-Open `http://localhost:7000` when the containers are healthy. The first admin password is printed in `docker compose logs odysseus`.
+Open `http://localhost:7000` when the containers are healthy. The first admin
+password is printed in the container logs — find it with `docker compose logs`.
 
 Native installs, GPU notes, Windows/macOS instructions, HTTPS, and configuration live in the [setup guide](docs/setup.md).
 
-Updates preserve `data/` and `logs/`: run `./update.sh` on Linux/macOS or
-`update_windows.bat` on Windows. Each published GitHub Release produces
-`ghcr.io/psmithul/restia:latest` plus a versioned image tag, so users pull the
+### Updating
+
+Updates preserve your `data/` and `logs/` directories: run `./update.sh` on
+Linux/macOS or `update_windows.bat` on Windows. Each published GitHub Release
+builds `ghcr.io/psmithul/restia:latest` plus a versioned tag, so you pull the
 same verified multi-architecture image instead of rebuilding stale source.
 
 ## Features
@@ -51,6 +52,7 @@ same verified multi-architecture image instead of rebuilding stale source.
 - **Deep Research** — multi-step web research with source reading and report generation.
 - **Compare** — blind side-by-side model testing and synthesis.
 - **Documents** — writing-first editor with AI edits, suggestions, Markdown, HTML, CSV, and syntax highlighting.
+- **Messages** — WhatsApp-style direct messages between accounts with real-time delivery (SSE), typing indicators, read receipts, emoji reactions, replies, and message editing/deletion — plus Home Link developer chat and Telegram.
 - **Email** — IMAP/SMTP inbox with triage, tags, summaries, reminders, and reply drafts.
 - **Notes, Tasks + Calendar** — reminders, todos, scheduled agent tasks, and CalDAV sync.
 - **Extras** — gallery/image editor, themes, uploads, web search, presets, sessions, update checker, and 2FA.
@@ -84,7 +86,7 @@ Help is welcome. The best entry points are fresh-install testing, provider setup
 
 ## Security
 
-Restia is a self-hosted workspace with powerful local tools. Keep auth enabled, keep private data out of Git, and do not expose raw model/service ports publicly. Deployment details are in the [setup guide](docs/setup.md#security-notes).
+Restia is a self-hosted workspace with powerful local tools. Keep auth enabled, keep private data out of Git, and do not expose raw model/service ports publicly. See [SECURITY.md](SECURITY.md) for the security policy and the [setup guide](docs/setup.md#security-notes) for deployment details.
 
 ## Star History
 
@@ -98,4 +100,4 @@ Restia is a self-hosted workspace with powerful local tools. Keep auth enabled, 
 
 ## License
 
-AGPL-3.0-or-later -- see [LICENSE](LICENSE) and [ACKNOWLEDGMENTS.md](ACKNOWLEDGMENTS.md).
+AGPL-3.0-or-later — see [LICENSE](LICENSE) and [ACKNOWLEDGMENTS.md](ACKNOWLEDGMENTS.md).
