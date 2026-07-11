@@ -41796,3 +41796,23 @@ body.theme-frosted .modal {
   padding: 8px 18px; border-radius: 8px; font-weight: 500;
 }
 .cmdp-capture-save:hover { filter: brightness(1.06); }
+
+/* Profile bar (set your name) */
+.msg-profile-bar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 12px; border-bottom: 1px solid var(--border-color, rgba(127,127,127,0.14));
+}
+.msg-profile-mid { display: flex; flex-direction: column; line-height: 1.2; min-width: 0; }
+.msg-profile-you { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.04em; opacity: 0.5; }
+.msg-profile-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.msg-profile-edit {
+  margin-left: auto; background: none; border: none; cursor: pointer; color: inherit;
+  padding: 6px; border-radius: 7px; opacity: 0.7; display: inline-flex;
+}
+.msg-profile-edit:hover { opacity: 1; background: var(--hover-bg, rgba(127,127,127,0.14)); }
+
+/* Moments section label */
+.msg-moments-section { border-bottom: 1px solid var(--border-color, rgba(127,127,127,0.14)); }
+.msg-moments-label { font-size: 0.72rem; opacity: 0.6; padding: 8px 12px 0; }
+.msg-moments-label span { opacity: 0.7; }
+.msg-moments { border-bottom: none; }

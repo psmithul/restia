@@ -787,6 +787,10 @@ app.include_router(setup_status_routes())
 from routes.call_routes import setup_call_routes
 app.include_router(setup_call_routes())
 
+# User display profiles (the name shown in chat)
+from routes.profile_routes import setup_profile_routes
+app.include_router(setup_profile_routes())
+
 # Gallery (image library)
 from routes.gallery.gallery_routes import setup_gallery_routes
 app.include_router(setup_gallery_routes())

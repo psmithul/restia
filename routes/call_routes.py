@@ -86,9 +86,16 @@ def _ice_servers() -> list:
 
 
 def calls_enabled() -> bool:
-    """The operator chose to require TURN, so calling is only advertised once a
-    TURN server is configured — otherwise calls would silently fail behind most
-    home routers."""
+    """Calling is available by default: public STUN alone connects on the same
+    LAN and across many home networks. A TURN server (TURN_URL) is strongly
+    recommended for reliable connections behind strict NATs, but requiring it
+    would hide the feature entirely — so we advertise calling as available and
+    let the client surface a hint when only STUN is present. Set
+    CALLS_ENABLED=false to turn the feature off completely."""
+    return os.getenv("CALLS_ENABLED", "true").strip().lower() != "false"
+
+
+def turn_configured() -> bool:
     return bool(os.getenv("TURN_URL", "").strip())
 
 
@@ -100,9 +107,12 @@ def setup_call_routes():
     @router.get("/config")
     async def config(request: Request):
         """Whether calling is available here, and the ICE servers the browser
-        should use for the peer connection."""
+        should use for the peer connection. `turn` tells the client whether a
+        relay is configured (reliable everywhere) or it's STUN-only (best on
+        LAN / friendly NATs)."""
         _require_me(request)
-        return {"enabled": calls_enabled(), "ice_servers": _ice_servers()}
+        return {"enabled": calls_enabled(), "turn": turn_configured(),
+                "ice_servers": _ice_servers()}
 
     @router.get("/stream")
     async def stream(request: Request):

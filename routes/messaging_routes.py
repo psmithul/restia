@@ -150,6 +150,15 @@ def _is_admin(request: Request, username: str) -> bool:
         return False
 
 
+def _my_display(me: str) -> Optional[str]:
+    """The signed-in user's own display name, or None to fall back to username."""
+    try:
+        from routes.profile_routes import display_names_for
+        return display_names_for([me]).get(me)
+    except Exception:
+        return None
+
+
 def _pair_filter(me: str, other: str):
     """Rows belonging to the {me, other} conversation — and only that pair."""
     return or_(
@@ -373,7 +382,16 @@ def setup_messaging_routes():
                 key=lambda c: c["last_at"] or "",
                 reverse=True,
             )
-            out = {"conversations": ordered, "me": me}
+            # Show friendly display names where set (fall back to username).
+            try:
+                from routes.profile_routes import display_names_for
+                names = display_names_for([c["username"] for c in ordered])
+                for c in ordered:
+                    if c["username"] in names:
+                        c["display"] = names[c["username"]]
+            except Exception:
+                pass
+            out = {"conversations": ordered, "me": me, "me_display": _my_display(me)}
             # Hub admins also get the queue of pending Home Link requests so
             # they can approve/block right from the Messages UI.
             if link_routes.hub_enabled() and _is_admin(request, me):
@@ -448,15 +466,23 @@ def setup_messaging_routes():
                 bus.publish(other_key, "read", {"from": me})
 
             replies = _reply_targets(db, msgs)
+            other_names = {}
+            try:
+                from routes.profile_routes import display_names_for
+                other_names = display_names_for([other_key])
+            except Exception:
+                pass
             return {
                 "messages": [_serialize(m, me, replies.get(m.reply_to_id)) for m in msgs],
                 "other": {
                     "username": other_key,
+                    "display": other_names.get(other_key),
                     "is_admin": _is_admin(request, other_key),
                     "home": False,
                     "remote": other_key.endswith(link_routes.GUEST_SUFFIX),
                 },
                 "me": me,
+                "me_display": _my_display(me),
             }
         finally:
             db.close()

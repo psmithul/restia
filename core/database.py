@@ -691,6 +691,18 @@ class UserKey(Base):
     updated_at      = Column(DateTime, default=utcnow_naive, nullable=False)
 
 
+class UserProfile(Base):
+    """A local account's display profile — the name (and avatar color) shown in
+    chat instead of the raw login username. One row per user; the absence of a
+    row just means 'fall back to the username'."""
+    __tablename__ = "user_profiles"
+
+    username     = Column(String, primary_key=True)          # normalized login username
+    display_name = Column(String, nullable=True)
+    avatar_color = Column(String, nullable=True)             # optional hex/hsl override
+    updated_at   = Column(DateTime, default=utcnow_naive, nullable=False)
+
+
 class StatusPost(Base):
     """A BeReal-style 'what I'm doing' photo shared with your chat contacts.
 

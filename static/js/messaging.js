@@ -33,6 +33,7 @@ const esc = uiModule.esc;
 
 let _open = false;
 let _me = null;
+let _meDisplay = null;              // my own display name (profile), or null
 let _activeOther = null;            // username of the open conversation, or null
 let _activeOtherMeta = null;        // "other" object from the thread GET ({home, remote, is_admin})
 let _threadReady = false;           // thread GET succeeded (vs connect/pending card showing)
@@ -433,9 +434,54 @@ async function _decryptThread() {
 async function _loadConversations() {
   const data = await _api('/api/messages/conversations');
   _me = data.me;
+  if (data.me_display !== undefined) _meDisplay = data.me_display;
   _conversations = data.conversations || [];
   _linkRequests = data.link_requests || [];
   _renderConversationList();
+  _renderProfileBar();
+}
+
+// ── Your profile (the name shown in chat) ───────────────────────────────────
+
+async function _loadProfile() {
+  try {
+    const p = await _api('/api/profile');
+    _me = _me || p.username;
+    _meDisplay = p.display_name;
+  } catch (_) { /* not signed in — leave defaults */ }
+  _renderProfileBar();
+}
+
+function _renderProfileBar() {
+  const host = document.getElementById('msg-profile-bar');
+  if (!host) return;
+  const name = _meDisplay || _me || 'You';
+  host.innerHTML = `
+    ${_avatarHtml(name, 'msg-avatar-lg')}
+    <div class="msg-profile-mid">
+      <span class="msg-profile-you">You</span>
+      <span class="msg-profile-name">${esc(name)}</span>
+    </div>
+    <button type="button" class="msg-profile-edit" id="msg-profile-edit" title="Set your display name" aria-label="Set your name">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+    </button>`;
+  document.getElementById('msg-profile-edit')?.addEventListener('click', _editProfile);
+}
+
+async function _editProfile() {
+  const name = await uiModule.styledPrompt(
+    'This is the name people see when you chat with them.',
+    { title: 'Your name', defaultValue: _meDisplay || '', placeholder: 'Your name', confirmText: 'Save', maxLength: 48 });
+  if (name === null) return;
+  try {
+    await _api('/api/profile', { method: 'POST', body: JSON.stringify({ display_name: name }) });
+    _meDisplay = name || null;
+    _renderProfileBar();
+    _loadConversations().catch(() => {});
+    uiModule.showToast && uiModule.showToast('Name saved');
+  } catch (e) {
+    uiModule.showError && uiModule.showError('Could not save name: ' + e.message);
+  }
 }
 
 // Approve / block a pending Home Link request (hub admins only — the
@@ -499,7 +545,7 @@ function _renderConversationList() {
         ${_avatarHtml(c.username, 'msg-avatar-lg')}
         <div class="msg-convo-mid">
           <div class="msg-convo-top">
-            <span class="msg-convo-name">${esc(c.username)}${c.home ? ' <span class="msg-admin-tag msg-dev-tag">dev</span>' : (c.is_admin ? ' <span class="msg-admin-tag">admin</span>' : '')}</span>
+            <span class="msg-convo-name">${esc(c.display || c.username)}${c.home ? ' <span class="msg-admin-tag msg-dev-tag">dev</span>' : (c.is_admin ? ' <span class="msg-admin-tag">admin</span>' : '')}</span>
             <span class="msg-convo-time">${esc(_fmtTime(c.last_at))}</span>
           </div>
           <div class="msg-convo-preview">${previewHtml}</div>
@@ -547,6 +593,7 @@ export async function openConversation(other) {
     const data = await _api(`/api/messages/conversations/${encodeURIComponent(other)}`);
     if (_activeOther !== other) return; // user opened another thread mid-flight
     _me = data.me;
+    if (data.me_display !== undefined) _meDisplay = data.me_display;
     _activeOtherMeta = data.other || null;
     _renderThreadHeader(other, data.other);
     _renderThread(data.messages || []);
@@ -585,9 +632,9 @@ function _renderThreadHeader(other, meta) {
     <button type="button" class="msg-back-btn" id="msg-back-btn" title="Back" aria-label="Back to conversations">
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
     </button>
-    ${_avatarHtml(other, '')}
+    ${_avatarHtml((meta && meta.display) || other, '')}
     <div class="msg-thread-who">
-      <span class="msg-thread-name">${esc(other)}${meta && meta.home ? ' <span class="msg-admin-tag msg-dev-tag">dev</span>' : (meta && meta.is_admin ? ' <span class="msg-admin-tag">admin</span>' : '')}</span>
+      <span class="msg-thread-name">${esc((meta && meta.display) || other)}${meta && meta.home ? ' <span class="msg-admin-tag msg-dev-tag">dev</span>' : (meta && meta.is_admin ? ' <span class="msg-admin-tag">admin</span>' : '')}</span>
     </div>
     ${_callBtnsHtml(meta)}
     ${_lockBtnHtml(meta)}`;
@@ -1473,7 +1520,11 @@ function _buildModal() {
             </button>
             <button type="button" class="close-btn msg-list-close" id="messages-close" title="Close">✖</button>
           </div>
-          <div class="msg-moments" id="msg-moments"></div>
+          <div class="msg-profile-bar" id="msg-profile-bar"></div>
+          <div class="msg-moments-section">
+            <div class="msg-moments-label">Moments <span>· share what you're up to</span></div>
+            <div class="msg-moments" id="msg-moments"></div>
+          </div>
           <div class="msg-list-search-wrap">
             <input type="text" id="msg-list-search" placeholder="Search chats…" autocomplete="off" aria-label="Search conversations" />
           </div>
@@ -1653,6 +1704,7 @@ export function open() {
   _typingPeers.clear();
   _buildModal();
   document.getElementById('tool-messages-btn')?.classList.add('active');
+  _loadProfile();
   _loadConversations().catch((e) => {
     const list = document.getElementById('msg-convo-list');
     if (list) list.innerHTML = `<div class="msg-thread-loading">${esc(e.message)}</div>`;
