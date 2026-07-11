@@ -25,6 +25,7 @@ import { makeWindowDraggable } from './windowDrag.js';
 import { bindMenuDismiss } from './escMenuStack.js';
 import { topPortalZ } from './toolWindowZOrder.js';
 import { _escLinkify } from './emailLibrary/utils.js';
+import e2ee from './e2ee.js';
 
 const API = '';
 const esc = uiModule.esc;
@@ -67,6 +68,15 @@ let _typingPeers = new Map();      // username → expiry ts for the "typing…"
 
 // Message context menu (⋯ / long-press)
 let _menuEl = null;
+
+// ── End-to-end encryption (static/js/e2ee.js) ───────────────────────────────
+// _e2ee holds this session's identity: `published` once an identity exists on
+// the server, `unlocked` once the private key is in memory (needs the
+// passphrase). Shared per-conversation AES keys are cached by peer username.
+// Missing-peer-key usernames are remembered so we don't refetch every render.
+let _e2ee = { published: false, unlocked: false, privateJwk: null, bundle: null };
+let _sharedKeys = new Map();     // peer username → derived CryptoKey
+let _peerKeyMiss = new Set();    // peers with no published key (send plaintext)
 
 const THREAD_POLL_FALLBACK_MS = 1500;  // SSE down
 const THREAD_POLL_HOME_MS = 2000;      // Home Link thread — remote hub, no local SSE
@@ -320,6 +330,103 @@ function _scheduleListRefresh() {
   }, 250);
 }
 
+// ── End-to-end encryption session ───────────────────────────────────────────
+// Encryption is applied to LOCAL conversations. Home Link / remote-guest
+// threads still send plaintext for now — their payload E2EE rides the
+// cross-instance identity exchange and is a separate step. Every failure path
+// degrades to plaintext + a clear indicator; E2EE never blocks chatting.
+
+async function _e2eeRefresh() {
+  try {
+    const me = await _api('/api/e2ee/me');
+    _e2ee.published = !!me.exists;
+    _e2ee.bundle = me.exists ? me : null;
+  } catch (_) { /* keep prior state — E2EE stays optional */ }
+}
+
+function _e2eeEligible() {
+  return !!_activeOther && !_isHomeThread()
+    && !(_activeOtherMeta && _activeOtherMeta.remote);
+}
+
+async function _e2eeSetup() {
+  const pass = await uiModule.styledPrompt(
+    'Choose an encryption passphrase. It never leaves this device and unlocks your encrypted messages anywhere you sign in. If you forget it, those messages can’t be recovered.',
+    { title: 'Set up encryption', placeholder: 'passphrase', confirmText: 'Enable', maxLength: 128 });
+  if (!pass) return false;
+  try {
+    const id = await e2ee.generateIdentity();
+    const w = await e2ee.wrapPrivateKey(id.privateJwk, pass);
+    await _api('/api/e2ee/me', { method: 'POST', body: JSON.stringify({
+      public_jwk: JSON.stringify(id.publicJwk),
+      wrapped_private: JSON.stringify(w.wrapped),
+      kdf_salt: w.kdf_salt, kdf_iterations: w.kdf_iterations,
+    })});
+    _e2ee = { published: true, unlocked: true, privateJwk: id.privateJwk, bundle: null };
+    _sharedKeys.clear(); _peerKeyMiss.clear();
+    uiModule.showToast && uiModule.showToast('Encryption enabled');
+    return true;
+  } catch (e) {
+    uiModule.showError && uiModule.showError('Could not enable encryption: ' + e.message);
+    return false;
+  }
+}
+
+async function _e2eeUnlock() {
+  const me = _e2ee.bundle || (await _api('/api/e2ee/me').catch(() => null));
+  if (!me || !me.exists) return false;
+  const pass = await uiModule.styledPrompt(
+    'Enter your encryption passphrase to unlock encrypted messages on this device.',
+    { title: 'Unlock encryption', placeholder: 'passphrase', confirmText: 'Unlock', maxLength: 128 });
+  if (!pass) return false;
+  try {
+    _e2ee.privateJwk = await e2ee.unwrapPrivateKey(
+      JSON.parse(me.wrapped_private), me.kdf_salt, me.kdf_iterations, pass);
+    _e2ee.unlocked = true; _e2ee.bundle = me; _sharedKeys.clear();
+    return true;
+  } catch (_) {
+    uiModule.showError && uiModule.showError('Wrong passphrase');
+    return false;
+  }
+}
+
+// Set up an identity if none exists, else unlock the existing one.
+async function _e2eeEnsure() {
+  if (_e2ee.unlocked) return true;
+  await _e2eeRefresh();
+  const ok = _e2ee.published ? await _e2eeUnlock() : await _e2eeSetup();
+  if (ok) { _renderThreadHeader(_activeOther, _activeOtherMeta); _decryptThread(); }
+  return ok;
+}
+
+async function _sharedKeyFor(user) {
+  if (!_e2ee.unlocked || !user) return null;
+  if (_sharedKeys.has(user)) return _sharedKeys.get(user);
+  if (_peerKeyMiss.has(user)) return null;
+  try {
+    const r = await _api(`/api/e2ee/key/${encodeURIComponent(user)}`);
+    if (!r.exists) { _peerKeyMiss.add(user); return null; }
+    const key = await e2ee.deriveSharedKey(_e2ee.privateJwk, JSON.parse(r.public_jwk));
+    _sharedKeys.set(user, key);
+    return key;
+  } catch (_) { return null; }
+}
+
+// Decrypt any still-locked envelopes in the open thread and patch them in
+// place. Safe to call repeatedly; only undecrypted envelopes do work.
+async function _decryptThread() {
+  if (!_e2ee.unlocked || !_activeOther) return;
+  const key = await _sharedKeyFor(_activeOther);
+  if (!key) return;
+  const patched = [];
+  for (const m of _messages.values()) {
+    if (m.deleted || m._plain != null || !e2ee.isEnvelope(m.body)) continue;
+    try { m._plain = await e2ee.decryptMessage(m.body, key); patched.push(m); }
+    catch (_) { /* not for this key — leave it locked */ }
+  }
+  for (const m of patched) _updateRowInPlace(m);
+}
+
 // ── Conversation list ───────────────────────────────────────────────────────
 
 async function _loadConversations() {
@@ -383,7 +490,9 @@ function _renderConversationList() {
       ? `<span class="msg-convo-unread">${c.unread > 99 ? '99+' : c.unread}</span>` : '';
     const preview = c.last_mine ? `You: ${c.last_body || ''}` : (c.last_body || '');
     const typing = (_typingPeers.get(c.username) || 0) > now;
-    const previewHtml = typing ? '<em class="msg-preview-typing">typing…</em>' : esc(preview);
+    const previewHtml = typing ? '<em class="msg-preview-typing">typing…</em>'
+      : e2ee.isEnvelope(c.last_body) ? '<em class="msg-locked">🔒 Encrypted message</em>'
+      : esc(preview);
     return `
       <div class="msg-convo-item${active}" data-user="${esc(c.username)}" role="button" tabindex="0">
         ${_avatarHtml(c.username, 'msg-avatar-lg')}
@@ -442,6 +551,13 @@ export async function openConversation(other) {
     _renderThread(data.messages || []);
     _threadReady = true;
     _reconfigurePolling();
+    // Sync E2EE state and decrypt any encrypted history (if already unlocked);
+    // re-render the header so the lock reflects this thread's eligibility.
+    _e2eeRefresh().then(() => {
+      if (_activeOther !== other) return;
+      _renderThreadHeader(other, data.other);
+      _decryptThread();
+    });
     // Opening marks read server-side; refresh list + badge to clear the count.
     _loadConversations().catch(() => {});
     _pollBadge();
@@ -471,9 +587,24 @@ function _renderThreadHeader(other, meta) {
     ${_avatarHtml(other, '')}
     <div class="msg-thread-who">
       <span class="msg-thread-name">${esc(other)}${meta && meta.home ? ' <span class="msg-admin-tag msg-dev-tag">dev</span>' : (meta && meta.is_admin ? ' <span class="msg-admin-tag">admin</span>' : '')}</span>
-    </div>`;
+    </div>
+    ${_lockBtnHtml(meta)}`;
   const back = document.getElementById('msg-back-btn');
   if (back) back.addEventListener('click', _closeThread);
+  const lb = document.getElementById('msg-lock-btn');
+  if (lb) lb.addEventListener('click', () => { _e2eeEnsure(); });
+}
+
+// Header encryption control. Only local threads are E2EE-eligible for now.
+function _lockBtnHtml(meta) {
+  const eligible = meta && !meta.home && !meta.remote;
+  if (!eligible) return '';
+  const on = _e2ee.unlocked;
+  const title = on
+    ? 'End-to-end encrypted. Messages you send here are encrypted to the recipient.'
+    : (_e2ee.published ? 'Unlock end-to-end encryption on this device' : 'Enable end-to-end encryption');
+  return `<button type="button" class="msg-lock-btn${on ? ' on' : ''}" id="msg-lock-btn"
+            title="${esc(title)}" aria-label="Encryption">${on ? '🔒' : '🔓'}</button>`;
 }
 
 function _closeThread() {
@@ -513,7 +644,7 @@ function _tickHtml(read) {
 function _quoteHtml(rt) {
   if (!rt) return '';
   const bodyHtml = rt.body
-    ? esc(_truncate(rt.body, 110))
+    ? (e2ee.isEnvelope(rt.body) ? '<em class="msg-locked">🔒 Encrypted</em>' : esc(_truncate(rt.body, 110)))
     : '<em class="msg-deleted">Message deleted</em>';
   return `
     <div class="msg-quote" data-quote-id="${Number(rt.id) || 0}" role="button" tabindex="0" title="Go to message">
@@ -540,15 +671,27 @@ function _reactionsHtml(m) {
   return `<div class="msg-reactions">${chips}</div>`;
 }
 
+// Locked-envelope placeholder: we have ciphertext but not (yet) the key.
+function _lockHtml() {
+  return '<em class="msg-locked">🔒 Encrypted — unlock to read</em>';
+}
+
 function _bubbleInnerHtml(m) {
+  const encrypted = !m.deleted && e2ee.isEnvelope(m.body);
+  const locked = encrypted && m._plain == null;
   const bodyHtml = m.deleted
     ? '<em class="msg-deleted">Message deleted</em>'
-    : _escLinkify(m.body || '');
+    : locked
+      ? _lockHtml()
+      : _escLinkify((m._plain != null ? m._plain : m.body) || '');
   const edited = (m.edited && !m.deleted) ? '<span class="msg-edited">(edited)</span>' : '';
+  // A small lock marks bubbles that travelled encrypted, once readable.
+  const lockBadge = (encrypted && !locked)
+    ? '<span class="msg-enc-badge" title="End-to-end encrypted">🔒</span>' : '';
   return `
     ${_quoteHtml(m.reply_to)}
     <div class="msg-bubble-text">${bodyHtml}</div>
-    <div class="msg-bubble-meta">${edited}${esc(_fmtClock(m.created_at))}${m.mine ? _tickHtml(m.read) : ''}</div>`;
+    <div class="msg-bubble-meta">${edited}${lockBadge}${esc(_fmtClock(m.created_at))}${m.mine ? _tickHtml(m.read) : ''}</div>`;
 }
 
 function _colInnerHtml(m) {
@@ -658,6 +801,8 @@ function _appendMessages(list) {
   if (ind && ind.parentElement === body) body.insertBefore(frag, ind);
   else body.appendChild(frag);
   if (nearBottom) body.scrollTop = body.scrollHeight;
+  // Decrypt any newly-arrived encrypted messages, then patch them in place.
+  if (fresh.some(m => e2ee.isEnvelope(m.body) && m._plain == null)) _decryptThread();
   return true;
 }
 
@@ -786,7 +931,7 @@ function _openMessageMenu(m, x, y) {
     _closeMessageMenu();
     switch (it.dataset.act) {
       case 'reply': _enterReply(m); break;
-      case 'copy': uiModule.copyToClipboard(m.body || ''); break;
+      case 'copy': uiModule.copyToClipboard((m._plain != null ? m._plain : m.body) || ''); break;
       case 'edit': _enterEdit(m); break;
       case 'delete': _confirmDelete(m); break;
     }
@@ -871,11 +1016,17 @@ function _enterReply(m) {
 
 function _enterEdit(m) {
   if (!m || !m.mine || m.deleted) return;
+  // Can't edit an encrypted message we haven't unlocked — the raw envelope
+  // isn't editable text.
+  if (e2ee.isEnvelope(m.body) && m._plain == null) {
+    uiModule.showError && uiModule.showError('Unlock encryption to edit this message');
+    return;
+  }
   _replyTo = null;
   _editingId = m.id;
   const input = document.getElementById('msg-composer-input');
   if (input) {
-    input.value = m.body || '';
+    input.value = (m._plain != null ? m._plain : m.body) || '';
     input.style.height = 'auto';
     input.style.height = Math.min(input.scrollHeight, 120) + 'px';
     input.focus();
@@ -1025,13 +1176,23 @@ async function _sendCurrent() {
   input.style.height = 'auto';
   const replyTo = _replyTo;
   try {
-    const payload = { body };
+    // Encrypt to the peer when the thread supports E2EE and both sides have
+    // keys; otherwise send plaintext (the composer footer shows which).
+    let outBody = body;
+    let encKey = null;
+    if (_e2eeEligible() && _e2ee.unlocked) {
+      encKey = await _sharedKeyFor(_activeOther);
+      if (encKey) outBody = await e2ee.encryptMessage(body, encKey);
+    }
+    const payload = { body: outBody };
     if (replyTo && replyTo.id != null) payload.reply_to_id = replyTo.id;
     const data = await _api(`/api/messages/conversations/${encodeURIComponent(_activeOther)}`, {
       method: 'POST',
       body: JSON.stringify(payload),
     });
-    if (data.message) _appendMessages([data.message]);
+    // Show my own message as plaintext immediately (the body I hold is the
+    // envelope; stash the cleartext so the bubble renders unlocked).
+    if (data.message) { if (encKey) data.message._plain = body; _appendMessages([data.message]); }
     if (_replyTo === replyTo) _cancelComposerState();
     _lastTypingSentAt = 0; // a fresh keystroke after sending signals typing again
     _scheduleListRefresh();
@@ -1049,11 +1210,19 @@ async function _submitEdit(body) {
   if (id == null || _sending) return;
   _sending = true;
   try {
+    // Keep an edited message encrypted if the original was.
+    let outBody = body;
+    const orig = _messages.get(id);
+    let encKey = null;
+    if (_e2eeEligible() && _e2ee.unlocked && orig && e2ee.isEnvelope(orig.body)) {
+      encKey = await _sharedKeyFor(_activeOther);
+      if (encKey) outBody = await e2ee.encryptMessage(body, encKey);
+    }
     const data = await _api(`/api/messages/msg/${id}`, {
       method: 'PUT',
-      body: JSON.stringify({ body }),
+      body: JSON.stringify({ body: outBody }),
     });
-    if (data.message) _updateRowInPlace(data.message);
+    if (data.message) { if (encKey) data.message._plain = body; _updateRowInPlace(data.message); }
     _cancelComposerState(); // clears the input too — it held the edit text
     _scheduleListRefresh();
   } catch (e) {
