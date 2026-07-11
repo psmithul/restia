@@ -48,6 +48,8 @@ function _spec() {
     { id: 'settings', icon: '⚙️', title: 'Settings', hint: 'Open settings', btns: ['rail-settings', 'user-bar-settings'], keys: 'settings preferences config' },
     { id: 'search', icon: '🔎', title: 'Search Chats', hint: 'Search your chats', btns: ['rail-search-btn'], keys: 'find search history' },
     // Actions
+    { id: 'quick-note', icon: '⚡', title: 'Quick Note', hint: 'Jot something instantly', run: () => _openCapture('note'), keys: 'quick note capture jot memo write' },
+    { id: 'quick-todo', icon: '⚡', title: 'Quick Todo', hint: 'Capture a checklist', run: () => _openCapture('todo'), keys: 'quick todo task checklist capture' },
     { id: 'new-chat', icon: '✨', title: 'New Chat', hint: 'Start a fresh session', btns: ['rail-new-session'], keys: 'new session conversation' },
     { id: 'new-message', icon: '📨', title: 'New Message', hint: 'Message someone', btns: ['tool-messages-btn', 'rail-messages'], after: 'msg-newchat-btn', keys: 'dm new message compose' },
     { id: 'share-moment', icon: '📸', title: 'Share a Moment', hint: 'Post a status photo', btns: ['tool-messages-btn', 'rail-messages'], after: 'msg-moment-add', keys: 'moment status photo bereal' },
@@ -257,6 +259,55 @@ export function close() {
 
 export function toggle() { _open ? close() : open(); }
 export function isOpen() { return _open; }
+
+// ── Quick capture ─────────────────────────────────────────────────────────
+// Jot a note (or checklist) and save it straight to the notes API — no
+// navigating into the tool. Cmd/Ctrl+Enter saves, Esc cancels.
+
+function _openCapture(kind) {
+  document.getElementById('cmdp-capture')?.remove();
+  const isTodo = kind === 'todo';
+  const wrap = document.createElement('div');
+  wrap.id = 'cmdp-capture';
+  wrap.className = 'cmdp-overlay';
+  wrap.style.zIndex = String(topPortalZ());
+  wrap.innerHTML = `
+    <div class="cmdp-backdrop"></div>
+    <div class="cmdp-panel cmdp-capture-panel">
+      <div class="cmdp-capture-head">${isTodo ? '⚡ Quick Todo' : '⚡ Quick Note'}</div>
+      <textarea class="cmdp-capture-text" id="cmdp-capture-text" rows="5"
+        placeholder="${isTodo ? 'One item per line…' : 'Type your note…'}"></textarea>
+      <div class="cmdp-capture-actions">
+        <span class="cmdp-capture-hint"><kbd>⌘</kbd><kbd>↵</kbd> save · <kbd>esc</kbd> cancel</span>
+        <button type="button" class="cmdp-capture-save" id="cmdp-capture-save">Save</button>
+      </div>
+    </div>`;
+  document.body.appendChild(wrap);
+  const ta = wrap.querySelector('#cmdp-capture-text');
+  const done = () => wrap.remove();
+  const save = async () => {
+    const text = ta.value.trim();
+    if (!text) { done(); return; }
+    const payload = isTodo
+      ? { note_type: 'checklist', title: '',
+          items: text.split('\n').map(l => l.trim()).filter(Boolean).map(t => ({ text: t, done: false })) }
+      : { note_type: 'note', title: text.split('\n')[0].slice(0, 80), content: text };
+    try {
+      const res = await fetch('/api/notes', { method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+      if (!res.ok) throw new Error('save failed (' + res.status + ')');
+      uiModule.showToast && uiModule.showToast(isTodo ? 'Todo saved' : 'Note saved');
+      done();
+    } catch (e) { uiModule.showError && uiModule.showError('Could not save: ' + e.message); }
+  };
+  wrap.querySelector('.cmdp-backdrop').addEventListener('click', done);
+  wrap.querySelector('#cmdp-capture-save').addEventListener('click', save);
+  ta.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); done(); }
+    else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); save(); }
+  });
+  setTimeout(() => ta.focus(), 20);
+}
 
 export function init() {
   document.addEventListener('keydown', (e) => {
