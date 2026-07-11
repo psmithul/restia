@@ -71,7 +71,13 @@ DEFAULT_HOME_SERVER = "https://app.restia.dev"
 HANDLE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,31}$")
 MAX_BODY_LEN = 8000            # keep in sync with routes/messaging_routes.py
 MESSAGES_PAGE_LIMIT = 200
-SUMMARY_CACHE_TTL = 0          # seconds between hub round-trips for badge/list polls
+# Seconds a hub summary (last message + unread, for the list row / badge) is
+# reused before another round-trip. 0 meant every conversation-list and badge
+# poll blocked on a network call to the remote hub — a big, constant latency
+# hit for any instance with a Home Link contact. The open thread still polls
+# the hub directly (THREAD_POLL_HOME_MS) for actual messages, so a few seconds
+# of list-preview staleness is invisible but removes most of the remote calls.
+SUMMARY_CACHE_TTL = 4
 MAX_HUB_RESPONSE_BYTES = 2 * 1024 * 1024  # refuse absurd payloads from a hub
 
 GUEST_PENDING = "pending"

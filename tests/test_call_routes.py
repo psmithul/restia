@@ -60,10 +60,17 @@ def _clean(monkeypatch):
     yield
 
 
-def test_config_disabled_without_turn_but_lists_stun():
+def test_config_enabled_by_default_with_stun_only():
+    # Calling is available by default (STUN), and reports TURN as not configured.
+    cfg = _run(ROUTES[("GET", "/api/calls/config")](_req("mika")))
+    assert cfg["enabled"] is True and cfg["turn"] is False
+    assert any("stun:" in s["urls"] for s in cfg["ice_servers"])
+
+
+def test_config_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("CALLS_ENABLED", "false")
     cfg = _run(ROUTES[("GET", "/api/calls/config")](_req("mika")))
     assert cfg["enabled"] is False
-    assert any("stun:" in s["urls"] for s in cfg["ice_servers"])
 
 
 def test_config_enabled_with_turn(monkeypatch):

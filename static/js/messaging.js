@@ -642,15 +642,27 @@ function _renderThreadHeader(other, meta) {
   if (back) back.addEventListener('click', _closeThread);
   const lb = document.getElementById('msg-lock-btn');
   if (lb) lb.addEventListener('click', () => { _e2eeEnsure(); });
-  document.getElementById('msg-call-voice')?.addEventListener('click', () => callModule.startCall(other, false));
-  document.getElementById('msg-call-video')?.addEventListener('click', () => callModule.startCall(other, true));
+  document.getElementById('msg-call-voice')?.addEventListener('click', () => _startCallSafe(other, false));
+  document.getElementById('msg-call-video')?.addEventListener('click', () => _startCallSafe(other, true));
 }
 
-// Voice/video call buttons — local threads only (calling shares the local
-// signaling bus; federated calling is a later step). Hidden unless the
-// instance has calling configured (a TURN server).
+// Calls run over the same-instance signaling bus. Contacts on another instance
+// (Home Link / '@remote') can't be dialed yet — say so plainly instead of
+// failing silently.
+function _startCallSafe(other, video) {
+  if (_activeOtherMeta && (_activeOtherMeta.remote || _activeOtherMeta.home)) {
+    uiModule.showToast && uiModule.showToast(
+      'Calling contacts on another instance is coming soon — calls between accounts here work now.');
+    return;
+  }
+  callModule.startCall(other, video);
+}
+
+// Voice/video call buttons — shown whenever calling is enabled so the feature
+// is discoverable on every thread. The action itself is gated in
+// _startCallSafe (same-instance calls connect; remote shows a clear message).
 function _callBtnsHtml(meta) {
-  const eligible = meta && !meta.home && !meta.remote && callModule.isEnabled && callModule.isEnabled();
+  const eligible = meta && callModule.isEnabled && callModule.isEnabled();
   if (!eligible) return '';
   return `
     <button type="button" class="msg-call-btn" id="msg-call-voice" title="Voice call" aria-label="Voice call">
