@@ -775,6 +775,10 @@ from routes.link_routes import setup_link_hub_routes, setup_home_link_routes
 app.include_router(setup_link_hub_routes())
 app.include_router(setup_home_link_routes())
 
+# End-to-end encryption key store (identity keys for encrypted DMs)
+from routes.e2ee_routes import setup_e2ee_routes
+app.include_router(setup_e2ee_routes())
+
 # Gallery (image library)
 from routes.gallery.gallery_routes import setup_gallery_routes
 app.include_router(setup_gallery_routes())

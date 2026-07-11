@@ -292,8 +292,15 @@ def _is_discoverable(db, request: Request, username: str) -> bool:
 
 
 def _local_user_pubkey(username: str) -> Optional[str]:
-    # E2EE public keys for local accounts arrive in Feature 2; None until then.
-    return None
+    """A local account's published E2EE public JWK, so a remote guest can
+    encrypt to them. None until that user has set up E2EE."""
+    db = SessionLocal()
+    try:
+        from core.database import UserKey
+        k = db.query(UserKey).filter(UserKey.username == _norm(username)).first()
+        return k.public_jwk if k else None
+    finally:
+        db.close()
 
 
 def _directory(request: Request, db, guest: LinkGuest) -> list:

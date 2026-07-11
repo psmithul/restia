@@ -667,6 +667,30 @@ class HomeLink(Base):
     created_at = Column(DateTime, default=utcnow_naive, nullable=False)
 
 
+class UserKey(Base):
+    """A local account's end-to-end-encryption identity keys.
+
+    The server stores the PUBLIC key (so others can encrypt to this account)
+    and the private key only in WRAPPED form: AES-GCM ciphertext produced in
+    the browser from a key the client derives (PBKDF2) from the user's separate
+    encryption passphrase, which is never transmitted. The server therefore
+    cannot unwrap the private key or read any message — a stolen database
+    yields only ciphertext. The flip side is unrecoverability: if the user
+    forgets the passphrase, the wrapped key can't be opened and those messages
+    are lost, because the server has nothing that could help. This is stronger
+    than the Fernet at-rest encryption on other columns, where a server-held
+    key can decrypt everything."""
+    __tablename__ = "user_keys"
+
+    username        = Column(String, primary_key=True)          # normalized username
+    public_jwk      = Column(Text, nullable=False)              # ECDH P-256 public JWK (JSON)
+    wrapped_private = Column(Text, nullable=False)              # {iv, ct}: AES-GCM of the private JWK
+    kdf_salt        = Column(String, nullable=False)           # base64 PBKDF2 salt
+    kdf_iterations  = Column(Integer, nullable=False, default=210000)
+    created_at      = Column(DateTime, default=utcnow_naive, nullable=False)
+    updated_at      = Column(DateTime, default=utcnow_naive, nullable=False)
+
+
 class CrewMember(TimestampMixin, Base):
     """A custom AI persona ('crew member') with its own personality, model, tools, and memory scope."""
     __tablename__ = "crew_members"
