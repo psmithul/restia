@@ -86,6 +86,9 @@ def _fresh(monkeypatch):
         conn.exec_driver_sql("DELETE FROM direct_messages")
         conn.exec_driver_sql("DELETE FROM link_guests")
         conn.exec_driver_sql("DELETE FROM home_link")
+        conn.exec_driver_sql("DELETE FROM link_invites")
+        conn.exec_driver_sql("DELETE FROM remote_contact_prefs")
+        conn.exec_driver_sql("DELETE FROM remote_blocks")
     yield
 
 

@@ -287,10 +287,12 @@ if AUTH_ENABLED:
         _re.compile(r"^/api/tasks/[^/]+/webhook/[^/]+/?$"),
         _re.compile(r"^/api/telegram/webhook/?$"),
         # Home Link hub API: callers are REMOTE instances with no session
-        # cookie. routes/link_routes.py does its own auth — register is
+        # cookie. routes/link_routes.py does its own auth — register/redeem are
         # rate-limited and everything else requires the guest bearer token —
-        # and the whole prefix 404s unless LINK_HUB_ENABLED=true.
-        _re.compile(r"^/api/link/(register|messages|summary)/?$"),
+        # and the whole prefix 404s unless LINK_HUB_ENABLED=true. The admin
+        # (/api/link/admin/*) and local-user (/api/link/me/*) endpoints are
+        # deliberately NOT here: those keep the hub's own session auth.
+        _re.compile(r"^/api/link/(register|redeem|messages|summary|directory|conversations)/?$"),
     ]
 
     def _is_auth_exempt(path: str) -> bool:

@@ -907,26 +907,38 @@ function _renderConnectCard(other, errText) {
   body.innerHTML = `
     <div class="msg-connect-card">
       <div class="msg-connect-icon">🔗</div>
-      <h4>Say hi to the developer</h4>
+      <h4>Connect to ${esc(other)}</h4>
       <p>Pick a handle to register this instance with <strong>${esc(other)}</strong>.
-         Messages you send here go straight to the developer's inbox, and replies
-         show up right in this thread.</p>
+         Have an <strong>invite code</strong>? Enter it and you're approved
+         instantly — otherwise your request waits for the owner to accept it.</p>
       <div class="msg-connect-row">
         <input type="text" id="msg-connect-handle" maxlength="32" autocomplete="off"
                placeholder="your-handle" aria-label="Handle" />
+      </div>
+      <div class="msg-connect-row">
+        <input type="text" id="msg-connect-code" maxlength="64" autocomplete="off"
+               placeholder="invite code (optional)" aria-label="Invite code" />
         <button type="button" id="msg-connect-btn">Connect</button>
       </div>
       <div class="msg-connect-err" id="msg-connect-err">${errText ? esc(errText) : ''}</div>
     </div>`;
   const input = document.getElementById('msg-connect-handle');
+  const codeInput = document.getElementById('msg-connect-code');
   const btn = document.getElementById('msg-connect-btn');
   const go = async () => {
     const handle = (input.value || '').trim().toLowerCase();
     if (!handle) { input.focus(); return; }
+    const code = (codeInput.value || '').trim();
     btn.disabled = true;
-    btn.textContent = 'Connecting…';
+    btn.textContent = code ? 'Joining…' : 'Connecting…';
     try {
-      await _api('/api/homelink/connect', { method: 'POST', body: JSON.stringify({ handle }) });
+      // A code redeems to instant approval; no code falls back to the classic
+      // register-and-wait flow.
+      if (code) {
+        await _api('/api/homelink/redeem', { method: 'POST', body: JSON.stringify({ handle, code }) });
+      } else {
+        await _api('/api/homelink/connect', { method: 'POST', body: JSON.stringify({ handle }) });
+      }
       openConversation(other);
     } catch (e) {
       btn.disabled = false;
@@ -936,7 +948,9 @@ function _renderConnectCard(other, errText) {
     }
   };
   btn.addEventListener('click', go);
-  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); go(); } });
+  const onEnter = (e) => { if (e.key === 'Enter') { e.preventDefault(); go(); } };
+  input.addEventListener('keydown', onEnter);
+  codeInput.addEventListener('keydown', onEnter);
   setTimeout(() => input.focus(), 50);
 }
 

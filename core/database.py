@@ -594,6 +594,60 @@ class LinkGuest(Base):
     status     = Column(String, nullable=False, default="pending", index=True)
     created_at = Column(DateTime, default=utcnow_naive, nullable=False)
     last_seen  = Column(DateTime, nullable=True)
+    # An approved invite code (LinkInvite) can create a guest pre-approved, so
+    # no manual owner approval is needed. NULL = classic register-and-wait guest.
+    invite_id  = Column(Integer, nullable=True, index=True)
+    # Guest's E2EE public key (base64 X25519), published at redeem time so local
+    # users can encrypt to it. NULL until the guest's instance supports E2EE.
+    pubkey     = Column(Text, nullable=True)
+
+
+class LinkInvite(Base):
+    """A hub-issued invite code. Redeeming one (routes/link_routes.py) creates
+    an *approved* LinkGuest immediately — the code IS the approval, replacing
+    the manual pending→approve gate for people the operator deliberately hands
+    a code to. Only the SHA-256 of the code is stored; the plaintext is shown
+    to the admin once at creation and never persisted. Codes expire, are
+    use-capped, and are revocable, so a leaked code has a bounded blast radius."""
+    __tablename__ = "link_invites"
+
+    id         = Column(Integer, primary_key=True, autoincrement=True)
+    code_hash  = Column(String, nullable=False, unique=True, index=True)
+    created_by = Column(String, nullable=False)                # admin who issued it
+    label      = Column(String, nullable=True)                 # optional note ("for alice")
+    created_at = Column(DateTime, default=utcnow_naive, nullable=False)
+    expires_at = Column(DateTime, nullable=True)               # NULL = never (discouraged)
+    max_uses   = Column(Integer, nullable=False, default=1)
+    uses       = Column(Integer, nullable=False, default=0)
+    revoked    = Column(Boolean, nullable=False, default=False)
+
+
+class RemoteContactPref(Base):
+    """Per-local-user control over remote (Home Link guest) contact.
+    A redeemed invite grants instance-wide reach, but each local account can
+    opt out of being reachable by remote guests. One row per local user; the
+    absence of a row means the default (discoverable) applies."""
+    __tablename__ = "remote_contact_prefs"
+
+    local_user   = Column(String, primary_key=True)            # normalized username
+    discoverable = Column(Boolean, nullable=False, default=True)
+    updated_at   = Column(DateTime, default=utcnow_naive, nullable=False)
+
+
+class RemoteBlock(Base):
+    """A specific local user blocking a specific remote guest handle. Blocked
+    pairs can't exchange messages and the local user is hidden from that guest's
+    directory, without affecting the guest's other conversations."""
+    __tablename__ = "remote_blocks"
+
+    id         = Column(Integer, primary_key=True, autoincrement=True)
+    local_user = Column(String, nullable=False, index=True)     # normalized username
+    handle     = Column(String, nullable=False, index=True)     # guest handle (no @remote)
+    created_at = Column(DateTime, default=utcnow_naive, nullable=False)
+
+    __table_args__ = (
+        Index('ix_remote_block_pair', 'local_user', 'handle', unique=True),
+    )
 
 
 class HomeLink(Base):
@@ -828,6 +882,34 @@ def _migrate_add_dm_feature_columns():
             conn.commit()
     except Exception as e:
         logging.getLogger(__name__).warning(f"direct_messages feature-columns migration failed: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _migrate_add_link_invite_columns():
+    """Add the invite/E2EE columns to link_guests for databases created before
+    invite-code onboarding. The link_invites / remote_contact_prefs /
+    remote_blocks tables themselves are created by create_all; only the
+    in-place column adds need a guarded migration. Idempotent."""
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cols = [row[1] for row in conn.execute("PRAGMA table_info(link_guests)").fetchall()]
+        if cols:
+            if "invite_id" not in cols:
+                conn.execute("ALTER TABLE link_guests ADD COLUMN invite_id INTEGER")
+            if "pubkey" not in cols:
+                conn.execute("ALTER TABLE link_guests ADD COLUMN pubkey TEXT")
+            conn.commit()
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"link_guests invite-columns migration failed: {e}")
     finally:
         try:
             conn.close()
@@ -1963,6 +2045,7 @@ def init_db():
     _migrate_add_last_message_at_column()
     _migrate_add_link_columns()
     _migrate_add_dm_feature_columns()
+    _migrate_add_link_invite_columns()
     _migrate_add_folder_column()
     _migrate_add_token_columns()
     _migrate_add_mode_column()

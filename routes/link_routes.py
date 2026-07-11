@@ -45,6 +45,7 @@ import os
 import re
 import secrets
 import time
+from datetime import timedelta
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -54,7 +55,10 @@ from pydantic import BaseModel
 from sqlalchemy import and_, or_
 
 from core.auth import RESERVED_USERNAMES
-from core.database import DirectMessage, HomeLink, LinkGuest, SessionLocal, utcnow_naive
+from core.database import (
+    DirectMessage, HomeLink, LinkGuest, LinkInvite, RemoteBlock,
+    RemoteContactPref, SessionLocal, utcnow_naive,
+)
 from src.auth_helpers import require_user
 from src.rate_limiter import RateLimiter
 
@@ -73,6 +77,12 @@ MAX_HUB_RESPONSE_BYTES = 2 * 1024 * 1024  # refuse absurd payloads from a hub
 GUEST_PENDING = "pending"
 GUEST_APPROVED = "approved"
 GUEST_BLOCKED = "blocked"
+
+# Invite codes: bounded blast radius for a leaked code.
+INVITE_DEFAULT_EXPIRY_DAYS = 7
+INVITE_MAX_EXPIRY_DAYS = 365
+INVITE_MAX_USES_CAP = 100      # a single code can't onboard an unbounded crowd
+PUBKEY_MAX_LEN = 128           # base64 X25519 is 44 chars; cap defensively
 
 # Sentinel detail strings the front-end matches on.
 NOT_CONNECTED = "link_not_connected"   # no registration stored → show connect card
@@ -93,14 +103,41 @@ class RegisterRequest(BaseModel):
 
 class LinkSendRequest(BaseModel):
     body: str
+    to: Optional[str] = None     # target local user; omitted → the hub owner
 
 
 class ConnectRequest(BaseModel):
     handle: str
 
 
+class RedeemHomeRequest(BaseModel):
+    handle: str
+    code: str
+
+
 class GuestActionRequest(BaseModel):
     action: str          # approve | block | delete
+
+
+class RedeemRequest(BaseModel):
+    code: str
+    handle: str
+    pubkey: Optional[str] = None     # base64 X25519, published for E2EE
+
+
+class InviteCreateRequest(BaseModel):
+    label: Optional[str] = None
+    expires_in_days: Optional[int] = None
+    max_uses: Optional[int] = None
+
+
+class BlockRequest(BaseModel):
+    handle: str          # guest handle (with or without @remote)
+    action: str          # block | unblock
+
+
+class RemotePrefRequest(BaseModel):
+    discoverable: bool
 
 
 # ── Shared helpers ──────────────────────────────────────────────────────────
@@ -200,6 +237,103 @@ def pending_requests() -> list:
         db.close()
 
 
+def _hash_code(code: str) -> str:
+    return hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+
+def _clean_pubkey(pubkey: Optional[str]) -> Optional[str]:
+    """Accept a base64 public key or nothing. A remote caller controls this,
+    so cap the length and allow only base64-ish characters — it can't smuggle
+    markup or an unbounded blob into the DB / directory responses."""
+    if not pubkey or not isinstance(pubkey, str):
+        return None
+    pk = pubkey.strip()
+    if not pk:
+        return None
+    if len(pk) > PUBKEY_MAX_LEN or not re.match(r"^[A-Za-z0-9+/=_-]+$", pk):
+        raise HTTPException(400, "Invalid public key")
+    return pk
+
+
+def _valid_invite(db, code: str) -> Optional[LinkInvite]:
+    """A redeemable invite for `code`, or None. Redeemable = exists, not
+    revoked, not expired, uses < max_uses. Looked up by hash so the stored
+    row never reveals the plaintext code."""
+    if not code:
+        return None
+    inv = db.query(LinkInvite).filter(LinkInvite.code_hash == _hash_code(code)).first()
+    if not inv or inv.revoked:
+        return None
+    if inv.expires_at is not None and inv.expires_at <= utcnow_naive():
+        return None
+    if inv.uses >= inv.max_uses:
+        return None
+    return inv
+
+
+def _is_blocked(db, local_user: str, handle: str) -> bool:
+    return db.query(RemoteBlock).filter(
+        RemoteBlock.local_user == _norm(local_user),
+        RemoteBlock.handle == _norm(handle),
+    ).first() is not None
+
+
+def _is_discoverable(db, request: Request, username: str) -> bool:
+    """A local account is reachable by remote guests unless it opted out. The
+    hub owner is always reachable, preserving the classic Home Link contract."""
+    key = _norm(username)
+    try:
+        if key == _owner_username(request):
+            return True
+    except HTTPException:
+        pass
+    pref = db.query(RemoteContactPref).filter(RemoteContactPref.local_user == key).first()
+    return pref is None or bool(pref.discoverable)
+
+
+def _local_user_pubkey(username: str) -> Optional[str]:
+    # E2EE public keys for local accounts arrive in Feature 2; None until then.
+    return None
+
+
+def _directory(request: Request, db, guest: LinkGuest) -> list:
+    """Local accounts this guest may message: discoverable, and not blocking
+    this guest. Each entry carries the user's E2EE public key (None for now) so
+    the guest can encrypt once Feature 2 lands."""
+    mgr = getattr(request.app.state, "auth_manager", None)
+    out = []
+    for uname in _known_users(request):
+        key = _norm(uname)
+        if not key or not _is_discoverable(db, request, key):
+            continue
+        if _is_blocked(db, key, guest.handle):
+            continue
+        try:
+            is_admin = bool(mgr and mgr.is_admin(key))
+        except Exception:
+            is_admin = False
+        out.append({"username": key, "is_admin": is_admin, "pubkey": _local_user_pubkey(key)})
+    out.sort(key=lambda u: u["username"])
+    return out
+
+
+def _resolve_target(request: Request, db, guest: LinkGuest, to: Optional[str]) -> str:
+    """Which local account a guest's message is for. Omitted → the owner (the
+    classic 1:1 Home Link contract, kept for old clients). Otherwise the named
+    account — but only if it is real, discoverable, and hasn't blocked this
+    guest. Every failure reads as the same 404 so a guest can't enumerate the
+    userbase or probe block/discoverability state."""
+    if not to:
+        return _owner_username(request)
+    key = _norm(to)
+    local = {_norm(u) for u in _known_users(request)}
+    if key not in local:
+        raise HTTPException(404, "No such recipient")
+    if not _is_discoverable(db, request, key) or _is_blocked(db, key, guest.handle):
+        raise HTTPException(404, "No such recipient")
+    return key
+
+
 def _owner_username(request: Request) -> str:
     """Who guest messages are addressed to: LINK_OWNER, else the first admin,
     else the first account."""
@@ -265,6 +399,7 @@ def setup_link_hub_routes():
     router = APIRouter(prefix="/api/link", tags=["link"])
 
     _register_limiter = RateLimiter(max_requests=5, window_seconds=300)
+    _redeem_limiter = RateLimiter(max_requests=10, window_seconds=300)
     _send_limiter = RateLimiter(max_requests=30, window_seconds=60)
     _fetch_limiter = RateLimiter(max_requests=240, window_seconds=60)
 
@@ -311,11 +446,76 @@ def setup_link_hub_routes():
         return {"ok": True, "handle": handle, "guest": gname,
                 "status": GUEST_PENDING, "token": token}
 
-    @router.get("/messages")
-    async def fetch_messages(request: Request, after_id: int = 0):
-        """The guest's conversation with the owner. Fetching marks the owner's
-        messages to the guest as read (the guest's UI only polls while the
-        thread is open, mirroring local DM semantics)."""
+    @router.post("/redeem")
+    async def redeem(body: RedeemRequest, request: Request):
+        """Redeem an invite code: create an APPROVED guest immediately — the
+        code IS the approval, so there's no pending→approve wait. Same handle
+        rules as /register. The use is consumed with a conditional UPDATE so a
+        single-use code can't be double-spent by two racing redemptions."""
+        _require_hub()
+        if not _redeem_limiter.check(_client_ip(request)):
+            raise HTTPException(429, "Too many attempts — try again later")
+        handle = _norm(body.handle)
+        if not HANDLE_RE.match(handle):
+            raise HTTPException(
+                400, "Handle must be 1-32 chars: lowercase letters, digits, . _ -")
+        pubkey = _clean_pubkey(body.pubkey)
+        code = (body.code or "").strip()
+        gname = guest_username(handle)
+        local = {_norm(u) for u in _known_users(request)}
+        if handle in local or gname in local or handle in RESERVED_USERNAMES:
+            raise HTTPException(409, "Handle unavailable")
+        token = secrets.token_urlsafe(32)
+        db = SessionLocal()
+        try:
+            if not _valid_invite(db, code):
+                # Generic on purpose: never reveal whether the code was wrong,
+                # expired, revoked, or already spent.
+                raise HTTPException(403, "Invalid or expired invite code")
+            if db.query(LinkGuest).filter(LinkGuest.handle == handle).first():
+                raise HTTPException(409, "Handle unavailable")
+            if db.query(LinkGuest).count() >= _max_guests():
+                raise HTTPException(429, "The hub is not accepting new guests right now")
+            # Atomically consume one use: the guard clauses in the WHERE mean two
+            # racing redemptions can't both spend the last use of a code.
+            consumed = db.query(LinkInvite).filter(
+                LinkInvite.code_hash == _hash_code(code),
+                LinkInvite.revoked == False,  # noqa: E712
+                LinkInvite.uses < LinkInvite.max_uses,
+                or_(LinkInvite.expires_at.is_(None), LinkInvite.expires_at > utcnow_naive()),
+            ).update({LinkInvite.uses: LinkInvite.uses + 1}, synchronize_session=False)
+            if not consumed:
+                raise HTTPException(403, "Invalid or expired invite code")
+            inv = db.query(LinkInvite).filter(LinkInvite.code_hash == _hash_code(code)).first()
+            db.add(LinkGuest(handle=handle, token_hash=_hash_token(token),
+                             status=GUEST_APPROVED, created_at=utcnow_naive(),
+                             invite_id=inv.id if inv else None, pubkey=pubkey))
+            db.commit()
+        finally:
+            db.close()
+        logger.info("Home Link invite redeemed: %s (approved)", gname)
+        return {"ok": True, "handle": handle, "guest": gname,
+                "status": GUEST_APPROVED, "token": token}
+
+    @router.get("/directory")
+    async def directory(request: Request):
+        """Local accounts this approved guest may start a chat with — the
+        guest's 'new chat' picker on their own instance."""
+        _require_hub()
+        if not _fetch_limiter.check(_client_ip(request)):
+            raise HTTPException(429, "Too many requests — slow down")
+        db = SessionLocal()
+        try:
+            g = _guest_from_bearer(request, db)
+            _require_approved(g)
+            return {"users": _directory(request, db, g), "me": guest_username(g.handle)}
+        finally:
+            db.close()
+
+    @router.get("/conversations")
+    async def guest_conversations(request: Request):
+        """Every local account this guest has a thread with: last message +
+        unread, most-recent first. Powers the guest's conversation list."""
         _require_hub()
         if not _fetch_limiter.check(_client_ip(request)):
             raise HTTPException(429, "Too many requests — slow down")
@@ -324,22 +524,64 @@ def setup_link_hub_routes():
             g = _guest_from_bearer(request, db)
             _require_approved(g)
             gname = guest_username(g.handle)
-            owner = _owner_username(request)
-            q = db.query(DirectMessage).filter(_pair_filter(gname, owner))
+            rows = (db.query(DirectMessage)
+                    .filter(or_(DirectMessage.sender == gname,
+                                DirectMessage.recipient == gname))
+                    .order_by(DirectMessage.created_at.asc()).all())
+            convos: dict = {}
+            for m in rows:
+                other = m.recipient if m.sender == gname else m.sender
+                c = convos.get(other)
+                if c is None:
+                    c = {"username": other, "last_body": None, "last_at": None,
+                         "last_mine": False, "unread": 0}
+                    convos[other] = c
+                c["last_body"] = m.body
+                c["last_at"] = (m.created_at.isoformat() + "Z") if m.created_at else None
+                c["last_mine"] = m.sender == gname
+                if m.recipient == gname and m.read_at is None:
+                    c["unread"] += 1
+            ordered = sorted(convos.values(), key=lambda c: c["last_at"] or "", reverse=True)
+            return {"conversations": ordered, "me": gname}
+        finally:
+            db.close()
+
+    @router.get("/messages")
+    async def fetch_messages(request: Request, after_id: int = 0, to: Optional[str] = None):
+        """The guest's conversation with one local user (`to`; omitted → the
+        owner, back-compat). Fetching marks that user's messages to the guest
+        as read, mirroring local DM semantics."""
+        _require_hub()
+        if not _fetch_limiter.check(_client_ip(request)):
+            raise HTTPException(429, "Too many requests — slow down")
+        db = SessionLocal()
+        try:
+            g = _guest_from_bearer(request, db)
+            _require_approved(g)
+            gname = guest_username(g.handle)
+            target = _resolve_target(request, db, g, to)
+            q = db.query(DirectMessage).filter(_pair_filter(gname, target))
             if after_id:
                 q = q.filter(DirectMessage.id > after_id)
             msgs = (q.order_by(DirectMessage.created_at.desc())
                     .limit(MESSAGES_PAGE_LIMIT).all())
             msgs.reverse()
-            db.query(DirectMessage).filter(
-                DirectMessage.sender == owner,
+            marked = db.query(DirectMessage).filter(
+                DirectMessage.sender == target,
                 DirectMessage.recipient == gname,
                 DirectMessage.read_at.is_(None),
             ).update({DirectMessage.read_at: utcnow_naive()}, synchronize_session=False)
             g.last_seen = utcnow_naive()
             db.commit()
+            if marked:
+                # Live read receipt to the local user's open SSE stream.
+                try:
+                    from routes.messaging_routes import bus
+                    bus.publish(target, "read", {"from": gname})
+                except Exception:
+                    pass
             return {"messages": [_ser(m, gname) for m in msgs],
-                    "owner": owner, "me": gname}
+                    "owner": target, "me": gname}
         finally:
             db.close()
 
@@ -358,14 +600,14 @@ def setup_link_hub_routes():
             g = _guest_from_bearer(request, db)
             _require_approved(g)
             gname = guest_username(g.handle)
-            owner = _owner_username(request)
-            msg = DirectMessage(sender=gname, recipient=owner, body=text,
+            target = _resolve_target(request, db, g, body.to)
+            msg = DirectMessage(sender=gname, recipient=target, body=text,
                                 created_at=utcnow_naive(), read_at=None)
             g.last_seen = utcnow_naive()
             db.add(msg)
             db.commit()
             db.refresh(msg)
-            # Fan out to the owner's open SSE stream (routes/messaging_routes)
+            # Fan out to the target's open SSE stream (routes/messaging_routes)
             # so hub-ingested guest messages arrive live too. Imported lazily —
             # messaging_routes imports this module at load time.
             from routes.messaging_routes import publish_message_event
@@ -450,6 +692,156 @@ def setup_link_hub_routes():
             logger.info("Home Link guest %s: %s", action, guest_username(_norm(handle)))
             return {"ok": True, "handle": _norm(handle),
                     "status": None if action == "delete" else g.status}
+        finally:
+            db.close()
+
+    # ── Admin: invite codes ─────────────────────────────────────────────────
+
+    @router.post("/admin/invites")
+    async def admin_create_invite(body: InviteCreateRequest, request: Request):
+        """Mint a one-off (or use-capped) invite code. The plaintext code is
+        returned exactly once here — only its hash is stored, so it can't be
+        recovered later; revoke and re-issue if it's lost."""
+        _require_hub()
+        require_admin(request)
+        me = _norm(require_user(request)) or "admin"
+        days = INVITE_DEFAULT_EXPIRY_DAYS if body.expires_in_days is None else body.expires_in_days
+        try:
+            days = int(days)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "expires_in_days must be a number")
+        if days <= 0 or days > INVITE_MAX_EXPIRY_DAYS:
+            raise HTTPException(400, f"expires_in_days must be 1..{INVITE_MAX_EXPIRY_DAYS}")
+        max_uses = 1 if body.max_uses is None else body.max_uses
+        try:
+            max_uses = int(max_uses)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "max_uses must be a number")
+        if max_uses < 1 or max_uses > INVITE_MAX_USES_CAP:
+            raise HTTPException(400, f"max_uses must be 1..{INVITE_MAX_USES_CAP}")
+        label = (body.label or "").strip()[:100] or None
+        code = secrets.token_urlsafe(24)
+        db = SessionLocal()
+        try:
+            inv = LinkInvite(code_hash=_hash_code(code), created_by=me, label=label,
+                             created_at=utcnow_naive(),
+                             expires_at=utcnow_naive() + timedelta(days=days),
+                             max_uses=max_uses, uses=0, revoked=False)
+            db.add(inv)
+            db.commit()
+            db.refresh(inv)
+            logger.info("Home Link invite created by %s (max_uses=%d, %dd)", me, max_uses, days)
+            return {"ok": True, "id": inv.id, "code": code, "label": label,
+                    "max_uses": max_uses,
+                    "expires_at": inv.expires_at.isoformat() + "Z"}
+        finally:
+            db.close()
+
+    @router.get("/admin/invites")
+    async def admin_list_invites(request: Request):
+        _require_hub()
+        require_admin(request)
+        db = SessionLocal()
+        try:
+            rows = db.query(LinkInvite).order_by(LinkInvite.created_at.desc()).all()
+            now = utcnow_naive()
+            out = []
+            for inv in rows:
+                expired = inv.expires_at is not None and inv.expires_at <= now
+                spent = inv.uses >= inv.max_uses
+                out.append({
+                    "id": inv.id, "label": inv.label, "created_by": inv.created_by,
+                    "created_at": (inv.created_at.isoformat() + "Z") if inv.created_at else None,
+                    "expires_at": (inv.expires_at.isoformat() + "Z") if inv.expires_at else None,
+                    "max_uses": inv.max_uses, "uses": inv.uses, "revoked": inv.revoked,
+                    "active": (not inv.revoked and not expired and not spent),
+                })
+            return {"invites": out}
+        finally:
+            db.close()
+
+    @router.post("/admin/invites/{invite_id}/revoke")
+    async def admin_revoke_invite(invite_id: int, request: Request):
+        """Kill a code immediately. Guests already created from it keep their
+        access (revoke the guest separately if needed)."""
+        _require_hub()
+        require_admin(request)
+        db = SessionLocal()
+        try:
+            inv = db.query(LinkInvite).filter(LinkInvite.id == invite_id).first()
+            if not inv:
+                raise HTTPException(404, "No such invite")
+            inv.revoked = True
+            db.commit()
+            return {"ok": True, "id": invite_id, "revoked": True}
+        finally:
+            db.close()
+
+    # ── Local user: discoverability + per-guest blocks ──────────────────────
+    # Session-authed (NOT in app.py's auth-exempt list): each local account
+    # controls its own reachability by remote guests.
+
+    def _me_or_403(request: Request) -> str:
+        me = _norm(require_user(request))
+        if not me:
+            raise HTTPException(403, "Sign in required")
+        return me
+
+    @router.get("/me/remote-prefs")
+    async def get_remote_prefs(request: Request):
+        _require_hub()
+        me = _me_or_403(request)
+        db = SessionLocal()
+        try:
+            pref = db.query(RemoteContactPref).filter(RemoteContactPref.local_user == me).first()
+            blocked = [r.handle for r in
+                       db.query(RemoteBlock).filter(RemoteBlock.local_user == me).all()]
+            return {"discoverable": pref is None or bool(pref.discoverable), "blocked": blocked}
+        finally:
+            db.close()
+
+    @router.post("/me/remote-prefs")
+    async def set_remote_prefs(body: RemotePrefRequest, request: Request):
+        _require_hub()
+        me = _me_or_403(request)
+        db = SessionLocal()
+        try:
+            pref = db.query(RemoteContactPref).filter(RemoteContactPref.local_user == me).first()
+            if pref is None:
+                db.add(RemoteContactPref(local_user=me, discoverable=bool(body.discoverable),
+                                         updated_at=utcnow_naive()))
+            else:
+                pref.discoverable = bool(body.discoverable)
+                pref.updated_at = utcnow_naive()
+            db.commit()
+            return {"ok": True, "discoverable": bool(body.discoverable)}
+        finally:
+            db.close()
+
+    @router.post("/me/block")
+    async def block_guest(body: BlockRequest, request: Request):
+        """Block or unblock a specific remote guest for my account only."""
+        _require_hub()
+        me = _me_or_403(request)
+        action = _norm(body.action)
+        if action not in ("block", "unblock"):
+            raise HTTPException(400, "action must be block or unblock")
+        handle = _norm(body.handle)
+        if handle.endswith(GUEST_SUFFIX):
+            handle = handle[: -len(GUEST_SUFFIX)]
+        if not handle:
+            raise HTTPException(400, "handle required")
+        db = SessionLocal()
+        try:
+            existing = db.query(RemoteBlock).filter(
+                RemoteBlock.local_user == me, RemoteBlock.handle == handle).first()
+            if action == "block" and not existing:
+                db.add(RemoteBlock(local_user=me, handle=handle, created_at=utcnow_naive()))
+                db.commit()
+            elif action == "unblock" and existing:
+                db.delete(existing)
+                db.commit()
+            return {"ok": True, "handle": handle, "blocked": action == "block"}
         finally:
             db.close()
 
@@ -556,8 +948,12 @@ async def _hub_call(method: str, path: str, *, token: Optional[str] = None,
         if resp.status_code == 401:
             raise HTTPException(409, NOT_CONNECTED)
         # Awaiting (or denied) approval — the front-end shows the waiting card.
-        if resp.status_code == 403 and detail == PENDING:
-            raise HTTPException(403, PENDING)
+        if resp.status_code == 403:
+            if detail == PENDING:
+                raise HTTPException(403, PENDING)
+            # e.g. an invalid/expired invite code — surface the reason, don't 502.
+            raise HTTPException(403, detail if isinstance(detail, str) and len(detail) <= 300
+                                else "Home server refused the request")
         if resp.status_code in (400, 409, 429):
             raise HTTPException(resp.status_code,
                                 detail if isinstance(detail, str) and len(detail) <= 300
@@ -732,6 +1128,43 @@ def setup_home_link_routes():
         _reset_summary_cache(me)
         return {"ok": True, "handle": data.get("handle") or handle,
                 "status": data.get("status") or GUEST_PENDING,
+                "contact": home_contact_name()}
+
+    @router.post("/redeem")
+    async def redeem_home(body: RedeemHomeRequest, request: Request):
+        """Join a hub with an invite code. Unlike /connect (register then wait
+        for the owner to approve), a redeemed code is approved on the spot, so
+        the conversation is usable immediately."""
+        me = _norm(require_user(request))
+        if not home_enabled():
+            raise HTTPException(404, "Home Link is disabled on this instance")
+        handle = _norm(body.handle)
+        if not HANDLE_RE.match(handle):
+            raise HTTPException(
+                400, "Handle must be 1-32 chars: lowercase letters, digits, . _ -")
+        code = (body.code or "").strip()
+        if not code:
+            raise HTTPException(400, "Invite code is required")
+        data = await _hub_call("POST", "/api/link/redeem",
+                               json_body={"handle": handle, "code": code})
+        token = data.get("token")
+        if not isinstance(token, str) or not (20 <= len(token) <= 128):
+            raise HTTPException(502, "Home server returned malformed data")
+        db = SessionLocal()
+        try:
+            old = _load_home_link(db, me)
+            if old:
+                db.delete(old)
+                db.flush()
+            db.add(HomeLink(local_user=me, home_url=home_server(),
+                            handle=data.get("handle") or handle, owner=None,
+                            token=token, created_at=utcnow_naive()))
+            db.commit()
+        finally:
+            db.close()
+        _reset_summary_cache(me)
+        return {"ok": True, "handle": data.get("handle") or handle,
+                "status": data.get("status") or GUEST_APPROVED,
                 "contact": home_contact_name()}
 
     @router.post("/disconnect")
