@@ -40803,6 +40803,23 @@ body.theme-frosted .modal {
   opacity: 1;
   background: color-mix(in srgb, var(--fg) 10%, transparent);
 }
+.msg-list-search-wrap {
+  padding: 8px 10px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+}
+.msg-list-search-wrap input {
+  width: 100%;
+  box-sizing: border-box;
+  background: color-mix(in srgb, var(--panel) 70%, var(--bg));
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 0.82rem;
+  padding: 6px 12px;
+  outline: none;
+}
+.msg-list-search-wrap input:focus { border-color: var(--accent, var(--red)); }
 .msg-convo-list {
   flex: 1;
   overflow-y: auto;
@@ -40925,7 +40942,8 @@ body.theme-frosted .modal {
   padding: 16px 16px 8px;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  /* No flex gap here — row margins carry the spacing so grouped messages
+     (.grp-cont) can actually sit tight against each other. */
   background:
     linear-gradient(color-mix(in srgb, var(--bg) 92%, transparent), color-mix(in srgb, var(--bg) 92%, transparent));
 }
@@ -40939,11 +40957,26 @@ body.theme-frosted .modal {
   align-items: center;
   gap: 10px;
 }
-.msg-bubble-row { display: flex; margin: 1px 0; }
-.msg-bubble-row.mine { justify-content: flex-end; }
+/* A row is [bubble column, ⋯ actions button]; .mine rows run row-reverse so
+   the button sits inboard of the bubble on both sides. Consecutive
+   same-sender messages within 5 minutes group: .grp-cont rows tuck up
+   against the previous one, and only the group's last row (.grp-tail)
+   shows the timestamp/ticks meta line. */
+.msg-bubble-row { display: flex; align-items: center; gap: 4px; margin: 7px 0 0; }
+.msg-bubble-row.grp-cont { margin-top: 1px; }
+.msg-bubble-row.mine { flex-direction: row-reverse; justify-content: flex-start; }
 .msg-bubble-row.theirs { justify-content: flex-start; }
-.msg-bubble {
+.msg-bubble-row:not(.grp-tail) .msg-bubble-meta { display: none; }
+.msg-bubble-col {
+  display: flex;
+  flex-direction: column;
   max-width: 72%;
+  min-width: 0;
+}
+.msg-bubble-row.mine .msg-bubble-col { align-items: flex-end; }
+.msg-bubble-row.theirs .msg-bubble-col { align-items: flex-start; }
+.msg-bubble {
+  max-width: 100%;
   padding: 6px 10px 5px;
   border-radius: 10px;
   font-size: 0.88rem;
@@ -40963,6 +40996,11 @@ body.theme-frosted .modal {
   border-bottom-left-radius: 3px;
 }
 .msg-bubble-text { white-space: pre-wrap; }
+.msg-bubble-text a {
+  color: var(--accent, #58a6ff);
+  text-decoration: underline;
+  word-break: break-all;
+}
 .msg-bubble-meta {
   font-size: 0.6rem;
   opacity: 0.55;
@@ -40973,7 +41011,227 @@ body.theme-frosted .modal {
   justify-content: flex-end;
   gap: 3px;
 }
+.msg-edited { opacity: 0.85; }
+.msg-deleted { opacity: 0.6; font-style: italic; }
 .msg-tick { display: inline-flex; align-items: center; }
+.msg-tick.read { color: var(--accent, #34b7f1); }
+
+/* ── Day separators ── */
+.msg-day-sep { display: flex; justify-content: center; margin: 12px 0 4px; }
+.msg-day-sep span {
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  opacity: 0.55;
+  background: color-mix(in srgb, var(--panel) 70%, transparent);
+  border: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+  border-radius: 10px;
+  padding: 2px 10px;
+}
+
+/* ── Per-message actions (⋯ hover button; long-press covers touch) ── */
+.msg-act-btn {
+  flex-shrink: 0;
+  align-self: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--fg);
+  font-size: 0.95rem;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s, background 0.12s;
+}
+.msg-bubble-row:hover .msg-act-btn,
+.msg-act-btn:focus-visible { opacity: 0.6; }
+.msg-act-btn:hover {
+  opacity: 1;
+  background: color-mix(in srgb, var(--fg) 10%, transparent);
+}
+.msg-bubble-row.deleted .msg-act-btn { display: none; }
+@media (hover: none) {
+  .msg-act-btn { display: none; }
+}
+
+/* ── Message context menu ── */
+.msg-ctx-menu {
+  position: fixed;
+  min-width: 150px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 4px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
+  display: flex;
+  flex-direction: column;
+}
+.msg-ctx-reacts {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+  margin-bottom: 3px;
+}
+.msg-ctx-react {
+  border: none;
+  background: transparent;
+  font-size: 1.05rem;
+  line-height: 1;
+  padding: 5px 6px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.msg-ctx-react:hover { background: color-mix(in srgb, var(--fg) 10%, transparent); }
+.msg-ctx-react.mine { background: color-mix(in srgb, var(--accent, var(--red)) 22%, transparent); }
+.msg-ctx-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: transparent;
+  color: var(--fg);
+  font-size: 0.85rem;
+  padding: 7px 10px;
+  border-radius: 7px;
+  cursor: pointer;
+}
+.msg-ctx-item:hover { background: color-mix(in srgb, var(--fg) 8%, transparent); }
+.msg-ctx-item.danger { color: var(--red, #e5484d); }
+
+/* ── Reaction chips (under the bubble) ── */
+.msg-reactions { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 2px; }
+.msg-react-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--panel) 80%, var(--bg));
+  color: var(--fg);
+  font-size: 0.78rem;
+  line-height: 1.3;
+  padding: 1px 8px 2px;
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s;
+}
+.msg-react-chip:hover { border-color: color-mix(in srgb, var(--fg) 30%, var(--border)); }
+.msg-react-chip.mine {
+  border-color: color-mix(in srgb, var(--accent, var(--red)) 60%, transparent);
+  background: color-mix(in srgb, var(--accent, var(--red)) 16%, transparent);
+}
+.msg-react-count { font-size: 0.68rem; font-weight: 600; opacity: 0.7; }
+
+/* ── Quoted reply inside a bubble ── */
+.msg-quote {
+  display: block;
+  border-left: 3px solid var(--accent, var(--red));
+  background: color-mix(in srgb, var(--fg) 7%, transparent);
+  border-radius: 6px;
+  padding: 3px 8px;
+  margin: 0 0 4px;
+  cursor: pointer;
+  font-size: 0.78rem;
+  max-width: 100%;
+  overflow: hidden;
+}
+.msg-quote-sender {
+  display: block;
+  font-weight: 600;
+  font-size: 0.72rem;
+  color: var(--accent, var(--red));
+}
+.msg-quote-body {
+  display: block;
+  opacity: 0.75;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+@keyframes msg-flash {
+  0% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent, var(--red)) 55%, transparent); }
+  100% { box-shadow: 0 0 0 3px transparent; }
+}
+.msg-bubble-row.msg-flash .msg-bubble { animation: msg-flash 1.2s ease-out both; }
+
+/* ── Typing indicator (animated dots bubble) ── */
+.msg-typing-ind { display: flex; margin: 7px 0 0; }
+.msg-typing-bubble {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: color-mix(in srgb, var(--panel) 85%, var(--bg));
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  border-bottom-left-radius: 3px;
+  padding: 9px 12px;
+}
+.msg-typing-bubble span {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--fg);
+  opacity: 0.4;
+  animation: msg-typing-dot 1.2s infinite ease-in-out;
+}
+.msg-typing-bubble span:nth-child(2) { animation-delay: 0.15s; }
+.msg-typing-bubble span:nth-child(3) { animation-delay: 0.3s; }
+@keyframes msg-typing-dot {
+  0%, 60%, 100% { transform: translateY(0); opacity: 0.35; }
+  30% { transform: translateY(-3px); opacity: 0.9; }
+}
+.msg-preview-typing { font-style: italic; color: var(--green); opacity: 0.9; }
+
+/* ── Composer reply/edit bar ── */
+.msg-composer-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-top: 1px solid var(--border);
+  background: color-mix(in srgb, var(--panel) 55%, transparent);
+}
+.msg-composer-bar.hidden { display: none; }
+.msg-cbar-main {
+  flex: 1;
+  min-width: 0;
+  border-left: 3px solid var(--accent, var(--red));
+  padding-left: 8px;
+}
+.msg-cbar-title {
+  display: block;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--accent, var(--red));
+}
+.msg-cbar-snippet {
+  display: block;
+  font-size: 0.78rem;
+  opacity: 0.7;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.msg-cbar-cancel {
+  flex-shrink: 0;
+  border: none;
+  background: transparent;
+  color: var(--fg);
+  opacity: 0.65;
+  cursor: pointer;
+  font-size: 0.9rem;
+  padding: 4px 6px;
+  border-radius: 6px;
+}
+.msg-cbar-cancel:hover {
+  opacity: 1;
+  background: color-mix(in srgb, var(--fg) 10%, transparent);
+}
+/* The bar supplies the top border when visible — avoid a double rule. */
+.msg-composer-bar:not(.hidden) + .msg-composer { border-top: none; }
 
 /* ── Composer ── */
 .msg-composer {
@@ -41191,7 +41449,7 @@ body.theme-frosted .modal {
     transform: translateX(0);
   }
   .msg-back-btn { display: inline-flex; }
-  .msg-bubble { max-width: 82%; }
+  .msg-bubble-col { max-width: 82%; }
   /* The thread's own header carries the close affordance via Back; keep the
      list header close button reachable when the list is showing. */
 }

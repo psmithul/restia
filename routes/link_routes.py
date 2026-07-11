@@ -365,6 +365,11 @@ def setup_link_hub_routes():
             db.add(msg)
             db.commit()
             db.refresh(msg)
+            # Fan out to the owner's open SSE stream (routes/messaging_routes)
+            # so hub-ingested guest messages arrive live too. Imported lazily —
+            # messaging_routes imports this module at load time.
+            from routes.messaging_routes import publish_message_event
+            publish_message_event(msg)
             return {"message": _ser(msg, gname)}
         finally:
             db.close()

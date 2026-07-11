@@ -552,15 +552,20 @@ class DirectMessage(Base):
     (EncryptedText) since private user-to-user messages are sensitive, matching
     how email passwords / signatures / endpoint keys are stored. Ownership is
     strict: a row is only ever visible to its sender or recipient, enforced in
-    routes/messaging_routes.py."""
+    routes/messaging_routes.py. Deletion is soft (deleted_at + blanked body)
+    so the other side's client renders a tombstone instead of a silent gap."""
     __tablename__ = "direct_messages"
 
-    id         = Column(Integer, primary_key=True, autoincrement=True)
-    sender     = Column(String, nullable=False, index=True)   # username who sent it
-    recipient  = Column(String, nullable=False, index=True)   # username it's addressed to
-    body       = Column(EncryptedText, nullable=False)
-    created_at = Column(DateTime, default=utcnow_naive, nullable=False, index=True)
-    read_at    = Column(DateTime, nullable=True)              # NULL = unread by recipient
+    id          = Column(Integer, primary_key=True, autoincrement=True)
+    sender      = Column(String, nullable=False, index=True)   # username who sent it
+    recipient   = Column(String, nullable=False, index=True)   # username it's addressed to
+    body        = Column(EncryptedText, nullable=False)
+    created_at  = Column(DateTime, default=utcnow_naive, nullable=False, index=True)
+    read_at     = Column(DateTime, nullable=True)              # NULL = unread by recipient
+    edited_at   = Column(DateTime, nullable=True)              # NULL = never edited
+    deleted_at  = Column(DateTime, nullable=True)              # soft delete: body blanked, tombstone kept
+    reply_to_id = Column(Integer, nullable=True)               # quoted message id, same {sender,recipient} pair
+    reactions   = Column(Text, nullable=True)                  # JSON {username: emoji}; parsed defensively in routes
 
     __table_args__ = (
         # Pull one conversation's messages in order.
@@ -797,6 +802,37 @@ def _migrate_add_link_columns():
     finally:
         if conn:
             conn.close()
+
+
+def _migrate_add_dm_feature_columns():
+    """Add the DM feature columns (editing, soft delete, replies, reactions)
+    to direct_messages for databases created before real-time messaging.
+    Guarded + idempotent; new installs get the full schema from create_all."""
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cols = [row[1] for row in conn.execute("PRAGMA table_info(direct_messages)").fetchall()]
+        if cols:
+            if "edited_at" not in cols:
+                conn.execute("ALTER TABLE direct_messages ADD COLUMN edited_at DATETIME")
+            if "deleted_at" not in cols:
+                conn.execute("ALTER TABLE direct_messages ADD COLUMN deleted_at DATETIME")
+            if "reply_to_id" not in cols:
+                conn.execute("ALTER TABLE direct_messages ADD COLUMN reply_to_id INTEGER")
+            if "reactions" not in cols:
+                conn.execute("ALTER TABLE direct_messages ADD COLUMN reactions TEXT")
+            conn.commit()
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"direct_messages feature-columns migration failed: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _migrate_add_last_message_at_column():
@@ -1926,6 +1962,7 @@ def init_db():
     _migrate_add_document_archived_column()
     _migrate_add_last_message_at_column()
     _migrate_add_link_columns()
+    _migrate_add_dm_feature_columns()
     _migrate_add_folder_column()
     _migrate_add_token_columns()
     _migrate_add_mode_column()
