@@ -10,6 +10,7 @@
 
 import uiModule from './ui.js';
 import { topPortalZ } from './toolWindowZOrder.js';
+import messagingModule from './messaging.js';
 
 const RECENTS_KEY = 'restia.palette.recents';
 const MAX_RECENTS = 6;
@@ -18,7 +19,8 @@ let _open = false;
 let _overlay = null;
 let _items = [];          // current filtered command list
 let _active = 0;          // highlighted index
-let _commands = null;     // built lazily on first open
+let _commands = null;     // static commands, built on open
+let _dynamic = [];        // content commands (conversations…), fetched async
 
 // ── Command registry ────────────────────────────────────────────────────────
 // btn: id of a button to click. run: custom action. after: id to click shortly
@@ -92,6 +94,31 @@ function _buildCommands() {
     });
   }
   return out;
+}
+
+// Content commands — jump straight to a conversation, Spotlight-style. Fetched
+// async on open so the palette shows instantly; merged in when they arrive.
+async function _loadDynamic() {
+  try {
+    const res = await fetch('/api/messages/conversations', { credentials: 'same-origin' });
+    if (!res.ok) return;
+    const data = await res.json();
+    _dynamic = (data.conversations || []).slice(0, 20).map(c => ({
+      id: 'chat:' + c.username,
+      icon: '💬',
+      title: c.username,
+      hint: 'Open chat',
+      keys: 'chat message ' + (c.username || ''),
+      run: () => {
+        messagingModule.open();
+        setTimeout(() => messagingModule.openConversation(c.username), 160);
+      },
+    }));
+    if (_open) {
+      _commands = [..._buildCommands(), ..._dynamic];
+      _render(_overlay.querySelector('#cmdp-input').value);
+    }
+  } catch (_) { /* not signed in / unavailable — tools-only palette */ }
 }
 
 // ── Fuzzy match ─────────────────────────────────────────────────────────────
@@ -189,7 +216,8 @@ function _exec(i) {
 export function open() {
   if (_open) return;
   _open = true;
-  _commands = _buildCommands();
+  _commands = [..._buildCommands(), ..._dynamic];
+  _loadDynamic();       // refresh conversation entries in the background
   _active = 0;
   _overlay = document.createElement('div');
   _overlay.className = 'cmdp-overlay';
