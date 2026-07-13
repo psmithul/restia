@@ -117,14 +117,20 @@ async def test_alerts_reach_only_chats_linked_to_the_callee_and_are_bounded():
             transport="local",
             offer_data=OFFER,
         ) is False
-        await _settle()
+        await _settle(rounds=100)
 
-        assert len(CALL_ALERT_OFFSETS_S) == 4
+        expected_offsets = tuple(float(offset) for offset in range(0, 45, 5))
+        assert CALL_ALERT_OFFSETS_S == expected_offsets
         assert all(0 <= offset < CALL_ALERT_TTL_S for offset in CALL_ALERT_OFFSETS_S)
         assert len(sent) == len(CALL_ALERT_OFFSETS_S)
         assert {chat_id for _, chat_id, _, _ in sent} == {"alice-phone"}
         assert all(rich_text is False for *_, rich_text in sent)
-        assert [f"Alert {n} of 4" in item[2] for n, item in enumerate(sent, 1)] == [True] * 4
+        total = len(CALL_ALERT_OFFSETS_S)
+        alert_labels = [
+            f"Alert {n} of {total}" in item[2]
+            for n, item in enumerate(sent, 1)
+        ]
+        assert alert_labels == [True] * total
         assert all("https://app.restia.dev/#messages=friend%40remote" in item[2] for item in sent)
         assert all(CALL_1 not in item[2] and OFFER["sdp"] not in item[2] for item in sent)
         assert all(item[0] not in item[2] for item in sent)

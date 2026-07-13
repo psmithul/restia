@@ -1,0 +1,71 @@
+name: ci / promote GHCR image
+
+# Promote an already-built immutable multi-architecture index to the release
+# channel. The digest-only input prevents mutable-tag races and avoids ever
+# replacing :latest with a single-architecture developer image.
+on:
+  workflow_dispatch:
+    inputs:
+      source_digest:
+        description: Immutable Restia OCI index digest (sha256:...)
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: ghcr-promotion
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  promote:
+    name: promote immutable index to latest
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate and promote immutable index
+        shell: bash
+        env:
+          SOURCE_DIGEST: ${{ inputs.source_digest }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+
+          image="${REGISTRY}/${IMAGE_NAME}"
+          source="${image}@${SOURCE_DIGEST}"
+
+          docker buildx imagetools inspect --raw "$source" > /tmp/source.json
+          jq -e '
+            (.mediaType == "application/vnd.oci.image.index.v1+json")
+            and (([
+              .manifests[]
+              | select(.platform.os == "linux")
+              | .platform.architecture
+            ] | sort) == ["amd64", "arm64"])
+          ' /tmp/source.json
+
+          docker buildx imagetools create \
+            --tag "${image}:latest" \
+            "$source"
+
+          actual="$(
+            docker buildx imagetools inspect "${image}:latest" |
+              awk '$1 == "Digest:" {print $2; exit}'
+          )"
+          test "$actual" = "$SOURCE_DIGEST"

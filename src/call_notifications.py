@@ -33,7 +33,8 @@ from src.telegram_bot import (
 logger = logging.getLogger(__name__)
 
 CALL_ALERT_TTL_S = 45.0
-# Send notifications more frequently to simulate continuous ringing
+# Telegram bots cannot create a native ringing notification, so send frequent
+# alerts across the existing 45-second window while retaining a strict cap.
 CALL_ALERT_OFFSETS_S = (0.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0)
 MAX_PENDING_CALLS = 256
 MAX_PENDING_CALLS_PER_OWNER = 4
@@ -108,7 +109,7 @@ def _https_public_origin(settings: Mapping[str, Any]) -> str:
     """
     raw = str((settings or {}).get("app_public_url") or "").strip()
     if not raw or len(raw) > 2048 or any(ord(ch) < 33 for ch in raw):
-        return "https://app.restia.dev"
+        return ""
     try:
         parsed = urlsplit(raw)
         if (

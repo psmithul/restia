@@ -246,7 +246,6 @@ def test_signal_rejects_noncanonical_call_ids(call_id):
     ("ice", {"candidate": {"candidate": "not-a-candidate"}}, "Invalid ICE payload"),
     ("ice", {"candidate": {"candidate": ICE["candidate"]["candidate"],
                             "sdpMLineIndex": True}}, "Invalid ICE payload"),
-    ("ice", {"candidate": {**ICE["candidate"], "private": "leak"}}, "Invalid ICE payload"),
     ("hangup", {"reason": "anything"}, "Control signals cannot contain data"),
 ])
 def test_signal_rejects_kind_mismatched_or_unbounded_shapes(kind, data, detail):
@@ -254,6 +253,17 @@ def test_signal_rejects_kind_mismatched_or_unbounded_shapes(kind, data, detail):
         _signal("mika", "bob", kind, data=data)
     assert e.value.status_code == 400
     assert e.value.detail == detail
+
+
+def test_signal_strips_unknown_browser_ice_fields_before_relay():
+    q = cr.call_bus.subscribe("bob")
+    candidate = {**ICE["candidate"], "vendorExtension": "not-relayed"}
+
+    assert _signal("mika", "bob", "ice", data={"candidate": candidate}) == {"ok": True}
+    _, payload = q.get_nowait()
+
+    assert payload["data"] == ICE
+    assert "vendorExtension" not in payload["data"]["candidate"]
 
 
 def test_signal_request_forbids_unknown_envelope_fields():
