@@ -41765,8 +41765,10 @@ body.theme-frosted .modal {
   color: #fff;
   font-size: 0.85rem;
   padding: 8px 16px;
-  position: sticky;
+  position: fixed;
   top: 0;
+  left: 0;
+  right: 0;
   z-index: 10000;
   display: flex;
   justify-content: center;
