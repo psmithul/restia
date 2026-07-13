@@ -347,7 +347,7 @@ def _validate_ice(data: dict) -> dict:
     if set(data) != {"candidate"} or not isinstance(data.get("candidate"), dict):
         raise _bad_signal("Invalid ICE payload")
     candidate = data["candidate"]
-    if not set(candidate).issubset(ICE_CANDIDATE_KEYS) or "candidate" not in candidate:
+    if "candidate" not in candidate:
         raise _bad_signal("Invalid ICE payload")
 
     text = candidate.get("candidate")
