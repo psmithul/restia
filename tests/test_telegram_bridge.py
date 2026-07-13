@@ -1,9 +1,14 @@
+import logging
+import traceback
+
+import httpx
 import pytest
 from fastapi import BackgroundTasks
 
 from src.telegram_bot import (
     TELEGRAM_SECRET_HEADER,
     TelegramConfig,
+    TelegramDeliveryError,
     consume_telegram_link_code,
     create_telegram_link_code,
     extract_telegram_message,
@@ -145,6 +150,113 @@ async def test_send_telegram_message_uses_html_parse_mode(monkeypatch):
         "reply_to_message_id": 7,
         "allow_sending_without_reply": True,
     }]
+
+
+@pytest.mark.asyncio
+async def test_send_telegram_message_redacts_token_from_httpx_info_log(monkeypatch, caplog):
+    token = "test-only-token:success"
+    real_client = httpx.AsyncClient
+
+    async def handler(request):
+        return httpx.Response(200, request=request)
+
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(
+        "src.telegram_bot.httpx.AsyncClient",
+        lambda *args, **kwargs: real_client(*args, transport=transport, **kwargs),
+    )
+    caplog.set_level(logging.INFO, logger="httpx")
+
+    await send_telegram_message(token, "111", "hello")
+
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert token not in messages
+    assert "bot[REDACTED]/sendMessage" in messages
+
+
+@pytest.mark.asyncio
+async def test_send_telegram_message_redacts_caught_http_status_error(monkeypatch):
+    token = "test-only-token:http-error"
+    real_client = httpx.AsyncClient
+
+    async def handler(request):
+        return httpx.Response(401, request=request)
+
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(
+        "src.telegram_bot.httpx.AsyncClient",
+        lambda *args, **kwargs: real_client(*args, transport=transport, **kwargs),
+    )
+
+    with pytest.raises(TelegramDeliveryError) as caught:
+        await send_telegram_message(token, "111", "hello")
+
+    assert token not in str(caught.value)
+    assert str(caught.value) == "Telegram API request failed with HTTP 401"
+    assert caught.value.__cause__ is None
+    assert caught.value.__suppress_context__ is True
+    assert caught.value.__context__ is None
+    assert token not in "".join(traceback.format_exception(caught.value))
+
+
+@pytest.mark.asyncio
+async def test_send_telegram_message_redacts_caught_transport_error(monkeypatch):
+    token = "test-only-token:transport-error"
+    real_client = httpx.AsyncClient
+
+    async def handler(request):
+        raise httpx.ConnectError(f"could not reach {request.url}", request=request)
+
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(
+        "src.telegram_bot.httpx.AsyncClient",
+        lambda *args, **kwargs: real_client(*args, transport=transport, **kwargs),
+    )
+
+    with pytest.raises(TelegramDeliveryError) as caught:
+        await send_telegram_message(token, "111", "hello")
+
+    assert token not in str(caught.value)
+    assert str(caught.value) == "Telegram API request failed (ConnectError)"
+    assert caught.value.__suppress_context__ is True
+    assert caught.value.__context__ is None
+    assert token not in "".join(traceback.format_exception(caught.value))
+    tb = caught.value.__traceback__
+    production_frames = []
+    while tb is not None:
+        if tb.tb_frame.f_code.co_filename.endswith("src/telegram_bot.py"):
+            production_frames.append(tb.tb_frame)
+        tb = tb.tb_next
+    assert production_frames
+    assert all(token not in repr(frame.f_locals) for frame in production_frames)
+
+
+@pytest.mark.asyncio
+async def test_send_telegram_message_sanitizes_non_httpx_transport_exception(monkeypatch):
+    token = "test-only-token:unexpected-error"
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, json):
+            raise RuntimeError(f"hook failed for {url}")
+
+    monkeypatch.setattr("src.telegram_bot.httpx.AsyncClient", _Client)
+
+    with pytest.raises(TelegramDeliveryError) as caught:
+        await send_telegram_message(token, "111", "hello")
+
+    rendered = "".join(traceback.format_exception(caught.value))
+    assert str(caught.value) == "Telegram API request failed"
+    assert caught.value.__context__ is None
+    assert token not in rendered
 
 
 class _Request:

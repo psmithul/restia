@@ -6,8 +6,10 @@
 // every 60 seconds and fires a Notification + toast for any note whose
 // `due_date` is in the past but within the staleness window.
 //
-// `start()` kicks off the poll loop + permission request. Call once from
-// the calendar's entry module.
+// `startReminderPoll()` only starts the poll loop. Notification permission is
+// requested from the explicit reminder-creation gesture in calendar.js; doing
+// it here during page startup is rejected by browsers and can force Firefox
+// out of DOM fullscreen.
 
 import uiModule from '../ui.js';
 
@@ -101,14 +103,11 @@ async function _pollReminders() {
 
 let _started = false;
 
-// Idempotent: safe to call multiple times. Kicks off permission request
-// and the 60s poll loop on first call.
+// Idempotent: safe to call multiple times. Kicks off the 60s poll loop on the
+// first call without prompting for permissions during page startup.
 export function startReminderPoll() {
   if (_started) return;
   _started = true;
-  if ('Notification' in window && Notification.permission === 'default') {
-    Notification.requestPermission();
-  }
   _pollReminders();
   setInterval(_pollReminders, 60000);
 }

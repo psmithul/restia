@@ -1,13 +1,13 @@
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 
 
 # Request Models
 class ChatRequest(BaseModel):
-    message: str = Field(..., min_length=1, max_length=50000, description="Chat message")
+    message: str = Field(default="", max_length=50000, description="Chat message")
     session: str = Field(..., description="Session ID")
-    attachments: Optional[List[str]] = Field(default=[], description="Attachment IDs")
+    attachments: List[str] = Field(default_factory=list, description="Attachment IDs")
     use_web: Optional[bool] = Field(default=False, description="Enable web search")
     use_research: Optional[bool] = Field(default=False, description="Enable deep research")
     time_filter: Optional[str] = Field(default=None, description="Time filter for search")
@@ -17,6 +17,12 @@ class ChatRequest(BaseModel):
     @classmethod
     def clean_message(cls, v):
         return v.strip()
+
+    @model_validator(mode="after")
+    def require_message_or_attachment(self):
+        if not self.message and not self.attachments:
+            raise ValueError("message or attachment is required")
+        return self
     
     @field_validator('time_filter')
     @classmethod

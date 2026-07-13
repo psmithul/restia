@@ -288,11 +288,15 @@ if AUTH_ENABLED:
         _re.compile(r"^/api/telegram/webhook/?$"),
         # Home Link hub API: callers are REMOTE instances with no session
         # cookie. routes/link_routes.py does its own auth — register/redeem are
-        # rate-limited and everything else requires the guest bearer token —
+        # rate-limited and messages/revoke/calls require the guest bearer token —
         # and the whole prefix 404s unless LINK_HUB_ENABLED=true. The admin
         # (/api/link/admin/*) and local-user (/api/link/me/*) endpoints are
         # deliberately NOT here: those keep the hub's own session auth.
-        _re.compile(r"^/api/link/(register|redeem|messages|summary|directory|conversations)/?$"),
+        _re.compile(r"^/api/link/(register|redeem|revoke|messages|summary|directory|conversations)/?$"),
+        # Federated call endpoints prove the remote installation with the same
+        # approved Home Link bearer. Keep this exact: no admin/me endpoint and
+        # no arbitrary /api/link/calls/* suffix is session-auth exempt.
+        _re.compile(r"^/api/link/calls/(signal|stream)/?$"),
     ]
 
     def _is_auth_exempt(path: str) -> bool:
@@ -321,6 +325,12 @@ if AUTH_ENABLED:
     def _refresh_token_cache():
         """Rebuild the prefix→[(id,hash)] map from the DB."""
         from collections import defaultdict
+        if auth_manager.auth_store_error:
+            # A quarantined credential store cannot vouch for any token owner,
+            # including otherwise well-formed rows left in the database.
+            _token_cache.clear()
+            app.state._token_cache_dirty = False
+            return
         new_map = defaultdict(list)
         db = SessionLocal()
         try:
@@ -395,7 +405,11 @@ if AUTH_ENABLED:
                     # is just owner attribution for notes/calendar/etc.
                     _impersonate = (request.headers.get("X-Restia-Owner") or "").strip()
                     _auth_mgr = getattr(request.app.state, "auth_manager", None) or auth_manager
-                    if _impersonate and _impersonate in getattr(_auth_mgr, "users", {}):
+                    if (
+                        not getattr(_auth_mgr, "auth_store_error", False)
+                        and _impersonate
+                        and _impersonate in getattr(_auth_mgr, "users", {})
+                    ):
                         request.state.current_user = _impersonate
                     else:
                         request.state.current_user = INTERNAL_TOOL_USER
@@ -403,6 +417,22 @@ if AUTH_ENABLED:
                     return await call_next(request)
             except Exception as _e:
                 logger.warning("Internal tool auth header check failed", exc_info=_e)
+            # Reserved legacy identities and unreadable/corrupt auth.json files
+            # are quarantined.  Keep the installation configured, but admit no
+            # profile-based access (including API bearer and localhost bypass)
+            # until an operator repairs the credential store. The genuine
+            # per-process internal-tool branch above remains available for
+            # explicit local recovery tooling and never impersonates a profile.
+            if auth_manager.auth_store_error:
+                if path.startswith("/api/"):
+                    return JSONResponse(
+                        status_code=503,
+                        content={
+                            "error": "Authentication store unavailable",
+                            "auth_store_error": True,
+                        },
+                    )
+                return RedirectResponse(url="/login", status_code=302)
             # Allow DIRECT localhost requests (internal service calls from
             # heartbeats etc.). Tunnel/proxy-forwarded requests are excluded by
             # _is_trusted_loopback so LOCALHOST_BYPASS can't be abused over a
@@ -771,7 +801,11 @@ from routes.messaging_routes import setup_messaging_routes
 app.include_router(setup_messaging_routes())
 
 # Home Link (chat with the developer from a self-hosted instance)
-from routes.link_routes import setup_link_hub_routes, setup_home_link_routes
+from routes.link_routes import (
+    home_call_alert_watcher,
+    setup_link_hub_routes,
+    setup_home_link_routes,
+)
 app.include_router(setup_link_hub_routes())
 app.include_router(setup_home_link_routes())
 
@@ -1317,6 +1351,11 @@ async def _startup_event():
 
     _startup_tasks.append(asyncio.create_task(_null_owner_sweep_loop()))
 
+    # One server-side Home Link call stream keeps incoming offers observable
+    # while the browser is closed, so the linked profile can receive its
+    # bounded Telegram alerts and follow the link back into the ringing call.
+    _startup_tasks.append(asyncio.create_task(home_call_alert_watcher()))
+
     # Nightly skill audit — at ~02:00 local, test + judge a batch of the
     # least-recently-checked skills, auto-fixing/escalating weak ones (never
     # deletes). Rotates through the library so each night covers different
@@ -1381,6 +1420,20 @@ async def _shutdown_event():
         await mcp_manager.disconnect_all()
     except Exception as e:
         logger.warning(f"MCP shutdown error: {e}")
+    # Stop every strong-referenced startup loop, including the Home Link call
+    # watcher, before clearing its in-memory alert tasks.
+    startup_tasks = list(getattr(app.state, "_startup_tasks", []))
+    for task in startup_tasks:
+        if not task.done():
+            task.cancel()
+    if startup_tasks:
+        await asyncio.gather(*startup_tasks, return_exceptions=True)
+    app.state._startup_tasks = []
+    try:
+        from src.call_notifications import incoming_call_notifications
+        await incoming_call_notifications.shutdown()
+    except Exception:
+        logger.warning("Incoming call notification shutdown failed")
     logger.info("Application shutdown complete")
 
 

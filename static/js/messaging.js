@@ -50,6 +50,14 @@ let _pendingCheckTimer = null;     // re-poll while the "waiting" card is up
 let _sending = false;
 let _listFilter = '';              // client-side conversation search
 
+// One still photo per message. Drafts are keyed by conversation so switching
+// threads cannot accidentally send a photo to the wrong person.
+const PHOTO_MIMES = new Set(['image/png', 'image/jpeg', 'image/webp']);
+const LOCAL_PHOTO_MAX = 8 * 1024 * 1024;
+const FEDERATED_PHOTO_MAX = 2 * 1024 * 1024;
+const PHOTO_ID_RE = /^[0-9a-f]{32}$/;
+let _photoDrafts = new Map();       // username → { file, url }
+
 // SSE stream state. _sseHealthy gates the poll timers: while the stream is
 // live, local conversations don't poll at all.
 let _es = null;
@@ -172,6 +180,74 @@ function _avatarHtml(name, cls) {
 
 function _isHomeThread() {
   return !!(_activeOtherMeta && _activeOtherMeta.home);
+}
+
+function _isFederatedThread() {
+  return !!(_activeOtherMeta && (_activeOtherMeta.home || _activeOtherMeta.remote));
+}
+
+function _photoLimit() {
+  return _isFederatedThread() ? FEDERATED_PHOTO_MAX : LOCAL_PHOTO_MAX;
+}
+
+function _discardPhotoDraft(peer, revoke = true) {
+  const item = _photoDrafts.get(peer);
+  if (item && revoke && item.url) URL.revokeObjectURL(item.url);
+  _photoDrafts.delete(peer);
+}
+
+function _renderPhotoDraft() {
+  const tray = document.getElementById('msg-photo-draft');
+  const attach = document.getElementById('msg-photo-btn');
+  const item = _activeOther ? _photoDrafts.get(_activeOther) : null;
+  if (attach) attach.disabled = !_threadReady || _editingId != null || _sending || !!item;
+  if (!tray) return;
+  if (!item || _editingId != null) {
+    tray.classList.add('hidden');
+    tray.innerHTML = '';
+    return;
+  }
+  const cap = _isFederatedThread() ? '2 MB between instances' : '8 MB';
+  tray.innerHTML = `
+    <div class="msg-photo-thumb">
+      <img src="${esc(item.url)}" alt="Selected photo preview" />
+      <button type="button" class="msg-photo-remove" aria-label="Remove selected photo" title="Remove">✕</button>
+    </div>
+    <div class="msg-photo-draft-copy">
+      <span class="msg-photo-draft-name">${esc(item.file.name || 'photo')}</span>
+      <span>One photo per message · ${cap} · encrypted at rest, not end-to-end</span>
+    </div>`;
+  tray.classList.remove('hidden');
+  tray.querySelector('.msg-photo-remove')?.addEventListener('click', () => {
+    _discardPhotoDraft(_activeOther);
+    _renderPhotoDraft();
+  });
+}
+
+function _queuePhoto(file) {
+  if (!file || !_activeOther || !_threadReady || _editingId != null) return;
+  if (!PHOTO_MIMES.has(file.type)) {
+    uiModule.showError && uiModule.showError('Only PNG, JPEG, and WebP photos are supported.');
+    return;
+  }
+  const limit = _photoLimit();
+  if (!file.size || file.size > limit) {
+    const mb = Math.floor(limit / (1024 * 1024));
+    uiModule.showError && uiModule.showError(`Photo must be ${mb} MB or smaller.`);
+    return;
+  }
+  _discardPhotoDraft(_activeOther);
+  _photoDrafts.set(_activeOther, { file, url: URL.createObjectURL(file) });
+  _renderPhotoDraft();
+}
+
+function _fileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : '');
+    reader.onerror = () => reject(new Error('Could not read the selected photo'));
+    reader.readAsDataURL(file);
+  });
 }
 
 // ── Sidebar unread badge ────────────────────────────────────────────────────
@@ -577,6 +653,7 @@ export async function openConversation(other) {
   _messages.clear();
   _lastRenderedMsg = null;
   _cancelComposerState();
+  _renderPhotoDraft();
   _closeMessageMenu();
   _hideTypingIndicator();
   _stopPendingCheck();
@@ -598,6 +675,7 @@ export async function openConversation(other) {
     _renderThreadHeader(other, data.other);
     _renderThread(data.messages || []);
     _threadReady = true;
+    _renderPhotoDraft();
     _reconfigurePolling();
     // Sync E2EE state and decrypt any encrypted history (if already unlocked);
     // re-render the header so the lock reflects this thread's eligibility.
@@ -628,13 +706,17 @@ export async function openConversation(other) {
 function _renderThreadHeader(other, meta) {
   const host = document.getElementById('msg-thread-header');
   if (!host) return;
+  const identityTag = !meta ? ''
+    : meta.home ? ' <span class="msg-admin-tag msg-dev-tag">dev</span>'
+    : meta.remote ? ' <span class="msg-admin-tag">user</span>'
+    : ` <span class="msg-admin-tag">${meta.is_admin ? 'profile · admin' : 'profile'}</span>`;
   host.innerHTML = `
     <button type="button" class="msg-back-btn" id="msg-back-btn" title="Back" aria-label="Back to conversations">
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
     </button>
     ${_avatarHtml((meta && meta.display) || other, '')}
     <div class="msg-thread-who">
-      <span class="msg-thread-name">${esc((meta && meta.display) || other)}${meta && meta.home ? ' <span class="msg-admin-tag msg-dev-tag">dev</span>' : (meta && meta.is_admin ? ' <span class="msg-admin-tag">admin</span>' : '')}</span>
+      <span class="msg-thread-name">${esc((meta && meta.display) || other)}${identityTag}</span>
     </div>
     ${_callBtnsHtml(meta)}
     ${_lockBtnHtml(meta)}`;
@@ -646,23 +728,25 @@ function _renderThreadHeader(other, meta) {
   document.getElementById('msg-call-video')?.addEventListener('click', () => _startCallSafe(other, true));
 }
 
-// Calls run over the same-instance signaling bus. Contacts on another instance
-// (Home Link / '@remote') can't be dialed yet — say so plainly instead of
-// failing silently.
 function _startCallSafe(other, video) {
-  if (_activeOtherMeta && (_activeOtherMeta.remote || _activeOtherMeta.home)) {
-    uiModule.showToast && uiModule.showToast(
-      'Calling contacts on another instance is coming soon — calls between accounts here work now.');
+  const meta = _activeOtherMeta || {};
+  if (callModule.canCall && !callModule.canCall(meta)) {
+    const message = meta.home
+      ? 'Only the profile that connected Home Link can call this contact.'
+      : meta.remote
+        ? 'Only this hub\'s configured owner can call linked users.'
+        : 'Calling is unavailable for this chat.';
+    uiModule.showToast && uiModule.showToast(message);
     return;
   }
-  callModule.startCall(other, video);
+  callModule.startCall(other, video, { home: !!meta.home, remote: !!meta.remote });
 }
 
-// Voice/video call buttons — shown whenever calling is enabled so the feature
-// is discoverable on every thread. The action itself is gated in
-// _startCallSafe (same-instance calls connect; remote shows a clear message).
 function _callBtnsHtml(meta) {
-  const eligible = meta && callModule.isEnabled && callModule.isEnabled();
+  const eligible = meta && (
+    callModule.canCall ? callModule.canCall(meta)
+      : callModule.isEnabled && callModule.isEnabled()
+  );
   if (!eligible) return '';
   return `
     <button type="button" class="msg-call-btn" id="msg-call-voice" title="Voice call" aria-label="Voice call">
@@ -679,7 +763,7 @@ function _lockBtnHtml(meta) {
   if (!eligible) return '';
   const on = _e2ee.unlocked;
   const title = on
-    ? 'End-to-end encrypted. Messages you send here are encrypted to the recipient.'
+    ? 'Text is end-to-end encrypted. Photos are encrypted at rest, not end-to-end.'
     : (_e2ee.published ? 'Unlock end-to-end encryption on this device' : 'Enable end-to-end encryption');
   return `<button type="button" class="msg-lock-btn${on ? ' on' : ''}" id="msg-lock-btn"
             title="${esc(title)}" aria-label="Encryption">${on ? '🔒' : '🔓'}</button>`;
@@ -690,6 +774,7 @@ function _closeThread() {
   _activeOtherMeta = null;
   _threadReady = false;
   _cancelComposerState();
+  _renderPhotoDraft();
   _closeMessageMenu();
   _hideTypingIndicator();
   _stopPendingCheck();
@@ -754,9 +839,36 @@ function _lockHtml() {
   return '<em class="msg-locked">🔒 Encrypted — unlock to read</em>';
 }
 
+function _messagePhotos(m) {
+  if (!m || !Array.isArray(m.attachments)) return [];
+  return m.attachments.slice(0, 1).filter(a =>
+    a && typeof a.id === 'string' && PHOTO_ID_RE.test(a.id) &&
+    PHOTO_MIMES.has(a.mime) && Number(a.width) > 0 && Number(a.height) > 0
+  );
+}
+
+function _photoUrl(id) {
+  let url = `/api/messages/media/${encodeURIComponent(id)}`;
+  if (_isHomeThread() && _activeOther) {
+    url += `?peer=${encodeURIComponent(_activeOther)}`;
+  }
+  return url;
+}
+
+function _photosHtml(m) {
+  const photos = _messagePhotos(m);
+  if (!photos.length) return '';
+  const a = photos[0];
+  const url = _photoUrl(a.id);
+  return `<a class="msg-photo" href="${esc(url)}" target="_blank" rel="noopener noreferrer" title="Open photo">
+    <img src="${esc(url)}" alt="${esc(a.name || 'Photo')}" loading="lazy" decoding="async" referrerpolicy="no-referrer" />
+  </a>`;
+}
+
 function _bubbleInnerHtml(m) {
   const encrypted = !m.deleted && e2ee.isEnvelope(m.body);
   const locked = encrypted && m._plain == null;
+  const photosHtml = m.deleted ? '' : _photosHtml(m);
   const bodyHtml = m.deleted
     ? '<em class="msg-deleted">Message deleted</em>'
     : locked
@@ -768,7 +880,8 @@ function _bubbleInnerHtml(m) {
     ? '<span class="msg-enc-badge" title="End-to-end encrypted">🔒</span>' : '';
   return `
     ${_quoteHtml(m.reply_to)}
-    <div class="msg-bubble-text">${bodyHtml}</div>
+    ${photosHtml}
+    ${bodyHtml ? `<div class="msg-bubble-text">${bodyHtml}</div>` : ''}
     <div class="msg-bubble-meta">${edited}${lockBadge}${esc(_fmtClock(m.created_at))}${m.mine ? _tickHtml(m.read) : ''}</div>`;
 }
 
@@ -973,13 +1086,14 @@ function _openMessageMenu(m, x, y) {
   const item = (act, label, danger) =>
     `<button type="button" class="msg-ctx-item${danger ? ' danger' : ''}" data-act="${act}">${label}</button>`;
   if (!isHome) parts.push(item('reply', 'Reply'));
-  parts.push(item('copy', 'Copy'));
+  if ((m._plain != null ? m._plain : m.body) || '') parts.push(item('copy', 'Copy'));
   // Edit/delete only for own messages, never in Home Link threads (the hub
   // rejects them — messages already left this instance).
   if (!isHome && m.mine) {
-    parts.push(item('edit', 'Edit'));
+    if ((m._plain != null ? m._plain : m.body) || '') parts.push(item('edit', 'Edit'));
     parts.push(item('delete', 'Delete', true));
   }
+  if (!parts.length) return;
   menu.innerHTML = parts.join('');
   document.body.appendChild(menu);
 
@@ -1072,10 +1186,11 @@ function _renderComposerBar() {
   }
   const m = _editingId != null ? _messages.get(_editingId) : _replyTo;
   const title = _editingId != null ? 'Editing message' : `Replying to ${esc((m && m.sender) || '')}`;
+  const snippet = (m && m.body) || (_messagePhotos(m).length ? 'Photo' : '');
   bar.innerHTML = `
     <div class="msg-cbar-main">
       <span class="msg-cbar-title">${title}</span>
-      <span class="msg-cbar-snippet">${esc(_truncate((m && m.body) || '', 90))}</span>
+      <span class="msg-cbar-snippet">${esc(_truncate(snippet, 90))}</span>
     </div>
     <button type="button" class="msg-cbar-cancel" title="Cancel" aria-label="Cancel">✕</button>`;
   bar.classList.remove('hidden');
@@ -1110,6 +1225,7 @@ function _enterEdit(m) {
     input.focus();
   }
   _renderComposerBar();
+  _renderPhotoDraft();
   _registerComposerEsc();
 }
 
@@ -1123,6 +1239,7 @@ function _cancelComposerState() {
   _replyTo = null;
   _unregisterComposerEsc();
   _renderComposerBar();
+  _renderPhotoDraft();
 }
 
 // ── Home Link connect card ─────────────────────────────────────────────────
@@ -1163,12 +1280,26 @@ function _renderConnectCard(other, errText) {
     try {
       // A code redeems to instant approval; no code falls back to the classic
       // register-and-wait flow.
-      if (code) {
-        await _api('/api/homelink/redeem', { method: 'POST', body: JSON.stringify({ handle, code }) });
-      } else {
-        await _api('/api/homelink/connect', { method: 'POST', body: JSON.stringify({ handle }) });
+      const connect = (forceReplace) => code
+        ? _api('/api/homelink/redeem', {
+            method: 'POST', body: JSON.stringify({ handle, code, force_replace: forceReplace }),
+          })
+        : _api('/api/homelink/connect', {
+            method: 'POST', body: JSON.stringify({ handle, force_replace: forceReplace }),
+          });
+      try {
+        await connect(false);
+      } catch (e) {
+        if (e.message !== 'home_revoke_required') throw e;
+        const force = await uiModule.styledConfirm(
+          'The previous Home Link could not be reached to revoke its credential. Replace it locally anyway? The old hub may retain that identity and its data.',
+          { confirmText: 'Force replace', danger: true },
+        );
+        if (!force) throw new Error('Previous Home Link was kept for safety.');
+        await connect(true);
       }
-      openConversation(other);
+      if (callModule.refreshConfig) await callModule.refreshConfig();
+      await openConversation(other);
     } catch (e) {
       btn.disabled = false;
       btn.textContent = 'Connect';
@@ -1247,9 +1378,12 @@ async function _sendCurrent() {
   const input = document.getElementById('msg-composer-input');
   if (!input || !_activeOther || _sending) return;
   const body = input.value.trim();
-  if (!body) return;
-  if (_editingId != null) { _submitEdit(body); return; }
+  if (_editingId != null) { if (body) _submitEdit(body); return; }
+  const peer = _activeOther;
+  const photo = _photoDrafts.get(peer);
+  if (!body && !photo) return;
   _sending = true;
+  _renderPhotoDraft();
   input.value = '';
   input.style.height = 'auto';
   const replyTo = _replyTo;
@@ -1258,28 +1392,39 @@ async function _sendCurrent() {
     // keys; otherwise send plaintext (the composer footer shows which).
     let outBody = body;
     let encKey = null;
-    if (_e2eeEligible() && _e2ee.unlocked) {
-      encKey = await _sharedKeyFor(_activeOther);
+    if (body && _e2eeEligible() && _e2ee.unlocked) {
+      encKey = await _sharedKeyFor(peer);
       if (encKey) outBody = await e2ee.encryptMessage(body, encKey);
     }
     const payload = { body: outBody };
+    if (photo) {
+      payload.attachments = [{
+        name: photo.file.name || 'photo',
+        data: await _fileAsDataUrl(photo.file),
+      }];
+    }
     if (replyTo && replyTo.id != null) payload.reply_to_id = replyTo.id;
-    const data = await _api(`/api/messages/conversations/${encodeURIComponent(_activeOther)}`, {
+    const data = await _api(`/api/messages/conversations/${encodeURIComponent(peer)}`, {
       method: 'POST',
       body: JSON.stringify(payload),
     });
     // Show my own message as plaintext immediately (the body I hold is the
     // envelope; stash the cleartext so the bubble renders unlocked).
-    if (data.message) { if (encKey) data.message._plain = body; _appendMessages([data.message]); }
-    if (_replyTo === replyTo) _cancelComposerState();
+    if (_activeOther === peer && data.message) {
+      if (encKey) data.message._plain = body;
+      _appendMessages([data.message]);
+    }
+    if (photo) _discardPhotoDraft(peer);
+    if (_activeOther === peer && _replyTo === replyTo) _cancelComposerState();
     _lastTypingSentAt = 0; // a fresh keystroke after sending signals typing again
     _scheduleListRefresh();
   } catch (e) {
-    input.value = body; // restore so the user doesn't lose their text
+    if (_activeOther === peer && !input.value) input.value = body;
     uiModule.showError && uiModule.showError('Message failed: ' + e.message);
   } finally {
     _sending = false;
-    input.focus();
+    _renderPhotoDraft();
+    if (_activeOther === peer) input.focus();
   }
 }
 
@@ -1319,18 +1464,18 @@ async function _openNewChatPicker() {
   const list = document.getElementById('msg-newchat-list');
   if (!overlay || !list) return;
   overlay.classList.remove('hidden');
-  list.innerHTML = `<div class="msg-thread-loading">Loading users…</div>`;
+  list.innerHTML = `<div class="msg-thread-loading">Loading profiles…</div>`;
   try {
-    const data = await _api('/api/messages/users');
-    const users = data.users || [];
-    if (!users.length) {
-      list.innerHTML = `<div class="msg-empty-list">Only your account exists on this instance.<br><span>Create another account in Settings → Users to start a direct message.</span></div>`;
+    const data = await _api('/api/messages/profiles');
+    const profiles = data.profiles || data.users || [];
+    if (!profiles.length) {
+      list.innerHTML = `<div class="msg-empty-list">Only your profile exists in this Restia installation.<br><span>Create another profile in Settings → Profiles to start a direct message.</span></div>`;
       return;
     }
-    list.innerHTML = users.map(u => {
+    list.innerHTML = profiles.map(u => {
       const tag = u.home ? ' <span class="msg-admin-tag msg-dev-tag">dev</span>'
-        : u.remote ? ' <span class="msg-admin-tag">remote</span>'
-        : u.is_admin ? ' <span class="msg-admin-tag">admin</span>' : '';
+        : u.remote ? ' <span class="msg-admin-tag">user</span>'
+        : ` <span class="msg-admin-tag">${u.is_admin ? 'profile · admin' : 'profile'}</span>`;
       const hint = u.home ? '<span class="msg-newchat-hint">Chat with the developer</span>' : '';
       return `
       <div class="msg-newchat-item" data-user="${esc(u.username)}" role="button" tabindex="0">
@@ -1551,7 +1696,12 @@ function _buildModal() {
             </div>
           </div>
           <div class="msg-composer-bar hidden" id="msg-composer-bar"></div>
+          <div class="msg-photo-draft hidden" id="msg-photo-draft"></div>
           <div class="msg-composer" id="msg-composer">
+            <button type="button" class="msg-photo-btn" id="msg-photo-btn" title="Attach a photo" aria-label="Attach a photo" disabled>
+              <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/></svg>
+            </button>
+            <input type="file" id="msg-photo-input" accept="image/png,image/jpeg,image/webp,.png,.jpg,.jpeg,.webp" hidden />
             <textarea id="msg-composer-input" rows="1" placeholder="Type a message…" aria-label="Message"></textarea>
             <button type="button" class="msg-send-btn" id="msg-send-btn" title="Send" aria-label="Send">
               <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M3 20.5v-17l19 8.5-19 8.5zM5 9.3l7.5 2.7L5 14.7V9.3z" opacity="0"/><path d="M2.5 21 22 12 2.5 3 2.5 10l13 2-13 2z"/></svg>
@@ -1583,6 +1733,13 @@ function _buildModal() {
     document.getElementById('msg-newchat-overlay').classList.add('hidden');
   });
   document.getElementById('msg-send-btn').addEventListener('click', _sendCurrent);
+  const photoInput = document.getElementById('msg-photo-input');
+  document.getElementById('msg-photo-btn')?.addEventListener('click', () => photoInput?.click());
+  photoInput?.addEventListener('change', () => {
+    const file = photoInput.files && photoInput.files[0];
+    if (file) _queuePhoto(file);
+    photoInput.value = '';
+  });
 
   const search = document.getElementById('msg-list-search');
   if (search) {
@@ -1605,7 +1762,27 @@ function _buildModal() {
       input.style.height = Math.min(input.scrollHeight, 120) + 'px';
       _maybeSendTyping();
     });
+    input.addEventListener('paste', (e) => {
+      const files = Array.from((e.clipboardData && e.clipboardData.files) || []);
+      const photo = files.find(file => PHOTO_MIMES.has(file.type));
+      if (!photo) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      _queuePhoto(photo);
+    });
   }
+
+  const composer = document.getElementById('msg-composer');
+  composer?.addEventListener('dragover', (e) => {
+    if (e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files')) e.preventDefault();
+  });
+  composer?.addEventListener('drop', (e) => {
+    const photo = Array.from((e.dataTransfer && e.dataTransfer.files) || [])
+      .find(file => PHOTO_MIMES.has(file.type));
+    if (!photo) return;
+    e.preventDefault();
+    _queuePhoto(photo);
+  });
 
   // Per-message actions are delegated on the thread body so they survive
   // re-renders: click (⋯ button, reaction chips, reply quotes), contextmenu
@@ -1746,6 +1923,7 @@ export function close() {
   document.getElementById('msg-status-viewer')?.remove();
   _typingPeers.clear();
   _messages.clear();
+  for (const peer of [..._photoDrafts.keys()]) _discardPhotoDraft(peer);
   _lastRenderedMsg = null;
   _activeOther = null;
   _activeOtherMeta = null;

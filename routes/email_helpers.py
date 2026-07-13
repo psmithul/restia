@@ -972,11 +972,15 @@ def _get_email_config(account_id: str | None = None, owner: str = "") -> dict:
             "smtp_port": settings.get("smtp_port", os.environ.get("SMTP_PORT", "465")),
         }),
         "smtp_user": settings.get("smtp_user", os.environ.get("SMTP_USER", "")),
-        "smtp_password": settings.get("smtp_password", os.environ.get("SMTP_PASSWORD", "")),
+        "smtp_password": _decrypt(
+            settings.get("smtp_password", os.environ.get("SMTP_PASSWORD", ""))
+        ),
         "imap_host": settings.get("imap_host", os.environ.get("IMAP_HOST", "")),
         "imap_port": int(settings.get("imap_port", os.environ.get("IMAP_PORT", "993")) or 993),
         "imap_user": settings.get("imap_user", os.environ.get("IMAP_USER", "")),
-        "imap_password": settings.get("imap_password", os.environ.get("IMAP_PASSWORD", "")),
+        "imap_password": _decrypt(
+            settings.get("imap_password", os.environ.get("IMAP_PASSWORD", ""))
+        ),
         "imap_starttls": settings.get("imap_starttls", True),
         "from_address": settings.get("email_from", os.environ.get("EMAIL_FROM", "")),
     }

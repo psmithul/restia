@@ -12,6 +12,7 @@ replace, and when ``os.replace`` itself fails.
 """
 import importlib.util
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -84,6 +85,18 @@ def test_atomic_write_json_leaves_no_tmp_file(tmp_path):
     assert _tmp_siblings(tmp_path, "data.json") == []
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode assertion")
+def test_atomic_write_json_is_private_even_with_permissive_umask(tmp_path):
+    target = tmp_path / "auth.json"
+    old_umask = os.umask(0)
+    try:
+        atomic_write_json(str(target), {"secret": "value"})
+    finally:
+        os.umask(old_umask)
+
+    assert target.stat().st_mode & 0o777 == 0o600
+
+
 # ---------------------------------------------------------------------------
 # atomic_write_json — failure path: target preserved on serialization error.
 # ---------------------------------------------------------------------------
@@ -98,6 +111,7 @@ def test_atomic_write_json_preserves_target_when_serialization_fails(tmp_path):
         atomic_write_json(str(target), {"bad": {1, 2, 3}})
 
     assert target.read_text(encoding="utf-8") == before
+    assert _tmp_siblings(tmp_path, "data.json") == []
 
 
 # ---------------------------------------------------------------------------
@@ -165,3 +179,4 @@ def test_atomic_write_text_preserves_target_when_replace_fails(tmp_path, monkeyp
         atomic_write_text(str(target), "new content that never lands")
 
     assert target.read_text(encoding="utf-8") == before
+    assert _tmp_siblings(tmp_path, "note.txt") == []

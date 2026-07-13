@@ -24,7 +24,6 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
 
-from core.platform_compat import safe_chmod
 from src.constants import APP_KEY_FILE
 
 logger = logging.getLogger(__name__)
@@ -32,6 +31,24 @@ logger = logging.getLogger(__name__)
 _KEY_PATH = Path(APP_KEY_FILE)
 _PREFIX = "enc:"
 _fernet: Fernet | None = None
+
+
+def _harden_key_permissions(path: Path) -> None:
+    """Apply owner-only POSIX permissions without importing ``core``.
+
+    Importing ``core.platform_compat`` first executes ``core.__init__``, which
+    imports the database and can re-enter this module while it is only partly
+    initialized. Secret storage is deliberately a low-level dependency, so the
+    tiny chmod operation stays stdlib-only here.
+    """
+    if os.name == "nt":
+        return
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        # Matches the existing cross-platform helper: permission hardening is
+        # best-effort because some mounted filesystems reject chmod.
+        pass
 
 
 def _load_or_create_key() -> bytes:
@@ -42,7 +59,7 @@ def _load_or_create_key() -> bytes:
     _KEY_PATH.write_bytes(key)
     # POSIX: lock the key to 0o600. Windows: no-op (the user-profile data dir is
     # already ACL-restricted); safe_chmod swallows both cases.
-    safe_chmod(_KEY_PATH, 0o600)
+    _harden_key_permissions(_KEY_PATH)
     logger.info(f"Generated new app key at {_KEY_PATH}")
     return key
 

@@ -208,13 +208,16 @@ html {
 
 body.bg-pattern-dots {
   background-image: radial-gradient(color-mix(in srgb, var(--bg-effect-color, var(--fg)) calc(5% * var(--bg-effect-intensity, 1)), transparent) 1px, transparent 1px);
-  background-size: 20px 20px; background-attachment: fixed;
+  /* Restia scrolls its inner panels rather than the body. Keeping this on the
+     normal body paint layer looks identical and avoids Firefox's asynchronous
+     panning warning for fixed, scroll-linked backgrounds. */
+  background-size: 20px 20px;
 }
 body.bg-pattern-synapse {
   /* CSS grid as base, canvas pulses overlay */
   background-image: linear-gradient(color-mix(in srgb, var(--bg-effect-color, var(--fg)) calc(3.5% * var(--bg-effect-intensity, 1)), transparent) 1px, transparent 1px),
     linear-gradient(90deg, color-mix(in srgb, var(--bg-effect-color, var(--fg)) calc(3.5% * var(--bg-effect-intensity, 1)), transparent) 1px, transparent 1px);
-  background-size: 24px 24px; background-attachment: fixed;
+  background-size: 24px 24px;
 }
 body.bg-pattern-perlin-flow,
 body.bg-pattern-petals,
@@ -40996,6 +40999,21 @@ body.theme-frosted .modal {
   border-bottom-left-radius: 3px;
 }
 .msg-bubble-text { white-space: pre-wrap; }
+.msg-photo {
+  display: block;
+  overflow: hidden;
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--bg) 86%, transparent);
+  color: inherit;
+}
+.msg-photo img {
+  display: block;
+  width: min(320px, 100%);
+  max-width: 100%;
+  max-height: 360px;
+  object-fit: contain;
+}
+.msg-photo + .msg-bubble-text { margin-top: 6px; }
 .msg-bubble-text a {
   color: var(--accent, #58a6ff);
   text-decoration: underline;
@@ -41442,8 +41460,63 @@ body.theme-frosted .modal {
   opacity: 1;
   background: color-mix(in srgb, var(--fg) 10%, transparent);
 }
-/* The bar supplies the top border when visible — avoid a double rule. */
-.msg-composer-bar:not(.hidden) + .msg-composer { border-top: none; }
+/* The state/draft bars supply the top border when visible — avoid a double rule. */
+.msg-composer-bar:not(.hidden) ~ .msg-composer,
+.msg-photo-draft:not(.hidden) + .msg-composer { border-top: none; }
+
+.msg-photo-draft {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+  background: color-mix(in srgb, var(--panel) 62%, transparent);
+}
+.msg-photo-draft.hidden { display: none; }
+.msg-photo-thumb {
+  position: relative;
+  flex: 0 0 58px;
+  width: 58px;
+  height: 58px;
+}
+.msg-photo-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.msg-photo-remove {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--panel);
+  color: var(--fg);
+  cursor: pointer;
+  line-height: 18px;
+}
+.msg-photo-draft-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 0.68rem;
+  opacity: 0.68;
+}
+.msg-photo-draft-name {
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.8rem;
+  font-weight: 600;
+  opacity: 1;
+}
 
 /* ── Composer ── */
 .msg-composer {
@@ -41468,6 +41541,26 @@ body.theme-frosted .modal {
   outline: none;
 }
 .msg-composer textarea:focus { border-color: var(--accent, var(--red)); }
+.msg-photo-btn {
+  flex-shrink: 0;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--fg);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.72;
+}
+.msg-photo-btn:hover:not(:disabled) {
+  opacity: 1;
+  background: color-mix(in srgb, var(--fg) 10%, transparent);
+}
+.msg-photo-btn:disabled { cursor: default; opacity: 0.3; }
 .msg-send-btn {
   flex-shrink: 0;
   width: 38px;

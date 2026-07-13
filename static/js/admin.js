@@ -1,5 +1,5 @@
 // static/js/admin.js — Admin panel module (ES6)
-// Admin-only: users, endpoints, MCP, RAG, embeddings, tokens, webhooks, features
+// Admin-only: local profiles, endpoints, MCP, RAG, embeddings, tokens, webhooks, features
 
 import uiModule from './ui.js';
 import settingsModule from './settings.js';
@@ -17,9 +17,16 @@ let _authPolicy = { password_min_length: 8, reserved_usernames: [] };
 
 function el(id) { return document.getElementById(id); }
 function esc(s) { return uiModule.esc(s); }
+function profileError(message, fallback = 'Profile request failed') {
+  return String(message || fallback)
+    .replace(/\bUsername\b/g, 'Profile name')
+    .replace(/\busername\b/g, 'profile name')
+    .replace(/\bUser\b/g, 'Profile')
+    .replace(/\buser\b/g, 'profile');
+}
 
 /* ═══════════════════════════════════════════
-   USERS TAB
+   PROFILES TAB
    ═══════════════════════════════════════════ */
 const PRIV_LABELS = {
   can_use_agent: 'Agent mode',
@@ -34,12 +41,13 @@ const PRIV_LABELS = {
 async function loadUsers() {
   const list = el('adm-userList');
   try {
-    const res = await fetch('/api/auth/users', { credentials: 'same-origin' });
+    const res = await fetch('/api/auth/profiles', { credentials: 'same-origin' });
     if (res.status === 401 || res.status === 403) { list.innerHTML = '<div class="admin-empty">Access denied</div>'; return; }
     const data = await res.json();
-    if (!data.users || data.users.length === 0) { list.innerHTML = '<div class="admin-empty">No users found</div>'; return; }
+    const profiles = data.profiles || data.users || [];
+    if (profiles.length === 0) { list.innerHTML = '<div class="admin-empty">No profiles found</div>'; return; }
     list.innerHTML = '';
-    data.users.forEach(u => {
+    profiles.forEach(u => {
       const row = document.createElement('div');
       row.className = 'admin-user-row';
 
@@ -140,7 +148,7 @@ async function loadUsers() {
             else if (input.type === 'number') value = parseInt(input.value) || 0;
             else value = input.value;
             try {
-              await fetch(`/api/auth/users/${encodeURIComponent(username)}/privileges`, {
+              await fetch(`/api/auth/profiles/${encodeURIComponent(username)}/privileges`, {
                 method: 'PUT', credentials: 'same-origin',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ [key]: value }),
@@ -158,15 +166,15 @@ async function loadUsers() {
         renameBtn.addEventListener('click', async (e) => {
           e.stopPropagation();
           const oldUsername = renameBtn.dataset.admRenameUser;
-          const next = await uiModule.styledPrompt(`Rename "${oldUsername}"`, {
+          const next = await uiModule.styledPrompt(`Rename profile "${oldUsername}"`, {
             defaultValue: oldUsername,
-            placeholder: 'New username',
+            placeholder: 'New profile name',
             confirmText: 'Rename',
           });
           const username = (next || '').trim();
           if (!username || username === oldUsername) return;
           try {
-            const res = await fetch(`/api/auth/users/${encodeURIComponent(oldUsername)}/rename`, {
+            const res = await fetch(`/api/auth/profiles/${encodeURIComponent(oldUsername)}/rename`, {
               method: 'PUT',
               credentials: 'same-origin',
               headers: { 'Content-Type': 'application/json' },
@@ -174,7 +182,7 @@ async function loadUsers() {
             });
             const data = await res.json().catch(() => ({}));
             if (!res.ok) {
-              uiModule.showError(data.detail || 'Failed to rename user');
+              uiModule.showError(profileError(data.detail, 'Failed to rename profile'));
               return;
             }
             if (data.renamed_self) {
@@ -183,7 +191,7 @@ async function loadUsers() {
             }
             loadUsers();
           } catch (err) {
-            uiModule.showError('Failed to rename user');
+            uiModule.showError('Failed to rename profile');
           }
         });
       }
@@ -194,10 +202,10 @@ async function loadUsers() {
         delBtn.addEventListener('click', async (e) => {
           e.stopPropagation();
           const username = delBtn.dataset.admDelUser;
-          if (!await uiModule.styledConfirm(`Remove user "${username}"?`, { confirmText: 'Remove', danger: true })) return;
-          const res = await fetch('/api/auth/users', { method: 'DELETE', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username }) });
+          if (!await uiModule.styledConfirm(`Remove profile "${username}"?`, { confirmText: 'Remove', danger: true })) return;
+          const res = await fetch('/api/auth/profiles', { method: 'DELETE', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username }) });
           if (res.ok) loadUsers();
-          else uiModule.showError('Failed to delete user');
+          else uiModule.showError('Failed to delete profile');
         });
       }
 
@@ -209,12 +217,12 @@ async function loadUsers() {
           const username = adminToggleBtn.dataset.admToggleAdmin;
           const makeAdmin = adminToggleBtn.dataset.makeAdmin === '1';
           const confirmMsg = makeAdmin
-            ? `Grant admin rights to "${username}"? They'll get full access to all settings and users — including the power to demote or remove other admins (you included).`
+            ? `Grant admin rights to "${username}"? They'll get full access to all settings and profiles — including the power to demote or remove other admins (you included).`
             : `Revoke admin rights from "${username}"? They'll lose access to the admin panel.`;
           if (!await uiModule.styledConfirm(confirmMsg, { confirmText: makeAdmin ? 'Make admin' : 'Revoke admin', danger: !makeAdmin })) return;
           adminToggleBtn.disabled = true;
           try {
-            const res = await fetch(`/api/auth/users/${encodeURIComponent(username)}/admin`, {
+            const res = await fetch(`/api/auth/profiles/${encodeURIComponent(username)}/admin`, {
               method: 'PUT',
               credentials: 'same-origin',
               headers: { 'Content-Type': 'application/json' },
@@ -222,12 +230,12 @@ async function loadUsers() {
             });
             const data = await res.json().catch(() => ({}));
             if (!res.ok) {
-              uiModule.showError(data.detail || 'Failed to change admin status');
+              uiModule.showError(profileError(data.detail, 'Failed to change admin status'));
               adminToggleBtn.disabled = false;
               return;
             }
             // Demoting yourself drops your own admin access — reload into the
-            // normal-user view (mirrors the rename-self reload above).
+            // normal-profile view (mirrors the rename-self reload above).
             if (data.self) { window.location.reload(); return; }
             loadUsers();
           } catch (err) {
@@ -239,7 +247,7 @@ async function loadUsers() {
 
       list.appendChild(row);
     });
-  } catch (e) { list.innerHTML = '<div class="admin-error">Failed to load users</div>'; }
+  } catch (e) { list.innerHTML = '<div class="admin-error">Failed to load profiles</div>'; }
 }
 
 async function _loadModelsForUser(username, allowedSet, modelsRestricted, blockAllModels, privPanel) {
@@ -304,7 +312,7 @@ async function _loadModelsForUser(username, allowedSet, modelsRestricted, blockA
       }
       const hint = privPanel.querySelector('.priv-models-list[data-user]')?.previousElementSibling?.querySelector('div[style*="opacity"]');
       if (hint) hint.textContent = hintText;
-      fetch(`/api/auth/users/${encodeURIComponent(username)}/privileges`, {
+      fetch(`/api/auth/profiles/${encodeURIComponent(username)}/privileges`, {
         method: 'PUT', credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ allowed_models: value, allowed_models_restricted: restricted, block_all_models: blockAll }),
@@ -381,15 +389,15 @@ function initAddUser() {
     const username = el('adm-newUsername').value.trim();
     const password = el('adm-newPassword').value;
     const is_admin = el('adm-newIsAdmin').checked;
-    if (!username) { msg.textContent = 'Username required'; msg.className = 'admin-error'; return; }
+    if (!username) { msg.textContent = 'Profile name required'; msg.className = 'admin-error'; return; }
     if (password.length < _authPolicy.password_min_length) { msg.textContent = `Password must be at least ${_authPolicy.password_min_length} characters`; msg.className = 'admin-error'; return; }
-    if (_authPolicy.reserved_usernames.includes(username.toLowerCase())) { msg.textContent = 'This username is reserved'; msg.className = 'admin-error'; return; }
+    if (_authPolicy.reserved_usernames.includes(username.toLowerCase())) { msg.textContent = 'This profile name is reserved'; msg.className = 'admin-error'; return; }
     el('adm-addBtn').disabled = true;
     try {
-      const res = await fetch('/api/auth/users', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password, is_admin }) });
+      const res = await fetch('/api/auth/profiles', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password, is_admin }) });
       const data = await res.json();
-      if (res.ok) { msg.textContent = 'User created'; msg.className = 'admin-success'; el('adm-newUsername').value = ''; el('adm-newPassword').value = ''; el('adm-newIsAdmin').checked = false; loadUsers(); }
-      else { msg.textContent = data.detail || 'Failed'; msg.className = 'admin-error'; }
+      if (res.ok) { msg.textContent = 'Profile created'; msg.className = 'admin-success'; el('adm-newUsername').value = ''; el('adm-newPassword').value = ''; el('adm-newIsAdmin').checked = false; loadUsers(); }
+      else { msg.textContent = profileError(data.detail); msg.className = 'admin-error'; }
     } catch (e) { msg.textContent = 'Request failed'; msg.className = 'admin-error'; }
     el('adm-addBtn').disabled = false;
   });

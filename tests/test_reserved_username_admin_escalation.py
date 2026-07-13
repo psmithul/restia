@@ -61,7 +61,7 @@ def test_rename_into_reserved_username_is_blocked(tmp_path):
     assert "bob" in mgr.users
 
 
-def test_legacy_reserved_username_is_removed_on_load(tmp_path):
+def test_legacy_reserved_username_store_is_preserved_and_locked(tmp_path):
     auth_path = tmp_path / "auth.json"
     auth_path.write_text(
         '{"users": {"internal-tool": {"password_hash": "unused", "is_admin": false}, '
@@ -70,9 +70,11 @@ def test_legacy_reserved_username_is_removed_on_load(tmp_path):
     )
     mgr = _fresh_auth_manager(tmp_path)
 
-    assert "internal-tool" not in mgr.users
+    assert "internal-tool" in mgr.users
     assert "admin" in mgr.users
-    assert "internal-tool" not in auth_path.read_text(encoding="utf-8")
+    assert mgr.status(None)["auth_store_error"] is True
+    assert mgr.is_configured is True
+    assert "internal-tool" in auth_path.read_text(encoding="utf-8")
 
 
 def test_legacy_reserved_username_session_cannot_authenticate(tmp_path):
@@ -121,7 +123,7 @@ def test_legacy_reserved_username_session_cannot_pass_admin_gate(tmp_path, monke
     assert exc.value.status_code == 403
 
 
-def test_legacy_reserved_single_user_migrates_to_admin(tmp_path):
+def test_legacy_reserved_single_user_store_is_preserved_and_locked(tmp_path):
     auth_path = tmp_path / "auth.json"
     auth_path.write_text(
         '{"username": "internal-tool", "password_hash": "unused"}',
@@ -130,8 +132,12 @@ def test_legacy_reserved_single_user_migrates_to_admin(tmp_path):
     mgr = _fresh_auth_manager(tmp_path)
 
     assert "internal-tool" not in mgr.users
-    assert "admin" in mgr.users
-    assert mgr.is_admin("admin") is True
+    assert "admin" not in mgr.users
+    assert mgr.status(None)["auth_store_error"] is True
+    assert mgr.is_configured is True
+    assert auth_path.read_text(encoding="utf-8") == (
+        '{"username": "internal-tool", "password_hash": "unused"}'
+    )
 
 
 def test_token_cache_owner_normalization_requires_current_user():

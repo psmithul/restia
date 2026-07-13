@@ -219,6 +219,9 @@ async function streamToPane(paneIdx, sessionId, message, aiMsgEl, opts) {
     const fd = new FormData();
     fd.append('message', message);
     fd.append('session', sessionId);
+    if (Array.isArray(opts?.attachments) && opts.attachments.length) {
+      fd.append('attachments', JSON.stringify(opts.attachments));
+    }
 
     // Compare mode determines what tools/features are enabled
     const isAgent = state._compareMode === 'agent';

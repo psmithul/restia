@@ -255,6 +255,14 @@ def _resolve_account(selector: str | None) -> dict | None:
     return _resolve_account_from_rows(_list_accounts_raw(), selector)
 
 
+def _decrypt_config_secret(value: str) -> str:
+    try:
+        from src.secret_storage import decrypt
+        return decrypt(value)
+    except Exception:
+        return value
+
+
 def _load_config(account: str | None = None) -> dict:
     """Return the full config dict for the requested account (or default).
 
@@ -315,11 +323,7 @@ def _load_config(account: str | None = None) -> dict:
         # src.secret_storage.encrypt — decrypt before handing to IMAP
         # (same path email_helpers.py:369 uses). Falling back to the raw
         # ciphertext is what produced AUTHENTICATIONFAILED previously.
-        try:
-            from src.secret_storage import decrypt as _decrypt
-        except Exception:
-            _decrypt = lambda v: v  # noqa: E731
-        cfg["imap_password"] = _decrypt(row["imap_password"]) if row["imap_password"] else cfg["imap_password"]
+        cfg["imap_password"] = _decrypt_config_secret(row["imap_password"]) if row["imap_password"] else cfg["imap_password"]
         cfg["imap_starttls"] = bool(row["imap_starttls"])
         # The email_accounts table stores STARTTLS but not an explicit IMAP SSL
         # flag. Port 993 is implicit TLS for IMAP providers like Gmail.
@@ -328,7 +332,7 @@ def _load_config(account: str | None = None) -> dict:
         cfg["smtp_port"] = int(row["smtp_port"] or cfg["smtp_port"])
         cfg["smtp_security"] = row["smtp_security"] or cfg["smtp_security"] or ("starttls" if int(cfg["smtp_port"]) == 587 else "ssl")
         cfg["smtp_user"] = row["smtp_user"] or cfg["smtp_user"]
-        cfg["smtp_password"] = _decrypt(row["smtp_password"]) if row["smtp_password"] else cfg["smtp_password"]
+        cfg["smtp_password"] = _decrypt_config_secret(row["smtp_password"]) if row["smtp_password"] else cfg["smtp_password"]
         cfg["from_address"] = row["from_address"] or row["imap_user"] or cfg["from_address"]
     else:
         # Legacy fallback: settings.json flat keys
@@ -342,7 +346,10 @@ def _load_config(account: str | None = None) -> dict:
                     "from_address", "archive_folder", "trash_folder",
                 ):
                     if settings.get(key) not in (None, ""):
-                        cfg[key] = int(settings[key]) if key.endswith("_port") else settings[key]
+                        value = settings[key]
+                        if key in {"imap_password", "smtp_password"}:
+                            value = _decrypt_config_secret(value)
+                        cfg[key] = int(value) if key.endswith("_port") else value
         except Exception:
             pass
 

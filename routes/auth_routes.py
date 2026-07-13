@@ -156,7 +156,13 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
             if not body.totp_code:
                 # Password OK but need TOTP — tell client to show code input
                 return {"ok": False, "requires_totp": True, "username": username}
-            if not auth_manager.totp_verify(username, body.totp_code):
+            # Legacy backup codes use bcrypt. Keep that CPU-bound verification
+            # off the event loop so one login cannot stall every other request.
+            if not await asyncio.to_thread(
+                auth_manager.totp_verify,
+                username,
+                body.totp_code,
+            ):
                 raise HTTPException(401, "Invalid 2FA code")
         # All checks passed — create session (password already verified above)
         token = await asyncio.to_thread(auth_manager.create_session_trusted, username)
@@ -252,9 +258,9 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
         user = _get_current_user(request)
         if not user:
             raise HTTPException(401, "Not authenticated")
-        if not auth_manager.totp_confirm_enable(user, body.code):
+        backup = auth_manager.totp_confirm_enable(user, body.code)
+        if not backup:
             raise HTTPException(400, "Invalid code — try again")
-        backup = auth_manager.users.get(user, {}).get("totp_backup_codes", [])
         return {"ok": True, "backup_codes": backup}
 
     class TotpDisableRequest(BaseModel):
@@ -278,15 +284,19 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
             raise HTTPException(401, "Not authenticated")
         return {"enabled": auth_manager.totp_enabled(user)}
 
-    # Admin-only routes
-    @router.get("/users")
+    # Admin-only profile management.  ``/users`` remains a compatibility
+    # surface for older clients; new UI and API consumers use ``/profiles``.
+    @router.get("/profiles")
+    @router.get("/users", deprecated=True)
     async def list_users(request: Request):
         user = _get_current_user(request)
         if not user or not auth_manager.is_admin(user):
             raise HTTPException(403, "Admin only")
-        return {"users": auth_manager.list_users()}
+        profiles = auth_manager.list_users()
+        return {"profiles": profiles, "users": profiles}
 
-    @router.post("/users")
+    @router.post("/profiles")
+    @router.post("/users", deprecated=True)
     async def admin_create_user(body: CreateUserRequest, request: Request):
         user = _get_current_user(request)
         if not user or not auth_manager.is_admin(user):
@@ -302,7 +312,8 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
             raise HTTPException(409, "Username already taken")
         return {"ok": True}
 
-    @router.put("/users/{username}/privileges")
+    @router.put("/profiles/{username}/privileges")
+    @router.put("/users/{username}/privileges", deprecated=True)
     async def update_user_privileges(username: str, request: Request):
         user = _get_current_user(request)
         if not user or not auth_manager.is_admin(user):
@@ -313,7 +324,8 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
             raise HTTPException(404, "User not found or is admin")
         return {"ok": True, "privileges": auth_manager.get_privileges(username)}
 
-    @router.put("/users/{username}/rename")
+    @router.put("/profiles/{username}/rename")
+    @router.put("/users/{username}/rename", deprecated=True)
     async def rename_user(username: str, body: RenameUserRequest, request: Request):
         user = _get_current_user(request)
         if not user or not auth_manager.is_admin(user):
@@ -344,7 +356,13 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
             # username, so the rollback must authenticate as the new user.
             rollback_user = new_username if user == old_username else user
             try:
-                return bool(auth_manager.rename_user(new_username, old_username, rollback_user))
+                return bool(
+                    auth_manager.rollback_user_rename(
+                        new_username,
+                        old_username,
+                        rollback_user,
+                    )
+                )
             except Exception as rollback_err:
                 logger.error(
                     "Failed to roll back auth rename %s -> %s after owner migration failure: %s",
@@ -357,7 +375,11 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
         # docs, email accounts, tasks, etc.
         try:
             from sqlalchemy import func
-            from core.database import Base, SessionLocal
+            from core.database import (
+                Base, DirectMessage, HomeLink, LinkInvite, RemoteBlock,
+                RemoteContactPref, SessionLocal, StatusPost, StatusView,
+                UserKey, UserProfile,
+            )
             db = SessionLocal()
             try:
                 for mapper in Base.registry.mappers:
@@ -369,6 +391,45 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
                         .filter(func.lower(model.owner) == old_username)
                         .update({"owner": new_username}, synchronize_session=False)
                     )
+                # Identity-bearing tables predate the generic ``owner``
+                # convention. Leaving any of these behind either orphaned the
+                # renamed profile's private state or let a later profile with
+                # the old name inherit it.
+                identity_columns = (
+                    (DirectMessage, DirectMessage.sender),
+                    (DirectMessage, DirectMessage.recipient),
+                    (UserKey, UserKey.username),
+                    (UserProfile, UserProfile.username),
+                    (StatusPost, StatusPost.author),
+                    (StatusView, StatusView.viewer),
+                    (HomeLink, HomeLink.local_user),
+                    (RemoteContactPref, RemoteContactPref.local_user),
+                    (RemoteBlock, RemoteBlock.local_user),
+                    (LinkInvite, LinkInvite.created_by),
+                )
+                for model, column in identity_columns:
+                    (
+                        db.query(model)
+                        .filter(func.lower(column) == old_username)
+                        .update({column.key: new_username}, synchronize_session=False)
+                    )
+                # Reaction ownership is encoded as JSON object keys rather
+                # than a column, so it needs an explicit rewrite too.
+                reacted = db.query(DirectMessage).filter(DirectMessage.reactions.isnot(None)).all()
+                for message in reacted:
+                    try:
+                        reactions = json.loads(message.reactions or "{}")
+                    except (TypeError, ValueError):
+                        continue
+                    if not isinstance(reactions, dict):
+                        continue
+                    key = next(
+                        (k for k in reactions if str(k).strip().lower() == old_username),
+                        None,
+                    )
+                    if key is not None:
+                        reactions[new_username] = reactions.pop(key)
+                        message.reactions = json.dumps(reactions)
                 db.commit()
             except Exception:
                 db.rollback()
@@ -536,9 +597,12 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
         invalidator = getattr(request.app.state, "invalidate_token_cache", None)
         if callable(invalidator):
             invalidator()
+        # AuthManager reserved the former ownership key atomically with the
+        # initial rename, before any of these external stores were migrated.
         return {"ok": True, "username": new_username, "renamed_self": old_username == user}
 
-    @router.put("/users/{username}/admin")
+    @router.put("/profiles/{username}/admin")
+    @router.put("/users/{username}/admin", deprecated=True)
     async def set_user_admin(username: str, body: SetAdminRequest, request: Request):
         """Promote/demote a user to/from admin. Admin only.
 
@@ -588,7 +652,8 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
         auth_manager.signup_enabled = body.enabled
         return {"ok": True,"signup_enabled": auth_manager.signup_enabled}
 
-    @router.delete("/users")
+    @router.delete("/profiles")
+    @router.delete("/users", deprecated=True)
     async def admin_delete_user(body: DeleteUserRequest, request: Request):
         user = _get_current_user(request)
         if not user or not auth_manager.is_admin(user):

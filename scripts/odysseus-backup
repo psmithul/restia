@@ -115,6 +115,16 @@ def cmd_snapshot(args):
                 except Exception:
                     pass
 
+    # The archive contains the Fernet key and credential-bearing runtime
+    # state. A permissive host umask must never leave it group/world-readable.
+    # Windows user-profile ACLs are the security boundary there; POSIX modes
+    # are applied where the platform supports them.
+    if os.name != "nt":
+        try:
+            os.chmod(out_path, 0o600)
+        except OSError:
+            fail("backup was created but owner-only permissions could not be applied")
+
     emit({
         "ok": True,
         "path": str(out_path),

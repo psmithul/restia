@@ -10,10 +10,14 @@ Defaults work out of the box: clone, run, then configure models/search/email
 inside **Settings**. Only edit `.env` for deployment-level overrides like
 `APP_BIND`, `APP_PORT`, `AUTH_ENABLED`, `DATABASE_URL`, or a pre-seeded admin password.
 
-On first setup, Restia creates an admin account (`admin` unless
+On first setup, Restia creates an owner/admin profile (`admin` unless
 `ODYSSEUS_ADMIN_USER` is set) and prints a temporary password in the terminal.
 For Docker installs, the same line is in `docker compose logs odysseus`.
 Use that for the first login, then change it in **Settings**.
+
+One Restia installation is the external Restia user/identity. Login principals
+inside it are called **profiles**; each profile has its own permissions and
+private local state.
 
 Contributing? See [CONTRIBUTING.md](../CONTRIBUTING.md) for setup, testing, and
 pull request guidelines.
@@ -46,7 +50,7 @@ Published GitHub Releases build the public multi-architecture image
 On Windows, run `update_windows.bat`. Developers who intentionally want to
 build the current checkout can still run `docker compose up -d --build`.
 
-### Telegram for multiple users
+### Telegram for multiple profiles
 
 Create a bot with Telegram's `@BotFather`, expose Restia through HTTPS, then
 register the bot token and webhook without printing the token:
@@ -57,10 +61,10 @@ docker compose exec -T odysseus python scripts/configure_telegram_runtime.py \
 ```
 
 The command reads the bot token from standard input. After the administrator
-configures the bot once, every account opens **Settings → Reminders →
+configures the bot once, every profile opens **Settings → Reminders →
 Telegram**, generates a one-time code, and sends `/link CODE` to the bot.
 Chats, conversations, digests, and reminders are routed only to that linked
-Restia account. Existing single-user `TELEGRAM_OWNER` configurations remain
+Restia profile. Existing single-profile `TELEGRAM_OWNER` configurations remain
 supported.
 
 > **On Apple Silicon (M-series) Macs:** Docker can't reach the Metal GPU, so
@@ -410,12 +414,14 @@ Restia is a self-hosted workspace with powerful local tools: shell access, file 
 - Use `SECURE_COOKIES=true` when Restia is served through HTTPS by a trusted reverse proxy or private access gateway.
 - Do not expose it directly to the public internet without HTTPS and a trusted reverse proxy or private access layer.
 - Keep `.env`, `data/`, `logs/`, databases, uploads, generated media, backups, auth/session files, API keys, and model/provider tokens out of Git and private shares. They are ignored by default.
-- Review `data/auth.json` after first boot: disable open signup unless you intentionally want it, make only your own account admin, and keep demo/test accounts non-admin.
-- Non-admin users do not get shell/Python/file read/write by default, and admin-only routes/tools such as MCP management, API tokens, webhooks, model/cookbook serving, backup/vault, and app settings are admin-gated. Other features are controlled by per-user privileges, so review each user's privileges before exposing a deployment.
+- Review `data/auth.json` after first boot: disable open signup unless you intentionally want it, make only your own profile admin, and keep demo/test profiles non-admin.
+- Non-admin profiles do not get shell/Python/file read/write by default, and admin-only routes/tools such as MCP management, API tokens, webhooks, model/cookbook serving, backup/vault, and app settings are admin-gated. Other features are controlled by per-profile privileges, so review each profile's privileges before exposing a deployment.
 - Rotate any API keys or tokens that were ever pasted into a shared chat, demo, screenshot, or log.
 - If you enable API tokens or webhooks, create separate tokens per integration and delete unused ones.
 - Prefer binding manual development runs to `127.0.0.1`; bind to `0.0.0.0` only when you intentionally want LAN/reverse-proxy access.
 - Keep ChromaDB, SearXNG, ntfy, Ollama, vLLM, llama.cpp, databases, and raw model/provider APIs internal-only. Expose only the authenticated Restia web/API entrypoint through your trusted proxy or private access layer.
+- Use HTTPS for any non-loopback Home Link hub. Home Link photos are validated, metadata-stripped, and encrypted at rest, but they are not end-to-end encrypted; WebRTC call media is peer-to-peer and encrypted in transit.
+- Configure a TURN relay with short-lived credentials for reliable calls across strict NAT, CGNAT, or corporate networks. Public STUN alone cannot guarantee that two remote instances will connect.
 - Before publishing a fork, run `git status --short` and confirm no private files from `.env`, `data/`, `logs/`, uploads, backups, or local databases are staged.
 
 ### Private or proxied deployments
@@ -499,7 +505,7 @@ docs/      landing page (index.html) + preview clips
 ```
 
 ## Data
-All user data lives in `data/` (gitignored): `app.db` (sessions, messages, documents),
+All profile data lives in `data/` (gitignored): `app.db` (sessions, messages, documents),
 `memory.json`, `presets.json`, `uploads/`, `personal_docs/`, `chroma/`, `settings.json`.
 
 To back up or restore everything in `data/`, see the

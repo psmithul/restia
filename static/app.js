@@ -323,6 +323,16 @@ function initializeEventListeners() {
   // Paste handler
   window.addEventListener('paste', async (e)=>{
     if (!e.clipboardData) return;
+    // File drafts belong to the composer that currently owns focus. A pasted
+    // DM photo (or a file pasted into another modal/editor) must never leak
+    // into the assistant chat's singleton pending-file queue.
+    const target = e.target instanceof Element ? e.target : null;
+    const mainComposer = target?.closest('#chat-form');
+    const otherComposer = target?.closest(
+      '#messages-modal, input, textarea, [contenteditable="true"], [role="textbox"]'
+    );
+    if (!mainComposer && otherComposer) return;
+    if (e.defaultPrevented) return;
     let changed = false;
     for (const item of e.clipboardData.items){
       if (item.kind === 'file'){
@@ -1095,6 +1105,11 @@ function initializeEventListeners() {
   const toolMessagesBtn = el('tool-messages-btn');
   if (toolMessagesBtn) {
     toolMessagesBtn.addEventListener('click', () => {
+      // Permission prompts must stay on an explicit user gesture. The call
+      // module also refuses to prompt while Firefox DOM fullscreen is active.
+      if (callModule && callModule.requestNotificationPermission) {
+        callModule.requestNotificationPermission().catch(() => {});
+      }
       if (messagingModule) messagingModule.toggle();
     });
   }
@@ -3790,35 +3805,53 @@ function startRestiaApp() {
     _messageInput.addEventListener('pointerdown', () => _bumpChatPriority(15000), { passive: true });
   }
 
-  function handleSubmit(e) {
+  async function handleSubmit(e) {
     if (e) e.preventDefault();
     _bumpChatPriority(30000);
     // Debounce: prevent double-submit while a request is being initiated
     if (_submitting) return;
     _submitting = true;
-    // Release after a short delay (stream start sets its own isStreaming guard)
-    setTimeout(() => { _submitting = false; }, 300);
+    try {
+      // Await the compare handler's upload/preparation phase. It launches the
+      // long-running streams without awaiting them, so this guard releases in
+      // time for the next click to retain its Stop behavior.
+      if (compareModule && compareModule.isActive()) {
+        return await compareModule.handleCompareSubmit(e);
+      }
 
-    // Compare mode: route submit to compare handler (same message to all panes)
-    if (compareModule && compareModule.isActive()) {
-      return compareModule.handleCompareSubmit(e);
+      // Group chat: route to group module
+      if (groupModule && groupModule.isActive()) {
+        console.log('[group] Submit intercepted');
+        const msgInput = document.getElementById('message');
+        const msg = msgInput ? msgInput.value.trim() : '';
+        const pendingCount = fileHandlerModule.getPendingCount?.() || 0;
+        if (!msg && !pendingCount) { console.log('[group] Empty message, skipping'); return; }
+        const pendingInfo = fileHandlerModule.getPendingInfo?.() || [];
+        const attachmentIds = pendingCount
+          ? await fileHandlerModule.uploadPending({ sessionId: groupModule.getParentSessionId?.() })
+          : [];
+        // uploadPending deliberately retains the pending files on failure. Do
+        // not send a text-only turn that silently drops them.
+        if (pendingCount && attachmentIds.length !== pendingCount) return;
+        const uploadedMeta = fileHandlerModule.getLastUploadedMeta?.() || [];
+        const attachments = pendingInfo.map((info, idx) => ({
+          ...info,
+          id: attachmentIds[idx],
+          width: uploadedMeta[idx]?.width,
+          height: uploadedMeta[idx]?.height,
+        }));
+        console.log('[group] Sending:', msg);
+        chatRenderer.hideWelcomeScreen();
+        chatRenderer.addMessage('user', msg, null, { attachments });
+        msgInput.value = '';
+        groupModule.sendMessage(msg, attachmentIds, attachments);
+        return;
+      }
+
+      return originalSubmit.call(chatModule, e);
+    } finally {
+      _submitting = false;
     }
-
-    // Group chat: route to group module
-    if (groupModule && groupModule.isActive()) {
-      console.log('[group] Submit intercepted');
-      const msgInput = document.getElementById('message');
-      const msg = msgInput ? msgInput.value.trim() : '';
-      if (!msg) { console.log('[group] Empty message, skipping'); return; }
-      console.log('[group] Sending:', msg);
-      chatRenderer.hideWelcomeScreen();
-      chatRenderer.addMessage('user', msg);
-      msgInput.value = '';
-      groupModule.sendMessage(msg);
-      return;
-    }
-
-    return originalSubmit.call(chatModule, e);
   }
 
   chatForm.onsubmit = handleSubmit;
@@ -4295,7 +4328,27 @@ function startRestiaApp() {
   voiceRecorderModule.init();
   voiceModeModule.init();
   if (messagingModule) messagingModule.init();
-  if (callModule) { try { callModule.init(); } catch (e) { console.warn('call init failed', e); } }
+  if (callModule) {
+    try { Promise.resolve(callModule.init()).catch((e) => console.warn('call init failed', e)); }
+    catch (e) { console.warn('call init failed', e); }
+  }
+  // Outgoing call alerts use this narrow deep-link. Open only the requested
+  // first-party tool, then remove the parameter so refreshes do not keep
+  // reopening it. No call id or bearer credential is placed in the URL.
+  try {
+    const launchUrl = new URL(window.location.href);
+    const messageHash = launchUrl.hash.match(/^#messages=([^&]{1,288})$/);
+    if ((launchUrl.searchParams.get('open') === 'messages' || messageHash) && messagingModule) {
+      messagingModule.open();
+      if (messageHash) {
+        const peer = decodeURIComponent(messageHash[1]);
+        if (peer && peer.length <= 96) messagingModule.openConversation(peer).catch(() => {});
+      }
+      launchUrl.searchParams.delete('open');
+      if (messageHash) launchUrl.hash = '';
+      window.history.replaceState({}, '', launchUrl.pathname + launchUrl.search + launchUrl.hash);
+    }
+  } catch (_) {}
   if (commandPaletteModule) { try { commandPaletteModule.init(); } catch (e) { console.warn('command palette init failed', e); } }
   if (censorModule) censorModule.init();
 
@@ -4421,7 +4474,6 @@ function startRestiaApp() {
 
 
   if (window.hljs) {
-    console.log('Highlighting all code blocks on page load');
     document.querySelectorAll('pre code:not(.hljs)').forEach(block => {
       window.hljs.highlightElement(block);
     });

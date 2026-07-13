@@ -242,7 +242,9 @@ class BrainAugmentedMemoryManager(MemoryManager):
             return None
 
         text = self._compact_brain_text(chunk or title)
-        digest = hashlib.sha1(f"{citation}\n{text}".encode("utf-8")).hexdigest()[:24]
+        digest = hashlib.sha1(
+            f"{citation}\n{text}".encode("utf-8"), usedforsecurity=False
+        ).hexdigest()[:24]
         memory: Dict[str, Any] = {
             "id": f"brain:{digest}",
             "text": text,
@@ -288,7 +290,7 @@ class BrainAugmentedMemoryManager(MemoryManager):
             pass
 
         memory: Dict[str, Any] = {
-            "id": f"brain:{hashlib.sha1(path.encode('utf-8')).hexdigest()[:24]}",
+            "id": f"brain:{hashlib.sha1(path.encode('utf-8'), usedforsecurity=False).hexdigest()[:24]}",
             "text": text,
             "timestamp": self._timestamp_from_iso(
                 row["updated_at"] or row["indexed_at"] or row["created_at"]

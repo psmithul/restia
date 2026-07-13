@@ -111,3 +111,36 @@ def test_login_offloads_bcrypt_bearing_calls(monkeypatch):
     # The whole point: the expensive bcrypt-bearing calls go through
     # asyncio.to_thread rather than running inline in the request coroutine.
     assert calls == [auth.verify_password, auth.create_session_trusted]
+
+
+def test_login_offloads_legacy_backup_code_verification(monkeypatch):
+    calls = []
+    auth = MagicMock()
+
+    async def fake_to_thread(fn, *args, **kwargs):
+        calls.append(fn)
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr("routes.auth_routes.asyncio.to_thread", fake_to_thread)
+    auth.verify_password.return_value = True
+    auth.totp_enabled.return_value = True
+    auth.totp_verify.return_value = True
+    auth.create_session_trusted.return_value = "tok-2fa"
+
+    login = _login_endpoint(auth)
+    request = SimpleNamespace(client=SimpleNamespace(host="198.51.100.9"), cookies={})
+    response = MagicMock()
+    body = LoginRequest(
+        username="alice",
+        password="hunter2",
+        totp_code="legacy-backup",
+    )
+
+    result = asyncio.run(login(body=body, request=request, response=response))
+
+    assert result["ok"] is True
+    assert calls == [
+        auth.verify_password,
+        auth.totp_verify,
+        auth.create_session_trusted,
+    ]

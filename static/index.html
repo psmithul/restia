@@ -203,20 +203,14 @@
     @font-face { font-family: 'Inter'; font-weight: 600; font-style: normal; font-display: swap; src: url('/static/fonts/Inter-SemiBold.woff2') format('woff2'); }
   </style>
   <!-- KaTeX CSS is loaded with media="print" so it doesn't block render,
-       then flipped to "all" via JS after load. Mermaid init runs once the
-       library finishes loading. Both hooks are wired via addEventListener
-       below (inline onload= attrs are blocked by CSP script-src-attr). -->
+       then flipped to "all" via JS after load. Mermaid is pinned and loaded
+       lazily by markdown.js only when a diagram is actually rendered. -->
   <link id="katex-css" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.css" media="print">
   <script async src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.js"></script>
-  <script id="mermaid-script" async src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
   <script nonce="{{CSP_NONCE}}">
     (function(){
       var k = document.getElementById('katex-css');
       if (k) k.addEventListener('load', function(){ k.media = 'all'; }, { once: true });
-      var m = document.getElementById('mermaid-script');
-      if (m) m.addEventListener('load', function(){
-        if (window.odysseusInitMermaid) window.odysseusInitMermaid();
-      }, { once: true });
     })();
   </script>
   <link rel="stylesheet" href="/static/style.css?v=20260709notifcenter">
@@ -956,7 +950,7 @@
     <div class="sidebar-user-bar" id="sidebar-user-bar">
       <div class="user-bar-left" id="user-bar-profile">
         <div class="user-bar-avatar" id="user-bar-avatar"></div>
-        <span class="user-bar-name" id="user-bar-name">User</span>
+        <span class="user-bar-name" id="user-bar-name">Profile</span>
       </div>
       <div class="user-bar-actions">
         <button type="button" class="user-bar-btn" id="user-bar-settings" title="Settings">
@@ -1375,7 +1369,7 @@
     </div>
   </div>
 
-  <!-- Settings Modal (all users) -->
+  <!-- Settings Modal (all local profiles) -->
   <div id="settings-modal" class="modal hidden">
     <div class="modal-content settings-modal-content" role="dialog" aria-label="Settings">
       <div class="modal-header">
@@ -1432,10 +1426,10 @@
             <span>Shortcuts</span>
           </button>
           <div class="settings-sidebar-divider"></div>
-          <!-- Section 4: Account (sits at the bottom of the user section) -->
+          <!-- Section 4: Profile (sits at the bottom of the local-profile section) -->
           <button class="settings-nav-item" data-settings-tab="account">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
-            <span>Account</span>
+            <span>Profile</span>
           </button>
           <div class="settings-sidebar-divider admin-only"></div>
           <div class="settings-sidebar-label admin-only">Admin</div>
@@ -1445,7 +1439,7 @@
           </button>
           <button class="settings-nav-item admin-only" data-settings-tab="users">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
-            <span>Users</span>
+            <span>Profiles</span>
           </button>
           <button class="settings-nav-item admin-only" data-settings-tab="system">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
@@ -1849,12 +1843,12 @@
               </label>
               <label class="vis-row">
                 <span class="vis-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg></span>
-                <span class="vis-label">User <span class="vis-hint">Avatar &amp; name</span></span>
+                <span class="vis-label">Profile <span class="vis-hint">Avatar &amp; name</span></span>
                 <input type="checkbox" checked data-ui-key="user-bar"><span class="vis-switch"></span>
               </label>
               <label class="vis-row">
                 <span class="vis-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></span>
-                <span class="vis-label">Settings Button <span class="vis-hint">Cog next to user — re-open with <code>/settings</code></span></span>
+                <span class="vis-label">Settings Button <span class="vis-hint">Cog next to profile — re-open with <code>/settings</code></span></span>
                 <input type="checkbox" checked data-ui-key="sidebar-settings-btn"><span class="vis-switch"></span>
               </label>
             </div>
@@ -1967,7 +1961,7 @@
         <!-- ═══ ACCOUNT TAB ═══ -->
         <div data-settings-panel="account" class="hidden">
           <div class="admin-card">
-            <h2><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px;opacity:0.6"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>Account</h2>
+            <h2><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px;opacity:0.6"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>Profile</h2>
             <div style="display:flex;align-items:center;gap:10px;margin:12px 0 12px;">
               <div class="user-bar-avatar" id="settings-account-avatar" style="width:32px;height:32px;font-size:14px;"></div>
               <div style="flex:1;">
@@ -2024,7 +2018,7 @@
         <div data-settings-panel="reminders" class="hidden">
           <div class="admin-card">
             <h2><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px;opacity:0.6"><path d="M21.2 4.2 2.9 11.3c-1.2.5-1.2 1.2-.2 1.5l4.7 1.5 1.8 5.5c.2.6.1.8.8.8.5 0 .8-.2 1-.4l2.3-2.2 4.8 3.5c.9.5 1.5.2 1.7-.8l3.1-14.7c.3-1.3-.5-1.9-1.7-1.4Z"/></svg>Telegram</h2>
-            <div class="admin-toggle-sub" style="margin-bottom:8px">Link this Restia account to a Telegram chat. Each user gets a separate chat and separate conversation history.</div>
+            <div class="admin-toggle-sub" style="margin-bottom:8px">Link this Restia profile to a Telegram chat. Each profile gets a separate chat and separate conversation history.</div>
             <div class="settings-col">
               <div class="settings-row" style="align-items:center;gap:8px">
                 <span id="set-telegram-link-status" style="font-size:11px;flex:1">Checking Telegram…</span>
@@ -2098,7 +2092,7 @@
           </div>
           <div class="admin-card">
             <h2><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px;opacity:0.6"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>Public App URL</h2>
-            <div class="admin-toggle-sub" style="margin-bottom:8px">Used to build clickable links back to Restia inside outgoing reminder / urgent-email emails (e.g. <code>https://chat.yourdomain.com</code>). Leave blank to omit links.</div>
+            <div class="admin-toggle-sub" style="margin-bottom:8px">Used to build safe links back to Restia in reminders, urgent-email alerts, and incoming-call Telegram notifications (e.g. <code>https://chat.yourdomain.com</code>). Use the instance's HTTPS origin; leave blank to omit links.</div>
             <div class="settings-col">
               <div class="settings-row">
                 <label class="settings-label">URL</label>
@@ -2109,14 +2103,14 @@
           </div>
         </div>
 
-        <!-- ═══ ADMIN: USERS TAB ═══ -->
+        <!-- ═══ ADMIN: PROFILES TAB ═══ -->
         <div data-settings-panel="users" class="hidden">
           <div class="admin-card">
             <h2><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px;opacity:0.6"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><line x1="20" y1="8" x2="20" y2="14"/><line x1="23" y1="11" x2="17" y2="11"/></svg>Registration</h2>
             <div class="admin-toggle-row">
               <div>
                 <div class="admin-toggle-label">Open signup</div>
-                <div class="admin-toggle-sub">Allow anyone to create an account from the login page</div>
+                <div class="admin-toggle-sub">Allow anyone to create a local profile from the login page</div>
               </div>
               <label class="admin-switch"><input type="checkbox" id="adm-signupToggle"><span class="admin-slider"></span></label>
             </div>
@@ -2125,25 +2119,25 @@
             <h2><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px;opacity:0.6"><path d="M12 15v3m-3-3h6M12 3v2m0 16v-2M4.93 4.93l1.41 1.41m11.32 11.32l1.41 1.41M3 12h2m16 0h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/><circle cx="12" cy="12" r="3"/></svg>Model Defaults</h2>
             <div class="admin-toggle-row">
               <div>
-                <div class="admin-toggle-label">Share defaults with users</div>
-                <div class="admin-toggle-sub">When on, users without a personal default inherit the global default model (only if those models are allowed for them).</div>
+                <div class="admin-toggle-label">Share defaults with profiles</div>
+                <div class="admin-toggle-sub">When on, profiles without a personal default inherit the global default model (only if those models are allowed for them).</div>
               </div>
               <label class="admin-switch"><input type="checkbox" id="adm-shareDefaultsToggle"><span class="admin-slider"></span></label>
             </div>
           </div>
           <div class="admin-card">
-            <h2><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px;opacity:0.6"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>Users</h2>
+            <h2><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px;opacity:0.6"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>Profiles</h2>
             <div id="adm-userList"><div class="admin-empty">Loading...</div></div>
           </div>
           <div class="admin-card">
-            <h2><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px;opacity:0.6"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><line x1="20" y1="8" x2="20" y2="14"/><line x1="23" y1="11" x2="17" y2="11"/></svg>Add User</h2>
+            <h2><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px;opacity:0.6"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><line x1="20" y1="8" x2="20" y2="14"/><line x1="23" y1="11" x2="17" y2="11"/></svg>Add Profile</h2>
             <div class="admin-add-form">
-              <input id="adm-newUsername" type="text" placeholder="Username">
+              <input id="adm-newUsername" type="text" placeholder="Profile name">
               <input id="adm-newPassword" type="password" placeholder="Password">
               <div class="admin-switch-inline" title="Grant full admin access"><label class="admin-switch"><input type="checkbox" id="adm-newIsAdmin"><span class="admin-slider"></span></label> Admin</div>
             </div>
             <div class="settings-row" style="margin-top:6px;">
-              <button class="admin-btn-add" id="adm-addBtn">Add User</button>
+              <button class="admin-btn-add" id="adm-addBtn">Add Profile</button>
               <span id="adm-addMsg" style="font-size:11px"></span>
             </div>
           </div>
@@ -2405,7 +2399,7 @@
           </div>
           <div class="admin-card">
             <h2><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px;opacity:0.6"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>Data Backup</h2>
-            <div class="admin-toggle-sub" style="margin-bottom:8px">Export or import your user data (memories, presets, settings, skills, preferences) as a JSON file.</div>
+            <div class="admin-toggle-sub" style="margin-bottom:8px">Export or import your profile data (memories, presets, settings, skills, preferences) as a JSON file.</div>
             <div style="display:flex;gap:8px;flex-wrap:wrap;">
               <button class="admin-btn-add" id="adm-exportDataBtn">Export Data</button>
               <button class="admin-btn-add" id="adm-importDataBtn">Import Data</button>

@@ -39,6 +39,7 @@ import spinnerModule from '../spinner.js';
 import themeModule from '../theme.js';
 import presetsModule from '../presets.js';
 import markdownModule from '../markdown.js';
+import fileHandlerModule from '../fileHandler.js';
 import { bindMenuDismiss } from '../escMenuStack.js';
 
 var escapeHtml = uiModule.esc;
@@ -574,7 +575,7 @@ function _setSendBtn(mode) {
  * Handle submit from the main chat input while compare is active.
  * Called by app.js submit guard.
  */
-function handleCompareSubmit(e) {
+async function handleCompareSubmit(e) {
   // If streaming, act as stop button
   if (state._streaming) {
     stopAll();
@@ -582,7 +583,22 @@ function handleCompareSubmit(e) {
   }
   const input = document.getElementById('message');
   const message = input ? input.value.trim() : '';
-  if (!message) return;
+  const pendingCount = fileHandlerModule.getPendingCount?.() || 0;
+  if (!message && !pendingCount) return;
+  if (pendingCount && state._compareMode === 'search') {
+    uiModule.showError?.('Attachments are available when comparing chat, agent, or research models.');
+    return;
+  }
+  const pendingInfo = fileHandlerModule.getPendingInfo?.() || [];
+  const attachmentIds = pendingCount ? await fileHandlerModule.uploadPending() : [];
+  if (pendingCount && attachmentIds.length !== pendingCount) return;
+  const uploadedMeta = fileHandlerModule.getLastUploadedMeta?.() || [];
+  const attachments = pendingInfo.map((info, idx) => ({
+    ...info,
+    id: attachmentIds[idx],
+    width: uploadedMeta[idx]?.width,
+    height: uploadedMeta[idx]?.height,
+  }));
   input.value = '';
   // Reset textarea height
   input.style.height = '';
@@ -624,7 +640,7 @@ function handleCompareSubmit(e) {
       }, 120);
     } catch {}
   }
-  _executeCompare(message);
+  _executeCompare(message, attachmentIds, attachments);
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -635,7 +651,7 @@ function handleCompareSubmit(e) {
  * Send prompt to all panes, stream responses.
  * Works for both first and follow-up messages.
  */
-async function _executeCompare(message) {
+async function _executeCompare(message, attachmentIds = [], attachments = []) {
   if (state._streaming) return;
   if (state._selectedModels.length < 1) return;
 
@@ -905,7 +921,14 @@ async function _executeCompare(message) {
       const userMsg = document.createElement('div');
       userMsg.className = 'msg msg-user';
       userMsg.innerHTML = '<div class="role">You</div><div class="body"></div>';
-      userMsg.querySelector('.body').textContent = message;
+      const userBody = userMsg.querySelector('.body');
+      userBody.textContent = message;
+      if (attachments.length) {
+        const list = document.createElement('div');
+        list.className = 'compare-attachment-list';
+        list.textContent = attachments.map(a => a.name || 'attachment').join(', ');
+        userBody.appendChild(list);
+      }
       hist.appendChild(userMsg);
 
       const aiMsg = document.createElement('div');
@@ -968,7 +991,11 @@ async function _executeCompare(message) {
     if (state._parallel) {
       // Run all panes at once
       await Promise.all(state._paneSessionIds.map((sid, i) =>
-        streamToPane(i, sid, message, aiElements[i], { searchContext: sharedSearchContext, timeout: runTimeout })
+        streamToPane(i, sid, message, aiElements[i], {
+          searchContext: sharedSearchContext,
+          timeout: runTimeout,
+          attachments: attachmentIds,
+        })
       ));
     } else {
       // Run one pane at a time (sequential) — active pane full opacity, others dimmed
@@ -983,7 +1010,11 @@ async function _executeCompare(message) {
           aiElements[i]._spinner.updateLabel('Processing...');
         }
 
-        await streamToPane(i, state._paneSessionIds[i], message, aiElements[i], { searchContext: sharedSearchContext, timeout: runTimeout });
+        await streamToPane(i, state._paneSessionIds[i], message, aiElements[i], {
+          searchContext: sharedSearchContext,
+          timeout: runTimeout,
+          attachments: attachmentIds,
+        });
 
         // Swap opacity: dim current, brighten next
         if (allPanes[i]) allPanes[i].style.opacity = '0.35';

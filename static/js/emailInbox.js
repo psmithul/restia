@@ -1219,7 +1219,7 @@ async function _createReplyReminder(em, dueDate) {
     const fmt = dueDate.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
     showToast(`Reminder set for ${fmt}`);
     // Request notification permission if needed
-    if ('Notification' in window && Notification.permission === 'default') {
+    if ('Notification' in window && Notification.permission === 'default' && !document.fullscreenElement) {
       try { Notification.requestPermission(); } catch {}
     }
   } catch (e) {

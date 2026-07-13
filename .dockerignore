@@ -43,6 +43,11 @@ search_analytics.json
 **/search_analytics.json
 tests/
 api/
+# Local side projects and ad-hoc developer probes are not part of the Restia
+# runtime image. Keeping them out also prevents private save data from entering
+# an otherwise shareable/deployable build context.
+/emberline/
+/test_mnemo.py
 *.log
 *.error.log
 chart.png

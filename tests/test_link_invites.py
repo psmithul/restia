@@ -7,10 +7,9 @@ Pins the security guarantees of the invite-onboarding feature:
     wait; the guest can send/read immediately.
   - Invalid / expired / revoked / spent codes all fail the same generic way,
     and single-use codes can't be double-spent.
-  - A redeemed guest may message ANY discoverable local user, not just the
-    owner ("everyone on the instance" reach) — but a per-user opt-out and a
-    per-guest block both hold, and every reachability failure reads as 404 so
-    the userbase / block state can't be probed.
+  - A bearer represents one remote installation and can reach only the hub
+    installation's opaque identity. Internal profile names, roles, and keys are
+    neither discoverable nor valid routing targets.
 """
 import asyncio
 import itertools
@@ -79,7 +78,7 @@ def _fresh(monkeypatch):
     monkeypatch.delenv("LINK_MAX_GUESTS", raising=False)
     lr._reset_summary_cache()
     with _ENGINE.begin() as conn:
-        for t in ("direct_messages", "link_guests", "home_link",
+        for t in ("direct_message_attachments", "direct_messages", "link_guests", "home_link",
                   "link_invites", "remote_contact_prefs", "remote_blocks"):
             conn.exec_driver_sql(f"DELETE FROM {t}")
     yield
@@ -170,7 +169,8 @@ def test_redeem_creates_an_approved_guest_immediately():
     token = out["token"]
     # No approval step: the guest can message the owner right away.
     sent = _send(token, "hi mika")
-    assert sent["message"]["recipient"] == "mika" and sent["message"]["mine"] is True
+    assert sent["message"]["recipient"] == lr.INSTANCE_REMOTE_ALIAS
+    assert sent["message"]["mine"] is True
 
 
 def test_redeem_consumes_a_single_use_code():
@@ -250,52 +250,56 @@ def test_redeem_404s_when_hub_disabled(monkeypatch):
 
 # ── Instance-wide reach + per-user controls ─────────────────────────────────
 
-def test_guest_can_message_any_discoverable_local_user():
+def test_guest_sees_and_messages_only_the_opaque_installation_identity():
     token = _redeem(_mint()["code"], "friend")["token"]
-    # Directory shows every local account (all discoverable by default).
-    names = {u["username"] for u in _directory(token)}
-    assert {"mika", "alice", "bob"} <= names
-    # Guest DMs a NON-owner; it lands in that user's normal inbox.
-    out = _send(token, "hey alice", to="alice")
-    assert out["message"]["recipient"] == "alice"
-    convos = _run(MSG[("GET", "/api/messages/conversations")](_req("alice")))["conversations"]
-    assert convos[0]["username"] == "friend@remote" and convos[0]["unread"] == 1
+    assert _directory(token) == [{"username": lr.INSTANCE_REMOTE_ALIAS}]
+    assert set(_directory(token)[0]) == {"username"}
+    out = _send(token, "hello installation", to=lr.INSTANCE_REMOTE_ALIAS)
+    assert out["message"]["recipient"] == lr.INSTANCE_REMOTE_ALIAS
+    assert "mika" not in str(out) and "alice" not in str(out)
+    owner_convos = _run(MSG[("GET", "/api/messages/conversations")](
+        _req("mika")
+    ))["conversations"]
+    assert owner_convos[0]["username"] == "friend@remote"
+    assert _run(MSG[("GET", "/api/messages/conversations")](
+        _req("alice")
+    ))["conversations"] == []
 
 
-def test_user_can_opt_out_of_discovery():
+def test_internal_profile_names_are_never_bearer_targets_or_directory_entries():
     token = _redeem(_mint()["code"], "friend")["token"]
     _run(HUB[("POST", "/api/link/me/remote-prefs")](
         lr.RemotePrefRequest(discoverable=False), _req("alice")))
-    names = {u["username"] for u in _directory(token)}
-    assert "alice" not in names and "mika" in names   # owner stays reachable
-    with pytest.raises(HTTPException) as e:
-        _send(token, "hi", to="alice")
-    assert e.value.status_code == 404
+    assert _directory(token) == [{"username": lr.INSTANCE_REMOTE_ALIAS}]
+    for profile in USERS:
+        with pytest.raises(HTTPException) as e:
+            _send(token, "profile injection", to=profile)
+        assert e.value.status_code == 404
 
 
 def test_owner_remains_reachable_even_if_opted_out():
-    # The owner opting out must not break the classic Home Link contract.
+    # Internal profile discoverability does not alter the opaque installation
+    # identity or the owner routing hidden behind it.
     _run(HUB[("POST", "/api/link/me/remote-prefs")](
         lr.RemotePrefRequest(discoverable=False), _req("mika")))
     token = _redeem(_mint()["code"], "friend")["token"]
-    assert _send(token, "hi owner")["message"]["recipient"] == "mika"
-    assert "mika" in {u["username"] for u in _directory(token)}
+    assert _send(token, "hi owner")["message"]["recipient"] == lr.INSTANCE_REMOTE_ALIAS
+    assert _directory(token) == [{"username": lr.INSTANCE_REMOTE_ALIAS}]
 
 
-def test_block_hides_user_and_stops_delivery_then_unblock_restores():
+def test_owner_block_hides_instance_and_stops_delivery_then_unblock_restores():
     token = _redeem(_mint()["code"], "friend")["token"]
-    _send(token, "first hello", to="bob")     # thread exists
+    _send(token, "first hello")
     _run(HUB[("POST", "/api/link/me/block")](
-        lr.BlockRequest(handle="friend@remote", action="block"), _req("bob")))
-    assert "bob" not in {u["username"] for u in _directory(token)}
+        lr.BlockRequest(handle="friend@remote", action="block"), _req("mika")))
+    assert _directory(token) == []
     with pytest.raises(HTTPException) as e:
-        _send(token, "again", to="bob")
+        _send(token, "again")
     assert e.value.status_code == 404
-    # Unblock restores reachability.
     _run(HUB[("POST", "/api/link/me/block")](
-        lr.BlockRequest(handle="friend", action="unblock"), _req("bob")))
-    assert "bob" in {u["username"] for u in _directory(token)}
-    assert _send(token, "back", to="bob")["message"]["recipient"] == "bob"
+        lr.BlockRequest(handle="friend", action="unblock"), _req("mika")))
+    assert _directory(token) == [{"username": lr.INSTANCE_REMOTE_ALIAS}]
+    assert _send(token, "back")["message"]["recipient"] == lr.INSTANCE_REMOTE_ALIAS
 
 
 def test_unknown_target_is_a_generic_404():
@@ -305,12 +309,28 @@ def test_unknown_target_is_a_generic_404():
     assert e.value.status_code == 404
 
 
-def test_guest_conversations_lists_threads_across_users():
+def test_guest_conversations_hide_internal_profiles_and_legacy_threads():
     token = _redeem(_mint()["code"], "friend")["token"]
-    _send(token, "to mika")
-    _send(token, "to alice", to="alice")
-    convos = _run(HUB[("GET", "/api/link/conversations")](_req(bearer=token)))["conversations"]
-    assert {c["username"] for c in convos} == {"mika", "alice"}
+    _send(token, "to installation")
+    # Simulate a pre-boundary legacy row addressed to another local profile.
+    db = _TS()
+    try:
+        db.add(cdb.DirectMessage(
+            sender="friend@remote",
+            recipient="alice",
+            body="legacy profile thread",
+            created_at=cdb.utcnow_naive(),
+        ))
+        db.commit()
+    finally:
+        db.close()
+    convos = _run(HUB[("GET", "/api/link/conversations")](
+        _req(bearer=token)
+    ))["conversations"]
+    assert len(convos) == 1
+    assert convos[0]["username"] == lr.INSTANCE_REMOTE_ALIAS
+    assert convos[0]["last_body"] == "to installation"
+    assert "mika" not in str(convos) and "alice" not in str(convos)
 
 
 def test_prefs_and_block_require_signed_in_user():

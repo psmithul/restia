@@ -2110,7 +2110,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                 var _rToggle = document.getElementById('research-toggle-btn');
                 if (_rToggle) _rToggle.classList.add('research-running');
                 // Request notification permission on first research event
-                if ('Notification' in window && Notification.permission === 'default') {
+                if ('Notification' in window && Notification.permission === 'default' && !document.fullscreenElement) {
                   Notification.requestPermission();
                 }
                 // Mark session as researching in sidebar

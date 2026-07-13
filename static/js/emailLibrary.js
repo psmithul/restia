@@ -7765,7 +7765,7 @@ async function _createEmailReplyReminder(em, dueDate, customText = '') {
     } else {
       showToast('Reply note saved');
     }
-    if ('Notification' in window && Notification.permission === 'default') {
+    if ('Notification' in window && Notification.permission === 'default' && !document.fullscreenElement) {
       try { Notification.requestPermission(); } catch {}
     }
   } catch (e) {

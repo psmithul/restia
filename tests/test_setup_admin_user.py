@@ -26,6 +26,28 @@ def test_create_default_admin_normalizes_env_username(tmp_path, monkeypatch):
     assert "AdminUser" not in data["users"]
 
 
+def test_create_env_restricts_new_file_permissions(tmp_path, monkeypatch):
+    setup_module = _load_setup_module()
+    monkeypatch.setattr(setup_module, "BASE_DIR", str(tmp_path))
+    (tmp_path / ".env.example").write_text("SECRET=placeholder\n", encoding="utf-8")
+
+    setup_module.create_env()
+
+    assert (tmp_path / ".env").stat().st_mode & 0o777 == 0o600
+
+
+def test_create_env_repairs_existing_file_permissions(tmp_path, monkeypatch):
+    setup_module = _load_setup_module()
+    monkeypatch.setattr(setup_module, "BASE_DIR", str(tmp_path))
+    env_path = tmp_path / ".env"
+    env_path.write_text("SECRET=configured\n", encoding="utf-8")
+    env_path.chmod(0o644)
+
+    setup_module.create_env()
+
+    assert env_path.stat().st_mode & 0o777 == 0o600
+
+
 def test_main_loads_admin_password_from_env_file(tmp_path, monkeypatch):
     """Regression: setup.py must honor an admin password pre-seeded in .env on
     native installs, even when the var is not exported into the shell

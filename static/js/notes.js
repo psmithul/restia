@@ -803,6 +803,7 @@ async function _ensureNotificationPermission() {
   if (!('Notification' in window)) return false;
   if (Notification.permission === 'granted') return true;
   if (Notification.permission === 'denied') return false;
+  if (document.fullscreenElement) return false;
   try { const p = await Notification.requestPermission(); return p === 'granted'; }
   catch { return false; }
 }

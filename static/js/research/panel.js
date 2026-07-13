@@ -299,7 +299,7 @@ export function openPanel(focusJobId) {
   _updateResearchCount();
   jobs.refreshLibrary?.({ force: true });
 
-  if ('Notification' in window && Notification.permission === 'default') {
+  if ('Notification' in window && Notification.permission === 'default' && !document.fullscreenElement) {
     try { Notification.requestPermission(); } catch {}
   }
 

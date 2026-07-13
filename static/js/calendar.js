@@ -606,7 +606,7 @@ async function _createEventReminder(ev, dueDate) {
     const fmt = dueDate.toLocaleString([], { month:'short', day:'numeric', hour:'numeric', minute:'2-digit' });
     if (uiModule.showToast) uiModule.showToast(`Reminder set for ${fmt}`);
     try { window.notesModule?.refreshDueBadge?.({ force: true }); } catch {}
-    if ('Notification' in window && Notification.permission === 'default') {
+    if ('Notification' in window && Notification.permission === 'default' && !document.fullscreenElement) {
       try { Notification.requestPermission(); } catch {}
     }
   } catch (e) {

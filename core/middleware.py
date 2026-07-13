@@ -59,6 +59,22 @@ def require_admin(request: Request):
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     """Add standard security headers to all responses."""
 
+    # These routes all serve the same authenticated SPA document. Camera and
+    # microphone access stays disabled everywhere else (login/setup pages, API
+    # responses, reports, tool renders, and arbitrary static HTML) so enabling
+    # WebRTC does not widen media permissions across the whole origin.
+    _SPA_MEDIA_PATHS = {
+        "/",
+        "/notes",
+        "/calendar",
+        "/cookbook",
+        "/email",
+        "/memory",
+        "/gallery",
+        "/tasks",
+        "/library",
+    }
+
     async def dispatch(self, request: Request, call_next) -> Response:
         # Generate a per-request nonce for inline scripts
         nonce = secrets.token_hex(16)
@@ -76,7 +92,18 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
-        response.headers["Permissions-Policy"] = "camera=(), microphone=(self), geolocation=()"
+        # A few focused middleware tests use minimal request doubles without a
+        # method attribute; they model GET responses. Real Starlette Requests
+        # always provide it.
+        method = getattr(request, "method", "GET")
+        if method == "GET" and path in self._SPA_MEDIA_PATHS:
+            response.headers["Permissions-Policy"] = (
+                "camera=(self), microphone=(self), geolocation=()"
+            )
+        else:
+            response.headers["Permissions-Policy"] = (
+                "camera=(), microphone=(), geolocation=()"
+            )
 
         is_https = (
             request.url.scheme == "https"

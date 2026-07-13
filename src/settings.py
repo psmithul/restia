@@ -21,6 +21,71 @@ _CACHE_TTL = 2.0
 _settings_cache: tuple[float, dict] | None = None
 _features_cache: tuple[float, dict] | None = None
 
+# Values in this file are configuration, but several are credentials.  The
+# explicit set documents current fields while suffix matching also protects
+# legacy/optional provider settings that are not materialized in defaults.
+SECRET_SETTING_KEYS = frozenset({
+    "brave_api_key",
+    "google_pse_key",
+    "search_url",
+    "serper_api_key",
+    "tavily_api_key",
+    "telegram_bot_token",
+    "telegram_webhook_secret",
+})
+_SECRET_SETTING_SUFFIXES = (
+    "_api_key",
+    "_credential",
+    "_credentials",
+    "_key",
+    "_password",
+    "_secret",
+    "_token",
+)
+
+
+def _is_secret_setting(key: Any, value: Any) -> bool:
+    normalized = key.lower().replace("-", "_") if isinstance(key, str) else ""
+    return (
+        isinstance(key, str)
+        and isinstance(value, str)
+        and (
+            normalized in SECRET_SETTING_KEYS
+            or normalized.endswith(_SECRET_SETTING_SUFFIXES)
+        )
+    )
+
+
+def _encrypt_settings_for_storage(settings: dict) -> dict:
+    """Return a shallow copy whose configured credentials are encrypted."""
+    from src.secret_storage import encrypt
+
+    protected = dict(settings)
+    for key, value in protected.items():
+        if _is_secret_setting(key, value):
+            protected[key] = encrypt(value)
+    return protected
+
+
+def _decrypt_settings_for_runtime(settings: dict) -> dict:
+    """Return settings with secret envelopes opened for existing callers."""
+    from src.secret_storage import decrypt
+
+    plaintext = dict(settings)
+    for key, value in plaintext.items():
+        if _is_secret_setting(key, value):
+            plaintext[key] = decrypt(value)
+    return plaintext
+
+
+def _blank_secret_settings(settings: dict) -> dict:
+    """Fail closed while retaining non-secret configuration values."""
+    safe = dict(settings)
+    for key, value in safe.items():
+        if _is_secret_setting(key, value):
+            safe[key] = ""
+    return safe
+
 def _invalidate_caches():
     global _settings_cache, _features_cache
     _settings_cache = None
@@ -249,7 +314,24 @@ def load_settings() -> dict:
             saved = json.load(f)
         if not isinstance(saved, dict):
             raise ValueError("settings must be an object")
-        merged = {**DEFAULT_SETTINGS, **saved}
+        protected = saved
+        migration_failed = False
+        # Best-effort in-place migration for legacy plaintext files.  A
+        # read-only key/data directory must not make settings unavailable, but
+        # the next successful save will retry encryption.
+        try:
+            protected = _encrypt_settings_for_storage(saved)
+            if protected != saved:
+                from core.atomic_io import atomic_write_json
+                atomic_write_json(SETTINGS_FILE, protected, indent=2)
+        except (OSError, UnicodeError, ValueError):
+            protected = saved
+            migration_failed = True
+            logger.warning("Could not migrate plaintext settings credentials")
+        runtime_settings = _decrypt_settings_for_runtime(protected)
+        if migration_failed:
+            runtime_settings = _blank_secret_settings(runtime_settings)
+        merged = {**DEFAULT_SETTINGS, **runtime_settings}
     except (FileNotFoundError, PermissionError, json.JSONDecodeError, ValueError):
         merged = dict(DEFAULT_SETTINGS)
     _settings_cache = (now, merged)
@@ -259,7 +341,11 @@ def load_settings() -> dict:
 def save_settings(settings: dict):
     """Persist settings to disk (atomic; see core.atomic_io)."""
     from core.atomic_io import atomic_write_json
-    atomic_write_json(SETTINGS_FILE, settings, indent=2)
+    atomic_write_json(
+        SETTINGS_FILE,
+        _encrypt_settings_for_storage(settings),
+        indent=2,
+    )
     _invalidate_caches()
 
 

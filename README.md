@@ -52,42 +52,56 @@ same verified multi-architecture image instead of rebuilding stale source.
 - **Deep Research** — multi-step web research with source reading and report generation.
 - **Compare** — blind side-by-side model testing and synthesis.
 - **Documents** — writing-first editor with AI edits, suggestions, Markdown, HTML, CSV, and syntax highlighting.
-- **Messages** — WhatsApp-style direct messages with real-time delivery (SSE), typing indicators, read receipts, emoji reactions, replies, and editing/deletion; optional **end-to-end encryption** (per-account keys, the server stores only ciphertext); **voice/video calls** (WebRTC, peer-to-peer); **Moments** (BeReal-style status photos shared with your contacts); cross-instance chat via **invite codes**; plus Home Link developer chat and Telegram.
+- **Messages** — WhatsApp-style direct messages with real-time delivery (SSE), typing indicators, read receipts, emoji reactions, replies, editing/deletion, and standalone photo messages; optional **end-to-end encryption** for text (per-profile keys, so the server stores only ciphertext); **voice/video calls** (WebRTC, peer-to-peer); **Moments** (BeReal-style status photos shared with your contacts); cross-instance messages, photos, and calls through **Home Link** and invite codes; plus Telegram.
 - **Email** — IMAP/SMTP inbox with triage, tags, summaries, reminders, and reply drafts.
 - **Notes, Tasks + Calendar** — reminders, todos, scheduled agent tasks, and CalDAV sync.
 - **Command palette** — a keyboard-first launcher (⌘K / Ctrl+K): fuzzy-jump to any tool, jump straight to a conversation, or Quick Capture a note/todo without leaving what you're doing.
 - **Extras** — gallery/image editor, themes, uploads, web search, presets, sessions, update checker, and 2FA.
 
+**Identity terminology.** One Restia installation is the external Restia
+user/identity that connects to another installation. Password-protected local
+sign-ins inside that installation are **profiles**. Profiles keep their own
+permissions, history, integrations, and local chat state; they are not separate
+Restia installations.
+
 ## Chat with the developer
 
 Every Restia install ships with **Home Link**: once you've built the app and
-logged in, open **Messages** (the sidebar icon) → **✎ New message** → pick the
+signed in to a profile, open **Messages** (the sidebar icon) → **✎ New message** → pick the
 contact tagged `dev`. Choose a handle, send the request, and once the
 developer approves it the thread opens — chat directly from your own
-instance, with replies landing back in the same thread. You never get (or
-need) an account on the developer's server: your instance registers with the
+installation, with replies landing back in the same thread. You never get (or
+need) a profile on the developer's server: your installation registers with the
 home server (`app.restia.dev`), stores its token locally encrypted, and that
 token unlocks exactly one conversation — nothing else.
 
 Privacy notes: nothing is sent anywhere until you pick a handle and hit
-Connect, and only the messages you type in that one thread leave your
-instance — your accounts, keys, and data stay on your device. Set
+Connect. Only the messages, photos, and call-signaling data you deliberately
+send in that Home Link thread leave your instance; your other profiles, keys,
+and data stay on your device. Photo files are validated, metadata-stripped,
+and encrypted at rest on each participating instance, but Home Link photos are
+not end-to-end encrypted. Set
 `RESTIA_HOME_SERVER=` (empty) in `.env` to remove the contact entirely, or
 point it at a friend's instance that has `LINK_HUB_ENABLED=true` to chat with
-them instead; as a hub you approve or block each request from the Messages
-UI.
+them instead. Non-loopback Home Link hubs must use HTTPS. As a hub you approve
+or block each request from the Messages UI.
 
 **Invite codes.** As a hub you can also hand someone an invite code
 (Messages → chat requests) instead of approving them by hand: they enter it
 with their handle when connecting and are approved on the spot, then can
-message anyone on your instance who hasn't opted out of remote contact. Codes
+message your installation through its single external identity. Home Link
+never exposes or routes to individual profile names, roles, or keys. Codes
 expire, are use-capped, and are revocable, so a leaked code has a bounded
 blast radius.
 
-**Calls.** Voice and video calls are peer-to-peer (WebRTC). Because most home
-networks need a relay to connect, calling turns on once you configure a TURN
-server — set `TURN_URL` (and `TURN_USERNAME` / `TURN_CREDENTIAL`) in `.env`.
-The server only relays signaling; it never sees your audio or video.
+**Calls.** Voice and video media is peer-to-peer and encrypted by WebRTC. The
+Restia servers relay only signaling; they never proxy the audio or video.
+STUN-only calls can work on a LAN or friendly NAT, but reliable calling across
+strict NAT, CGNAT, and corporate networks requires a TURN relay. Configure
+`TURN_URL` plus `TURN_USERNAME` and `TURN_CREDENTIAL` in `.env`; use short-lived
+TURN credentials for an internet-facing deployment. To include a safe link in
+incoming-call Telegram alerts, set the instance's HTTPS **Public App URL** in
+Settings → Reminders and link each profile's Telegram chat there.
 
 ## Demo
 

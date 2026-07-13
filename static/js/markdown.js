@@ -816,20 +816,39 @@ export function renderContent(content) {
   return content;
 }
 
+const MERMAID_URL = 'https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js';
+let _mermaidLoadPromise = null;
+
+function _loadMermaid() {
+  if (window.mermaid) return Promise.resolve(window.mermaid);
+  if (_mermaidLoadPromise) return _mermaidLoadPromise;
+  _mermaidLoadPromise = new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = MERMAID_URL;
+    script.async = true;
+    script.addEventListener('load', () => resolve(window.mermaid), { once: true });
+    script.addEventListener('error', () => reject(new Error('Mermaid failed to load')), { once: true });
+    document.head.appendChild(script);
+  }).catch((error) => {
+    _mermaidLoadPromise = null;
+    throw error;
+  });
+  return _mermaidLoadPromise;
+}
+
 /**
  * Initialize any unprocessed Mermaid diagrams in a container (or whole document)
  */
 export function renderMermaid(container) {
-  if (!window.mermaid) return;
-  initMermaid();
   const target = container || document;
   const pending = target.querySelectorAll('pre.mermaid:not([data-processed])');
   if (pending.length === 0) return;
-  try {
-    window.mermaid.run({ nodes: pending });
-  } catch (e) {
-    console.warn('Mermaid render error:', e);
-  }
+  _loadMermaid().then(() => {
+    initMermaid();
+    const nodes = target.querySelectorAll('pre.mermaid:not([data-processed])');
+    if (nodes.length === 0) return;
+    return window.mermaid.run({ nodes });
+  }).catch((e) => console.warn('Mermaid render error:', e));
 }
 
 const markdownModule = {
@@ -849,13 +868,13 @@ const markdownModule = {
 
 export default markdownModule;
 
-// Mermaid is loaded async so it cannot delay the app shell.
+// Mermaid is loaded lazily so its large parser and Firefox's upstream
+// minified-code warning do not affect ordinary page loads.
 function initMermaid() {
   if (!window.mermaid || window.__odysseusMermaidReady) return;
   window.mermaid.initialize({ startOnLoad: false, theme: 'dark', securityLevel: 'loose' });
   window.__odysseusMermaidReady = true;
 }
-window.odysseusInitMermaid = initMermaid;
 initMermaid();
 
 // Persist which thinking sections were expanded across page refreshes.

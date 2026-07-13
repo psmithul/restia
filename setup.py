@@ -8,6 +8,7 @@ initial admin user. Safe to re-run (skips what already exists).
 import os
 import platform
 import shutil
+import stat
 import subprocess
 import sys
 
@@ -157,16 +158,33 @@ def create_default_admin():
         return "skipped"
 
 
+def _secure_env_permissions(env_path: str) -> None:
+    """Keep deployment credentials private on POSIX filesystems."""
+    if os.name != "posix":
+        return
+    try:
+        os.chmod(env_path, 0o600)
+        mode = stat.S_IMODE(os.stat(env_path).st_mode)
+    except OSError as exc:
+        raise RuntimeError(f"Could not restrict permissions on {env_path}: {exc}") from exc
+    if mode & 0o077:
+        raise RuntimeError(
+            f"Could not restrict permissions on {env_path}: mode remained {mode:04o}"
+        )
+
+
 def create_env():
     """Copy .env.example to .env if it doesn't exist."""
     env_path = os.path.join(BASE_DIR, ".env")
     example_path = os.path.join(BASE_DIR, ".env.example")
     if os.path.exists(env_path):
+        _secure_env_permissions(env_path)
         print("  [skip] .env already exists")
         return
     if os.path.exists(example_path):
         import shutil
         shutil.copy2(example_path, env_path)
+        _secure_env_permissions(env_path)
         print("  [ok] .env created from .env.example")
         print("        ** Edit .env with your LLM host and API keys **")
     else:

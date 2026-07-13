@@ -50,3 +50,4 @@ def test_readable_template_injects_nonce(tmp_path):
     body = resp.body.decode("utf-8")
     assert "nonce-abc" in body
     assert "{{CSP_NONCE}}" not in body
+    assert resp.headers["cache-control"] == "no-store, no-transform"

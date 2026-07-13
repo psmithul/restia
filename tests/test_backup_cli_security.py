@@ -1,4 +1,6 @@
 import io
+import os
+import stat
 import tarfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,6 +27,15 @@ def _verify_args(path: Path):
     return SimpleNamespace(path=str(path), pretty=False)
 
 
+def _snapshot_args(path: Path):
+    return SimpleNamespace(
+        out=str(path),
+        include_research=False,
+        include_attachments=False,
+        pretty=False,
+    )
+
+
 def test_snapshot_rejects_output_inside_data_dir(tmp_path, monkeypatch):
     backup = _load_backup_cli()
     repo = tmp_path / "repo"
@@ -34,6 +45,25 @@ def test_snapshot_rejects_output_inside_data_dir(tmp_path, monkeypatch):
 
     with pytest.raises(SystemExit):
         backup._reject_output_inside_data(data / "self.tar.gz")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits are not the Windows ACL boundary")
+def test_snapshot_is_owner_only_even_under_permissive_umask(tmp_path, monkeypatch):
+    backup = _load_backup_cli()
+    repo = tmp_path / "repo"
+    data = repo / "data"
+    data.mkdir(parents=True)
+    (data / ".app_key").write_text("test-key", encoding="utf-8")
+    _patch_repo(backup, monkeypatch, repo)
+    archive = tmp_path / "snapshot.tar.gz"
+
+    previous = os.umask(0o000)
+    try:
+        backup.cmd_snapshot(_snapshot_args(archive))
+    finally:
+        os.umask(previous)
+
+    assert stat.S_IMODE(archive.stat().st_mode) == 0o600
 
 
 def test_restore_rejects_symlink_escape(tmp_path, monkeypatch):

@@ -16,19 +16,33 @@ link protocol doesn't sync them.
 """
 
 import asyncio
+import base64
+import binascii
+import hashlib
+import hmac
+import io
 import json
 import logging
+import os
+import re
+import threading
+import uuid
+import warnings
 from typing import Dict, Optional, Set
+from urllib.parse import quote
 
 from fastapi import APIRouter, Request, HTTPException
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from fastapi.responses import Response, StreamingResponse
+from pydantic import BaseModel, Field
 from sqlalchemy import or_, and_
+from sqlalchemy.orm import load_only
+from starlette.concurrency import run_in_threadpool
 
-from core.database import SessionLocal, DirectMessage
+from core.database import SessionLocal, DirectMessage, DirectMessageAttachment
 from core.database import utcnow_naive
 from routes import link_routes
 from src.auth_helpers import require_user
+from src.rate_limiter import RateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -37,11 +51,39 @@ MESSAGES_PAGE_LIMIT = 200      # max messages returned per conversation fetch
 REPLY_PREVIEW_LEN = 140        # quoted-message excerpt shown above a reply
 MAX_REACTION_LEN = 16          # one emoji (ZWJ sequences included), not an essay
 SSE_KEEPALIVE_S = 15           # comment-ping cadence so proxies don't idle-kill
+MAX_PHOTOS_PER_MESSAGE = 1
+MAX_PHOTO_BYTES = 8 * 1024 * 1024
+MAX_PHOTO_PIXELS = 12_000_000
+MAX_PHOTO_DATA_CHARS = ((MAX_PHOTO_BYTES + 2) // 3) * 4 + 128
+_PHOTO_FORMATS = {
+    "PNG": ("image/png", ".png"),
+    "JPEG": ("image/jpeg", ".jpg"),
+    "WEBP": ("image/webp", ".webp"),
+}
+_PHOTO_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+# Pillow expands compressed images to full pixel buffers before re-encoding.
+# Keep only one normalization in flight so several authenticated profiles
+# cannot multiply that peak memory and OOM the single-process deployment.
+# Per-profile rate limiting also bounds sustained CPU-heavy decode attempts.
+_photo_decode_slot = threading.BoundedSemaphore(1)
+photo_send_limiter = RateLimiter(max_requests=12, window_seconds=60)
+
+
+class PhotoAttachmentRequest(BaseModel):
+    name: str = Field(default="photo", max_length=240)
+    # Browser FileReader data URL or raw base64. MIME is derived from decoded
+    # bytes, never trusted from this field/name.
+    data: str = Field(..., min_length=1, max_length=MAX_PHOTO_DATA_CHARS)
 
 
 class SendMessageRequest(BaseModel):
-    body: str
+    body: str = ""
     reply_to_id: Optional[int] = None
+    attachments: list[PhotoAttachmentRequest] = Field(
+        default_factory=list,
+        max_length=MAX_PHOTOS_PER_MESSAGE,
+    )
 
 
 class EditMessageRequest(BaseModel):
@@ -113,6 +155,225 @@ def _known_users(request: Request) -> dict:
 
 def _normalize_username(name: Optional[str]) -> str:
     return str(name or "").strip().lower()
+
+
+def _safe_photo_filename(value: object, suffix: str) -> str:
+    """Return a display-only filename with the verified format's suffix."""
+    name = str(value or "photo").replace("\\", "/").rsplit("/", 1)[-1]
+    name = re.sub(r"[\x00-\x1f\x7f]+", "", name).strip().lstrip(".")
+    stem = os.path.splitext(name)[0].strip() or "photo"
+    stem = re.sub(r"\s+", " ", stem)[:160].strip() or "photo"
+    return stem + suffix
+
+
+def _decode_photo_data(value: str) -> bytes:
+    raw = (value or "").strip()
+    if raw.startswith("data:"):
+        head, sep, payload = raw.partition(",")
+        if not sep or ";base64" not in head.lower():
+            raise HTTPException(400, "Photo must be base64 encoded")
+    else:
+        payload = raw
+    # FileReader emits compact base64. Reject whitespace/alternate alphabets so
+    # encoded-size checks cannot be bypassed with ignored characters.
+    if not payload or any(ch.isspace() for ch in payload):
+        raise HTTPException(400, "Photo data is malformed")
+    try:
+        data = base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError):
+        raise HTTPException(400, "Photo data is malformed")
+    if not data:
+        raise HTTPException(400, "Photo is empty")
+    if len(data) > MAX_PHOTO_BYTES:
+        raise HTTPException(413, f"Photo exceeds {MAX_PHOTO_BYTES // (1024 * 1024)} MB limit")
+    return data
+
+
+def _normalize_photo(item: PhotoAttachmentRequest | dict) -> dict:
+    """Verify and normalize one untrusted raster image.
+
+    Re-encoding strips EXIF/text/profile payloads and prevents a file extension
+    or claimed MIME from controlling the served Content-Type. Animated images
+    are rejected: this feature intentionally carries still photos only.
+    """
+    if isinstance(item, BaseModel):
+        item = item.model_dump() if hasattr(item, "model_dump") else item.dict()
+    if not isinstance(item, dict):
+        raise HTTPException(400, "Invalid photo attachment")
+    source = _decode_photo_data(str(item.get("data") or ""))
+    try:
+        from PIL import Image, ImageOps
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(source)) as probe:
+                fmt = str(probe.format or "").upper()
+                if fmt not in _PHOTO_FORMATS:
+                    raise HTTPException(400, "Only PNG, JPEG, and WebP photos are allowed")
+                width, height = int(probe.width or 0), int(probe.height or 0)
+                if width < 1 or height < 1 or width * height > MAX_PHOTO_PIXELS:
+                    raise HTTPException(413, "Photo dimensions are too large")
+                if int(getattr(probe, "n_frames", 1) or 1) != 1:
+                    raise HTTPException(400, "Animated images are not allowed")
+                probe.verify()
+
+            with Image.open(io.BytesIO(source)) as image:
+                if int(getattr(image, "n_frames", 1) or 1) != 1:
+                    raise HTTPException(400, "Animated images are not allowed")
+                image = ImageOps.exif_transpose(image)
+                width, height = image.size
+                out = io.BytesIO()
+                if fmt == "JPEG":
+                    image.convert("RGB").save(out, format="JPEG", quality=90)
+                elif fmt == "PNG":
+                    if image.mode not in ("RGB", "RGBA", "L", "LA"):
+                        image = image.convert("RGBA")
+                    image.save(out, format="PNG")
+                else:  # WEBP
+                    image = image.convert("RGBA" if "A" in image.getbands() else "RGB")
+                    image.save(out, format="WEBP", quality=90, method=4)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # Pillow's DecompressionBombError/Warning and all parser failures are
+        # intentionally indistinguishable to callers.
+        logger.info("Rejected invalid DM photo: %s", exc.__class__.__name__)
+        raise HTTPException(400, "Invalid or unsafe photo")
+
+    normalized = out.getvalue()
+    if not normalized or len(normalized) > MAX_PHOTO_BYTES:
+        raise HTTPException(413, "Normalized photo exceeds size limit")
+    mime, suffix = _PHOTO_FORMATS[fmt]
+    return {
+        "id": uuid.uuid4().hex,
+        "filename": _safe_photo_filename(item.get("name"), suffix),
+        "mime": mime,
+        "size": len(normalized),
+        "width": width,
+        "height": height,
+        "sha256": hashlib.sha256(normalized).hexdigest(),
+        "data_b64": base64.b64encode(normalized).decode("ascii"),
+    }
+
+
+def prepare_photo_attachments(items) -> list[dict]:
+    values = list(items or [])
+    if len(values) > MAX_PHOTOS_PER_MESSAGE:
+        raise HTTPException(400, f"Maximum {MAX_PHOTOS_PER_MESSAGE} photos per message")
+    if not values:
+        return []
+    if not _photo_decode_slot.acquire(blocking=False):
+        raise HTTPException(429, "Photo processing is busy — try again shortly")
+    try:
+        return [_normalize_photo(item) for item in values]
+    finally:
+        _photo_decode_slot.release()
+
+
+def attach_prepared_photos(db, message: DirectMessage, prepared: list[dict]) -> list[DirectMessageAttachment]:
+    rows = []
+    for item in prepared:
+        row = DirectMessageAttachment(
+            id=item["id"],
+            message_id=message.id,
+            filename=item["filename"],
+            mime=item["mime"],
+            size=item["size"],
+            width=item["width"],
+            height=item["height"],
+            sha256=item["sha256"],
+            data_b64=item["data_b64"],
+            created_at=utcnow_naive(),
+        )
+        db.add(row)
+        rows.append(row)
+    return rows
+
+
+def _attachment_meta(row: DirectMessageAttachment) -> dict:
+    return {
+        "id": row.id,
+        "name": row.filename,
+        "mime": row.mime,
+        "size": int(row.size or 0),
+        "width": int(row.width or 0),
+        "height": int(row.height or 0),
+    }
+
+
+def attachment_rows_by_message(db, message_ids) -> dict[int, list[DirectMessageAttachment]]:
+    ids = {int(mid) for mid in (message_ids or []) if mid is not None}
+    if not ids:
+        return {}
+    rows = (
+        db.query(DirectMessageAttachment)
+        .options(load_only(
+            DirectMessageAttachment.id,
+            DirectMessageAttachment.message_id,
+            DirectMessageAttachment.filename,
+            DirectMessageAttachment.mime,
+            DirectMessageAttachment.size,
+            DirectMessageAttachment.width,
+            DirectMessageAttachment.height,
+            DirectMessageAttachment.created_at,
+        ))
+        .filter(DirectMessageAttachment.message_id.in_(ids))
+        .order_by(DirectMessageAttachment.created_at.asc())
+        .all()
+    )
+    out: dict[int, list[DirectMessageAttachment]] = {}
+    for row in rows:
+        out.setdefault(row.message_id, []).append(row)
+    return out
+
+
+def serialized_attachments(rows) -> list[dict]:
+    return [_attachment_meta(row) for row in (rows or [])]
+
+
+def _photo_preview(rows) -> str:
+    count = len(rows or [])
+    return "Photo" if count == 1 else (f"{count} photos" if count else "")
+
+
+def _photo_response(filename: str, mime: str, data: bytes) -> Response:
+    allowed = {value[0]: value[1] for value in _PHOTO_FORMATS.values()}
+    suffix = allowed.get(str(mime or "").lower())
+    if not suffix:
+        raise HTTPException(404, "Photo not found")
+    safe_name = _safe_photo_filename(filename, suffix)
+    ascii_name = safe_name.encode("ascii", "ignore").decode("ascii") or f"photo{suffix}"
+    ascii_name = ascii_name.replace('"', "")
+    return Response(
+        content=data,
+        media_type=mime,
+        headers={
+            "Cache-Control": "private, no-store",
+            "Content-Disposition": (
+                f'inline; filename="{ascii_name}"; '
+                f"filename*=UTF-8''{quote(safe_name, safe='')}"
+            ),
+            "Content-Security-Policy": "default-src 'none'; sandbox",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+def _decode_stored_photo(encoded, expected_sha256: str = "") -> bytes:
+    value = str(encoded or "")
+    if not value or len(value) > MAX_PHOTO_DATA_CHARS:
+        raise HTTPException(500, "Stored photo is corrupt")
+    try:
+        data = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError):
+        raise HTTPException(500, "Stored photo is corrupt")
+    if not data or len(data) > MAX_PHOTO_BYTES:
+        raise HTTPException(500, "Stored photo is corrupt")
+    if expected_sha256 and not hmac.compare_digest(
+        hashlib.sha256(data).hexdigest(),
+        str(expected_sha256),
+    ):
+        raise HTTPException(500, "Stored photo failed integrity verification")
+    return data
 
 
 def _resolve_other(request: Request, other: str) -> str:
@@ -194,7 +455,9 @@ def _parse_reactions(raw) -> dict:
 
 
 def _serialize(msg: DirectMessage, me: str,
-               reply_to: Optional[DirectMessage] = None) -> dict:
+               reply_to: Optional[DirectMessage] = None,
+               attachments=None,
+               reply_attachments=None) -> dict:
     """One message as the frontend renders it, from `me`'s perspective.
     Deleted messages are tombstones: blank body, no reactions. The reply
     quote is denormalized (id/sender/excerpt) so the client never has to
@@ -211,14 +474,18 @@ def _serialize(msg: DirectMessage, me: str,
         "edited": msg.edited_at is not None,
         "deleted": deleted,
         "reactions": {} if deleted else _parse_reactions(msg.reactions),
+        "attachments": [] if deleted else serialized_attachments(attachments),
         "reply_to": None,
     }
     if msg.reply_to_id and reply_to is not None:
+        reply_deleted = reply_to.deleted_at is not None
+        reply_body = "" if reply_deleted else (reply_to.body or "")[:REPLY_PREVIEW_LEN]
+        if not reply_body and not reply_deleted:
+            reply_body = _photo_preview(reply_attachments)
         out["reply_to"] = {
             "id": reply_to.id,
             "sender": reply_to.sender,
-            "body": "" if reply_to.deleted_at is not None
-                    else (reply_to.body or "")[:REPLY_PREVIEW_LEN],
+            "body": reply_body,
         }
     return out
 
@@ -240,7 +507,9 @@ def _reply_targets(db, msgs) -> dict:
 
 
 def publish_message_event(msg: DirectMessage, event: str = "message",
-                          reply_to: Optional[DirectMessage] = None) -> None:
+                          reply_to: Optional[DirectMessage] = None,
+                          attachments=None,
+                          reply_attachments=None) -> None:
     """Fan one new/changed message out to both participants' SSE streams,
     serialized per receiver (the `mine` flag differs). Every code path that
     inserts or mutates a direct_messages row must come through here —
@@ -249,7 +518,16 @@ def publish_message_event(msg: DirectMessage, event: str = "message",
     point. Call while the row's attributes are loaded (before Session.close)."""
     for user in (msg.sender, msg.recipient):
         other = msg.recipient if user == msg.sender else msg.sender
-        bus.publish(user, event, {"with": other, "message": _serialize(msg, user, reply_to)})
+        bus.publish(user, event, {
+            "with": other,
+            "message": _serialize(
+                msg,
+                user,
+                reply_to,
+                attachments=attachments,
+                reply_attachments=reply_attachments,
+            ),
+        })
 
 
 def setup_messaging_routes():
@@ -311,11 +589,13 @@ def setup_messaging_routes():
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    @router.get("/users")
+    @router.get("/profiles")
+    @router.get("/users", deprecated=True)
     async def list_dm_users(request: Request):
-        """Every account except me — the 'start a new chat' picker. Also
+        """Every local profile except me — the 'start a new chat' picker. Also
         includes Home Link guests (hub side) and the home contact (client
-        side) so both ends can start those conversations."""
+        side) so both ends can start those conversations. ``/users`` and the
+        ``users`` response key remain for older clients."""
         me = _require_me(request)
         users = _known_users(request)
         out = []
@@ -331,13 +611,14 @@ def setup_messaging_routes():
                     out.append({"username": gname, "is_admin": False, "remote": True})
         out.sort(key=lambda u: u["username"])
         if link_routes.home_enabled():
+            connected = link_routes.home_connected(me)
             out.append({
                 "username": link_routes.home_contact_name(),
                 "is_admin": False,
                 "home": True,
-                "connected": link_routes.home_connected(me),
+                "connected": connected,
             })
-        return {"users": out, "me": me}
+        return {"profiles": out, "users": out, "me": me}
 
     @router.get("/conversations")
     async def list_conversations(request: Request):
@@ -352,6 +633,7 @@ def setup_messaging_routes():
                 .order_by(DirectMessage.created_at.asc())
                 .all()
             )
+            attachments = attachment_rows_by_message(db, [m.id for m in rows])
             convos: dict = {}
             for m in rows:
                 other = m.recipient if m.sender == me else m.sender
@@ -368,7 +650,10 @@ def setup_messaging_routes():
                     }
                     convos[other] = c
                 # rows are ascending, so the final assignment is the latest.
-                c["last_body"] = m.body
+                c["last_body"] = (
+                    "" if m.deleted_at is not None
+                    else ((m.body or "") or _photo_preview(attachments.get(m.id)))
+                )
                 c["last_sender"] = m.sender
                 c["last_mine"] = m.sender == me
                 c["last_at"] = (m.created_at.isoformat() + "Z") if m.created_at else None
@@ -421,6 +706,66 @@ def setup_messaging_routes():
         finally:
             db.close()
 
+    @router.get("/media/{attachment_id}")
+    async def get_message_photo(
+        attachment_id: str,
+        request: Request,
+        peer: str = "",
+    ):
+        """Return one pair-scoped message photo.
+
+        The opaque id is not authorization: the signed-in profile must be one
+        of the parent message's two participants.  There is intentionally no
+        administrator override and no generic upload/gallery URL.
+        """
+        me = _require_me(request)
+        if not _PHOTO_ID_RE.fullmatch(attachment_id or ""):
+            raise HTTPException(404, "Photo not found")
+
+        if peer and link_routes.is_home_contact(peer):
+            remote = await link_routes.home_get_media(me, attachment_id)
+            data = _decode_stored_photo(remote.get("data"), remote.get("sha256", ""))
+            # The configured hub is still an external trust boundary. Verify
+            # and re-encode its bytes locally before a browser ever sees them;
+            # its claimed MIME/name can never select executable content.
+            try:
+                safe = await run_in_threadpool(
+                    _normalize_photo,
+                    {
+                        "name": remote.get("name", "photo"),
+                        "data": base64.b64encode(data).decode("ascii"),
+                    },
+                )
+                safe_data = _decode_stored_photo(safe["data_b64"], safe["sha256"])
+            except HTTPException:
+                raise HTTPException(502, "Home server returned an unsafe photo")
+            return _photo_response(safe["filename"], safe["mime"], safe_data)
+
+        db = SessionLocal()
+        try:
+            row = db.query(DirectMessageAttachment).filter(
+                DirectMessageAttachment.id == attachment_id
+            ).first()
+            if row is None:
+                raise HTTPException(404, "Photo not found")
+            msg = db.query(DirectMessage).filter(
+                DirectMessage.id == row.message_id
+            ).first()
+            if (
+                msg is None
+                or msg.deleted_at is not None
+                or me not in (msg.sender, msg.recipient)
+            ):
+                raise HTTPException(404, "Photo not found")
+            try:
+                data = _decode_stored_photo(row.data_b64, row.sha256)
+            except HTTPException:
+                logger.exception("Corrupt stored DM photo %s", attachment_id)
+                raise
+            return _photo_response(row.filename, row.mime, data)
+        finally:
+            db.close()
+
     @router.get("/conversations/{other}")
     async def get_conversation(other: str, request: Request, after_id: int = 0):
         """Messages in the {me, other} conversation, chronological. Opening a
@@ -466,6 +811,9 @@ def setup_messaging_routes():
                 bus.publish(other_key, "read", {"from": me})
 
             replies = _reply_targets(db, msgs)
+            attachment_ids = [m.id for m in msgs]
+            attachment_ids.extend(r.id for r in replies.values())
+            attachments = attachment_rows_by_message(db, attachment_ids)
             other_names = {}
             try:
                 from routes.profile_routes import display_names_for
@@ -473,7 +821,16 @@ def setup_messaging_routes():
             except Exception:
                 pass
             return {
-                "messages": [_serialize(m, me, replies.get(m.reply_to_id)) for m in msgs],
+                "messages": [
+                    _serialize(
+                        m,
+                        me,
+                        replies.get(m.reply_to_id),
+                        attachments=attachments.get(m.id),
+                        reply_attachments=attachments.get(m.reply_to_id),
+                    )
+                    for m in msgs
+                ],
                 "other": {
                     "username": other_key,
                     "display": other_names.get(other_key),
@@ -493,19 +850,29 @@ def setup_messaging_routes():
         message from this same conversation (reply_to_id)."""
         me = _require_me(request)
         body = (req.body or "").strip()
-        if not body:
-            raise HTTPException(400, "Message body is required")
         if len(body) > MAX_BODY_LEN:
             raise HTTPException(400, f"Message too long (max {MAX_BODY_LEN} characters)")
+        if not body and not req.attachments:
+            raise HTTPException(400, "A message or photo is required")
+        if req.attachments and not photo_send_limiter.check(me):
+            raise HTTPException(429, "Too many photos — try again later")
         if link_routes.is_home_contact(other):
-            # home_send_message proxies a bare body; the link protocol has no
-            # reply field, so a quote would silently vanish hub-side.
             if req.reply_to_id:
                 raise HTTPException(400, "Replies are not available in this conversation")
-            return await link_routes.home_send_message(me, body)
+            prepared = await run_in_threadpool(prepare_photo_attachments, req.attachments)
+            return await link_routes.home_send_message(me, body, prepared)
         other_key = _resolve_other(request, other)
         if other_key == me:
             raise HTTPException(400, "Cannot send a message to yourself")
+        prepared = await run_in_threadpool(prepare_photo_attachments, req.attachments)
+        if _is_federated(other_key) and any(
+            item["size"] > link_routes.MAX_FEDERATED_PHOTO_BYTES
+            for item in prepared
+        ):
+            raise HTTPException(
+                413,
+                "Photos sent between instances must be 2 MB or smaller",
+            )
 
         db = SessionLocal()
         try:
@@ -529,10 +896,30 @@ def setup_messaging_routes():
                 reply_to_id=reply_to.id if reply_to else None,
             )
             db.add(msg)
+            db.flush()
+            photo_rows = attach_prepared_photos(db, msg, prepared)
             db.commit()
             db.refresh(msg)
-            publish_message_event(msg, "message", reply_to)
-            return {"message": _serialize(msg, me, reply_to)}
+            reply_photos = (
+                attachment_rows_by_message(db, [reply_to.id]).get(reply_to.id)
+                if reply_to else None
+            )
+            publish_message_event(
+                msg,
+                "message",
+                reply_to,
+                attachments=photo_rows,
+                reply_attachments=reply_photos,
+            )
+            return {
+                "message": _serialize(
+                    msg,
+                    me,
+                    reply_to,
+                    attachments=photo_rows,
+                    reply_attachments=reply_photos,
+                )
+            }
         finally:
             db.close()
 
@@ -541,8 +928,6 @@ def setup_messaging_routes():
         """Edit my own message in place (sets edited_at)."""
         me = _require_me(request)
         body = (req.body or "").strip()
-        if not body:
-            raise HTTPException(400, "Message body is required")
         if len(body) > MAX_BODY_LEN:
             raise HTTPException(400, f"Message too long (max {MAX_BODY_LEN} characters)")
         db = SessionLocal()
@@ -551,13 +936,32 @@ def setup_messaging_routes():
             _reject_federated_pair(msg, me)
             if msg.deleted_at is not None:
                 raise HTTPException(400, "Message was deleted")
+            photos = attachment_rows_by_message(db, [msg.id]).get(msg.id)
+            if not body and not photos:
+                raise HTTPException(400, "Message body is required")
             msg.body = body
             msg.edited_at = utcnow_naive()
             db.commit()
             db.refresh(msg)
             reply_to = _reply_target(db, msg)
-            publish_message_event(msg, "update", reply_to)
-            return {"message": _serialize(msg, me, reply_to)}
+            reply_photos = (
+                attachment_rows_by_message(db, [reply_to.id]).get(reply_to.id)
+                if reply_to else None
+            )
+            publish_message_event(
+                msg,
+                "update",
+                reply_to,
+                attachments=photos,
+                reply_attachments=reply_photos,
+            )
+            return {"message": _serialize(
+                msg,
+                me,
+                reply_to,
+                attachments=photos,
+                reply_attachments=reply_photos,
+            )}
         finally:
             db.close()
 
@@ -575,6 +979,9 @@ def setup_messaging_routes():
                 msg.deleted_at = utcnow_naive()
                 msg.body = ""
                 msg.reactions = None
+                db.query(DirectMessageAttachment).filter(
+                    DirectMessageAttachment.message_id == msg.id
+                ).delete(synchronize_session=False)
                 db.commit()
                 db.refresh(msg)
                 publish_message_event(msg, "update")
@@ -613,8 +1020,25 @@ def setup_messaging_routes():
             db.commit()
             db.refresh(msg)
             reply_to = _reply_target(db, msg)
-            publish_message_event(msg, "update", reply_to)
-            return {"message": _serialize(msg, me, reply_to)}
+            photos = attachment_rows_by_message(db, [msg.id]).get(msg.id)
+            reply_photos = (
+                attachment_rows_by_message(db, [reply_to.id]).get(reply_to.id)
+                if reply_to else None
+            )
+            publish_message_event(
+                msg,
+                "update",
+                reply_to,
+                attachments=photos,
+                reply_attachments=reply_photos,
+            )
+            return {"message": _serialize(
+                msg,
+                me,
+                reply_to,
+                attachments=photos,
+                reply_attachments=reply_photos,
+            )}
         finally:
             db.close()
 

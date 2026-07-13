@@ -1,4 +1,5 @@
 import os
+import json
 import logging
 import sqlite3
 from datetime import datetime, timezone
@@ -9,6 +10,7 @@ from sqlalchemy.types import TypeDecorator
 from sqlalchemy.ext.declarative import declarative_base, declared_attr
 from sqlalchemy.orm import relationship, sessionmaker, backref
 
+from core.platform_compat import safe_chmod
 from src.runtime_paths import get_app_root
 
 logger = logging.getLogger(__name__)
@@ -35,6 +37,7 @@ class TimestampMixin:
 # Ensure the writable data directory exists before SQLite connects.
 from src.constants import DATA_DIR, AUTH_FILE, MEMORY_FILE, USER_PREFS_FILE, SETTINGS_FILE
 Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
+safe_chmod(DATA_DIR, 0o700)
 
 
 def _default_database_url() -> str:
@@ -52,6 +55,19 @@ def _normalize_sqlite_url(url: str) -> str:
 
 # Get database URL from environment, default to SQLite in DATA_DIR
 DATABASE_URL = _normalize_sqlite_url(os.getenv("DATABASE_URL", _default_database_url()))
+
+
+def harden_database_permissions() -> None:
+    """Keep the local data store private even under a permissive host umask."""
+    safe_chmod(DATA_DIR, 0o700)
+    if not DATABASE_URL.startswith("sqlite:///"):
+        return
+    db_path = DATABASE_URL.replace("sqlite:///", "", 1)
+    if db_path == ":memory:":
+        return
+    for candidate in (db_path, db_path + "-wal", db_path + "-shm"):
+        if os.path.exists(candidate):
+            safe_chmod(candidate, 0o600)
 
 # Create engine
 engine = create_engine(
@@ -73,6 +89,7 @@ def set_sqlite_pragma(dbapi_connection, connection_record):
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")
         cursor.close()
+        harden_database_permissions()
 
 
 class EncryptedText(TypeDecorator):
@@ -100,6 +117,50 @@ class EncryptedText(TypeDecorator):
         return decrypt(value)
 
 
+class EncryptedJSON(TypeDecorator):
+    """JSON-compatible values encrypted through the app's secret envelope.
+
+    The envelope is stored as a JSON string, so existing ``JSON`` columns do
+    not need a table rebuild. Legacy plaintext JSON remains readable and is
+    rewritten by the startup migration below. Consumers continue to receive
+    ordinary Python values.
+    """
+
+    # Keep JSON as the database-level type so existing PostgreSQL/MySQL JSON
+    # columns remain writable.  The encrypted envelope is stored as a JSON
+    # string; legacy rows arrive here as a dict and remain readable.
+    impl = JSON
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            raise ValueError("encrypted JSON value must be an object")
+        from src.secret_storage import encrypt
+        serialized = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        return encrypt(serialized)
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            return value
+        if not isinstance(value, str):
+            logger.error("Stored session headers are not a JSON object")
+            return {}
+        from src.secret_storage import decrypt
+        plaintext = decrypt(value)
+        if not plaintext:
+            return {}
+        try:
+            decoded = json.loads(plaintext)
+        except (TypeError, json.JSONDecodeError):
+            logger.error("Failed to decode encrypted session headers")
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+
+
 class Session(TimestampMixin, Base):
     """
     SQLAlchemy model for Session table.
@@ -123,8 +184,9 @@ class Session(TimestampMixin, Base):
     # Organization
     folder = Column(String, nullable=True, default=None)
     
-    # Headers stored as JSON
-    headers = Column(JSON, default=dict)
+    # Endpoint authorization headers are API credentials.  Keep the public ORM
+    # value as a dict while encrypting the serialized object in the database.
+    headers = Column(EncryptedJSON, default=dict)
     
     # Timestamps are provided by TimestampMixin
     last_accessed = Column(DateTime, default=func.now(), onupdate=func.now())
@@ -575,6 +637,39 @@ class DirectMessage(Base):
     )
 
 
+class DirectMessageAttachment(Base):
+    """A durable raster attachment belonging to one direct message.
+
+    Attachment bytes are normalized before insert and stored as base64 through
+    ``EncryptedText``.  Keeping media in its own table avoids reusing the
+    assistant-chat upload store, whose ownership and retention rules are wrong
+    for a two-party conversation.  Read authorization is always derived from
+    the parent ``DirectMessage`` pair; there is deliberately no owner/admin
+    shortcut on this model.
+    """
+    __tablename__ = "direct_message_attachments"
+
+    id         = Column(String(36), primary_key=True)
+    message_id = Column(
+        Integer,
+        ForeignKey("direct_messages.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    filename   = Column(EncryptedText, nullable=False)
+    mime       = Column(String(32), nullable=False)
+    size       = Column(Integer, nullable=False)
+    width      = Column(Integer, nullable=False)
+    height     = Column(Integer, nullable=False)
+    sha256     = Column(String(64), nullable=False)
+    data_b64   = Column(EncryptedText, nullable=False)
+    created_at = Column(DateTime, default=utcnow_naive, nullable=False)
+
+    __table_args__ = (
+        Index("ix_dm_attachment_message_created", "message_id", "created_at"),
+    )
+
+
 class LinkGuest(Base):
     """A Home Link guest — someone running their own instance who registered
     with this hub to DM its owner (routes/link_routes.py). Only the SHA-256 of
@@ -653,9 +748,10 @@ class RemoteBlock(Base):
 class HomeLink(Base):
     """This instance's registration with its home server — the credential
     behind the 'chat with the developer' contact (routes/link_routes.py).
-    One row per local account (local_user), so users of a shared instance
-    can't read or write each other's conversation with the developer. The
-    bearer token is encrypted at rest like DM bodies."""
+    New pairings use one installation sentinel in ``local_user``; older
+    profile-scoped rows remain readable for migration compatibility. The
+    profile that established the shared pairing is kept in ``owner`` as a
+    local-only call-routing hint. The bearer token is encrypted at rest."""
     __tablename__ = "home_link"
 
     id         = Column(Integer, primary_key=True, autoincrement=True)
@@ -2096,8 +2192,10 @@ def init_db():
     Initialize the database by creating all tables.
     Should be called when starting the application.
     """
+    harden_database_permissions()
     _migrate_model_endpoints()
     Base.metadata.create_all(bind=engine)
+    harden_database_permissions()
     _migrate_add_hidden_models_column()
     _migrate_add_cached_models_column()
     _migrate_add_pinned_models_column()
@@ -2143,6 +2241,7 @@ def init_db():
     _migrate_add_caldav_sync_columns()
     _migrate_add_calendar_recurrence_exdates()
     _migrate_chat_messages_fts()
+    _migrate_encrypt_session_headers()
     _migrate_encrypt_email_passwords()
     _migrate_encrypt_signatures()
     _migrate_encrypt_endpoint_keys()
@@ -2295,6 +2394,66 @@ def _migrate_encrypt_endpoint_keys():
                 logger.info(f"Encrypted plaintext API key on {migrated} endpoint row(s)")
     except Exception as e:
         logger.warning(f"Endpoint-key encryption migration skipped: {e}")
+
+
+def _migrate_encrypt_session_headers():
+    """Encrypt legacy plaintext JSON stored in ``sessions.headers``.
+
+    The mapped type stores new values as an encrypted JSON string and handles
+    both legacy dicts and encrypted strings on read.  Inspecting the raw driver
+    value here keeps the migration idempotent without decrypting/re-encrypting
+    every session on each startup.
+    """
+    try:
+        from src.secret_storage import is_encrypted
+    except Exception:
+        logger.warning("secret_storage import failed; skipping session-header migration")
+        return
+
+    try:
+        with engine.connect() as conn:
+            rows = conn.exec_driver_sql("SELECT id, headers FROM sessions").fetchall()
+            migrated = 0
+            for session_id, raw_headers in rows:
+                if raw_headers in (None, ""):
+                    continue
+
+                decoded = raw_headers
+                if isinstance(raw_headers, str):
+                    if is_encrypted(raw_headers):
+                        continue
+                    try:
+                        decoded = json.loads(raw_headers)
+                    except json.JSONDecodeError:
+                        logger.warning(
+                            "Session-header encryption migration skipped malformed row %s",
+                            session_id,
+                        )
+                        continue
+                    if isinstance(decoded, str) and is_encrypted(decoded):
+                        continue
+
+                if not isinstance(decoded, dict):
+                    logger.warning(
+                        "Session-header encryption migration skipped non-object row %s",
+                        session_id,
+                    )
+                    continue
+
+                conn.execute(
+                    Session.__table__.update()
+                    .where(Session.__table__.c.id == session_id)
+                    .values(headers=decoded)
+                )
+                migrated += 1
+
+            if migrated:
+                conn.commit()
+                logger.info("Encrypted endpoint headers on %d session row(s)", migrated)
+    except Exception:
+        # SQLAlchemy exception strings can include bound values. Never attach
+        # an endpoint Authorization header to a migration log record.
+        logger.warning("Session-header encryption migration skipped")
 
 
 def _migrate_encrypt_signatures():

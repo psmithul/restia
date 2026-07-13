@@ -46,7 +46,14 @@ def serve_html_with_nonce(request: Request, file_path: str) -> HTMLResponse:
         raise HTTPException(500, "Internal server error")
     nonce = getattr(request.state, "csp_nonce", "")
     html = html.replace("{{CSP_NONCE}}", nonce)
-    return HTMLResponse(html)
+    # Every bundled page contains a per-request CSP nonce, so neither browsers
+    # nor shared proxies may retain it.  ``no-transform`` also prevents an edge
+    # proxy (notably Cloudflare Web Analytics automatic setup) from injecting
+    # an unpinned third-party beacon into the security-sensitive app shell.
+    return HTMLResponse(
+        html,
+        headers={"Cache-Control": "no-store, no-transform"},
+    )
 
 
 def inside_base_dir(base_dir: str, path: str) -> bool:

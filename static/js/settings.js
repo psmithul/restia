@@ -2138,7 +2138,7 @@ function initAccount() {
       const roleEl = el('settings-account-role');
       const avatarEl = el('settings-account-avatar');
       if (nameEl) nameEl.textContent = d.username || 'Unknown';
-      if (roleEl) roleEl.textContent = d.is_admin ? 'Admin' : 'User';
+      if (roleEl) roleEl.textContent = d.is_admin ? 'Owner / Admin profile' : 'Local profile';
       if (avatarEl) {
         const initial = (d.username || '?')[0].toUpperCase();
         avatarEl.textContent = initial;
@@ -2354,7 +2354,7 @@ async function initReminderSettings() {
   const root = el('settings-modal');
   if (!root || !root.querySelector('[data-settings-panel="reminders"]')) return;
 
-  // Public URL field (used for deep-links in outgoing alert emails)
+  // Public URL field (used for deep-links in outgoing email/Telegram alerts)
   const pubUrlIn = el('set-app-public-url');
   const pubUrlMsg = el('set-app-public-url-msg');
   if (pubUrlIn) {

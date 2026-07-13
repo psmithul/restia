@@ -9,6 +9,7 @@ import secrets
 import hashlib
 import threading
 import time
+import traceback
 from html import escape as _html_escape
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
@@ -29,6 +30,70 @@ _BOLD_RE = re.compile(r"(\*\*|__)([^\n]+?)\1")
 _STRIKE_RE = re.compile(r"~~([^\n]+?)~~")
 _HEADING_RE = re.compile(r"(?m)^(#{1,6})\s+(.+)$")
 _QUOTE_RE = re.compile(r"(?m)^&gt;\s?(.+)$")
+
+
+class TelegramDeliveryError(RuntimeError):
+    """Telegram delivery failed without exposing request credentials."""
+
+
+class _TelegramTokenLogFilter(logging.Filter):
+    """Redact the path credential from HTTPX request log records."""
+
+    def __init__(self, token: str) -> None:
+        super().__init__()
+        self._token = token
+
+    def clear(self) -> None:
+        self._token = ""
+
+    def _redact(self, value: Any) -> Any:
+        if not self._token:
+            return value
+        try:
+            rendered = str(value)
+        except Exception:
+            return value
+        if self._token not in rendered:
+            return value
+        return rendered.replace(self._token, "[REDACTED]")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = self._redact(record.msg)
+        if isinstance(record.args, tuple):
+            record.args = tuple(self._redact(value) for value in record.args)
+        elif isinstance(record.args, dict):
+            record.args = {key: self._redact(value) for key, value in record.args.items()}
+        record.stack_info = self._redact(record.stack_info)
+        if record.exc_info:
+            rendered = "".join(traceback.format_exception(*record.exc_info))
+            if self._token in rendered:
+                # Formatters render exc_info after filters run, so replacing
+                # only msg/args would leave an exception-bearing log unsafe.
+                record.exc_info = None
+                record.exc_text = self._redact(rendered)
+        return True
+
+
+def _install_telegram_log_filter(token: str) -> tuple[_TelegramTokenLogFilter, list[Any]]:
+    """Cover HTTPX plus propagated HTTP Core records for one request window."""
+    token_filter = _TelegramTokenLogFilter(token)
+    targets: list[Any] = []
+    candidates: list[Any] = [
+        logging.getLogger("httpx"),
+        logging.getLogger("httpcore"),
+        logging.getLogger("httpcore.connection"),
+        logging.getLogger("httpcore.http11"),
+        logging.getLogger("httpcore.http2"),
+        logging.getLogger("httpcore.proxy"),
+        logging.getLogger("httpcore.socks"),
+        *logging.getLogger().handlers,
+    ]
+    for target in candidates:
+        if target in targets:
+            continue
+        target.addFilter(token_filter)
+        targets.append(target)
+    return token_filter, targets
 
 
 def _escape_telegram_href(value: str) -> str:
@@ -359,18 +424,48 @@ async def send_telegram_message(
     if not bot_token:
         raise ValueError("Telegram bot token is not configured")
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    async with httpx.AsyncClient(timeout=15) as client:
-        first = True
-        for chunk in _chunks(text):
-            payload: dict[str, Any] = {
-                "chat_id": chat_id,
-                "text": format_telegram_html(chunk) if rich_text else str(chunk or ""),
-            }
-            if rich_text:
-                payload["parse_mode"] = "HTML"
-            if first and reply_to_message_id is not None:
-                payload["reply_to_message_id"] = reply_to_message_id
-                payload["allow_sending_without_reply"] = True
-            response = await client.post(url, json=payload)
-            response.raise_for_status()
-            first = False
+    token_filter, filter_targets = _install_telegram_log_filter(bot_token)
+    failure: str | None = None
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            first = True
+            for chunk in _chunks(text):
+                payload: dict[str, Any] = {
+                    "chat_id": chat_id,
+                    "text": format_telegram_html(chunk) if rich_text else str(chunk or ""),
+                }
+                if rich_text:
+                    payload["parse_mode"] = "HTML"
+                if first and reply_to_message_id is not None:
+                    payload["reply_to_message_id"] = reply_to_message_id
+                    payload["allow_sending_without_reply"] = True
+                response = await client.post(url, json=payload)
+                status = int(getattr(response, "status_code", 200))
+                if status < 200 or status >= 300:
+                    failure = f"Telegram API request failed with HTTP {status}"
+                    break
+                first = False
+    except httpx.HTTPError as exc:
+        failure = f"Telegram API request failed ({exc.__class__.__name__})"
+    except Exception:
+        # Third-party transports/hooks can raise non-HTTPX exceptions whose
+        # message contains the request URL. Never let that text escape.
+        failure = "Telegram API request failed"
+    finally:
+        try:
+            for target in filter_targets:
+                target.removeFilter(token_filter)
+        finally:
+            token_filter.clear()
+
+    # Raise outside the exception handler so the sensitive HTTPX exception is
+    # not retained as __context__ or rendered by an upstream traceback logger.
+    if failure:
+        # Some error reporters capture frame locals. Clear every local that can
+        # retain the Bot API credential or the credential-bearing request.
+        bot_token = ""
+        url = ""
+        response = None
+        client = None
+        filter_targets = []
+        raise TelegramDeliveryError(failure) from None

@@ -7,11 +7,11 @@ hardening:
   1. HSTS is emitted only for HTTPS requests, including those reaching
      the app over a reverse proxy (`X-Forwarded-Proto: https`).
   2. HSTS is absent on plain HTTP so local/dev deployments are unaffected.
-  3. `Permissions-Policy` locks down camera/geolocation but preserves
-     same-origin microphone access (`microphone=(self)`), so the app's
-     own voice/STT flow (`getUserMedia({ audio: true })`) keeps working.
+  3. `Permissions-Policy` grants camera/microphone only to the authenticated
+     SPA document and keeps them disabled on every other response.
 """
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -55,13 +55,28 @@ def test_hsts_present_via_x_forwarded_proto_https():
     )
 
 
-def test_permissions_policy_locks_camera_and_geolocation_but_allows_self_microphone():
-    response = _client().get("/")
+@pytest.mark.parametrize("path", ["/", "/notes", "/gallery"])
+def test_permissions_policy_allows_same_origin_media_on_spa_documents(path):
+    response = _client().get(path)
 
     policy = response.headers["permissions-policy"]
-    assert policy == "camera=(), microphone=(self), geolocation=()"
-
-    # Explicitly pin the contract the reviewer flagged: an empty allowlist
-    # would also block the app's own same-origin voice/STT button.
+    assert policy == "camera=(self), microphone=(self), geolocation=()"
+    assert "camera=()" not in policy
     assert "microphone=()" not in policy
-    assert "microphone=(self)" in policy
+
+
+@pytest.mark.parametrize("path", ["/login", "/api/health", "/static/index.html"])
+def test_permissions_policy_denies_media_outside_spa_documents(path):
+    response = _client().get(path)
+
+    assert response.headers["permissions-policy"] == (
+        "camera=(), microphone=(), geolocation=()"
+    )
+
+
+def test_permissions_policy_denies_media_on_non_get_spa_response():
+    response = _client().post("/")
+
+    assert response.headers["permissions-policy"] == (
+        "camera=(), microphone=(), geolocation=()"
+    )
