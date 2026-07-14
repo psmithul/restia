@@ -2681,7 +2681,7 @@ function initializeEventListeners() {
     'tool-library':        '#tool-library-btn',
     'tool-memory':         '#tool-memory-btn',
     'tool-notes':          '#tool-notes-btn',
-    'tool-study':          '#tool-study-btn',
+    'tool-study':          '#tool-study-btn, #rail-study',
     'tool-todos':          '#tool-todos-btn',
     'tool-tasks':          '#tool-tasks-btn',
     'tool-theme':          '#tool-theme-btn',
@@ -3294,7 +3294,8 @@ function initializeEventListeners() {
       if (!sessionModule) return;
       if (_closeCompareIfActive()) return;
       if (studyModule && studyModule.isActive()) {
-        studyModule.close({ startFresh: false });
+        const closed = await studyModule.close({ startFresh: false });
+        if (!closed) return;
       }
       _deactivateIncognito();
       // Clear character on new chat

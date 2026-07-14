@@ -1695,6 +1695,44 @@ def _migrate_assign_legacy_owner():
                         logger.info(f"Assigned {res.rowcount} legacy rows in {table} to '{admin_user}'")
             except Exception as e:
                 logger.warning(f"Legacy owner assignment for {table} failed: {e}")
+
+        # Study Mode has one state row per owner but legacy local installs use
+        # the ownerless ``local:default`` row. Never blanket-assign it when an
+        # authenticated admin row already exists: ``owner`` is not a unique DB
+        # column, and creating two admin rows would make goal/timer lookup
+        # ambiguous. If no admin row exists, claim exactly one deterministic
+        # ownerless row and leave any malformed extras quarantined.
+        try:
+            columns = [
+                row[1]
+                for row in conn.execute("PRAGMA table_info(study_states)").fetchall()
+            ]
+            if "owner" in columns:
+                existing = conn.execute(
+                    "SELECT id FROM study_states WHERE owner = ? ORDER BY id LIMIT 1",
+                    (admin_user,),
+                ).fetchone()
+                if existing is None:
+                    candidate = conn.execute(
+                        """
+                        SELECT id FROM study_states
+                        WHERE owner IS NULL
+                        ORDER BY CASE WHEN id = 'local:default' THEN 0 ELSE 1 END, id
+                        LIMIT 1
+                        """
+                    ).fetchone()
+                    if candidate is not None:
+                        conn.execute(
+                            "UPDATE study_states SET owner = ? WHERE id = ? AND owner IS NULL",
+                            (admin_user, candidate[0]),
+                        )
+                        logger.info(
+                            "Assigned legacy Study Mode state '%s' to '%s'",
+                            candidate[0],
+                            admin_user,
+                        )
+        except Exception as e:
+            logger.warning(f"Legacy owner assignment for study_states failed: {e}")
         conn.commit()
     except Exception as e:
         logger.warning(f"Legacy owner migration failed: {e}")

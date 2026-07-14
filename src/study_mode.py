@@ -4,13 +4,23 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
+from functools import wraps
+from threading import RLock
 from typing import Optional
 from uuid import uuid4
+
+from sqlalchemy.exc import IntegrityError
 
 from core.database import SessionLocal, StudyState, utcnow_naive
 
 
 LOCAL_OWNER_KEY = "local:default"
+DEFAULT_STUDY_GOAL = (
+    "Build deep, transferable mastery through first-principles explanations, "
+    "retrieval, derivation, and deliberate practice."
+)
+DEFAULT_TARGET_MINUTES = 60
+_STATE_LOCK = RLock()
 
 
 class StudyGoalConflictError(ValueError):
@@ -19,6 +29,17 @@ class StudyGoalConflictError(ValueError):
 
 class StudyGoalRequiredError(ValueError):
     """Raised when a focus timer is started before a goal exists."""
+
+
+def _serialized_state_access(function):
+    """Keep owner-state initialization and timer mutations ordered in-process."""
+
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        with _STATE_LOCK:
+            return function(*args, **kwargs)
+
+    return wrapped
 
 
 def owner_key(owner: Optional[str]) -> str:
@@ -45,21 +66,60 @@ def _find_state(db, owner: Optional[str]) -> Optional[StudyState]:
     value = str(owner or "").strip()
     if value:
         return db.query(StudyState).filter(StudyState.owner == value).first()
-    return db.query(StudyState).filter(StudyState.id == LOCAL_OWNER_KEY).first()
+    return (
+        db.query(StudyState)
+        .filter(StudyState.id == LOCAL_OWNER_KEY, StudyState.owner.is_(None))
+        .first()
+    )
+
+
+def _next_state_key(db, owner: Optional[str]) -> str:
+    """Return the normal owner key, or a collision-safe replacement."""
+
+    key = owner_key(owner)
+    if db.query(StudyState).filter(StudyState.id == key).first() is not None:
+        key = f"{key}:{uuid4().hex}"
+    return key
+
+
+def _apply_starter_goal(state: StudyState) -> bool:
+    """Repair legacy/empty rows so Study Mode is usable on first open."""
+
+    changed = False
+    if not (state.goal_text or "").strip():
+        state.goal_text = DEFAULT_STUDY_GOAL
+        changed = True
+    if int(state.target_minutes or 0) <= 0:
+        state.target_minutes = DEFAULT_TARGET_MINUTES
+        changed = True
+    return changed
 
 
 def _get_or_create(db, owner: Optional[str]) -> StudyState:
     state = _find_state(db, owner)
-    if state is None:
-        key = owner_key(owner)
-        # A renamed profile can leave its creation key behind. If that old
-        # username is later reused, avoid a PK collision while keeping owner
-        # lookup authoritative.
-        if db.query(StudyState).filter(StudyState.id == key).first() is not None:
-            key = f"{key}:{uuid4().hex}"
-        state = StudyState(id=key, owner=owner)
-        db.add(state)
+    if state is not None:
+        _apply_starter_goal(state)
+        return state
+
+    value = str(owner or "").strip()
+    state = StudyState(
+        id=_next_state_key(db, owner),
+        owner=value or None,
+        goal_text=DEFAULT_STUDY_GOAL,
+        target_minutes=DEFAULT_TARGET_MINUTES,
+    )
+    db.add(state)
+    try:
         db.flush()
+    except IntegrityError:
+        # Two tabs can initialize Study Mode at the same time. The deterministic
+        # primary key makes one insert win; recover the committed owner row
+        # rather than surfacing a misleading 500 to the second tab.
+        db.rollback()
+        state = _find_state(db, owner)
+        if state is None:
+            raise
+        _apply_starter_goal(state)
     return state
 
 
@@ -110,15 +170,22 @@ def serialize_study_state(state: Optional[StudyState], now: Optional[datetime] =
     }
 
 
+@_serialized_state_access
 def get_study_state(owner: Optional[str]) -> dict:
     db = SessionLocal()
     try:
-        state = _find_state(db, owner)
+        state = _get_or_create(db, owner)
+        db.commit()
+        db.refresh(state)
         return serialize_study_state(state)
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()
 
 
+@_serialized_state_access
 def save_study_goal(
     owner: Optional[str],
     goal_text: str,
@@ -158,12 +225,13 @@ def save_study_goal(
         db.close()
 
 
+@_serialized_state_access
 def start_study_timer(owner: Optional[str]) -> dict:
     """Start or resume the focus timer; repeated starts are idempotent."""
 
     db = SessionLocal()
     try:
-        state = _find_state(db, owner)
+        state = _get_or_create(db, owner)
         if state is None or not (state.goal_text or "").strip() or int(state.target_minutes or 0) <= 0:
             raise StudyGoalRequiredError("Set a study goal before starting the focus timer.")
         if not state.timer_running:
@@ -179,6 +247,7 @@ def start_study_timer(owner: Optional[str]) -> dict:
         db.close()
 
 
+@_serialized_state_access
 def pause_study_timer(owner: Optional[str]) -> dict:
     """Pause without losing the current focus block."""
 
@@ -200,6 +269,7 @@ def pause_study_timer(owner: Optional[str]) -> dict:
         db.close()
 
 
+@_serialized_state_access
 def finish_study_timer(owner: Optional[str]) -> dict:
     """Commit the current focus block to goal progress and reset the clock."""
 

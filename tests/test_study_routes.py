@@ -1,6 +1,9 @@
 """Focused persistence and timer regressions for Study Mode."""
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+import json
+from threading import Barrier
 from types import SimpleNamespace
 
 import httpx
@@ -146,17 +149,51 @@ async def test_auth_disabled_keeps_local_study_mode_working(study_db, monkeypatc
     assert state.json()["goal_text"] == "Learn controls"
 
 
-async def test_timer_requires_a_saved_goal(study_db):
+async def test_first_open_bootstraps_a_starter_goal_and_timer(study_db):
     async with _client() as client:
+        initial = await client.get(
+            "/api/study/state", headers={"x-test-user": "alice"}
+        )
         response = await client.post(
             "/api/study/timer/start", headers={"x-test-user": "alice"}
         )
 
-    assert response.status_code == 400
-    assert "Set a study goal" in response.json()["detail"]
+    assert initial.status_code == 200
+    assert initial.json()["goal_text"] == study.DEFAULT_STUDY_GOAL
+    assert initial.json()["target_minutes"] == study.DEFAULT_TARGET_MINUTES
+    assert response.status_code == 200
+    assert response.json()["timer_running"] is True
     db = study_db()
-    assert db.query(StudyState).count() == 0
+    row = db.query(StudyState).filter_by(owner="alice").one()
     db.close()
+    assert row.goal_text == study.DEFAULT_STUDY_GOAL
+    assert row.target_minutes == study.DEFAULT_TARGET_MINUTES
+
+
+async def test_timer_http_lifecycle_survives_reload(study_db, monkeypatch):
+    clock = _Clock(datetime(2026, 7, 14, 9, 0, 0))
+    monkeypatch.setattr(study, "_now", clock)
+    headers = {"x-test-user": "alice"}
+
+    async with _client() as client:
+        started = await client.post("/api/study/timer/start", headers=headers)
+        assert started.status_code == 200
+        clock.advance(65)
+        running = await client.get("/api/study/state", headers=headers)
+        assert running.json()["timer_seconds"] == 65
+        paused = await client.post("/api/study/timer/pause", headers=headers)
+        assert paused.json()["timer_running"] is False
+        assert paused.json()["timer_seconds"] == 65
+
+    # A fresh client simulates reopening the Study surface after navigation.
+    clock.advance(300)
+    async with _client() as client:
+        reloaded = await client.get("/api/study/state", headers=headers)
+        finished = await client.post("/api/study/timer/finish", headers=headers)
+
+    assert reloaded.json()["timer_seconds"] == 65
+    assert finished.json()["timer_seconds"] == 0
+    assert finished.json()["total_seconds"] == 65
 
 
 @pytest.mark.parametrize(
@@ -194,6 +231,88 @@ def test_owner_key_is_stable_and_normalized():
     assert study.owner_key("  alice  ") == "user:alice"
     assert study.owner_key(None) == study.LOCAL_OWNER_KEY
     assert study.owner_key("   ") == study.LOCAL_OWNER_KEY
+
+
+def test_authenticated_profile_never_claims_anonymous_study_state(study_db):
+    study.save_study_goal(None, "Local controls goal", 240, "2026-08-15")
+
+    alice = study.get_study_state("alice")
+
+    assert alice["goal_text"] == study.DEFAULT_STUDY_GOAL
+    db = study_db()
+    rows = db.query(StudyState).all()
+    db.close()
+    assert {(row.owner, row.goal_text) for row in rows} == {
+        (None, "Local controls goal"),
+        ("alice", study.DEFAULT_STUDY_GOAL),
+    }
+
+
+def test_startup_owner_migration_assigns_local_study_state_to_admin(
+    study_db, monkeypatch, tmp_path
+):
+    study.save_study_goal(None, "Local controls goal", 240, "2026-08-15")
+    auth_file = tmp_path / "auth.json"
+    auth_file.write_text(
+        json.dumps(
+            {
+                "users": {
+                    "alice": {"is_admin": True},
+                    "bob": {"is_admin": False},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cdb, "DATABASE_URL", f"sqlite:///{tmp_path / 'study.db'}")
+
+    cdb._migrate_assign_legacy_owner()
+
+    db = study_db()
+    row = db.query(StudyState).filter_by(id=study.LOCAL_OWNER_KEY).one()
+    db.close()
+    assert row.owner == "alice"
+    assert row.goal_text == "Local controls goal"
+
+
+def test_startup_owner_migration_does_not_duplicate_existing_admin_state(
+    study_db, monkeypatch, tmp_path
+):
+    study.save_study_goal(None, "Quarantined local goal", 240, "2026-08-15")
+    study.save_study_goal("alice", "Authenticated goal", 600, "2026-09-01")
+    (tmp_path / "auth.json").write_text(
+        json.dumps({"users": {"alice": {"is_admin": True}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cdb, "DATABASE_URL", f"sqlite:///{tmp_path / 'study.db'}")
+
+    cdb._migrate_assign_legacy_owner()
+
+    db = study_db()
+    rows = db.query(StudyState).order_by(StudyState.id).all()
+    snapshot = [(row.id, row.owner, row.goal_text) for row in rows]
+    db.close()
+    assert snapshot == [
+        (study.LOCAL_OWNER_KEY, None, "Quarantined local goal"),
+        ("user:alice", "alice", "Authenticated goal"),
+    ]
+
+
+def test_concurrent_first_open_is_idempotent(study_db):
+    barrier = Barrier(2)
+
+    def open_study():
+        barrier.wait(timeout=5)
+        return study.get_study_state("alice")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        states = list(pool.map(lambda _: open_study(), range(2)))
+
+    assert {state["goal_text"] for state in states} == {study.DEFAULT_STUDY_GOAL}
+    db = study_db()
+    rows = db.query(StudyState).filter_by(owner="alice").all()
+    db.close()
+    assert len(rows) == 1
 
 
 def test_timer_start_pause_resume_finish_and_idempotence(study_db, monkeypatch):

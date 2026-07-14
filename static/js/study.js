@@ -20,8 +20,14 @@ let _collapsed = false;
 let _state = { ...EMPTY_STATE };
 let _syncClockMs = 0;
 let _ticker = null;
-let _requestController = null;
+let _stateController = null;
+let _mutationChain = Promise.resolve();
 let _busy = false;
+let _closing = false;
+let _closePromise = null;
+let _goalDirty = false;
+let _lastResyncMs = 0;
+let _composerObserver = null;
 let _elements = {};
 let _previousChatUi = null;
 let _options = {};
@@ -188,10 +194,10 @@ function _syncControls(live = _liveState()) {
   const pause = _elements['study-timer-pause'];
   const finish = _elements['study-timer-finish'];
   const save = _elements['study-goal-save'];
-  if (start) start.disabled = _busy || live.timer_running || !live.goal_text || !live.target_minutes;
-  if (pause) pause.disabled = _busy || !live.timer_running;
-  if (finish) finish.disabled = _busy || live.timer_seconds <= 0;
-  if (save) save.disabled = _busy;
+  if (start) start.disabled = _busy || _closing || live.timer_running || _goalDirty;
+  if (pause) pause.disabled = _busy || _closing || !live.timer_running;
+  if (finish) finish.disabled = _busy || _closing || live.timer_seconds <= 0;
+  if (save) save.disabled = _busy || _closing;
 }
 
 function _setBusy(value) {
@@ -206,7 +212,9 @@ function _renderLive() {
   _setText(_elements['study-timer'], formatDuration(live.timer_seconds));
   _setText(
     _elements['study-timer-status'],
-    !live.goal_text
+    _goalDirty && !live.timer_running
+      ? 'Save goal changes before starting'
+      : !live.goal_text
       ? 'Set a learning goal to start'
       : (live.timer_running ? 'Focus timer running' : (live.timer_seconds ? 'Focus timer paused' : 'Ready to study')),
   );
@@ -251,6 +259,7 @@ function _renderForm() {
   if (goal) goal.value = _state.goal_text || '';
   if (hours) hours.value = _hoursValue(_state.target_minutes);
   if (date) date.value = _state.target_date || '';
+  _goalDirty = false;
 }
 
 function _applyState(payload, { syncForm = false } = {}) {
@@ -275,12 +284,9 @@ function _syncTicker() {
 }
 
 async function _request(path, options = {}) {
-  if (_requestController) _requestController.abort();
-  _requestController = new AbortController();
   const response = await fetch(`${API_BASE}${path}`, {
     credentials: 'same-origin',
     ...options,
-    signal: _requestController.signal,
   });
   const text = await response.text();
   let payload = {};
@@ -294,26 +300,40 @@ async function _request(path, options = {}) {
   return payload;
 }
 
-async function _loadState() {
+function _queueMutation(operation) {
+  const queued = _mutationChain.then(operation, operation);
+  _mutationChain = queued.catch(() => {});
+  return queued;
+}
+
+async function _loadState({ syncForm = true } = {}) {
+  if (_busy || _closing) return false;
+  if (_stateController) _stateController.abort();
+  const controller = new AbortController();
+  _stateController = controller;
   _setBusy(true);
   _showError('');
   try {
-    const state = await _request('/state');
-    _applyState(state, { syncForm: true });
+    const state = await _request('/state', { signal: controller.signal });
+    _applyState(state, { syncForm });
+    _lastResyncMs = _monotonicNow();
+    return true;
   } catch (error) {
     if (error && error.name !== 'AbortError') _showError(error.message || 'Could not load Study Mode.');
+    return false;
   } finally {
+    if (_stateController === controller) _stateController = null;
     _setBusy(false);
   }
 }
 
 async function _timerAction(action) {
-  if (_busy) return;
+  if (_busy || _closing) return;
   const before = _liveState();
   _setBusy(true);
   _showError('');
   try {
-    const state = await _request(`/timer/${action}`, { method: 'POST' });
+    const state = await _queueMutation(() => _request(`/timer/${action}`, { method: 'POST' }));
     _applyState(state, { syncForm: false });
     if (action === 'start') _announce('Focus timer started.');
     if (action === 'pause') _announce('Focus timer paused.');
@@ -330,7 +350,7 @@ async function _timerAction(action) {
 
 async function _saveGoal(event) {
   if (event) event.preventDefault();
-  if (_busy) return;
+  if (_busy || _closing) return;
   const goal = String(_elements['study-goal-text']?.value || '').trim();
   const hours = _number(_elements['study-target-hours']?.value, NaN);
   const targetMinutes = Math.round(hours * 60);
@@ -360,7 +380,7 @@ async function _saveGoal(event) {
   _setBusy(true);
   _showError('');
   try {
-    const state = await _request('/goal', {
+    const state = await _queueMutation(() => _request('/goal', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -369,7 +389,7 @@ async function _saveGoal(event) {
         target_date: targetDate,
         reset_progress: resetProgress,
       }),
-    });
+    }));
     _applyState(state, { syncForm: true });
     _announce(resetProgress
       ? 'New study goal saved. Previous goal effort was reset.'
@@ -379,6 +399,45 @@ async function _saveGoal(event) {
   } finally {
     _setBusy(false);
   }
+}
+
+function _syncGoalDirty() {
+  const goal = String(_elements['study-goal-text']?.value || '').trim();
+  const hours = _number(_elements['study-target-hours']?.value, NaN);
+  const targetMinutes = Number.isFinite(hours) ? Math.round(hours * 60) : NaN;
+  const targetDate = String(_elements['study-target-date']?.value || '').trim() || null;
+  _goalDirty = (
+    goal !== String(_state.goal_text || '').trim()
+    || targetMinutes !== _seconds(_state.target_minutes)
+    || targetDate !== (_state.target_date || null)
+  );
+  _renderLive();
+}
+
+function _syncDrawerClearance() {
+  const panel = _elements['study-panel'];
+  if (!panel || !_active) return;
+  const viewportWidth = _number(window.innerWidth, 0);
+  if (viewportWidth > 1100) {
+    panel.style.removeProperty('--study-drawer-bottom');
+    return;
+  }
+  const composer = document.querySelector('.chat-input-bar');
+  const viewportHeight = _number(window.innerHeight, document.documentElement?.clientHeight || 0);
+  const rect = composer?.getBoundingClientRect?.();
+  if (!rect || rect.top <= 0 || rect.top >= viewportHeight) {
+    panel.style.removeProperty('--study-drawer-bottom');
+    return;
+  }
+  const clearance = Math.max(12, Math.ceil(viewportHeight - rect.top + 12));
+  panel.style.setProperty('--study-drawer-bottom', `${clearance}px`);
+}
+
+function _refreshAuthoritativeState() {
+  if (!_active || _busy || _closing || document.visibilityState === 'hidden') return;
+  const now = _monotonicNow();
+  if (_lastResyncMs && now - _lastResyncMs < 1000) return;
+  void _loadState({ syncForm: !_goalDirty });
 }
 
 function _setCollapsed(value) {
@@ -516,18 +575,32 @@ function _onSessionSelected(event) {
   if (mode === 'study') {
     void open({ focus: false, refresh: true, fromSession: true });
   } else if (mode && _active) {
-    close({ manual: false, startFresh: false });
+    void close({ manual: false, startFresh: false });
   }
 }
 
 function _wireEvents() {
   _elements['study-panel-collapse']?.addEventListener('click', () => _setCollapsed(!_collapsed));
-  _elements['study-panel-close']?.addEventListener('click', () => close({ manual: true }));
+  _elements['study-panel-close']?.addEventListener('click', () => void close({ manual: true }));
   _elements['study-timer-start']?.addEventListener('click', () => void _timerAction('start'));
   _elements['study-timer-pause']?.addEventListener('click', () => void _timerAction('pause'));
   _elements['study-timer-finish']?.addEventListener('click', () => void _timerAction('finish'));
   _elements['study-goal-form']?.addEventListener('submit', event => void _saveGoal(event));
+  ['study-goal-text', 'study-target-hours', 'study-target-date'].forEach(id => {
+    _elements[id]?.addEventListener('input', _syncGoalDirty);
+    _elements[id]?.addEventListener('change', _syncGoalDirty);
+  });
   window.addEventListener('restia:session-selected', _onSessionSelected);
+  window.addEventListener('focus', _refreshAuthoritativeState);
+  window.addEventListener('resize', _syncDrawerClearance);
+  document.addEventListener('visibilitychange', _refreshAuthoritativeState);
+  if (typeof ResizeObserver !== 'undefined') {
+    const composer = document.querySelector('.chat-input-bar');
+    if (composer) {
+      _composerObserver = new ResizeObserver(_syncDrawerClearance);
+      _composerObserver.observe(composer);
+    }
+  }
 }
 
 export function init(apiBase, options = {}) {
@@ -567,6 +640,7 @@ export function init(apiBase, options = {}) {
 
 export async function open(options = {}) {
   if (!_initialized && !init(options.apiBase, options)) return false;
+  if (_closePromise) await _closePromise;
   if (_active) {
     if (options.refresh) await _loadState();
     if (options.focus !== false) focus();
@@ -583,18 +657,43 @@ export async function open(options = {}) {
   _enterChatShell();
   _forceChatMode();
   _setCollapsed(_collapsed);
+  _syncDrawerClearance();
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(_syncDrawerClearance);
   await _loadState();
   if (options.focus !== false) focus();
   return true;
 }
 
-export function close(options = {}) {
+async function _close(options = {}) {
   if (typeof options === 'boolean') options = { manual: options };
   const manual = Boolean(options.manual);
   const startFresh = manual
     && options.startFresh !== false
     && _options.startFreshOnManualClose !== false;
-  if (!_active) return false;
+  _closing = true;
+  if (_stateController) {
+    _stateController.abort();
+    _stateController = null;
+  }
+  _setBusy(true);
+  _showError('');
+
+  // Mutations are deliberately serialized. If Close races with Start, this
+  // pause runs only after Start has resolved, so the server can never be left
+  // with an invisible timer that continues counting outside Study Mode.
+  try {
+    const paused = await _queueMutation(
+      () => _request('/timer/pause', { method: 'POST' }),
+    );
+    _applyState(paused, { syncForm: false });
+  } catch (error) {
+    const message = error?.message || 'Could not pause the focus timer while leaving Study Mode.';
+    console.error('Study Mode close failed to pause the timer:', error);
+    _showError(message);
+    _closing = false;
+    _setBusy(false);
+    return false;
+  }
 
   _active = false;
   if (typeof window !== 'undefined') window.__restiaStudyModeActive = false;
@@ -606,16 +705,22 @@ export function close(options = {}) {
     panel.setAttribute('aria-busy', 'false');
   }
   _stopTicker();
-  if (_requestController) {
-    _requestController.abort();
-    _requestController = null;
-  }
   _busy = false;
+  _closing = false;
   _activateNavigation(false);
   _restoreChatShell({ manual });
   _leaveStudyRoute();
   if (startFresh) _startFreshNormalChat();
   return true;
+}
+
+export function close(options = {}) {
+  if (_closePromise) return _closePromise;
+  if (!_active) return Promise.resolve(false);
+  _closePromise = _close(options).finally(() => {
+    _closePromise = null;
+  });
+  return _closePromise;
 }
 
 export function isActive() {

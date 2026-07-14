@@ -1766,8 +1766,18 @@ export async function selectSession(id, { keepSidebar = false, showLoading = tru
     window.compareModule.deactivate(true);
     return; // deactivate does a page reload
   }
+  const navToken = ++_sessionNavToken;
+  const targetMeta = sessions.find(session => session.id === id);
+  const targetMode = String((targetMeta && targetMeta.mode) || 'chat').toLowerCase();
+
+  // Selecting an ordinary chat must not commit until Study Mode has safely
+  // paused its server timer. Otherwise a quick send during a slow close would
+  // carry study_mode=true and permanently relabel the ordinary session.
+  if (targetMode !== 'study' && window.studyModule?.isActive?.()) {
+    const closed = await window.studyModule.close({ manual: false, startFresh: false });
+    if (!closed || navToken !== _sessionNavToken) return false;
+  }
   try {
-    const navToken = ++_sessionNavToken;
     const prevSessionId = currentSessionId;
     _clearHistoryPager();
     // Re-archive peeked session when navigating away

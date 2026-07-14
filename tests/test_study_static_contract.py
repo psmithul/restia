@@ -133,6 +133,8 @@ def test_app_imports_initializes_and_routes_the_study_module():
     assert re.search(r"['\"]rail-study['\"]\s*:\s*['\"]tool-study-btn['\"]", source)
     assert re.search(r"toolStudyBtn\.addEventListener\(['\"]click['\"]", source)
     assert "await studyModule.open()" in source
+    assert "await studyModule.close({ startFresh: false })" in source
+    assert "'#tool-study-btn, #rail-study'" in source
 
     module = STUDY_JS.read_text(encoding="utf-8")
     for export in ("init", "open", "close", "isActive", "focus"):
@@ -186,13 +188,16 @@ def test_study_sessions_have_an_icon_and_restore_event():
         r"detail\s*:\s*\{\s*id\s*,\s*mode\s*:\s*\(meta\s*&&\s*meta\.mode\)\s*\|\|\s*['\"]chat['\"]",
         source,
     )
+    select_body = source[source.index("export async function selectSession") :]
+    assert "await window.studyModule.close({ manual: false, startFresh: false })" in select_body
+    assert select_body.index("await window.studyModule.close") < select_body.index("currentSessionId = id")
 
 
 def test_service_worker_precaches_study_asset_with_cache_bump():
     source = SW_JS.read_text(encoding="utf-8")
     version = re.search(r"const\s+CACHE_NAME\s*=\s*['\"]restia-v(\d+)['\"]", source)
     assert version, "versioned service-worker cache name is required"
-    assert int(version.group(1)) >= 349
+    assert int(version.group(1)) >= 350
 
     precache = re.search(r"const\s+PRECACHE\s*=\s*\[(?P<body>.*?)\];", source, re.DOTALL)
     assert precache
@@ -212,6 +217,12 @@ def test_study_release_assets_use_one_cache_key_and_exclude_local_backups():
     study_css = css[css.index("/* ── Study Mode") :]
     assert re.search(r"#study-panel\s*\{[^}]*height:\s*100%;", study_css, re.DOTALL)
     assert "@media (max-width: 1100px)" in study_css
+    assert "--study-drawer-bottom" in study_css
+
+    module = STUDY_JS.read_text(encoding="utf-8")
+    assert "_queueMutation" in module
+    assert "() => _request('/timer/pause', { method: 'POST' })" in module
+    assert "ResizeObserver(_syncDrawerClearance)" in module
 
     admin = ADMIN_JS.read_text(encoding="utf-8")
     assert re.search(r"\bstudy:\s*['\"]study goals and timer progress", admin)
