@@ -121,6 +121,10 @@
           "<line x1='10' y1='10' x2='22' y2='10' stroke='" + ac + "' stroke-width='2'/>" +
           "<line x1='10' y1='15' x2='22' y2='15' stroke='" + ac + "' stroke-width='2'/>" +
           "<line x1='10' y1='20' x2='18' y2='20' stroke='" + ac + "' stroke-width='2'/>",
+        '/study':
+          "<path d='M5 7.5 C9 6 12 7 16 10 V27 C12 24 9 23.5 5 24.5 Z' fill='none' stroke='" + ac + "' stroke-width='2.3' stroke-linejoin='round'/>" +
+          "<path d='M27 7.5 C23 6 20 7 16 10 V27 C20 24 23 23.5 27 24.5 Z' fill='none' stroke='" + ac + "' stroke-width='2.3' stroke-linejoin='round'/>" +
+          "<path d='M16 10 V27' fill='none' stroke='" + ac + "' stroke-width='2.3' stroke-linecap='round'/>",
         '/cookbook':
           "<path d='M5 8 L5 26 A2 2 0 0 0 7 28 L25 28 A2 2 0 0 0 27 26 L27 8' fill='none' stroke='" + ac + "' stroke-width='2.5' stroke-linejoin='round'/>" +
           "<path d='M9 4 L23 4 L23 8 L9 8 Z' fill='none' stroke='" + ac + "' stroke-width='2.5' stroke-linejoin='round'/>" +
@@ -158,6 +162,7 @@
       var titles = {
         '/calendar': 'Calendar — Restia',
         '/notes': 'Notes — Restia',
+        '/study': 'Study Mode — Restia',
         '/cookbook': 'Cookbook — Restia',
         '/email': 'Email — Restia',
         '/memory': 'Memory — Restia',
@@ -213,8 +218,8 @@
       if (k) k.addEventListener('load', function(){ k.media = 'all'; }, { once: true });
     })();
   </script>
-  <link rel="stylesheet" href="/static/style.css?v=20260709notifcenter">
-  <link rel="modulepreload" href="/static/app.js?v=20260630mdfontsize">
+  <link rel="stylesheet" href="/static/style.css?v=20260714study">
+  <link rel="modulepreload" href="/static/app.js?v=20260714study">
   <link rel="modulepreload" href="/static/js/chat.js">
   <link rel="modulepreload" href="/static/js/ui.js">
   <link rel="modulepreload" href="/static/js/sessions.js">
@@ -689,6 +694,7 @@
     <button class="icon-rail-btn" id="rail-archive" title="Library"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/><path d="M9 7h6M9 11h4"/></svg></button>
     <button class="icon-rail-btn" id="rail-memory" title="Brain"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/><path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/></svg></button>
     <button class="icon-rail-btn" id="rail-notes" title="Notes"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3h10l4 4v14H5z"/><path d="M15 3v5h5"/><path d="M8 17.5 15.5 10l2.5 2.5L10.5 20H8z"/></svg></button>
+    <button class="icon-rail-btn" id="rail-study" title="Study Mode"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5.5c3-1 6-.5 9 2v13c-3-2-6-2.5-9-1.5z"/><path d="M21 5.5c-3-1-6-.5-9 2v13c3-2 6-2.5 9-1.5z"/></svg></button>
     <button class="icon-rail-btn" id="rail-todos" title="To Do"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg></button>
     <button class="icon-rail-btn" id="rail-tasks" title="Tasks"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/><path d="M9 16l2 2 4-4"/></svg></button>
     <button class="icon-rail-btn" id="rail-theme" title="Theme"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 2a10 10 0 0 0 0 20 5 5 0 0 0 5-5 3 3 0 0 0-3-3h-2a3 3 0 0 1-3-3 5 5 0 0 1 5-5"/></svg></button>
@@ -909,6 +915,15 @@
             <path d="M8 17.5 15.5 10l2.5 2.5L10.5 20H8z"/>
           </svg>
           <span class="grow">Notes</span>
+        </div>
+        <div class="list-item" id="tool-study-btn">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+            stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+            style="flex-shrink:0;opacity:0.5;">
+            <path d="M3 5.5c3-1 6-.5 9 2v13c-3-2-6-2.5-9-1.5z"/>
+            <path d="M21 5.5c-3-1-6-.5-9 2v13c3-2 6-2.5 9-1.5z"/>
+          </svg>
+          <span class="grow">Study Mode</span>
         </div>
         <div class="list-item" id="tool-todos-btn">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -1270,6 +1285,77 @@
 
 
   </main>
+  <aside id="study-panel" class="study-panel" aria-labelledby="study-panel-title" hidden>
+    <header class="study-panel-header">
+      <div class="study-panel-heading">
+        <span class="study-panel-mark" aria-hidden="true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5.5c3-1 6-.5 9 2v13c-3-2-6-2.5-9-1.5z"/><path d="M21 5.5c-3-1-6-.5-9 2v13c3-2 6-2.5 9-1.5z"/></svg>
+        </span>
+        <div>
+          <h2 id="study-panel-title">Study Mode</h2>
+          <p>Learn by explaining, deriving, and retrieving.</p>
+        </div>
+      </div>
+      <div class="study-panel-controls">
+        <button type="button" id="study-panel-collapse" aria-label="Collapse Study panel" aria-expanded="true" title="Collapse panel">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+        </button>
+        <button type="button" id="study-panel-close" aria-label="Leave Study Mode" title="Leave Study Mode">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <div id="study-panel-body" class="study-panel-body">
+      <section class="study-card study-focus-card" aria-labelledby="study-focus-heading">
+        <div class="study-card-label" id="study-focus-heading">Current focus block</div>
+        <output id="study-timer" class="study-timer" role="timer" aria-label="Current study time">00:00:00</output>
+        <div id="study-timer-status" class="study-timer-status">Ready when you are</div>
+        <div class="study-timer-actions">
+          <button type="button" id="study-timer-start" class="study-action study-action-primary">Start</button>
+          <button type="button" id="study-timer-pause" class="study-action">Pause</button>
+          <button type="button" id="study-timer-finish" class="study-action">Finish block</button>
+        </div>
+        <div class="study-session-total"><span>Logged effort</span><strong id="study-session-total">0m</strong></div>
+      </section>
+
+      <section class="study-card" aria-labelledby="study-goal-heading">
+        <div class="study-card-label" id="study-goal-heading">Learning goal</div>
+        <form id="study-goal-form" autocomplete="off">
+          <label for="study-goal-text">What will you be able to explain or do?</label>
+          <textarea id="study-goal-text" maxlength="500" rows="3" required placeholder="Example: Derive rigid-body dynamics and solve unfamiliar problems"></textarea>
+          <div class="study-goal-grid">
+            <label for="study-target-hours">Effort target
+              <span class="study-input-suffix"><input id="study-target-hours" type="number" min="0.25" max="8760" step="0.25" inputmode="decimal" required><span>hours</span></span>
+            </label>
+            <label for="study-target-date">Target date
+              <input id="study-target-date" type="date">
+            </label>
+          </div>
+          <button type="submit" id="study-goal-save" class="study-action study-action-primary study-goal-save">Save goal</button>
+        </form>
+
+        <div class="study-progress-heading"><span>Effort progress</span><strong id="study-progress-value">0%</strong></div>
+        <div id="study-progress-bar" class="study-progress-track" role="progressbar" aria-label="Progress toward study-time target" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span></span></div>
+        <p id="study-progress-copy" class="study-progress-copy">Set a goal to see the effort remaining.</p>
+        <p id="study-deadline-copy" class="study-deadline-copy"></p>
+        <p class="study-mastery-note">Time tracks deliberate practice, not mastery. Your answers in chat are the evidence.</p>
+      </section>
+
+      <section id="study-method" class="study-card study-method" aria-labelledby="study-method-heading">
+        <div class="study-card-label" id="study-method-heading">How the tutor works</div>
+        <ol>
+          <li><strong>Explain</strong><span>Build intuition from first principles.</span></li>
+          <li><strong>Attempt</strong><span>You retrieve, predict, or derive.</span></li>
+          <li><strong>Repair</strong><span>Expose the exact gap and try again.</span></li>
+          <li><strong>Transfer</strong><span>Apply the idea in a new setting.</span></li>
+        </ol>
+      </section>
+
+      <p id="study-error" class="study-error" role="alert" hidden></p>
+      <p id="study-live-status" class="a11y-visually-hidden" aria-live="polite"></p>
+    </div>
+  </aside>
   <button id="scroll-bottom-btn" class="scroll-nav-btn" title="Scroll to bottom">▼</button>
   <script nonce="{{CSP_NONCE}}">
   (function(){
@@ -1825,6 +1911,11 @@
                 <span class="vis-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 7h6M9 11h6M9 15h4"/></svg></span>
                 <span class="vis-label">Notes</span>
                 <input type="checkbox" checked data-ui-key="tool-notes"><span class="vis-switch"></span>
+              </label>
+              <label class="vis-row">
+                <span class="vis-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5.5c3-1 6-.5 9 2v13c-3-2-6-2.5-9-1.5z"/><path d="M21 5.5c-3-1-6-.5-9 2v13c3-2 6-2.5 9-1.5z"/></svg></span>
+                <span class="vis-label">Study Mode</span>
+                <input type="checkbox" checked data-ui-key="tool-study"><span class="vis-switch"></span>
               </label>
               <label class="vis-row">
                 <span class="vis-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg></span>
@@ -2421,6 +2512,14 @@
 
             <div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px;">
               <div>
+                <div class="admin-toggle-label">Delete all Study Mode data</div>
+                <div class="admin-toggle-sub">Clears every learning goal, focus timer, and logged study-time total.</div>
+              </div>
+              <button class="admin-btn-delete" data-wipe-kind="study" title="Delete all Study Mode data" aria-label="Delete all Study Mode data" style="display:inline-flex;align-items:center;gap:5px;white-space:nowrap;"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>Delete</button>
+            </div>
+
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px;">
+              <div>
                 <div class="admin-toggle-label">Delete all memory</div>
                 <div class="admin-toggle-sub">Clears `memory.json`, the Memory table, and the vector store. Skills not affected.</div>
               </div>
@@ -2479,7 +2578,7 @@
             <div style="display:flex;justify-content:space-between;align-items:center;">
               <div>
                 <div class="admin-toggle-label" style="color:#e55;">Delete everything</div>
-                <div class="admin-toggle-sub">All eight categories above, in one go. Same effect as wiping each one in sequence.</div>
+                <div class="admin-toggle-sub">All nine categories above, in one go. Same effect as wiping each one in sequence.</div>
               </div>
               <button class="admin-btn-delete" data-wipe-kind="__all__" title="Delete every category" aria-label="Delete everything" style="display:inline-flex;align-items:center;gap:5px;white-space:nowrap;font-weight:600;"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>Delete All</button>
             </div>
@@ -2538,7 +2637,7 @@
 <script type="module" src="/static/js/settings.js"></script>
 <script type="module" src="/static/js/admin.js"></script>
 <script type="module" src="/static/js/assistant.js"></script>
-<script type="module" src="/static/app.js?v=20260630mdfontsize"></script>  <!-- app.js must be LAST -->
+<script type="module" src="/static/app.js?v=20260714study"></script>  <!-- app.js must be LAST -->
 <script type="module" src="/static/js/init.js"></script>
 <script type="module" src="/static/js/a11y.js"></script>
 <script type="module" src="/static/js/updateChecker.js"></script>

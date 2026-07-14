@@ -643,6 +643,7 @@ async def build_chat_context(
     webhook_manager=None,
     use_enhanced_message: bool = False,
     agent_mode: bool = False,
+    study_mode: bool = False,
     allow_tool_preprocessing: bool = True,
 ) -> ChatContext:
     """Build the full context (preface + messages) for an LLM call.
@@ -734,6 +735,17 @@ async def build_chat_context(
     if use_rag is not None or is_research_spinoff or casual_low_signal:
         _preface_kwargs["use_rag"] = use_rag_val
     preface, rag_sources, web_sources = chat_processor.build_context_preface(**_preface_kwargs)
+
+    if study_mode:
+        # Study Mode remains on the ordinary provider/chat path; this system
+        # message changes the pedagogy without bypassing model routing,
+        # streaming, memory, attachments, or session persistence.
+        from src.study_mode import study_context_messages_for_owner
+        study_messages = study_context_messages_for_owner(user)
+        preface.insert(0, study_messages[0])
+        # Goal text changes over time and is learner-controlled, so keep its
+        # guarded user-context message after the stable system preface.
+        preface.append(study_messages[1])
 
     # Capture used memories immediately
     used_memories = getattr(chat_processor, '_last_used_memories', [])

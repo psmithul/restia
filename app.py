@@ -732,6 +732,10 @@ app.include_router(setup_chat_routes(
     skills_manager=skills_manager,
 ))
 
+# Study Mode goal, persistent focus timer, and progress tracking
+from routes.study_routes import setup_study_routes
+app.include_router(setup_study_routes())
+
 # Research (background deep-research tasks)
 from routes.research.research_routes import setup_research_routes
 app.include_router(setup_research_routes(research_handler, session_manager=session_manager))
@@ -973,6 +977,10 @@ async def serve_notes(request: Request):
 
 @app.get("/calendar")
 async def serve_calendar(request: Request):
+    return await serve_index(request)
+
+@app.get("/study")
+async def serve_study(request: Request):
     return await serve_index(request)
 
 # Per-tool deep-link routes — all serve the same SPA, the JS auto-opens

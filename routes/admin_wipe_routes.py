@@ -6,7 +6,7 @@ nuking everything. The catch-all `chats` endpoint mirrors the
 existing /api/sessions/all so the Danger Zone speaks one URL pattern.
 
 URL shape: DELETE /api/admin/wipe/{kind}
-Kinds: chats, memory, skills, notes, tasks, documents, gallery, calendar.
+Kinds: chats, study, memory, skills, notes, tasks, documents, gallery, calendar.
 """
 
 import json
@@ -30,6 +30,7 @@ from core.database import (
     GalleryAlbum,
     CalendarEvent,
     CalendarCal,
+    StudyState,
 )
 from src.constants import DATA_DIR, SKILLS_DIR, SKILLS_FILE, GALLERY_DIR, GALLERY_UPLOADS_DIR
 
@@ -101,6 +102,12 @@ def setup_admin_wipe_routes(session_manager):
                         mv.clear()
                 except Exception as e:
                     logger.info(f"Memory vector clear skipped: {e}")
+                return {"status": "deleted", "kind": kind, "count": count}
+
+            if kind == "study":
+                count = db.query(StudyState).count()
+                db.query(StudyState).delete()
+                db.commit()
                 return {"status": "deleted", "kind": kind, "count": count}
 
             if kind == "skills":

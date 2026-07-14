@@ -270,6 +270,28 @@ class ChatMessage(Base):
         Index('ix_messages_session_time', 'session_id', 'timestamp'),  # Composite for efficient message retrieval
     )
 
+
+class StudyState(TimestampMixin, Base):
+    """Owner-scoped Study Mode goal, focus timer, and accumulated progress.
+
+    One owner-scoped row is used per signed-in profile (or for the local
+    single-user instance). Authenticated lookup uses ``owner`` so profile
+    renames retain the row even when its creation-time primary key is stale.
+    Keeping the timer in SQLite means refresh/restart cannot lose a block.
+    """
+
+    __tablename__ = "study_states"
+
+    id = Column(String, primary_key=True)
+    owner = Column(String, nullable=True, index=True)
+    goal_text = Column(Text, nullable=False, default="")
+    target_minutes = Column(Integer, nullable=False, default=0)
+    target_date = Column(String, nullable=True)
+    total_seconds = Column(Integer, nullable=False, default=0)
+    current_session_seconds = Column(Integer, nullable=False, default=0)
+    timer_started_at = Column(DateTime, nullable=True)
+    timer_running = Column(Boolean, nullable=False, default=False)
+
 class Document(TimestampMixin, Base):
     """Living document that the AI can create and edit in-place."""
     __tablename__ = "documents"

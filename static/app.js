@@ -29,6 +29,7 @@ import galleryModule from './js/gallery.js';
 import tasksModule from './js/tasks.js?v=20260630tasksactivity';
 import calendarModule from './js/calendar.js';
 import notesModule from './js/notes.js';
+import studyModule from './js/study.js';
 import notificationCenterModule from './js/notificationCenter.js';
 import adminModule from './js/admin.js';
 import settingsModule from './js/settings.js';
@@ -57,6 +58,7 @@ window.sessionModule = sessionModule;
 window.uiModule = uiModule;
 window.adminModule = adminModule;
 window.cookbookModule = cookbookModule;
+window.studyModule = studyModule;
 
 function _isMobileChatInput() {
   return window.innerWidth <= 768;
@@ -175,6 +177,7 @@ function initRailHoverLabels() {
     'rail-archive': 'Library',
     'rail-memory': 'Brain',
     'rail-notes': 'Notes',
+    'rail-study': 'Study',
     'rail-todos': 'To Do',
     'rail-tasks': 'Tasks',
     'rail-theme': 'Theme',
@@ -1124,6 +1127,21 @@ function initializeEventListeners() {
     });
   }
 
+  // Study uses the existing composer and stream, but always begins in a
+  // dedicated fresh session so tutor behavior cannot leak into an old chat.
+  const toolStudyBtn = el('tool-study-btn');
+  if (toolStudyBtn) {
+    toolStudyBtn.addEventListener('click', async () => {
+      if (!studyModule) return;
+      if (studyModule.isActive()) {
+        studyModule.focus();
+        return;
+      }
+      await _handleNewChatAction({ focus: false });
+      await studyModule.open();
+    });
+  }
+
   // To Do tool button
   const toolTodosBtn = el('tool-todos-btn');
   if (toolTodosBtn) {
@@ -1206,6 +1224,7 @@ function initializeEventListeners() {
     }
   }
   const _routeOpen = {
+    '/study':    () => document.getElementById('tool-study-btn')?.click(),
     '/notes':    () => {
       if (!notesModule) return;
       _collapseSidebarToRail();
@@ -2662,6 +2681,7 @@ function initializeEventListeners() {
     'tool-library':        '#tool-library-btn',
     'tool-memory':         '#tool-memory-btn',
     'tool-notes':          '#tool-notes-btn',
+    'tool-study':          '#tool-study-btn',
     'tool-todos':          '#tool-todos-btn',
     'tool-tasks':          '#tool-tasks-btn',
     'tool-theme':          '#tool-theme-btn',
@@ -3273,6 +3293,9 @@ function initializeEventListeners() {
   async function _handleNewChatAction({ preferModel = true, focus = true } = {}) {
       if (!sessionModule) return;
       if (_closeCompareIfActive()) return;
+      if (studyModule && studyModule.isActive()) {
+        studyModule.close({ startFresh: false });
+      }
       _deactivateIncognito();
       // Clear character on new chat
       if (presetsModule && presetsModule.deactivateCharacter) presetsModule.deactivateCharacter();
@@ -3666,6 +3689,7 @@ function startRestiaApp() {
   searchModule.init(API_BASE);
   chatModule.init(API_BASE);
   chatModule.initListeners();
+  studyModule.init(API_BASE);
   groupModule.init(API_BASE);
   // Initialize compare module
   if (compareModule) {
@@ -3705,6 +3729,7 @@ function startRestiaApp() {
     'rail-messages':  'tool-messages-btn',
     'rail-calendar':  'tool-calendar-btn',
     'rail-notes':     'tool-notes-btn',
+    'rail-study':     'tool-study-btn',
     'rail-todos':     'tool-todos-btn',
     'rail-memory':    'tool-memory-btn',
     'rail-theme':     'tool-theme-btn',

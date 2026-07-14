@@ -1199,15 +1199,19 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
       // on; explicit web/current-info requests are handled by the backend
       // intent gate.
       const toggleState = Storage.loadToggleState();
-      let isAgentMode = (toggleState.mode || 'chat') === 'agent';
+      const isStudyMode = window.__restiaStudyModeActive === true;
+      let isAgentMode = !isStudyMode && (toggleState.mode || 'chat') === 'agent';
       const incognitoChk = el('incognito-toggle');
       const isIncognito = !!(incognitoChk && incognitoChk.checked);
       // Auto-escalate to agent mode when a document is open — the user expects
       // the AI to see the document and have tools to edit it
-      if (!isIncognito && !isAgentMode && documentModule && activeDocIdForSend) {
+      if (!isStudyMode && !isIncognito && !isAgentMode && documentModule && activeDocIdForSend) {
         isAgentMode = true;
       }
       fd.append('mode', isAgentMode ? 'agent' : 'chat');
+      if (isStudyMode) {
+        fd.append('study_mode', 'true');
+      }
       if (el('web-toggle').checked) {
         if (!isAgentMode) {
           fd.append('use_web', 'true');
@@ -1216,12 +1220,16 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
       if (isAgentMode) {
         fd.append('allow_web_search', el('web-toggle').checked ? 'true' : 'false');
       }
-      if (el('research-toggle').checked) {
+      if (!isStudyMode && el('research-toggle').checked) {
         fd.append('use_research', 'true');
         // Research always runs in chat mode — override agent if set
         fd.set('mode', 'chat');
       }
-      fd.append('allow_bash', el('bash-toggle').checked ? 'true' : 'false');
+      if (isStudyMode) {
+        fd.append('allow_bash', 'false');
+      } else {
+        fd.append('allow_bash', el('bash-toggle').checked ? 'true' : 'false');
+      }
       const ragChk = el('rag-toggle');
       if (ragChk && !ragChk.checked) {
         fd.append('use_rag', 'false');
@@ -1233,7 +1241,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
       if (_ws) {
         fd.append('workspace', _ws);
       }
-      if (presetsModule.getSelectedPreset()) {
+      if (!isStudyMode && presetsModule.getSelectedPreset()) {
         fd.append('preset_id', presetsModule.getSelectedPreset());
       }
 
@@ -1243,7 +1251,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
       currentAbort = abortCtrl;
 
       const _tState = Storage.loadToggleState();
-      const _isAgent = (_tState.mode || 'chat') === 'agent';
+      const _isAgent = !isStudyMode && (_tState.mode || 'chat') === 'agent';
 
       // Timeout: 6 min for research and agent mode, 3 min otherwise
       const timeoutMs = el('research-toggle').checked || _isAgent ? RESEARCH_TIMEOUT_MS : DEFAULT_TIMEOUT_MS;

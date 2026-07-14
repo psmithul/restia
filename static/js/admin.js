@@ -2825,7 +2825,7 @@ function initDangerZone() {
   // via data-wipe-kind; one delegated handler handles double-confirm,
   // POSTs to /api/admin/wipe/{kind}, and writes the result.
   const _LABELS = {
-    chats: 'chats', memory: 'memory entries', skills: 'skills',
+    chats: 'chats', study: 'study goals and timer progress', memory: 'memory entries', skills: 'skills',
     notes: 'notes', tasks: 'tasks', documents: 'documents',
     gallery: 'gallery images', calendar: 'calendar items',
   };

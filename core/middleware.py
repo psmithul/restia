@@ -67,6 +67,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         "/",
         "/notes",
         "/calendar",
+        "/study",
         "/cookbook",
         "/email",
         "/memory",

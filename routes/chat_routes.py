@@ -433,6 +433,12 @@ def setup_chat_routes(
         use_research = chat_request.use_research
         time_filter = chat_request.time_filter
         preset_id = chat_request.preset_id
+        study_mode = chat_request.study_mode
+        if study_mode:
+            # The teaching contract is built in and non-optional. A stale
+            # persona selection must not compete with it.
+            preset_id = None
+            use_research = False
 
         # Verify the caller owns this session before loading it.
         # Without this, any authenticated user can post into another user's chat.
@@ -480,8 +486,12 @@ def setup_chat_routes(
             use_web=use_web,
             time_filter=time_filter,
             webhook_manager=webhook_manager,
+            study_mode=study_mode,
             allow_tool_preprocessing=allow_tool_preprocessing,
         )
+
+        if study_mode:
+            set_session_mode(session, "study")
 
         # Research injection
         research_blocked_by_policy = (
@@ -570,6 +580,21 @@ def setup_chat_routes(
         # manual form posts that still send plan_mode=true.
         plan_mode = False
         chat_mode = str(form_data.get("mode", "")).lower()  # 'chat' or 'agent'
+        if chat_mode not in ("chat", "agent"):
+            # Never let an unknown mode fall through to the full agent branch.
+            chat_mode = "chat"
+        study_mode = str(
+            form_data.get("study_mode")
+            or (body or {}).get("study_mode")
+            or ""
+        ).lower() == "true"
+        if study_mode:
+            # A tutor turn stays conversational. Search/RAG context can still
+            # be injected through the ordinary chat pre-processing path, but a
+            # stale Agent-mode UI state must never grant tools.
+            chat_mode = "chat"
+            preset_id = None
+            use_research = None
         # Workspace: confine the agent's file/shell tools to this folder.
         workspace, workspace_rejected = _resolve_request_workspace(
             request, form_data.get("workspace")
@@ -599,7 +624,7 @@ def setup_chat_routes(
         # shell disabled).
         auto_escalated = False
         _tool_intent = _classify_tool_intent(message) if isinstance(message, str) else None
-        if chat_mode == "chat" and _tool_intent and _tool_intent.needs_tools:
+        if not study_mode and chat_mode == "chat" and _tool_intent and _tool_intent.needs_tools:
             chat_mode = "agent"
             auto_escalated = True
             logger.info(
@@ -607,7 +632,7 @@ def setup_chat_routes(
                 _tool_intent.category,
                 _tool_intent.reason,
             )
-        elif chat_mode == "chat" and _search_enabled:
+        elif not study_mode and chat_mode == "chat" and _search_enabled:
             chat_mode = "agent"
             auto_escalated = True
             logger.info("chat→agent auto-escalation: search enabled")
@@ -704,7 +729,8 @@ def setup_chat_routes(
                     "No model selected for this chat. Open the model picker and choose one before sending.",
                 )
             if (
-                chat_mode == "chat"
+                not study_mode
+                and chat_mode == "chat"
                 and isinstance(message, str)
                 and (not _tool_intent or not _tool_intent.needs_tools)
                 and _is_contextual_web_followup(message, sess)
@@ -736,8 +762,8 @@ def setup_chat_routes(
         resolve_session_auth(sess, session, owner=effective_owner(request))
 
         # Check for research_pending BEFORE mode persist overwrites it
-        do_research = str(use_research).lower() == "true"
-        if not do_research:
+        do_research = not study_mode and str(use_research).lower() == "true"
+        if not study_mode and not do_research:
             if get_session_mode(session) == 'research_pending':
                 do_research = True
                 logger.info(f"Session {session} in research_pending — auto-triggering research")
@@ -777,6 +803,7 @@ def setup_chat_routes(
             # manage_skills (agent mode). In plain chat or incognito the
             # index would be useless / unwanted noise.
             agent_mode=(chat_mode == "agent"),
+            study_mode=study_mode,
             allow_tool_preprocessing=allow_tool_preprocessing,
         )
 
@@ -1004,8 +1031,11 @@ def setup_chat_routes(
 
         # Persist session mode after policy/privilege gates so blocked research
         # turns remain ordinary chat/agent streams and saved messages.
-        _effective_mode = 'research' if effective_do_research else (chat_mode or 'chat')
-        if _effective_mode in ('agent', 'research', 'chat'):
+        _effective_mode = (
+            'research' if effective_do_research
+            else ('study' if study_mode else (chat_mode or 'chat'))
+        )
+        if _effective_mode in ('agent', 'research', 'chat', 'study'):
             set_session_mode(session, _effective_mode)
 
         async def stream_with_save() -> AsyncGenerator[str, None]:
@@ -1188,7 +1218,10 @@ def setup_chat_routes(
                 _fallback_candidates = []
 
             # Send model name early so the frontend can show it during streaming
-            _model_suffix = "Research" if effective_do_research else None
+            _model_suffix = (
+                "Research" if effective_do_research
+                else ("Study" if study_mode else None)
+            )
             _model_info = {"type": "model_info", "model": sess.model}
             if _model_suffix:
                 _model_info["suffix"] = _model_suffix

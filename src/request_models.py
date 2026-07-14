@@ -12,6 +12,7 @@ class ChatRequest(BaseModel):
     use_research: Optional[bool] = Field(default=False, description="Enable deep research")
     time_filter: Optional[str] = Field(default=None, description="Time filter for search")
     preset_id: Optional[str] = Field(default=None, description="Preset identifier")
+    study_mode: bool = Field(default=False, description="Enable the interactive Study Mode tutor")
     
     @field_validator('message')
     @classmethod

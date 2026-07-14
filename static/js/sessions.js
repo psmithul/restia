@@ -516,6 +516,8 @@ function createSessionItem(s) {
   } else if (_isFork) {
     icon.textContent = '\u2ADD';
     icon.style.fontSize = '14px';
+  } else if (s.mode === 'study') {
+    icon.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5.5c3-1 6-.5 9 2v13c-3-2-6-2.5-9-1.5z"/><path d="M21 5.5c-3-1-6-.5-9 2v13c3-2 6-2.5 9-1.5z"/></svg>';
   } else if (s.has_documents) {
     icon.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>';
   } else if (s.has_images) {
@@ -1795,6 +1797,13 @@ export async function selectSession(id, { keepSidebar = false, showLoading = tru
       if (presetsModule && presetsModule.onSessionSwitch) presetsModule.onSessionSwitch(id);
     } catch (e) {}
     const meta = sessions.find(s => s.id === id);
+
+    // Study Mode is a property of the chat session, not a global toggle.
+    // The dedicated frontend module listens for this event to restore its
+    // tutor panel or leave it when an ordinary session is selected.
+    window.dispatchEvent(new CustomEvent('restia:session-selected', {
+      detail: { id, mode: (meta && meta.mode) || 'chat' },
+    }));
 
     // Detach any in-flight stream to background instead of aborting
     try {

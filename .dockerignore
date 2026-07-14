@@ -47,6 +47,7 @@ api/
 # runtime image. Keeping them out also prevents private save data from entering
 # an otherwise shareable/deployable build context.
 /emberline/
+/backups/
 /test_mnemo.py
 *.log
 *.error.log

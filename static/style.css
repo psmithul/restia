@@ -41911,3 +41911,648 @@ body.theme-frosted .modal {
 .msg-moments-label { font-size: 0.72rem; opacity: 0.6; padding: 8px 12px 0; }
 .msg-moments-label span { opacity: 0.7; }
 .msg-moments { border-bottom: none; }
+
+/* ── Study Mode ────────────────────────────────────────────────────────────
+   Persistent effort timer + goal panel beside the existing chat. Study Mode
+   deliberately reuses the normal chat history/composer; only this companion
+   panel is new. */
+#study-panel {
+  order: 1;
+  width: clamp(276px, 24vw, 336px);
+  min-width: 276px;
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  color: var(--fg);
+  background: var(--sidebar-bg, var(--panel));
+  border-left: 1px solid var(--border);
+  box-shadow: -12px 0 32px color-mix(in srgb, var(--bg) 58%, transparent);
+  position: relative;
+  z-index: 24;
+  overflow: hidden;
+  transition: width 180ms cubic-bezier(0.22, 0.61, 0.36, 1),
+              min-width 180ms cubic-bezier(0.22, 0.61, 0.36, 1),
+              transform 180ms ease,
+              opacity 140ms ease;
+}
+
+#study-panel[hidden] {
+  display: none !important;
+}
+
+body.study-view .chat-container {
+  flex: 1;
+  min-width: 0;
+}
+
+/* When the user's navigation sits on the right it already has order:2, so the
+   Study panel (order:1) remains between chat and navigation. */
+#study-panel > header,
+#study-panel .study-panel-header,
+#study-panel .study-panel-head {
+  min-height: 54px;
+  padding: 10px 10px 10px 14px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--panel) 92%, var(--bg));
+}
+
+#study-panel .study-panel-heading {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+#study-panel .study-panel-heading > div {
+  min-width: 0;
+}
+
+#study-panel .study-panel-heading p {
+  margin: 2px 0 0;
+  overflow: hidden;
+  color: color-mix(in srgb, var(--fg) 56%, transparent);
+  font-size: 0.66rem;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#study-panel .study-panel-mark {
+  width: 32px;
+  height: 32px;
+  flex: 0 0 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid color-mix(in srgb, var(--accent-primary, var(--red)) 32%, var(--border));
+  border-radius: 9px;
+  color: var(--accent-primary, var(--red));
+  background: color-mix(in srgb, var(--accent-primary, var(--red)) 10%, transparent);
+}
+
+#study-panel .study-panel-controls {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+#study-panel-title {
+  min-width: 0;
+  flex: 1;
+  margin: 0;
+  color: var(--fg);
+  font-size: 0.9rem;
+  font-weight: 650;
+  line-height: 1.25;
+  letter-spacing: 0.01em;
+}
+
+#study-panel-collapse,
+#study-panel-close {
+  width: 34px;
+  height: 34px;
+  min-width: 34px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--fg);
+  opacity: 0.58;
+  cursor: pointer;
+  transition: opacity 100ms ease, background 100ms ease, border-color 100ms ease;
+}
+
+#study-panel-collapse:hover,
+#study-panel-close:hover {
+  opacity: 1;
+  border-color: var(--border);
+  background: color-mix(in srgb, var(--fg) 7%, transparent);
+}
+
+#study-panel-collapse svg {
+  transition: transform 180ms ease;
+}
+
+#study-panel.study-panel-collapsed {
+  width: 58px;
+  min-width: 58px;
+}
+
+#study-panel.study-panel-collapsed #study-panel-body {
+  display: none;
+}
+
+#study-panel.study-panel-collapsed > header,
+#study-panel.study-panel-collapsed .study-panel-header,
+#study-panel.study-panel-collapsed .study-panel-head {
+  height: 100%;
+  padding: 10px 11px;
+  flex-direction: column;
+  justify-content: flex-start;
+  border-bottom: none;
+}
+
+#study-panel.study-panel-collapsed #study-panel-title {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+#study-panel.study-panel-collapsed #study-panel-collapse svg {
+  transform: rotate(180deg);
+}
+
+@media (min-width: 769px) {
+  #study-panel.study-panel-collapsed .study-panel-heading {
+    display: none;
+  }
+
+  #study-panel.study-panel-collapsed .study-panel-controls {
+    flex-direction: column;
+  }
+}
+
+#study-panel-body {
+  min-height: 0;
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+#study-panel .study-card,
+#study-panel .study-section,
+#study-method {
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, var(--border) 82%, transparent);
+  border-radius: 11px;
+  background: color-mix(in srgb, var(--bg) 52%, transparent);
+}
+
+#study-panel .study-section-title,
+#study-panel .study-label,
+#study-panel .study-card-label,
+#study-panel .study-goal-grid > label,
+#study-goal-form > label {
+  display: block;
+  margin: 0 0 6px;
+  color: color-mix(in srgb, var(--fg) 68%, transparent);
+  font-size: 0.7rem;
+  font-weight: 650;
+  line-height: 1.35;
+  letter-spacing: 0.055em;
+  text-transform: uppercase;
+}
+
+#study-timer {
+  margin: 2px 0 0;
+  color: var(--fg);
+  font-size: clamp(1.75rem, 3.2vw, 2.35rem);
+  font-weight: 650;
+  line-height: 1.1;
+  letter-spacing: 0.025em;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+}
+
+#study-timer-status {
+  min-height: 1.25em;
+  margin-top: 5px;
+  color: color-mix(in srgb, var(--fg) 62%, transparent);
+  font-size: 0.72rem;
+}
+
+#study-panel .study-timer-actions,
+#study-panel .study-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  margin-top: 11px;
+}
+
+#study-panel .study-session-total {
+  margin-top: 11px;
+  padding-top: 9px;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  color: color-mix(in srgb, var(--fg) 58%, transparent);
+  font-size: 0.7rem;
+}
+
+#study-panel .study-session-total strong {
+  color: var(--fg);
+  font-size: 0.76rem;
+}
+
+#study-panel .study-action {
+  min-height: 44px;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--panel) 75%, var(--bg));
+  color: var(--fg);
+  font: inherit;
+  font-size: 0.72rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 90ms ease, background 100ms ease, border-color 100ms ease, opacity 100ms ease;
+}
+
+#study-panel .study-action-primary {
+  border-color: color-mix(in srgb, var(--accent-primary, var(--red)) 56%, var(--border));
+  background: color-mix(in srgb, var(--accent-primary, var(--red)) 15%, var(--panel));
+}
+
+#study-timer-finish {
+  border-color: color-mix(in srgb, var(--color-save-green, #4caf50) 46%, var(--border));
+}
+
+#study-panel .study-action:hover {
+  transform: translateY(-1px);
+  border-color: var(--accent-primary, var(--red));
+  background: color-mix(in srgb, var(--accent-primary, var(--red)) 20%, var(--panel));
+}
+
+#study-panel button:disabled {
+  cursor: not-allowed;
+  opacity: 0.38;
+  transform: none;
+}
+
+#study-session-total {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+}
+
+#study-goal-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+}
+
+#study-goal-form > label:first-of-type,
+#study-goal-text,
+#study-goal-save {
+  grid-column: 1 / -1;
+}
+
+#study-goal-form label {
+  min-width: 0;
+}
+
+#study-panel .study-goal-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+}
+
+#study-panel .study-input-suffix {
+  position: relative;
+  display: block;
+}
+
+#study-panel .study-input-suffix > span {
+  position: absolute;
+  top: 50%;
+  right: 9px;
+  transform: translateY(-50%);
+  color: color-mix(in srgb, var(--fg) 48%, transparent);
+  font-size: 0.68rem;
+  pointer-events: none;
+}
+
+#study-goal-text,
+#study-target-hours,
+#study-target-date {
+  width: 100%;
+  border: 1px solid var(--input-border, var(--border));
+  border-radius: 8px;
+  background: var(--input-bg, var(--bg));
+  color: var(--fg);
+  font: inherit;
+  font-size: 0.76rem;
+  line-height: 1.45;
+  outline: none;
+}
+
+#study-goal-text {
+  min-height: 84px;
+  max-height: 190px;
+  padding: 9px 10px;
+  resize: vertical;
+}
+
+#study-target-hours,
+#study-target-date {
+  height: 38px;
+  padding: 6px 8px;
+}
+
+#study-target-hours {
+  padding-right: 43px;
+}
+
+#study-goal-text:focus,
+#study-target-hours:focus,
+#study-target-date:focus {
+  border-color: var(--accent-primary, var(--red));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-primary, var(--red)) 18%, transparent);
+}
+
+#study-progress-bar {
+  width: 100%;
+  height: 8px;
+  margin: 5px 0 9px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--fg) 10%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--border) 58%, transparent);
+}
+
+#study-progress-bar > span {
+  display: block;
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(
+    90deg,
+    var(--accent-primary, var(--red)),
+    color-mix(in srgb, var(--accent-primary, var(--red)) 68%, var(--fg))
+  );
+  transition: width 260ms ease;
+}
+
+#study-progress-value {
+  color: var(--fg);
+  font-size: 0.72rem;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+
+#study-panel .study-progress-heading {
+  margin-top: 15px;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  color: color-mix(in srgb, var(--fg) 62%, transparent);
+  font-size: 0.7rem;
+}
+
+#study-progress-copy,
+#study-deadline-copy {
+  margin: 0;
+  color: color-mix(in srgb, var(--fg) 67%, transparent);
+  font-size: 0.7rem;
+  line-height: 1.5;
+}
+
+#study-deadline-copy {
+  margin-top: 3px;
+  opacity: 0.84;
+}
+
+#study-panel .study-mastery-note {
+  margin: 10px 0 0;
+  padding-top: 9px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 64%, transparent);
+  color: color-mix(in srgb, var(--fg) 50%, transparent);
+  font-size: 0.66rem;
+  line-height: 1.5;
+}
+
+#study-method {
+  color: color-mix(in srgb, var(--fg) 72%, transparent);
+  font-size: 0.71rem;
+  line-height: 1.55;
+}
+
+#study-method ol {
+  margin: 9px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 7px;
+  list-style: none;
+}
+
+#study-method li {
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr);
+  gap: 8px;
+  align-items: baseline;
+}
+
+#study-method li strong {
+  color: var(--fg);
+  font-size: 0.69rem;
+  font-weight: 650;
+}
+
+#study-method li span {
+  color: color-mix(in srgb, var(--fg) 59%, transparent);
+}
+
+#study-error {
+  padding: 9px 10px;
+  border: 1px solid color-mix(in srgb, var(--color-error, var(--red)) 55%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--color-error, var(--red)) 10%, transparent);
+  color: var(--color-error, var(--red));
+  font-size: 0.7rem;
+  line-height: 1.45;
+}
+
+#study-error[hidden],
+#study-live-status:empty {
+  display: none;
+}
+
+#study-live-status {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+#study-panel :is(button, input, textarea):focus-visible {
+  outline: 2px solid var(--accent-primary, var(--red));
+  outline-offset: 2px;
+}
+
+body.study-view .mode-toggle {
+  display: none;
+}
+
+/* On narrower desktops the panel floats instead of squeezing the chat. */
+@media (max-width: 1100px) {
+  #study-panel {
+    position: fixed;
+    left: auto;
+    right: 12px;
+    bottom: 12px;
+    width: min(360px, calc(100vw - 24px));
+    min-width: 0;
+    height: auto;
+    max-height: min(80dvh, 700px);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    box-shadow: 0 18px 52px color-mix(in srgb, #000 50%, transparent);
+    z-index: 185;
+    transform-origin: bottom center;
+    animation: study-drawer-enter 180ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  }
+
+  #study-panel > header,
+  #study-panel .study-panel-header,
+  #study-panel .study-panel-head {
+    min-height: 52px;
+    padding: 8px 9px 8px 13px;
+  }
+
+  #study-panel-body {
+    max-height: calc(min(80dvh, 700px) - 52px);
+    padding: 12px;
+  }
+
+  #study-panel.study-panel-collapsed {
+    width: auto;
+    min-width: 0;
+    height: 52px;
+  }
+
+  #study-panel.study-panel-collapsed > header,
+  #study-panel.study-panel-collapsed .study-panel-header,
+  #study-panel.study-panel-collapsed .study-panel-head {
+    height: 52px;
+    padding: 8px 9px 8px 13px;
+    flex-direction: row;
+    justify-content: flex-start;
+  }
+
+  #study-panel.study-panel-collapsed #study-panel-title {
+    position: static;
+    width: auto;
+    height: auto;
+    padding: 0;
+    margin: 0;
+    overflow: hidden;
+    clip: auto;
+    white-space: nowrap;
+  }
+
+  #study-panel.study-panel-collapsed .study-panel-heading {
+    display: flex;
+  }
+
+  #study-panel.study-panel-collapsed .study-panel-heading p,
+  #study-panel.study-panel-collapsed .study-panel-mark {
+    display: none;
+  }
+
+  #study-timer-start,
+  #study-timer-pause,
+  #study-timer-finish,
+  #study-goal-save {
+    min-height: 44px;
+  }
+
+  #study-panel-collapse,
+  #study-panel-close {
+    width: 42px;
+    height: 42px;
+    min-width: 42px;
+  }
+
+  @keyframes study-drawer-enter {
+    from { opacity: 0; transform: translateY(12px) scale(0.985); }
+    to { opacity: 1; transform: translateY(0) scale(1); }
+  }
+}
+
+/* On phones the drawer sits above the real composer, which stays mounted for
+   streaming and keyboard behavior. */
+@media (max-width: 768px) {
+  #study-panel {
+    left: 10px;
+    right: 10px;
+    bottom: calc(96px + env(safe-area-inset-bottom, 0px));
+    width: auto;
+    max-height: min(64dvh, 560px);
+  }
+
+  #study-panel-body {
+    max-height: calc(min(64dvh, 560px) - 52px);
+  }
+
+  #study-goal-text,
+  #study-target-hours,
+  #study-target-date {
+    font-size: 16px; /* Prevent iOS focus zoom. */
+  }
+}
+
+@media (max-width: 390px) {
+  #study-panel {
+    left: 6px;
+    right: 6px;
+    bottom: calc(90px + env(safe-area-inset-bottom, 0px));
+  }
+
+  #study-panel-body {
+    padding: 10px;
+  }
+
+  #study-panel .study-goal-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  #study-panel .study-timer-actions,
+  #study-panel .study-actions {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  #study-timer-finish {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #study-panel,
+  #study-panel-collapse svg,
+  #study-progress-bar > span,
+  #study-timer-start,
+  #study-timer-pause,
+  #study-timer-finish,
+  #study-goal-save {
+    animation: none !important;
+    transition: none !important;
+  }
+}
