@@ -12,6 +12,8 @@ from core.models import ChatMessage
 from core.database import SessionLocal, ChatMessage as DbChatMessage, Session as DbSession
 from src.topic_analyzer import analyze_topics
 from routes.session_routes import (
+    _is_hidden_history_message,
+    _message_metadata,
     _message_role,
     _message_text,
     _reject_compact_during_active_run,
@@ -148,7 +150,7 @@ def setup_history_routes(session_manager) -> APIRouter:
                 )
                 history_dict = [
                     entry for entry in (_db_history_entry(m) for m in rows)
-                    if not (entry.get("metadata") or {}).get("hidden")
+                    if not _is_hidden_history_message(entry)
                 ]
                 return {
                     "history": history_dict,
@@ -171,17 +173,14 @@ def setup_history_routes(session_manager) -> APIRouter:
 
         history_dict = []
         for msg in session.history:
+            if _is_hidden_history_message(msg):
+                continue
             if isinstance(msg, ChatMessage):
-                # Skip hidden messages (e.g. compaction summaries for AI context)
-                if msg.metadata and msg.metadata.get("hidden"):
-                    continue
                 entry = {"role": msg.role, "content": _history_display_content(msg.content)}
                 if msg.metadata:
                     entry["metadata"] = msg.metadata
                 history_dict.append(entry)
             elif isinstance(msg, dict):
-                if msg.get("metadata", {}).get("hidden"):
-                    continue
                 entry = {
                     "role": msg.get("role", ""),
                     "content": _history_display_content(msg.get("content", "")),
@@ -213,7 +212,7 @@ def setup_history_routes(session_manager) -> APIRouter:
                 # Response excludes hidden messages, matching the in-memory path.
                 history_dict = [
                     m for m in db_history
-                    if not (m.get("metadata") or {}).get("hidden")
+                    if not _is_hidden_history_message(m)
                 ]
             except Exception as e:
                 logger.error(f"DB fallback failed for {session_id}: {e}")
@@ -646,6 +645,8 @@ def setup_history_routes(session_manager) -> APIRouter:
             from src.model_context import estimate_tokens, get_context_length
             from src.llm_core import llm_call_async
             from src.endpoint_resolver import resolve_endpoint
+            from src.prompt_security import untrusted_context_message
+            from core.database import get_session_mode
 
             if len(session.history) < 6:
                 return {"status": "ok", "message": "Not enough messages to compact"}
@@ -662,9 +663,12 @@ def setup_history_routes(session_manager) -> APIRouter:
             recent = session.history[-keep_count:]
 
             # Build text to summarize
+            def _summary_source_text(message):
+                text = _message_text(message)
+                return text if _message_metadata(message).get("compacted") else text[:2000]
+
             convo_text = "\n".join(
-                f"{_message_role(m).upper()}: "
-                f"{_message_text(m)[:2000]}"
+                f"{_message_role(m).upper()}: {_summary_source_text(m)}"
                 for m in older
             )
 
@@ -674,14 +678,24 @@ def setup_history_routes(session_manager) -> APIRouter:
             compact_model = util_model or session.model
             compact_headers = util_headers if util_url else session.headers
 
-            from src.context_compactor import SELF_SUMMARY_SYSTEM_PROMPT
+            from src.context_compactor import (
+                SELF_SUMMARY_SYSTEM_PROMPT,
+                STUDY_SUMMARY_SYSTEM_PROMPT,
+                _summary_prompt_message,
+            )
             compaction_count = sum(1 for m in session.history if isinstance(m, ChatMessage) and "[Conversation summary" in (m.content or ""))
-            sys_prompt = SELF_SUMMARY_SYSTEM_PROMPT.replace("{count}", str(len(older))).replace("{n}", str(compaction_count + 1))
+            study_mode = get_session_mode(session_id) == "study"
+            sys_prompt = STUDY_SUMMARY_SYSTEM_PROMPT if study_mode else (
+                SELF_SUMMARY_SYSTEM_PROMPT.replace("{count}", str(len(older))).replace("{n}", str(compaction_count + 1))
+            )
             summary = await llm_call_async(
                 compact_url, compact_model,
                 [
                     {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": convo_text},
+                    untrusted_context_message(
+                        "conversation history to summarize",
+                        convo_text,
+                    ),
                 ],
                 temperature=0.2, max_tokens=1024,
                 headers=compact_headers, timeout=30,
@@ -689,11 +703,22 @@ def setup_history_routes(session_manager) -> APIRouter:
 
             # Replace session history: summary as system message + recent messages
             # System message holds the full summary for AI context
-            system_summary = ChatMessage(
-                role="system",
-                content=f"[Conversation summary — {len(older)} earlier messages were compacted]\n\n{summary}",
-                metadata={"compacted": True, "hidden": True},
-            )
+            if study_mode:
+                summary_payload = _summary_prompt_message(summary, study_mode=True)
+                system_summary = ChatMessage(
+                    role=summary_payload["role"],
+                    content=summary_payload["content"],
+                    metadata={
+                        **summary_payload["metadata"],
+                        "summarized_count": len(older),
+                    },
+                )
+            else:
+                system_summary = ChatMessage(
+                    role="system",
+                    content=f"[Conversation summary — {len(older)} earlier messages were compacted]\n\n{summary}",
+                    metadata={"compacted": True, "hidden": True},
+                )
             # Visible assistant message just shows stats
             summary_msg = ChatMessage(
                 role="assistant",
@@ -724,7 +749,7 @@ def setup_history_routes(session_manager) -> APIRouter:
                 db_sys_summary = DbChatMessage(
                     id=str(uuid.uuid4()),
                     session_id=session_id,
-                    role="system",
+                    role=system_summary.role,
                     content=system_summary.content,
                     meta_data=_json.dumps(system_summary.metadata),
                     timestamp=now,

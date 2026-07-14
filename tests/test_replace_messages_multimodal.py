@@ -15,6 +15,7 @@ import uuid
 import pytest
 
 import core.database as cdb
+import src.context_compactor as context_compactor
 from core.models import ChatMessage
 from tests.helpers.sqlite_db import make_temp_sqlite
 
@@ -81,3 +82,50 @@ def test_replace_messages_keeps_history_alias_for_context_messages(manager):
 
     session.history.append(ChatMessage(role="user", content="after direct mutation"))
     assert session.get_context_messages()[-1]["content"] == "after direct mutation"
+
+
+def test_replace_messages_cas_rejects_same_id_database_edit(manager):
+    sid = "sess-" + uuid.uuid4().hex[:8]
+    _make_session(sid)
+    original = [
+        ChatMessage(role="user", content="original question"),
+        ChatMessage(role="assistant", content="original answer"),
+        ChatMessage(role="user", content="latest attempt"),
+        ChatMessage(role="assistant", content="latest feedback"),
+    ]
+    assert manager.replace_messages(sid, original) is True
+    session = manager.sessions[sid]
+    expected = context_compactor._history_snapshot(session.history)
+    edited_id = session.history[0].metadata["_db_id"]
+
+    db = _TS()
+    try:
+        row = db.query(cdb.ChatMessage).filter(cdb.ChatMessage.id == edited_id).first()
+        row.content = "concurrently edited question"
+        db.commit()
+    finally:
+        db.close()
+
+    replacement = [
+        ChatMessage(role="user", content="compaction summary"),
+        *session.history[2:],
+    ]
+    assert manager.replace_messages(
+        sid,
+        replacement,
+        expected_history_snapshot=expected,
+    ) is False
+
+    db = _TS()
+    try:
+        rows = db.query(cdb.ChatMessage).filter(
+            cdb.ChatMessage.session_id == sid
+        ).order_by(cdb.ChatMessage.timestamp).all()
+        assert [row.content for row in rows] == [
+            "concurrently edited question",
+            "original answer",
+            "latest attempt",
+            "latest feedback",
+        ]
+    finally:
+        db.close()

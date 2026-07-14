@@ -1,0 +1,102 @@
+"""Focused contracts for the shared sidebar collapse and viewport state."""
+
+from __future__ import annotations
+
+import json
+import re
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+pytestmark = pytest.mark.skipif(not shutil.which("node"), reason="node binary not on PATH")
+
+
+def _node_eval(source: str):
+    result = subprocess.run(
+        ["node", "--input-type=module", "-e", source],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    return json.loads(result.stdout)
+
+
+def test_rail_section_expansion_uses_canonical_state_and_updates_aria():
+    values = _node_eval(
+        """
+        import { setSidebarSectionCollapsed } from './static/js/section-management.js';
+
+        class FakeClassList {
+          constructor(...names) { this.values = new Set(names); }
+          add(...names) { names.forEach(name => this.values.add(name)); }
+          remove(...names) { names.forEach(name => this.values.delete(name)); }
+          contains(name) { return this.values.has(name); }
+          toggle(name, force) {
+            const enabled = force === undefined ? !this.values.has(name) : Boolean(force);
+            if (enabled) this.values.add(name); else this.values.delete(name);
+            return enabled;
+          }
+        }
+        const attributes = new Map();
+        const button = {
+          title: '',
+          setAttribute(name, value) { attributes.set(name, String(value)); },
+        };
+        const title = { textContent: 'Chats' };
+        const section = {
+          id: 'sessions-section',
+          classList: new FakeClassList('collapsed', 'section-just-collapsing'),
+          querySelector(selector) {
+            return selector === '.section-collapse-btn' ? button : title;
+          },
+        };
+        const values = new Map([['section-collapsed', { 'sessions-section': true }]]);
+        const Storage = {
+          KEYS: { SIDEBAR_COLLAPSED: 'sidebar-collapsed' },
+          getJSON(key, fallback) { return values.has(key) ? values.get(key) : fallback; },
+          setJSON(key, value) { values.set(key, value); },
+        };
+
+        const changed = setSidebarSectionCollapsed(Storage, section, false);
+        console.log(JSON.stringify({
+          changed,
+          collapsed: section.classList.contains('collapsed'),
+          animating: section.classList.contains('section-just-collapsing'),
+          canonical: values.get('sidebar-collapsed'),
+          legacy: values.get('section-collapsed'),
+          expanded: attributes.get('aria-expanded'),
+          label: attributes.get('aria-label'),
+          title: button.title,
+        }));
+        """
+    )
+
+    assert values == {
+        "changed": True,
+        "collapsed": False,
+        "animating": False,
+        "canonical": {"sessions-section": False},
+        "legacy": {"sessions-section": True},
+        "expanded": "true",
+        "label": "Collapse Chats",
+        "title": "Collapse Chats",
+    }
+
+
+def test_sidebar_uses_one_inclusive_mobile_breakpoint_and_migrates_legacy_state():
+    layout = (ROOT / "static/js/sidebar-layout.js").read_text(encoding="utf-8")
+    init = (ROOT / "static/js/init.js").read_text(encoding="utf-8")
+
+    assert "const MOBILE_BREAKPOINT = 768" in layout
+    assert "window.innerWidth <= MOBILE_BREAKPOINT" in layout
+    assert not re.search(r"window\.innerWidth\s*(?:<|>=|<=|>)\s*(?:700|768)", layout)
+    assert "_temporaryMobileRightSide" in layout
+    assert "Storage.get(Storage.KEYS.SIDEBAR_SIDE) === 'right'" in layout
+    assert "Storage.getJSON('section-collapsed', null)" in init
+    assert "Storage.setJSON(KEY, saved)" in init

@@ -10,7 +10,14 @@ import logging
 from core.session_manager import SessionManager
 from core.models import ChatMessage
 from src.request_models import SessionResponse
-from core.database import Session as DbSession, SessionLocal, Document, GalleryImage, utcnow_naive
+from core.database import (
+    Session as DbSession,
+    SessionLocal,
+    Document,
+    GalleryImage,
+    StudyState,
+    utcnow_naive,
+)
 from src.auth_helpers import effective_user, _auth_disabled, owner_filter
 from src.session_actions import is_session_recently_active
 
@@ -84,6 +91,16 @@ def _message_metadata(message) -> dict:
     else:
         metadata = getattr(message, "metadata", None)
     return metadata if isinstance(metadata, dict) else {}
+
+
+def _is_hidden_history_message(message) -> bool:
+    """Return whether an internal context message must stay out of user views."""
+
+    metadata = _message_metadata(message)
+    return bool(
+        metadata.get("hidden")
+        or metadata.get("hidden_from_user_view")
+    )
 
 
 def _reject_compact_during_active_run(session_id: str) -> None:
@@ -327,8 +344,12 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
         skip_validation: str = Form(None),
         api_key: str = Form(""),
         endpoint_id: str = Form(""),
+        mode: str = Form(""),
     ):
         skip_val = str(skip_validation).lower() == "true"
+        requested_mode = str(mode or "").strip().lower()
+        if requested_mode not in ("", "chat", "study"):
+            raise HTTPException(400, "mode must be 'chat' or 'study'")
         user = effective_user(request)
         endpoint_api_key = ""
         endpoint_base_url = ""
@@ -415,7 +436,7 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
         
         sid = str(uuid.uuid4())
         user = effective_user(request)
-        session = session_manager.create_session(
+        create_kwargs = dict(
             session_id=sid,
             name=name or "",
             endpoint_url=endpoint_url or "",
@@ -423,6 +444,12 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
             rag=str(rag).lower() == "true" if rag else False,
             owner=user,
         )
+        # Keep legacy/fake SessionManager call signatures working for ordinary
+        # chats while allowing the real manager to persist a Study workspace
+        # before its first tutor turn.
+        if requested_mode:
+            create_kwargs["mode"] = requested_mode
+        session = session_manager.create_session(**create_kwargs)
         # Set auth headers for custom API-key endpoints
         resolved_key = request_api_key
         resolved_base = endpoint_url
@@ -446,7 +473,8 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
             name=session.name,
             model=model_to_use,
             rag=str(rag).lower() == "true" if rag else False,
-            archived=False
+            archived=False,
+            mode=requested_mode or None,
         )    
     @router.patch("/session/{sid}")
     def rename_session(
@@ -620,6 +648,10 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
         try:
             from core.database import ChatMessage as DbChatMessage
             count = db.query(DbSession).count()
+            session_ids = db.query(DbSession.id)
+            db.query(StudyState).filter(StudyState.id.in_(session_ids)).delete(
+                synchronize_session=False
+            )
             db.query(DbChatMessage).delete()
             db.query(DbSession).delete()
             db.commit()
@@ -752,7 +784,13 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
             session = session_manager.get_session(sid)
         except KeyError:
             raise HTTPException(404, f"Session {sid} not found")
-        return {"history": [msg.to_dict() for msg in session.history]}
+        return {
+            "history": [
+                msg.to_dict()
+                for msg in session.history
+                if not _is_hidden_history_message(msg)
+            ]
+        }
     
     @router.get("/session/{sid}/export")
     def export_session(request: Request, sid: str, fmt: str = "md", filename: str = ""):
@@ -766,6 +804,12 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
         except KeyError:
             raise HTTPException(404, f"Session {sid} not found")
 
+        visible_history = [
+            message
+            for message in session.history
+            if not _is_hidden_history_message(message)
+        ]
+
         safe_name = re.sub(r'[^\w\-_]', '_', session.name)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         filename = _sanitize_export_filename(filename)
@@ -776,7 +820,7 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
                 "name": session.name,
                 "model": session.model,
                 "exported": datetime.now().isoformat(),
-                "messages": [{"role": m.role, "content": m.content} for m in session.history],
+                "messages": [{"role": m.role, "content": m.content} for m in visible_history],
             }
             out_name = filename or f"conversation_{safe_name}_{timestamp}.json"
             return Response(
@@ -787,7 +831,7 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
 
         if fmt == "txt":
             lines = []
-            for m in session.history:
+            for m in visible_history:
                 lines.append(f"[{m.role.upper()}]")
                 lines.append(_content_to_text(m.content))
                 lines.append("")
@@ -810,7 +854,7 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
                 "pre{background:#000;padding:0.5rem;border-radius:4px;overflow-x:auto}</style></head><body>",
                 f"<h1>{safe_title}</h1>",
             ]
-            for m in session.history:
+            for m in visible_history:
                 cls = "user" if m.role == "user" else "ai"
                 content = _content_to_text(m.content).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
                 content = content.replace("\n", "<br>")
@@ -829,7 +873,7 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
         markdown_lines.append(f"*Exported on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
         markdown_lines.append(f"*Model: {session.model}*")
         markdown_lines.append("\n---\n")
-        for message in session.history:
+        for message in visible_history:
             role = message.role.upper()
             content = _content_to_text(message.content)
             markdown_lines.append(f"### {role}")
@@ -936,9 +980,15 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
         if not older:
             raise HTTPException(400, "Nothing old enough to compact")
 
-        from src.context_compactor import SELF_SUMMARY_SYSTEM_PROMPT
+        from core.database import get_session_mode
+        from src.context_compactor import (
+            SELF_SUMMARY_SYSTEM_PROMPT,
+            STUDY_SUMMARY_SYSTEM_PROMPT,
+            _summary_prompt_message,
+        )
         from src.endpoint_resolver import resolve_endpoint
         from src.llm_core import llm_call_async
+        from src.prompt_security import untrusted_context_message
 
         owner = getattr(session, "owner", None) or effective_user(request)
         url, model, headers = resolve_endpoint("utility", owner=owner)
@@ -951,20 +1001,34 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
             1 for m in history
             if _message_metadata(m).get("compacted") or "[Conversation summary" in _message_text(m)
         )
-        prompt = SELF_SUMMARY_SYSTEM_PROMPT.replace(
-            "{count}", str(len(older))
-        ).replace(
-            "{n}", str(prior_compactions + 1)
+        study_mode = get_session_mode(session_id) == "study"
+        prompt = STUDY_SUMMARY_SYSTEM_PROMPT if study_mode else (
+            SELF_SUMMARY_SYSTEM_PROMPT.replace(
+                "{count}", str(len(older))
+            ).replace(
+                "{n}", str(prior_compactions + 1)
+            )
         )
+
+        def _summary_source_text(message):
+            text = _message_text(message)
+            return text if _message_metadata(message).get("compacted") else text[:2000]
+
         convo_text = "\n".join(
-            f"{_message_role(m).upper()}: {_message_text(m)[:2000]}"
+            f"{_message_role(m).upper()}: {_summary_source_text(m)}"
             for m in older
         )
         try:
             summary = await llm_call_async(
                 url,
                 model,
-                [{"role": "system", "content": prompt}, {"role": "user", "content": convo_text}],
+                [
+                    {"role": "system", "content": prompt},
+                    untrusted_context_message(
+                        "conversation history to summarize",
+                        convo_text,
+                    ),
+                ],
                 temperature=0.2,
                 max_tokens=1024,
                 headers=headers,
@@ -974,15 +1038,28 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
             logger.error("Manual compaction failed: %s", e)
             raise HTTPException(500, "Compaction failed")
 
-        summary_msg = ChatMessage(
-            role="system",
-            content=f"[Conversation summary]\n{summary}",
-            metadata={
-                "compacted": True,
+        if study_mode:
+            summary_payload = _summary_prompt_message(summary, study_mode=True)
+            summary_metadata = dict(summary_payload["metadata"])
+            summary_metadata.update({
                 "summarized_count": len(older),
                 "timestamp": utcnow_naive().isoformat(),
-            },
-        )
+            })
+            summary_msg = ChatMessage(
+                role=summary_payload["role"],
+                content=summary_payload["content"],
+                metadata=summary_metadata,
+            )
+        else:
+            summary_msg = ChatMessage(
+                role="system",
+                content=f"[Conversation summary]\n{summary}",
+                metadata={
+                    "compacted": True,
+                    "summarized_count": len(older),
+                    "timestamp": utcnow_naive().isoformat(),
+                },
+            )
         new_history = [summary_msg] + recent
         if not session_manager.replace_messages(session_id, new_history):
             raise HTTPException(500, "Failed to save compacted history")

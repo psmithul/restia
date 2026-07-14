@@ -209,7 +209,7 @@ class Session(TimestampMixin, Base):
     message_count = Column(Integer, default=0)
     total_input_tokens = Column(Integer, default=0)
     total_output_tokens = Column(Integer, default=0)
-    mode = Column(String, nullable=True)  # 'agent', 'chat', or 'research'
+    mode = Column(String, nullable=True)  # 'agent', 'chat', 'research', or 'study'
     crew_member_id = Column(String, nullable=True)  # links to crew_members.id
 
     # Relationship to chat messages
@@ -272,12 +272,15 @@ class ChatMessage(Base):
 
 
 class StudyState(TimestampMixin, Base):
-    """Owner-scoped Study Mode goal, focus timer, and accumulated progress.
+    """Session-scoped Study workspace goal, timer, and accumulated progress.
 
-    One owner-scoped row is used per signed-in profile (or for the local
-    single-user instance). Authenticated lookup uses ``owner`` so profile
-    renames retain the row even when its creation-time primary key is stale.
-    Keeping the timer in SQLite means refresh/restart cannot lose a block.
+    A Study chat session UUID is the workspace id, while ``owner`` remains the
+    authorization boundary. Legacy installs may still contain the former
+    owner-keyed ``local:default``/``user:<name>`` row; ``src.study_mode`` claims
+    that row once for the owner's first session-scoped workspace so existing
+    goals and logged effort are preserved without being duplicated.
+
+    Keeping the timer in SQLite means refresh/restart cannot lose a focus block.
     """
 
     __tablename__ = "study_states"
@@ -291,6 +294,13 @@ class StudyState(TimestampMixin, Base):
     current_session_seconds = Column(Integer, nullable=False, default=0)
     timer_started_at = Column(DateTime, nullable=True)
     timer_running = Column(Boolean, nullable=False, default=False)
+    # Deterministic spaced-review state.  These fields deliberately track only
+    # demonstrated review evidence; the focus timer remains an effort measure.
+    review_level = Column(Integer, nullable=False, default=0)
+    review_count = Column(Integer, nullable=False, default=0)
+    last_review_result = Column(String, nullable=True)
+    last_reviewed_at = Column(DateTime, nullable=True)
+    next_review_at = Column(DateTime, nullable=True)
 
 class Document(TimestampMixin, Base):
     """Living document that the AI can create and edit in-place."""
@@ -1474,6 +1484,57 @@ def _migrate_add_notes_sort_order():
         except Exception:
             pass
 
+
+def _migrate_add_study_review_columns():
+    """Add durable spaced-review evidence to existing Study Mode installs.
+
+    ``create_all`` covers fresh databases but never alters an existing SQLite
+    table.  Add each column independently so the migration is safe to retry
+    after an interrupted startup or on an already-upgraded database.
+    """
+
+    if not DATABASE_URL.startswith("sqlite:///"):
+        return
+    db_path = DATABASE_URL.replace("sqlite:///", "", 1)
+    if db_path == ":memory:" or not os.path.exists(db_path):
+        return
+
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(study_states)").fetchall()
+        }
+        if not columns:
+            return
+        additions = {
+            "review_level": "INTEGER NOT NULL DEFAULT 0",
+            "review_count": "INTEGER NOT NULL DEFAULT 0",
+            "last_review_result": "TEXT",
+            "last_reviewed_at": "DATETIME",
+            "next_review_at": "DATETIME",
+        }
+        changed = False
+        for column, declaration in additions.items():
+            if column in columns:
+                continue
+            conn.execute(
+                f"ALTER TABLE study_states ADD COLUMN {column} {declaration}"
+            )
+            changed = True
+        if changed:
+            conn.commit()
+            logger.info("Migrated: added spaced-review columns to study_states")
+    except Exception as exc:
+        logger.warning("study_states review migration failed: %s", exc)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def _migrate_add_mode_column():
     """Add mode column to sessions table if it doesn't exist."""
     import sqlite3
@@ -2256,6 +2317,7 @@ def init_db():
     _migrate_model_endpoints()
     Base.metadata.create_all(bind=engine)
     harden_database_permissions()
+    _migrate_add_study_review_columns()
     _migrate_add_hidden_models_column()
     _migrate_add_cached_models_column()
     _migrate_add_pinned_models_column()

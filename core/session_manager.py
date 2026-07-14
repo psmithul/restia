@@ -11,16 +11,27 @@ This is the single place that handles:
 import json
 import uuid
 import logging
+from threading import RLock
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Optional
+from typing import Any, Dict, List, Optional
 
-from .database import Session as DbSession, ChatMessage as DbChatMessage, Document as DbDocument, SessionLocal, utcnow_naive
+from sqlalchemy import or_
+
+from .database import (
+    Session as DbSession,
+    ChatMessage as DbChatMessage,
+    Document as DbDocument,
+    StudyState as DbStudyState,
+    SessionLocal,
+    utcnow_naive,
+)
 from .models import Session, ChatMessage
 
 # Re-export singleton accessors from models for convenience
 from .models import set_session_manager_instance, get_session_manager_instance
 
 logger = logging.getLogger(__name__)
+_HISTORY_LOCKS_INIT_GUARD = RLock()
 
 
 def _message_timestamp_iso(value: Optional[datetime]) -> Optional[str]:
@@ -58,6 +69,54 @@ def _parse_msg_content(raw):
     return raw
 
 
+def _snapshot_metadata(metadata: Any) -> Dict[str, Any]:
+    value = dict(metadata) if isinstance(metadata, dict) else {}
+    value.pop("_db_id", None)
+    # Legacy DB rows synthesize this display value on load, while newer rows may
+    # persist it. It is not part of the editable conversational payload.
+    value.pop("timestamp", None)
+    return value
+
+
+def _history_snapshot_from_messages(messages: List[Any]) -> List[Dict[str, Any]]:
+    snapshot: List[Dict[str, Any]] = []
+    for message in messages:
+        if isinstance(message, dict):
+            role = message.get("role", "user")
+            content = message.get("content")
+            metadata = message.get("metadata")
+        else:
+            role = getattr(message, "role", "user")
+            content = getattr(message, "content", None)
+            metadata = getattr(message, "metadata", None)
+        db_id = metadata.get("_db_id") if isinstance(metadata, dict) else None
+        snapshot.append({
+            "id": str(db_id) if db_id else None,
+            "role": role,
+            "content": content,
+            "metadata": _snapshot_metadata(metadata),
+        })
+    return snapshot
+
+
+def _history_snapshot_from_db(rows: List[Any]) -> List[Dict[str, Any]]:
+    snapshot: List[Dict[str, Any]] = []
+    for row in rows:
+        try:
+            metadata = json.loads(row.meta_data) if row.meta_data else {}
+        except (json.JSONDecodeError, TypeError, ValueError):
+            # A malformed persisted row cannot be proven equal to the in-memory
+            # snapshot, so retain an unmistakable sentinel and fail the CAS.
+            metadata = {"_invalid_raw_metadata": row.meta_data}
+        snapshot.append({
+            "id": str(row.id),
+            "role": row.role,
+            "content": _parse_msg_content(row.content),
+            "metadata": _snapshot_metadata(metadata),
+        })
+    return snapshot
+
+
 class SessionManager:
     """
     Manages chat sessions with database persistence.
@@ -72,7 +131,22 @@ class SessionManager:
     def __init__(self, sessions_file: str = None):
         # sessions_file kept for backward compat, not used
         self.sessions: Dict[str, Session] = {}
+        self._history_locks: Dict[str, RLock] = {}
         self.load_sessions()
+
+    def _history_lock_for(self, session_id: str) -> RLock:
+        """Return a per-session write lock, including for lightweight test managers."""
+
+        with _HISTORY_LOCKS_INIT_GUARD:
+            locks = getattr(self, "_history_locks", None)
+            if locks is None:
+                locks = {}
+                self._history_locks = locks
+            lock = locks.get(session_id)
+            if lock is None:
+                lock = RLock()
+                locks[session_id] = lock
+            return lock
 
     # ------------------------------------------------------------------
     # Loading
@@ -89,7 +163,7 @@ class SessionManager:
         try:
             db_sessions = db.query(DbSession).filter(
                 DbSession.archived == False,
-                DbSession.message_count > 0,
+                or_(DbSession.message_count > 0, DbSession.mode == "study"),
             ).order_by(DbSession.last_accessed.desc()).limit(100).all()
 
             loaded_count = 0
@@ -131,6 +205,7 @@ class SessionManager:
             history=[],
             owner=getattr(db_session, "owner", None),
             is_important=getattr(db_session, "is_important", False) or False,
+            mode=getattr(db_session, "mode", None),
         )
         session.message_count = getattr(db_session, "message_count", 0) or 0
         return session
@@ -189,6 +264,7 @@ class SessionManager:
             history=history,
             owner=getattr(db_session, 'owner', None),
             is_important=getattr(db_session, 'is_important', False) or False,
+            mode=getattr(db_session, 'mode', None),
         )
 
         session.message_count = getattr(db_session, 'message_count', len(history))
@@ -219,6 +295,20 @@ class SessionManager:
 
     def _persist_message(self, session_id: str, message: ChatMessage):
         """Persist a single message to the database."""
+        with self._history_lock_for(session_id):
+            self._persist_message_locked(session_id, message)
+
+    def _persist_message_locked(self, session_id: str, message: ChatMessage):
+        """Persist while serialized against whole-history replacement."""
+
+        # Session.add_message appends before delegating here. If a compaction
+        # committed in that narrow interval, restore this exact late message so
+        # the replacement cannot silently drop it from the in-memory transcript.
+        cached = self.sessions.get(session_id)
+        if cached is not None and not any(existing is message for existing in cached.history):
+            cached.history.append(message)
+            cached.message_count = len(cached.history)
+
         db = SessionLocal()
         try:
             db_session = db.query(DbSession).filter(DbSession.id == session_id).first()
@@ -317,15 +407,93 @@ class SessionManager:
         finally:
             db.close()
 
-    def replace_messages(self, session_id: str, messages: list) -> bool:
-        """Replace a session's persisted and in-memory history atomically."""
+    def replace_messages(
+        self,
+        session_id: str,
+        messages: list,
+        *,
+        expected_history_snapshot: Optional[List[Dict[str, Any]]] = None,
+    ) -> bool:
+        """Replace history, optionally only if its exact persisted version matches."""
+
+        with self._history_lock_for(session_id):
+            return self._replace_messages_locked(
+                session_id,
+                messages,
+                expected_history_snapshot=expected_history_snapshot,
+            )
+
+    def _replace_messages_locked(
+        self,
+        session_id: str,
+        messages: list,
+        *,
+        expected_history_snapshot: Optional[List[Dict[str, Any]]] = None,
+    ) -> bool:
         session = self.get_session(session_id)
         db = SessionLocal()
         try:
-            db.query(DbChatMessage).filter(DbChatMessage.session_id == session_id).delete()
+            if (
+                expected_history_snapshot is not None
+                and _history_snapshot_from_messages(session.history)
+                != expected_history_snapshot
+            ):
+                logger.warning(
+                    "Skipped replacing session %s history: in-memory version changed",
+                    session_id,
+                )
+                return False
+
+            db_messages = db.query(DbChatMessage).filter(
+                DbChatMessage.session_id == session_id
+            ).order_by(DbChatMessage.timestamp).all()
+            if expected_history_snapshot is not None:
+                if _history_snapshot_from_db(db_messages) != expected_history_snapshot:
+                    logger.warning(
+                        "Skipped replacing session %s history: database version changed",
+                        session_id,
+                    )
+                    return False
+
+                # Delete each version-checked row with its exact stored payload.
+                # A same-id edit committed after the snapshot makes the affected
+                # delete match zero rows and rolls the entire replacement back.
+                for row in db_messages:
+                    deleted = db.query(DbChatMessage).filter(
+                        DbChatMessage.session_id == session_id,
+                        DbChatMessage.id == row.id,
+                        DbChatMessage.role == row.role,
+                        DbChatMessage.content == row.content,
+                        DbChatMessage.meta_data == row.meta_data,
+                    ).delete(synchronize_session=False)
+                    if deleted != 1:
+                        db.rollback()
+                        logger.warning(
+                            "Skipped replacing session %s history: a message changed during CAS",
+                            session_id,
+                        )
+                        return False
+                db.flush()
+                if db.query(DbChatMessage).filter(
+                    DbChatMessage.session_id == session_id
+                ).count():
+                    db.rollback()
+                    logger.warning(
+                        "Skipped replacing session %s history: an unexpected message appeared",
+                        session_id,
+                    )
+                    return False
+            else:
+                db.query(DbChatMessage).filter(
+                    DbChatMessage.session_id == session_id
+                ).delete()
+
             now = datetime.now(timezone.utc)
+            assigned_ids = []
             for i, message in enumerate(messages):
                 msg_id = str(uuid.uuid4())
+                stored_metadata = dict(message.metadata or {})
+                stored_metadata.pop("_db_id", None)
                 db_message = DbChatMessage(
                     id=msg_id,
                     session_id=session_id,
@@ -339,13 +507,11 @@ class SessionManager:
                     content=(json.dumps(message.content)
                              if isinstance(message.content, list)
                              else message.content),
-                    meta_data=json.dumps(message.metadata) if message.metadata else None,
+                    meta_data=json.dumps(stored_metadata) if stored_metadata else None,
                     timestamp=now + timedelta(microseconds=i),
                 )
                 db.add(db_message)
-                if message.metadata is None:
-                    message.metadata = {}
-                message.metadata["_db_id"] = msg_id
+                assigned_ids.append((message, msg_id))
 
             db_session = db.query(DbSession).filter(DbSession.id == session_id).first()
             if db_session:
@@ -354,7 +520,23 @@ class SessionManager:
                 db_session.last_accessed = now
                 db_session.last_message_at = now
 
+            if (
+                expected_history_snapshot is not None
+                and _history_snapshot_from_messages(session.history)
+                != expected_history_snapshot
+            ):
+                db.rollback()
+                logger.warning(
+                    "Skipped replacing session %s history: in-memory version changed during CAS",
+                    session_id,
+                )
+                return False
+
             db.commit()
+            for message, msg_id in assigned_ids:
+                if message.metadata is None:
+                    message.metadata = {}
+                message.metadata["_db_id"] = msg_id
             session.history = list(messages)
             session._history = session.history
             session.message_count = len(messages)
@@ -419,6 +601,7 @@ class SessionManager:
             session.owner = getattr(db_session, "owner", None)
             session.is_important = getattr(db_session, "is_important", False) or False
             session.message_count = getattr(db_session, "message_count", session.message_count) or 0
+            session.mode = getattr(db_session, "mode", None)
             return True
         except Exception as e:
             logger.error(f"Error syncing session metadata {session_id}: {e}")
@@ -474,7 +657,8 @@ class SessionManager:
         endpoint_url: str,
         model: str,
         rag: bool = False,
-        owner: str = None
+        owner: str = None,
+        mode: str = None,
     ) -> Session:
         """Create a new session and save to database."""
         db = SessionLocal()
@@ -487,6 +671,7 @@ class SessionManager:
                 rag=rag,
                 headers={},
                 owner=owner,
+                mode=mode,
                 created_at=datetime.now(timezone.utc),
                 updated_at=datetime.now(timezone.utc)
             )
@@ -501,6 +686,7 @@ class SessionManager:
                 rag=rag,
                 headers={},
                 owner=owner,
+                mode=mode,
             )
 
             self.sessions[session_id] = session
@@ -524,6 +710,11 @@ class SessionManager:
 
             # Delete messages
             db.query(DbChatMessage).filter(DbChatMessage.session_id == session_id).delete()
+
+            # A Study workspace is identified by its chat-session UUID. Remove
+            # only the matching state so deleting one workspace never affects
+            # another Study session owned by the same profile.
+            db.query(DbStudyState).filter(DbStudyState.id == session_id).delete()
 
             # Delete session
             db_session = db.query(DbSession).filter(DbSession.id == session_id).first()
@@ -672,10 +863,17 @@ class SessionManager:
 
                 # Delete empty sessions only if older than min_age_hours
                 if db_session.message_count == 0:
+                    # Empty Study sessions are real workspaces: their goal/timer
+                    # state may already exist even before the first tutor turn.
+                    if str(getattr(db_session, "mode", "") or "").lower() == "study":
+                        continue
                     if db_session.created_at is not None:
                         created = db_session.created_at
-                        if created.tzinfo is None:
-                            created = created.replace(tzinfo=timezone.utc)
+                        # Database timestamps use naive UTC. Normalize any
+                        # aware legacy value back to that convention before
+                        # comparing with utcnow_naive().
+                        if created.tzinfo is not None:
+                            created = created.astimezone(timezone.utc).replace(tzinfo=None)
                         if created > min_age:
                             continue  # Too young to delete
                     if db_session.id in self.sessions:

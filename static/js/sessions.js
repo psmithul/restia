@@ -1770,12 +1770,18 @@ export async function selectSession(id, { keepSidebar = false, showLoading = tru
   const targetMeta = sessions.find(session => session.id === id);
   const targetMode = String((targetMeta && targetMeta.mode) || 'chat').toLowerCase();
 
-  // Selecting an ordinary chat must not commit until Study Mode has safely
-  // paused its server timer. Otherwise a quick send during a slow close would
-  // carry study_mode=true and permanently relabel the ordinary session.
-  if (targetMode !== 'study' && window.studyModule?.isActive?.()) {
-    const closed = await window.studyModule.close({ manual: false, startFresh: false });
-    if (!closed || navToken !== _sessionNavToken) return false;
+  // A Study-to-Study switch must pause the old workspace before committing to
+  // the new chat, and an ordinary-chat switch must close Study entirely. The
+  // Study module captures the old id so a slow response cannot update the new
+  // workspace's timer UI.
+  if (window.studyModule?.isActive?.() && id !== currentSessionId) {
+    if (window.studyModule.beforeSessionSwitch) {
+      const ready = await window.studyModule.beforeSessionSwitch(id, targetMode);
+      if (!ready || navToken !== _sessionNavToken) return false;
+    } else if (targetMode !== 'study') {
+      const closed = await window.studyModule.close({ manual: false, startFresh: false });
+      if (!closed || navToken !== _sessionNavToken) return false;
+    }
   }
   try {
     const prevSessionId = currentSessionId;
@@ -2161,6 +2167,50 @@ export function createDirectChat(url, modelId, endpointId) {
   // Enable input
   const msgInput = document.getElementById('message');
   if (msgInput) { msgInput.disabled = false; msgInput.value = ''; msgInput.focus(); }
+}
+
+/** Create a durable, empty Study chat immediately.
+ *
+ * Ordinary chats are intentionally deferred until first send, but a Study
+ * workspace already owns goal/timer state before it has messages. Creating it
+ * now keeps it visible after reload and gives every Study API an unambiguous
+ * session id from the first interaction.
+ */
+export async function createStudySession(name = 'New Study') {
+  let defaults = {};
+  try {
+    const response = await fetch(`${API_BASE}/api/default-chat`, { credentials: 'same-origin' });
+    if (response.ok) defaults = await response.json();
+  } catch (_) { /* A workspace can still be created before model setup. */ }
+
+  const fd = new FormData();
+  fd.append('name', String(name || 'New Study').trim().slice(0, 200) || 'New Study');
+  fd.append('endpoint_url', defaults.endpoint_url || '');
+  fd.append('model', defaults.model || '');
+  fd.append('skip_validation', 'true');
+  fd.append('mode', 'study');
+  if (defaults.endpoint_id) fd.append('endpoint_id', defaults.endpoint_id);
+
+  const response = await fetch(`${API_BASE}/api/session`, {
+    method: 'POST',
+    body: fd,
+    credentials: 'same-origin',
+  });
+  const text = await response.text();
+  let payload = {};
+  try { payload = text ? JSON.parse(text) : {}; }
+  catch (_) { payload = { detail: text }; }
+  if (!response.ok || !payload.id) {
+    throw new Error(payload.detail || `Could not create Study workspace (${response.status})`);
+  }
+
+  _suppressNextSessionLoading = true;
+  await loadSessions();
+  if (!sessions.some(session => String(session.id) === String(payload.id))) {
+    sessions.unshift({ ...payload, mode: 'study', message_count: 0 });
+    renderSessionList();
+  }
+  return payload;
 }
 
 /** Actually create the session in the DB. Called on first message send. */
@@ -3472,6 +3522,7 @@ const sessionModule = {
   loadSessions,
   selectSession,
   createDirectChat,
+  createStudySession,
   materializePendingSession,
   hasPendingChat,
   getPendingChat,

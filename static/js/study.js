@@ -1,7 +1,19 @@
 // static/js/study.js
 // Study Mode goal, effort timer, and panel lifecycle.
 
+const EMPTY_REVIEW = Object.freeze({
+  level: 0,
+  count: 0,
+  last_result: null,
+  last_reviewed_at: null,
+  next_review_at: null,
+  due: false,
+  due_in_seconds: null,
+  status: 'not_scheduled',
+});
+
 const EMPTY_STATE = Object.freeze({
+  session_id: null,
   goal_text: '',
   target_minutes: 0,
   target_date: null,
@@ -11,11 +23,13 @@ const EMPTY_STATE = Object.freeze({
   studied_seconds: 0,
   remaining_seconds: 0,
   progress_percent: 0,
+  review: EMPTY_REVIEW,
 });
 
 let API_BASE = '';
 let _initialized = false;
 let _active = false;
+let _activeSessionId = null;
 let _collapsed = false;
 let _state = { ...EMPTY_STATE };
 let _syncClockMs = 0;
@@ -41,6 +55,9 @@ const ids = [
   'study-target-date', 'study-goal-save', 'study-progress-bar',
   'study-progress-value', 'study-progress-copy', 'study-deadline-copy',
   'study-error', 'study-live-status', 'study-method',
+  'study-workspace-switcher', 'study-workspace-count',
+  'study-new-workspace', 'study-rename-workspace', 'study-quick-actions',
+  'study-review-status', 'study-review-due', 'study-review-actions',
 ];
 
 function _number(value, fallback = 0) {
@@ -54,6 +71,22 @@ function _seconds(value) {
 
 function _percent(value) {
   return Math.min(100, Math.max(0, _number(value)));
+}
+
+function _review(value) {
+  const review = value && typeof value === 'object' ? value : EMPTY_REVIEW;
+  return {
+    ...EMPTY_REVIEW,
+    ...review,
+    level: Math.max(0, Math.floor(_number(review.level))),
+    count: Math.max(0, Math.floor(_number(review.count))),
+    last_result: review.last_result || null,
+    last_reviewed_at: review.last_reviewed_at || null,
+    next_review_at: review.next_review_at || null,
+    due: Boolean(review.due),
+    due_in_seconds: review.due_in_seconds == null ? null : Math.floor(_number(review.due_in_seconds)),
+    status: String(review.status || 'not_scheduled'),
+  };
 }
 
 /** Format seconds as a stable HH:MM:SS clock value. */
@@ -84,6 +117,7 @@ export function deriveLiveProgress(state = EMPTY_STATE, elapsedSeconds = 0) {
   return {
     ...EMPTY_STATE,
     ...state,
+    session_id: state.session_id || null,
     goal_text: String(state.goal_text || ''),
     target_minutes: targetMinutes,
     target_date: state.target_date || null,
@@ -93,6 +127,7 @@ export function deriveLiveProgress(state = EMPTY_STATE, elapsedSeconds = 0) {
     studied_seconds: studiedSeconds,
     remaining_seconds: remainingSeconds,
     progress_percent: Math.round(_percent(progressPercent) * 10) / 10,
+    review: _review(state.review),
   };
 }
 
@@ -117,6 +152,45 @@ function _normalizeApiBase(value) {
   return `${base}/api/study`;
 }
 
+function _sessionId(value = _activeSessionId) {
+  return String(value || '').trim();
+}
+
+function _studySessions() {
+  try {
+    const sessions = typeof _options.getSessions === 'function' ? _options.getSessions() : [];
+    return (Array.isArray(sessions) ? sessions : []).filter(
+      session => String(session?.mode || '').toLowerCase() === 'study',
+    );
+  } catch (_) {
+    return [];
+  }
+}
+
+function _currentSessionId() {
+  try {
+    return _sessionId(typeof _options.getCurrentSessionId === 'function'
+      ? _options.getCurrentSessionId()
+      : null);
+  } catch (_) {
+    return '';
+  }
+}
+
+function _workspaceName(sessionId = _activeSessionId) {
+  const match = _studySessions().find(session => String(session.id) === _sessionId(sessionId));
+  return String(match?.name || 'Study workspace');
+}
+
+function _setActiveSessionId(value) {
+  _activeSessionId = _sessionId(value) || null;
+  if (typeof window !== 'undefined') {
+    window.__restiaStudyWorkspaceId = _activeSessionId;
+  }
+  const switcher = _elements['study-workspace-switcher'];
+  if (switcher && _activeSessionId) switcher.value = _activeSessionId;
+}
+
 function _get(id) {
   return typeof document === 'undefined' ? null : document.getElementById(id);
 }
@@ -134,6 +208,47 @@ function _humanTime(value) {
   const minutes = Math.floor((seconds % 3600) / 60);
   if (!hours) return `${minutes}m`;
   return minutes ? `${hours}h ${minutes}m` : `${hours}h`;
+}
+
+function _reviewTimestamp(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  const timestamp = /(?:Z|[+-]\d\d:\d\d)$/i.test(raw) ? raw : `${raw}Z`;
+  const parsed = new Date(timestamp);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function _reviewDueSeconds(review) {
+  const next = _reviewTimestamp(review?.next_review_at);
+  if (next) return Math.ceil((next.getTime() - Date.now()) / 1000);
+  if (review?.due_in_seconds != null) return Math.floor(_number(review.due_in_seconds));
+  return null;
+}
+
+function _reviewDueText(review) {
+  const dueSeconds = _reviewDueSeconds(review);
+  if (dueSeconds == null) return 'After a closed-book check, record the evidence here.';
+  if (dueSeconds <= 0 || review?.due) return 'Review due now. Use Recall sprint, then record the result.';
+  const next = _reviewTimestamp(review?.next_review_at);
+  if (dueSeconds < 3600) return `Next retrieval in ${Math.max(1, Math.ceil(dueSeconds / 60))}m.`;
+  if (dueSeconds < 86400) return `Next retrieval in ${Math.max(1, Math.ceil(dueSeconds / 3600))}h.`;
+  if (next) {
+    const label = new Intl.DateTimeFormat(undefined, {
+      month: 'short', day: 'numeric',
+      year: next.getFullYear() !== new Date().getFullYear() ? 'numeric' : undefined,
+    }).format(next);
+    return `Next closed-book retrieval ${label}.`;
+  }
+  return `Next retrieval in ${Math.max(1, Math.ceil(dueSeconds / 86400))}d.`;
+}
+
+function _renderReview(live = _liveState()) {
+  const review = _review(live.review);
+  const status = review.count
+    ? `Level ${review.level} · ${review.count} evidence check${review.count === 1 ? '' : 's'}`
+    : 'No mastery evidence recorded yet';
+  _setText(_elements['study-review-status'], status);
+  _setText(_elements['study-review-due'], _reviewDueText(review));
 }
 
 function _hoursValue(minutes) {
@@ -194,10 +309,22 @@ function _syncControls(live = _liveState()) {
   const pause = _elements['study-timer-pause'];
   const finish = _elements['study-timer-finish'];
   const save = _elements['study-goal-save'];
+  const switcher = _elements['study-workspace-switcher'];
+  const create = _elements['study-new-workspace'];
+  const rename = _elements['study-rename-workspace'];
   if (start) start.disabled = _busy || _closing || live.timer_running || _goalDirty;
   if (pause) pause.disabled = _busy || _closing || !live.timer_running;
   if (finish) finish.disabled = _busy || _closing || live.timer_seconds <= 0;
   if (save) save.disabled = _busy || _closing;
+  if (switcher) switcher.disabled = _busy || _closing || _studySessions().length < 2;
+  if (create) create.disabled = _busy || _closing;
+  if (rename) rename.disabled = _busy || _closing || !_activeSessionId;
+  const reviewActions = _elements['study-review-actions'];
+  if (reviewActions?.querySelectorAll) {
+    reviewActions.querySelectorAll('[data-study-result]').forEach(button => {
+      button.disabled = _busy || _closing || !_activeSessionId;
+    });
+  }
 }
 
 function _setBusy(value) {
@@ -249,6 +376,7 @@ function _renderLive() {
     _setText(_elements['study-progress-copy'], 'Set a study-time target to measure effort.');
   }
   _setText(_elements['study-deadline-copy'], _deadlineText(live.target_date));
+  _renderReview(live);
   _syncControls(live);
 }
 
@@ -262,12 +390,39 @@ function _renderForm() {
   _goalDirty = false;
 }
 
-function _applyState(payload, { syncForm = false } = {}) {
+function _renderWorkspaces() {
+  const sessions = _studySessions();
+  const switcher = _elements['study-workspace-switcher'];
+  const count = _elements['study-workspace-count'];
+  if (count) count.textContent = `${sessions.length} workspace${sessions.length === 1 ? '' : 's'}`;
+  if (!switcher) return;
+
+  const previous = _sessionId(_activeSessionId || switcher.value);
+  switcher.textContent = '';
+  if (typeof document.createElement === 'function') {
+    sessions.forEach(session => {
+      const option = document.createElement('option');
+      option.value = String(session.id || '');
+      option.textContent = String(session.name || 'Untitled Study');
+      switcher.appendChild(option);
+    });
+  }
+  if (previous) switcher.value = previous;
+  switcher.setAttribute('aria-label', sessions.length
+    ? `Current Study workspace: ${_workspaceName(previous)}`
+    : 'Current Study workspace');
+  _syncControls();
+}
+
+function _applyState(payload, { syncForm = false, sessionId = _activeSessionId } = {}) {
+  if (_sessionId(sessionId) && _sessionId(sessionId) !== _sessionId(_activeSessionId)) return false;
   _state = deriveLiveProgress(payload || EMPTY_STATE, 0);
   _syncClockMs = _monotonicNow();
   if (syncForm) _renderForm();
+  _renderWorkspaces();
   _renderLive();
   _syncTicker();
+  return true;
 }
 
 function _stopTicker() {
@@ -283,8 +438,11 @@ function _syncTicker() {
   _ticker = setInterval(_renderLive, 1000);
 }
 
-async function _request(path, options = {}) {
-  const response = await fetch(`${API_BASE}${path}`, {
+async function _request(path, options = {}, sessionId = _activeSessionId) {
+  const workspaceId = _sessionId(sessionId);
+  if (!workspaceId) throw new Error('Choose or create a Study workspace first.');
+  const separator = String(path).includes('?') ? '&' : '?';
+  const response = await fetch(`${API_BASE}${path}${separator}session_id=${encodeURIComponent(workspaceId)}`, {
     credentials: 'same-origin',
     ...options,
   });
@@ -306,16 +464,21 @@ function _queueMutation(operation) {
   return queued;
 }
 
-async function _loadState({ syncForm = true } = {}) {
+async function _loadState({ syncForm = true, sessionId = _activeSessionId } = {}) {
   if (_busy || _closing) return false;
+  const workspaceId = _sessionId(sessionId);
+  if (!workspaceId) {
+    _showError('Choose or create a Study workspace first.');
+    return false;
+  }
   if (_stateController) _stateController.abort();
   const controller = new AbortController();
   _stateController = controller;
   _setBusy(true);
   _showError('');
   try {
-    const state = await _request('/state', { signal: controller.signal });
-    _applyState(state, { syncForm });
+    const state = await _request('/state', { signal: controller.signal }, workspaceId);
+    if (!_applyState(state, { syncForm, sessionId: workspaceId })) return false;
     _lastResyncMs = _monotonicNow();
     return true;
   } catch (error) {
@@ -329,12 +492,14 @@ async function _loadState({ syncForm = true } = {}) {
 
 async function _timerAction(action) {
   if (_busy || _closing) return;
+  const workspaceId = _sessionId();
+  if (!workspaceId) return;
   const before = _liveState();
   _setBusy(true);
   _showError('');
   try {
-    const state = await _queueMutation(() => _request(`/timer/${action}`, { method: 'POST' }));
-    _applyState(state, { syncForm: false });
+    const state = await _queueMutation(() => _request(`/timer/${action}`, { method: 'POST' }, workspaceId));
+    if (!_applyState(state, { syncForm: false, sessionId: workspaceId })) return;
     if (action === 'start') _announce('Focus timer started.');
     if (action === 'pause') _announce('Focus timer paused.');
     if (action === 'finish') {
@@ -348,9 +513,41 @@ async function _timerAction(action) {
   }
 }
 
+async function _recordReview(outcome) {
+  const result = String(outcome || '').trim().toLowerCase();
+  if (_busy || _closing || !['missed', 'hinted', 'clean', 'transfer'].includes(result)) return;
+  const workspaceId = _sessionId();
+  if (!workspaceId) return;
+  _setBusy(true);
+  _showError('');
+  try {
+    const state = await _queueMutation(() => _request('/review', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ outcome: result }),
+    }, workspaceId));
+    if (!_applyState(state, { syncForm: false, sessionId: workspaceId })) return;
+    const labels = {
+      missed: 'Missed recorded. Restia will bring this back soon.',
+      hinted: 'Hint-assisted success recorded. A near-term review is scheduled.',
+      clean: 'Hint-free success recorded. The retrieval interval expanded.',
+      transfer: 'Transfer evidence recorded. The retrieval interval expanded.',
+    };
+    _announce(labels[result]);
+  } catch (error) {
+    if (error && error.name !== 'AbortError') {
+      _showError(error.message || 'Could not record mastery evidence.');
+    }
+  } finally {
+    _setBusy(false);
+  }
+}
+
 async function _saveGoal(event) {
   if (event) event.preventDefault();
   if (_busy || _closing) return;
+  const workspaceId = _sessionId();
+  if (!workspaceId) return;
   const goal = String(_elements['study-goal-text']?.value || '').trim();
   const hours = _number(_elements['study-target-hours']?.value, NaN);
   const targetMinutes = Math.round(hours * 60);
@@ -389,8 +586,8 @@ async function _saveGoal(event) {
         target_date: targetDate,
         reset_progress: resetProgress,
       }),
-    }));
-    _applyState(state, { syncForm: true });
+    }, workspaceId));
+    if (!_applyState(state, { syncForm: true, sessionId: workspaceId })) return;
     _announce(resetProgress
       ? 'New study goal saved. Previous goal effort was reset.'
       : 'Study goal saved. Progress is based on focused time, not assumed mastery.');
@@ -414,14 +611,120 @@ function _syncGoalDirty() {
   _renderLive();
 }
 
+async function _askWorkspaceName({ current = '', create = false } = {}) {
+  const fallback = current || `Study ${Math.max(1, _studySessions().length + 1)}`;
+  if (typeof _options.styledPrompt === 'function') {
+    return _options.styledPrompt(
+      create
+        ? 'Use a short subject or outcome so this workspace is easy to return to.'
+        : 'Rename this Study workspace without changing its goal or progress.',
+      {
+        title: create ? 'New Study workspace' : 'Rename Study workspace',
+        defaultValue: fallback,
+        placeholder: 'e.g. Controls interview prep',
+        confirmText: create ? 'Create' : 'Rename',
+        maxLength: 80,
+      },
+    );
+  }
+  if (typeof window.prompt === 'function') return window.prompt('Study workspace name', fallback);
+  return fallback;
+}
+
+async function _createWorkspace({ askName = true } = {}) {
+  if (_busy || _closing || typeof _options.createStudySession !== 'function') return null;
+  const suggested = `Study ${Math.max(1, _studySessions().length + 1)}`;
+  const name = askName ? await _askWorkspaceName({ current: suggested, create: true }) : suggested;
+  if (name == null || !String(name).trim()) return null;
+
+  _setBusy(true);
+  _showError('');
+  let created = null;
+  try {
+    created = await _options.createStudySession(String(name).trim());
+  } catch (error) {
+    _showError(error?.message || 'Could not create a Study workspace.');
+    return null;
+  } finally {
+    _setBusy(false);
+  }
+  _renderWorkspaces();
+  if (created?.id && typeof _options.selectSession === 'function') {
+    await _options.selectSession(created.id, { keepSidebar: true, showLoading: false });
+  }
+  if (created?.id) _announce(`${String(name).trim()} created with separate chat, goal, and progress.`);
+  return created;
+}
+
+async function _renameWorkspace() {
+  const workspaceId = _sessionId();
+  if (!workspaceId || _busy || _closing) return;
+  const current = _workspaceName(workspaceId);
+  const name = await _askWorkspaceName({ current, create: false });
+  const cleaned = String(name || '').trim();
+  if (!cleaned || cleaned === current) return;
+
+  _setBusy(true);
+  _showError('');
+  try {
+    const fd = new FormData();
+    fd.append('name', cleaned);
+    const origin = typeof window !== 'undefined' ? window.location.origin : '';
+    const response = await fetch(`${origin}/api/session/${encodeURIComponent(workspaceId)}`, {
+      method: 'PATCH', body: fd, credentials: 'same-origin',
+    });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.detail || `Could not rename workspace (${response.status})`);
+    }
+    if (typeof _options.reloadSessions === 'function') await _options.reloadSessions();
+    _renderWorkspaces();
+    _announce(`Study workspace renamed to ${cleaned}.`);
+  } catch (error) {
+    _showError(error?.message || 'Could not rename the Study workspace.');
+  } finally {
+    _setBusy(false);
+  }
+}
+
+async function _switchWorkspace(event) {
+  const workspaceId = _sessionId(event?.target?.value);
+  if (!workspaceId || workspaceId === _sessionId() || _busy || _closing) return;
+  if (typeof _options.selectSession !== 'function') return;
+  _showError('');
+  const selected = await _options.selectSession(workspaceId, { keepSidebar: true });
+  if (selected === false) _renderWorkspaces();
+}
+
+function _fillStudyPrompt(button) {
+  const prompt = String(button?.dataset?.studyPrompt || '').trim();
+  const composer = _get('message');
+  if (!prompt || !composer) return;
+  composer.value = prompt;
+  composer.dispatchEvent(new Event('input', { bubbles: true }));
+  try { composer.focus({ preventScroll: false }); } catch (_) { try { composer.focus(); } catch (_) {} }
+  _announce(`${String(button.textContent || 'Study move').trim()} ready. Edit it or send when ready.`);
+}
+
 function _syncDrawerClearance() {
   const panel = _elements['study-panel'];
   if (!panel || !_active) return;
   const viewportWidth = _number(window.innerWidth, 0);
   if (viewportWidth > 1100) {
     panel.style.removeProperty('--study-drawer-bottom');
+    panel.style.removeProperty('--study-drawer-right');
     return;
   }
+  let rightClearance = 12;
+  for (const navigation of [_get('sidebar'), _get('icon-rail')]) {
+    if (!navigation?.classList?.contains('right-side')) continue;
+    if (navigation.classList.contains('hidden') || navigation.classList.contains('rail-hidden')) continue;
+    const navRect = navigation.getBoundingClientRect?.();
+    if (navRect && navRect.width > 0 && navRect.right >= viewportWidth - 2) {
+      rightClearance = Math.max(rightClearance, Math.ceil(navRect.width + 12));
+    }
+  }
+  panel.style.setProperty('--study-drawer-right', `${rightClearance}px`);
   const composer = document.querySelector('.chat-input-bar');
   const viewportHeight = _number(window.innerHeight, document.documentElement?.clientHeight || 0);
   const rect = composer?.getBoundingClientRect?.();
@@ -572,8 +875,11 @@ function _sessionMode(detail) {
 
 function _onSessionSelected(event) {
   const mode = _sessionMode(event?.detail);
+  const raw = event?.detail || {};
+  const session = raw.session || raw;
+  const sessionId = _sessionId(raw.sessionId || raw.id || session.id);
   if (mode === 'study') {
-    void open({ focus: false, refresh: true, fromSession: true });
+    void open({ focus: false, refresh: true, fromSession: true, sessionId });
   } else if (mode && _active) {
     void close({ manual: false, startFresh: false });
   }
@@ -585,6 +891,21 @@ function _wireEvents() {
   _elements['study-timer-start']?.addEventListener('click', () => void _timerAction('start'));
   _elements['study-timer-pause']?.addEventListener('click', () => void _timerAction('pause'));
   _elements['study-timer-finish']?.addEventListener('click', () => void _timerAction('finish'));
+  _elements['study-workspace-switcher']?.addEventListener('change', event => void _switchWorkspace(event));
+  _elements['study-new-workspace']?.addEventListener('click', () => void _createWorkspace({ askName: true }));
+  _elements['study-rename-workspace']?.addEventListener('click', () => void _renameWorkspace());
+  const quickActions = _elements['study-quick-actions'];
+  if (quickActions?.querySelectorAll) {
+    quickActions.querySelectorAll('[data-study-prompt]').forEach(button => {
+      button.addEventListener('click', () => _fillStudyPrompt(button));
+    });
+  }
+  const reviewActions = _elements['study-review-actions'];
+  if (reviewActions?.querySelectorAll) {
+    reviewActions.querySelectorAll('[data-study-result]').forEach(button => {
+      button.addEventListener('click', () => void _recordReview(button.dataset.studyResult));
+    });
+  }
   _elements['study-goal-form']?.addEventListener('submit', event => void _saveGoal(event));
   ['study-goal-text', 'study-target-hours', 'study-target-date'].forEach(id => {
     _elements[id]?.addEventListener('input', _syncGoalDirty);
@@ -633,6 +954,7 @@ export function init(apiBase, options = {}) {
   _wireEvents();
   _setCollapsed(false);
   _applyState(EMPTY_STATE, { syncForm: true });
+  _renderWorkspaces();
   _initialized = true;
   window.studyModule = studyModule;
   return true;
@@ -641,12 +963,24 @@ export function init(apiBase, options = {}) {
 export async function open(options = {}) {
   if (!_initialized && !init(options.apiBase, options)) return false;
   if (_closePromise) await _closePromise;
+  const requestedId = _sessionId(options.sessionId || _currentSessionId() || _activeSessionId);
+  if (!requestedId) {
+    _showError('Create a Study workspace before opening Study Mode.');
+    return false;
+  }
   if (_active) {
-    if (options.refresh) await _loadState();
+    const changed = requestedId !== _sessionId(_activeSessionId);
+    if (changed) {
+      if (_stateController) _stateController.abort();
+      _setActiveSessionId(requestedId);
+      _applyState(EMPTY_STATE, { syncForm: true, sessionId: requestedId });
+    }
+    if (options.refresh || changed) await _loadState({ sessionId: requestedId });
     if (options.focus !== false) focus();
     return true;
   }
 
+  _setActiveSessionId(requestedId);
   _active = true;
   window.__restiaStudyModeActive = true;
   document.body.classList.add('study-view');
@@ -659,9 +993,52 @@ export async function open(options = {}) {
   _setCollapsed(_collapsed);
   _syncDrawerClearance();
   if (typeof requestAnimationFrame === 'function') requestAnimationFrame(_syncDrawerClearance);
-  await _loadState();
+  _renderWorkspaces();
+  await _loadState({ sessionId: requestedId });
   if (options.focus !== false) focus();
   return true;
+}
+
+/** Enter the current/recent Study workspace, creating the first one if needed. */
+export async function enter(options = {}) {
+  if (!_initialized && !init(options.apiBase, options)) return false;
+  const currentId = _currentSessionId();
+  const current = _studySessions().find(session => String(session.id) === currentId);
+  let workspaceId = current ? currentId : _sessionId(_studySessions()[0]?.id);
+  if (!workspaceId) {
+    const created = await _createWorkspace({ askName: false });
+    workspaceId = _sessionId(created?.id);
+    if (!workspaceId) return false;
+  } else if (currentId !== workspaceId && typeof _options.selectSession === 'function') {
+    const selected = await _options.selectSession(workspaceId, { keepSidebar: true, showLoading: false });
+    if (selected === false) return false;
+  }
+  return open({ ...options, sessionId: workspaceId });
+}
+
+/** Pause the old workspace before sessions.js commits a navigation. */
+export async function beforeSessionSwitch(targetId, targetMode) {
+  if (!_active) return true;
+  const previousId = _sessionId(_activeSessionId);
+  if (!previousId || previousId === _sessionId(targetId)) return true;
+  if (String(targetMode || '').toLowerCase() !== 'study') {
+    return close({ manual: false, startFresh: false });
+  }
+
+  _setBusy(true);
+  _showError('');
+  try {
+    const paused = await _queueMutation(
+      () => _request('/timer/pause', { method: 'POST' }, previousId),
+    );
+    _applyState(paused, { syncForm: false, sessionId: previousId });
+    return true;
+  } catch (error) {
+    _showError(error?.message || 'Could not pause the current Study workspace.');
+    return false;
+  } finally {
+    _setBusy(false);
+  }
 }
 
 async function _close(options = {}) {
@@ -671,6 +1048,7 @@ async function _close(options = {}) {
     && options.startFresh !== false
     && _options.startFreshOnManualClose !== false;
   _closing = true;
+  const closingSessionId = _sessionId(_activeSessionId);
   if (_stateController) {
     _stateController.abort();
     _stateController = null;
@@ -682,10 +1060,12 @@ async function _close(options = {}) {
   // pause runs only after Start has resolved, so the server can never be left
   // with an invisible timer that continues counting outside Study Mode.
   try {
-    const paused = await _queueMutation(
-      () => _request('/timer/pause', { method: 'POST' }),
-    );
-    _applyState(paused, { syncForm: false });
+    const paused = closingSessionId
+      ? await _queueMutation(
+        () => _request('/timer/pause', { method: 'POST' }, closingSessionId),
+      )
+      : null;
+    if (paused) _applyState(paused, { syncForm: false, sessionId: closingSessionId });
   } catch (error) {
     const message = error?.message || 'Could not pause the focus timer while leaving Study Mode.';
     console.error('Study Mode close failed to pause the timer:', error);
@@ -697,6 +1077,7 @@ async function _close(options = {}) {
 
   _active = false;
   if (typeof window !== 'undefined') window.__restiaStudyModeActive = false;
+  _setActiveSessionId(null);
   document.body.classList.remove('study-view');
   const panel = _elements['study-panel'];
   if (panel) {
@@ -737,8 +1118,10 @@ export function focus() {
 
 const studyModule = {
   init,
+  enter,
   open,
   close,
+  beforeSessionSwitch,
   isActive,
   focus,
 };

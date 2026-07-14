@@ -83,7 +83,16 @@ window.addEventListener('pageshow', clearFreshComposerRestore);
    anything" (even-count parity). Keep only the initial-state-apply here. */
 {
   const KEY = Storage.KEYS.SIDEBAR_COLLAPSED;
-  const saved = Storage.getJSON(KEY, {});
+  const legacy = Storage.getJSON('section-collapsed', null);
+  let saved = Storage.getJSON(KEY, null);
+  // One early build wrote collapse state under `section-collapsed`. Promote it
+  // once so existing preferences survive while every writer uses the canonical
+  // Storage key from now on.
+  if ((!saved || typeof saved !== 'object') && legacy && typeof legacy === 'object') {
+    saved = legacy;
+    Storage.setJSON(KEY, saved);
+  }
+  if (!saved || typeof saved !== 'object') saved = {};
   const _defaultCollapsed = { 'sessions-section': true };
   document.querySelectorAll('.sidebar .section').forEach((section) => {
     const id = section.id;

@@ -1127,8 +1127,9 @@ function initializeEventListeners() {
     });
   }
 
-  // Study uses the existing composer and stream, but always begins in a
-  // dedicated fresh session so tutor behavior cannot leak into an old chat.
+  // Study workspaces are durable Study chat sessions. Enter reopens the current
+  // workspace (or creates the first one); the panel's + New control creates
+  // additional subjects without sacrificing their separate chat or progress.
   const toolStudyBtn = el('tool-study-btn');
   if (toolStudyBtn) {
     toolStudyBtn.addEventListener('click', async () => {
@@ -1137,8 +1138,7 @@ function initializeEventListeners() {
         studyModule.focus();
         return;
       }
-      await _handleNewChatAction({ focus: false });
-      await studyModule.open();
+      await studyModule.enter();
     });
   }
 
@@ -3690,7 +3690,14 @@ function startRestiaApp() {
   searchModule.init(API_BASE);
   chatModule.init(API_BASE);
   chatModule.initListeners();
-  studyModule.init(API_BASE);
+  studyModule.init(API_BASE, {
+    getCurrentSessionId: sessionModule.getCurrentSessionId,
+    getSessions: sessionModule.getSessions,
+    selectSession: sessionModule.selectSession,
+    createStudySession: sessionModule.createStudySession,
+    reloadSessions: sessionModule.loadSessions,
+    styledPrompt: uiModule.styledPrompt,
+  });
   groupModule.init(API_BASE);
   // Initialize compare module
   if (compareModule) {

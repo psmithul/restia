@@ -741,7 +741,7 @@ async def build_chat_context(
         # message changes the pedagogy without bypassing model routing,
         # streaming, memory, attachments, or session persistence.
         from src.study_mode import study_context_messages_for_owner
-        study_messages = study_context_messages_for_owner(user)
+        study_messages = study_context_messages_for_owner(user, session_id)
         preface.insert(0, study_messages[0])
         # Goal text changes over time and is learner-controlled, so keep its
         # guarded user-context message after the stable system preface.

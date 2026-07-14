@@ -2,7 +2,14 @@
 // Sidebar Layout — icon rail, hamburger cycling, mobile backdrop & swipe
 // ============================================
 
+import { setSidebarSectionCollapsed } from './section-management.js';
+
 let _syncRailSideFn = null;
+const MOBILE_BREAKPOINT = 768;
+
+function _isMobileViewport() {
+  return window.innerWidth <= MOBILE_BREAKPOINT;
+}
 
 /**
  * Get the current syncRailSide function reference.
@@ -35,10 +42,25 @@ export function initSidebarLayout(Storage, opts) {
   const iconRail = document.getElementById('icon-rail');
   const hamburgerBtn = document.getElementById('hamburger-btn');
   const sidebarToggleBtn = document.getElementById('sidebar-toggle-btn');
+  const sidebar = document.getElementById('sidebar');
+  let _temporaryMobileRightSide = false;
+  let _wasMobileViewport = _isMobileViewport();
+
+  function _setSidebarRightSide(wantRight, { persist = false, syncDocument = true } = {}) {
+    if (!sidebar) return false;
+    const changed = sidebar.classList.contains('right-side') !== wantRight;
+    sidebar.classList.toggle('right-side', wantRight);
+    if (persist) {
+      try { Storage.set(Storage.KEYS.SIDEBAR_SIDE, wantRight ? 'right' : 'left'); } catch (_) {}
+    }
+    if (changed && syncDocument && documentModule?.swapSide) {
+      try { documentModule.swapSide(); } catch (_) {}
+    }
+    return changed;
+  }
 
   function _syncRailSideCore() {
-    const sidebar = document.getElementById('sidebar');
-    if (!iconRail) return;
+    if (!iconRail || !sidebar) return;
     const isRight = sidebar.classList.contains('right-side');
     const sidebarHidden = sidebar.classList.contains('hidden');
     const railHidden = iconRail.classList.contains('rail-hidden');
@@ -87,7 +109,7 @@ export function initSidebarLayout(Storage, opts) {
 
   // Restore sidebar side preference
   if (Storage.get(Storage.KEYS.SIDEBAR_SIDE) === 'right') {
-    document.getElementById('sidebar').classList.add('right-side');
+    _setSidebarRightSide(true, { syncDocument: false });
   }
   syncRailSide();
 
@@ -112,40 +134,35 @@ export function initSidebarLayout(Storage, opts) {
   // then checkSidebarAutoCollapse re-added .hidden because this flag was unset
   // — looked like nothing happened). Mirrors the hamburger's mobile-open path.
   window._odyOpenSidebar = function(side) {
-    const sidebar = document.getElementById('sidebar');
     if (!sidebar) return;
     // On mobile, never open the sidebar while Compare is running — the panes
     // own the screen and stray gestures (swipe, dragging a dock chip to the X)
     // were popping it open. Blocking the open helper covers every path.
     const cc = document.getElementById('chat-container');
-    if (window.innerWidth < 768 && cc && cc.classList.contains('compare-active')) return;
+    if (_isMobileViewport() && cc && cc.classList.contains('compare-active')) return;
     _userToggledSidebar = true;
     // Optionally place the sidebar on a specific edge (the swipe gesture passes
     // the direction). Persist it + re-anchor the doc panel.
     if (side === 'left' || side === 'right') {
       const wantRight = side === 'right';
-      if (sidebar.classList.contains('right-side') !== wantRight) {
-        sidebar.classList.toggle('right-side', wantRight);
-        try { Storage.set(Storage.KEYS.SIDEBAR_SIDE, side); } catch (_) {}
-        if (documentModule && documentModule.swapSide) { try { documentModule.swapSide(); } catch (_) {} }
-      }
+      _setSidebarRightSide(wantRight, { persist: true });
+      _temporaryMobileRightSide = false;
     }
     const backdrop = document.getElementById('sidebar-backdrop');
-    if (window.innerWidth < 768 && iconRail) { iconRail.classList.remove('mobile-mini'); iconRail.style.cssText = ''; }
+    if (_isMobileViewport() && iconRail) { iconRail.classList.remove('mobile-mini'); iconRail.style.cssText = ''; }
     sidebar.classList.remove('hidden');
-    if (backdrop && window.innerWidth < 768) backdrop.classList.add('visible');
+    if (backdrop && _isMobileViewport()) backdrop.classList.add('visible');
     syncRailSide();
   };
 
   function toggleSidebarFromControl(e) {
       e.stopPropagation();
-      const sidebar = document.getElementById('sidebar');
       if (!sidebar) return;
 
       _userToggledSidebar = true;
       const isSidebarVisible = !sidebar.classList.contains('hidden');
 
-      if (window.innerWidth < 768) {
+      if (_isMobileViewport()) {
         // Mobile: full sidebar ↔ hidden — simple toggle, no mini rail
         const backdrop = document.getElementById('sidebar-backdrop');
         if (iconRail) { iconRail.classList.remove('mobile-mini'); iconRail.style.cssText = ''; }
@@ -158,8 +175,8 @@ export function initSidebarLayout(Storage, opts) {
           // Mobile: the hamburger always opens the sidebar from the RIGHT.
           // (Not persisted — keeps the desktop side preference untouched.)
           if (!sidebar.classList.contains('right-side')) {
-            sidebar.classList.add('right-side');
-            if (documentModule && documentModule.swapSide) { try { documentModule.swapSide(); } catch (_) {} }
+            _setSidebarRightSide(true);
+            _temporaryMobileRightSide = Storage.get(Storage.KEYS.SIDEBAR_SIDE) !== 'right';
           }
           // Opening sidebar — blur keyboard first, then open after layout settles
           if (document.activeElement && document.activeElement !== document.body
@@ -211,13 +228,12 @@ export function initSidebarLayout(Storage, opts) {
       const section = document.getElementById(sectionId);
       if (section) {
         section.scrollIntoView({ behavior: 'smooth', block: 'start' });
-        section.classList.remove('collapsed');
+        setSidebarSectionCollapsed(Storage, section, false);
       }
     });
   }
 
   // Auto-collapse sidebar when window gets small or chat area is squeezed
-  const AUTO_COLLAPSE_WIDTH = 700;
   const MIN_CHAT_WIDTH = 380; // collapse sidebar if chat gets narrower than this
 
   function checkSidebarAutoCollapse() {
@@ -235,11 +251,11 @@ export function initSidebarLayout(Storage, opts) {
     const hasTileSnapped = document.querySelector('.modal-content[data-_tile-zone], .research-pane[data-_tile-zone]');
     const chatTooNarrow = chatContainer && chatContainer.offsetWidth < MIN_CHAT_WIDTH && !isHidden && !hasTileSnapped;
 
-    if ((window.innerWidth < AUTO_COLLAPSE_WIDTH || chatTooNarrow) && !isHidden) {
+    if ((_isMobileViewport() || chatTooNarrow) && !isHidden) {
       sidebar.classList.add('hidden');
       _wasAutoCollapsed = true;
       syncRailSide();
-    } else if (window.innerWidth >= AUTO_COLLAPSE_WIDTH && isHidden && _wasAutoCollapsed) {
+    } else if (!_isMobileViewport() && isHidden && _wasAutoCollapsed) {
       // Only restore if chat won't be too narrow
       sidebar.classList.remove('hidden');
       void document.body.offsetWidth; // reflow
@@ -253,6 +269,13 @@ export function initSidebarLayout(Storage, opts) {
   }
 
   window.addEventListener('resize', () => {
+    const mobile = _isMobileViewport();
+    if (_wasMobileViewport && !mobile && _temporaryMobileRightSide) {
+      _setSidebarRightSide(Storage.get(Storage.KEYS.SIDEBAR_SIDE) === 'right');
+      _temporaryMobileRightSide = false;
+      syncRailSide();
+    }
+    _wasMobileViewport = mobile;
     _userToggledSidebar = false; // allow auto-collapse on actual resize
     requestAnimationFrame(checkSidebarAutoCollapse);
   });
@@ -261,8 +284,7 @@ export function initSidebarLayout(Storage, opts) {
     .observe(document.body, { attributes: true, attributeFilter: ['class'] });
 
   // Auto-collapse on initial load if window is small
-  if (window.innerWidth < AUTO_COLLAPSE_WIDTH) {
-    const sidebar = document.getElementById('sidebar');
+  if (_isMobileViewport()) {
     if (sidebar && !sidebar.classList.contains('hidden')) {
       sidebar.classList.add('hidden');
       _wasAutoCollapsed = true;
@@ -277,7 +299,7 @@ export function initSidebarLayout(Storage, opts) {
   document.body.appendChild(mobileBackdrop);
 
   function updateMobileBackdrop() {
-    if (window.innerWidth >= 768) { mobileBackdrop.classList.remove('visible'); return; }
+    if (!_isMobileViewport()) { mobileBackdrop.classList.remove('visible'); return; }
     const sb = document.getElementById('sidebar');
     const rail = document.getElementById('icon-rail');
     const sidebarOpen = sb && !sb.classList.contains('hidden');
@@ -315,7 +337,6 @@ export function initSidebarLayout(Storage, opts) {
   window.syncRailSide = syncRailSide;
 
   // Swipe sidebar toward edge to close
-  const sidebar = document.getElementById('sidebar');
   if (sidebar && 'ontouchstart' in window) {
     let _swStartX = 0, _swStartY = 0, _swSwiping = false;
     sidebar.addEventListener('touchstart', (e) => {
@@ -343,7 +364,7 @@ export function initSidebarLayout(Storage, opts) {
 
   // ── Click outside sidebar / icon rail to close (mobile only) ──
   document.addEventListener('click', (e) => {
-    if (window.innerWidth >= 700) return; // desktop keeps sidebar open
+    if (!_isMobileViewport()) return; // desktop keeps sidebar open
     const sb = document.getElementById('sidebar');
     const rail = document.getElementById('icon-rail');
     // Ignore clicks on elements removed from DOM (e.g. session list re-render during folder toggle)
@@ -385,7 +406,7 @@ export function initSidebarLayout(Storage, opts) {
   let _sidebarWasOpenBeforeTool = false;
   let _railWasOpenBeforeTool = false;
   document.addEventListener('click', (e) => {
-    if (window.innerWidth >= 700) return;
+    if (!_isMobileViewport()) return;
     const btn = e.target.closest('[id^="tool-"], [id^="rail-"]');
     if (!btn) return;
     setTimeout(() => {
@@ -423,7 +444,7 @@ export function initSidebarLayout(Storage, opts) {
   // whatever state it was in before the tool was opened. ──
   // We watch every .modal for the .hidden class going on, and if our
   // remembered "sidebar-was-open" flag is set, undo the auto-close.
-  if (window.innerWidth < 700) {
+  if (_isMobileViewport()) {
     const _restoreSidebar = () => {
       const sb = document.getElementById('sidebar');
       const rail = document.getElementById('icon-rail');
@@ -502,7 +523,7 @@ function _initChatSwipeToOpenSidebar() {
 
   document.addEventListener('touchstart', (e) => {
     reset();
-    if (window.innerWidth >= 768) return;
+    if (!_isMobileViewport()) return;
     if (!e.touches || e.touches.length !== 1) return;
     if (window._chipDragging) return;
     const sb = document.getElementById('sidebar');

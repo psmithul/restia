@@ -46,12 +46,15 @@ def test_start_close_race_goal_guard_and_drawer_clearance():
           this.hidden = false;
           this.title = '';
           this.placeholder = '';
+          this.dataset = {};
+          this.queryResults = [];
           this.firstElementChild = null;
         }
         setAttribute(name, value) { this.attributes.set(name, String(value)); }
         getAttribute(name) { return this.attributes.has(name) ? this.attributes.get(name) : null; }
         removeAttribute(name) { this.attributes.delete(name); }
         querySelector() { return null; }
+        querySelectorAll() { return this.queryResults; }
         focus() { this.focused = true; }
         click() { this.dispatchEvent(new Event('click')); }
       }
@@ -65,10 +68,19 @@ def test_start_close_race_goal_guard_and_drawer_clearance():
         'study-goal-save', 'study-progress-bar', 'study-progress-value',
         'study-progress-copy', 'study-deadline-copy', 'study-error',
         'study-live-status', 'study-method', 'tool-study-btn', 'rail-study',
+        'study-quick-actions', 'study-review-status', 'study-review-due',
+        'study-review-actions',
         'message', 'welcome-screen', 'chat-container', 'chat-history',
       ];
       const elements = new Map(ids.map(id => [id, new FakeElement(id)]));
       elements.get('study-progress-bar').firstElementChild = new FakeElement('progress-fill');
+      const recallButton = new FakeElement('recall-button');
+      recallButton.textContent = 'Recall sprint';
+      recallButton.dataset.studyPrompt = 'Run a closed-book recall sprint.';
+      elements.get('study-quick-actions').queryResults = [recallButton];
+      const cleanButton = new FakeElement('clean-button');
+      cleanButton.dataset.studyResult = 'clean';
+      elements.get('study-review-actions').queryResults = [cleanButton];
 
       const composerBar = new FakeElement('composer-bar');
       composerBar.getBoundingClientRect = () => ({ top: 700, bottom: 790 });
@@ -112,6 +124,16 @@ def test_start_close_race_goal_guard_and_drawer_clearance():
         timer_running: false,
         timer_seconds: 0,
         total_seconds: 0,
+        review: {
+          level: 0,
+          count: 0,
+          last_result: null,
+          last_reviewed_at: null,
+          next_review_at: null,
+          due: false,
+          due_in_seconds: null,
+          status: 'not_scheduled',
+        },
       };
       const response = payload => ({
         ok: true,
@@ -135,12 +157,40 @@ def test_start_close_race_goal_guard_and_drawer_clearance():
           server.timer_running = false;
           return response({ ...server });
         }
+        if (path.endsWith('/review')) {
+          const payload = JSON.parse(options.body || '{}');
+          events.push(`review:${payload.outcome}`);
+          server.review = {
+            level: 1,
+            count: 1,
+            last_result: payload.outcome,
+            last_reviewed_at: '2026-07-14T09:00:00Z',
+            next_review_at: '2026-07-15T09:00:00Z',
+            due: false,
+            due_in_seconds: 86400,
+            status: 'scheduled',
+          };
+          return response({ ...server });
+        }
         throw new Error(`Unexpected Study request: ${options.method || 'GET'} ${path}`);
       };
 
       const study = await import('./static/js/study.js');
-      study.init('http://study.test');
+      study.init('http://study.test', {
+        getCurrentSessionId: () => 'study-a',
+        getSessions: () => [{ id: 'study-a', name: 'Dynamics', mode: 'study' }],
+      });
       await study.open({ focus: false });
+
+      recallButton.click();
+      cleanButton.click();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await new Promise(resolve => setTimeout(resolve, 0));
+      const recallPrompt = elements.get('message').value;
+      const reviewStatus = elements.get('study-review-status').textContent;
 
       const start = elements.get('study-timer-start');
       const goal = elements.get('study-goal-text');
@@ -175,6 +225,8 @@ def test_start_close_race_goal_guard_and_drawer_clearance():
         dirtyDisablesStart,
         drawerBottom,
         refreshedTotal,
+        recallPrompt,
+        reviewStatus,
         events,
         closed,
         reopened,
@@ -198,7 +250,9 @@ def test_start_close_race_goal_guard_and_drawer_clearance():
         "dirtyDisablesStart": True,
         "drawerBottom": "112px",
         "refreshedTotal": "2m",
-        "events": ["state", "state", "start", "pause", "state"],
+        "recallPrompt": "Run a closed-book recall sprint.",
+        "reviewStatus": "Level 1 · 1 evidence check",
+        "events": ["state", "review:clean", "state", "start", "pause", "state"],
         "closed": True,
         "reopened": True,
         "timerRunning": False,

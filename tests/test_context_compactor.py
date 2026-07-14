@@ -231,3 +231,26 @@ class TestResearchPrimerPreserved:
         trimmed = trim_for_context(msgs, context_length=1024, reserve_tokens=256)
         joined = "\n".join(str(m.get("content", "")) for m in trimmed)
         assert "You are Restia." in joined
+
+
+def test_protected_context_is_not_double_counted_when_sizing_current_turn():
+    protected = {
+        "role": "system",
+        "content": "study-contract " + ("p" * 2000),
+        "_protected": True,
+    }
+    current = "current-attempt " + ("c" * 3000)
+    messages = [
+        protected,
+        {"role": "system", "content": "safety policy"},
+        *[
+            {"role": "user", "content": f"old-{index} " + ("x" * 1000)}
+            for index in range(5)
+        ],
+        {"role": "user", "content": current},
+    ]
+
+    trimmed = trim_for_context(messages, context_length=2048, reserve_tokens=256)
+
+    assert any(message is protected for message in trimmed)
+    assert trimmed[-1]["content"] == current

@@ -104,12 +104,25 @@ def test_study_rail_tool_and_panel_dom_contract_is_complete():
         "study-error",
         "study-live-status",
         "study-method",
+        "study-workspace-switcher",
+        "study-workspace-count",
+        "study-new-workspace",
+        "study-rename-workspace",
+        "study-quick-actions",
+        "study-review-status",
+        "study-review-due",
+        "study-review-actions",
+        "study-review-help",
     }
     assert required <= ids, f"missing Study Mode DOM ids: {sorted(required - ids)}"
 
     html = INDEX_HTML.read_text(encoding="utf-8")
     assert 'data-ui-key="tool-study"' in html
     assert 'data-wipe-kind="study"' in html
+    for move in ("Mastery map", "Recall sprint", "Mixed drill", "Transfer test"):
+        assert f">{move}</button>" in html
+    for outcome in ("missed", "hinted", "clean", "transfer"):
+        assert f'data-study-result="{outcome}"' in html
 
 
 def test_index_has_no_duplicate_dom_ids():
@@ -125,19 +138,19 @@ def test_app_imports_initializes_and_routes_the_study_module():
         r"import\s+studyModule\s+from\s+['\"]\./js/study\.js['\"]",
         source,
     )
-    assert re.search(r"\bstudyModule\.init\(\s*API_BASE\s*\)", source)
+    assert re.search(r"\bstudyModule\.init\(\s*API_BASE\s*,", source)
     assert re.search(
         r"['\"]/study['\"]\s*:\s*\(\)\s*=>\s*document\.getElementById\(['\"]tool-study-btn['\"]\)",
         source,
     )
     assert re.search(r"['\"]rail-study['\"]\s*:\s*['\"]tool-study-btn['\"]", source)
     assert re.search(r"toolStudyBtn\.addEventListener\(['\"]click['\"]", source)
-    assert "await studyModule.open()" in source
+    assert "await studyModule.enter()" in source
     assert "await studyModule.close({ startFresh: false })" in source
     assert "'#tool-study-btn, #rail-study'" in source
 
     module = STUDY_JS.read_text(encoding="utf-8")
-    for export in ("init", "open", "close", "isActive", "focus"):
+    for export in ("init", "enter", "open", "close", "beforeSessionSwitch", "isActive", "focus"):
         assert re.search(rf"export\s+(?:async\s+)?function\s+{export}\b", module)
     assert "export default studyModule" in module
 
@@ -169,6 +182,7 @@ def test_chat_formdata_marks_study_and_disables_conflicting_modes():
     )
     assert "allow_bash', el('bash-toggle').checked ? 'true' : 'false'" in source
     assert "reset_progress: resetProgress" in STUDY_JS.read_text(encoding="utf-8")
+    assert "session_id=${encodeURIComponent(workspaceId)}" in STUDY_JS.read_text(encoding="utf-8")
     assert re.search(
         r"if\s*\(\s*!isStudyMode\s*&&\s*presetsModule\.getSelectedPreset\(\)\s*\)",
         source,
@@ -221,8 +235,11 @@ def test_study_release_assets_use_one_cache_key_and_exclude_local_backups():
 
     module = STUDY_JS.read_text(encoding="utf-8")
     assert "_queueMutation" in module
-    assert "() => _request('/timer/pause', { method: 'POST' })" in module
+    assert "() => _request('/timer/pause', { method: 'POST' }, previousId)" in module
+    assert "() => _request('/timer/pause', { method: 'POST' }, closingSessionId)" in module
     assert "ResizeObserver(_syncDrawerClearance)" in module
+    assert "_request('/review'" in module
+    assert "querySelectorAll('[data-study-result]')" in module
 
     admin = ADMIN_JS.read_text(encoding="utf-8")
     assert re.search(r"\bstudy:\s*['\"]study goals and timer progress", admin)

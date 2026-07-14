@@ -218,8 +218,8 @@
       if (k) k.addEventListener('load', function(){ k.media = 'all'; }, { once: true });
     })();
   </script>
-  <link rel="stylesheet" href="/static/style.css?v=20260714studyfix">
-  <link rel="modulepreload" href="/static/app.js?v=20260714studyfix">
+  <link rel="stylesheet" href="/static/style.css?v=20260714masteryloop">
+  <link rel="modulepreload" href="/static/app.js?v=20260714masteryloop">
   <link rel="modulepreload" href="/static/js/chat.js">
   <link rel="modulepreload" href="/static/js/ui.js">
   <link rel="modulepreload" href="/static/js/sessions.js">
@@ -916,7 +916,7 @@
           </svg>
           <span class="grow">Notes</span>
         </div>
-        <div class="list-item" id="tool-study-btn">
+        <button type="button" class="list-item" id="tool-study-btn" aria-pressed="false">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
             stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
             style="flex-shrink:0;opacity:0.5;">
@@ -924,7 +924,7 @@
             <path d="M21 5.5c-3-1-6-.5-9 2v13c3-2 6-2.5 9-1.5z"/>
           </svg>
           <span class="grow">Study Mode</span>
-        </div>
+        </button>
         <div class="list-item" id="tool-todos-btn">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
             stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
@@ -1307,6 +1307,22 @@
     </header>
 
     <div id="study-panel-body" class="study-panel-body">
+      <section class="study-workspace-card" aria-labelledby="study-workspace-heading">
+        <div class="study-workspace-label-row">
+          <div class="study-card-label" id="study-workspace-heading">Study workspace</div>
+          <span id="study-workspace-count" class="study-workspace-count">1 workspace</span>
+        </div>
+        <div class="study-workspace-controls">
+          <label class="a11y-visually-hidden" for="study-workspace-switcher">Current Study workspace</label>
+          <select id="study-workspace-switcher" aria-label="Current Study workspace"></select>
+          <button type="button" id="study-rename-workspace" class="study-icon-action" aria-label="Rename Study workspace" title="Rename workspace">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>
+          </button>
+          <button type="button" id="study-new-workspace" class="study-action study-action-primary">+ New</button>
+        </div>
+        <p class="study-workspace-help">Each workspace keeps its own tutor conversation, goal, timer, and progress.</p>
+      </section>
+
       <section class="study-card study-focus-card" aria-labelledby="study-focus-heading">
         <div class="study-card-label" id="study-focus-heading">Current focus block</div>
         <output id="study-timer" class="study-timer" role="timer" aria-label="Current study time">00:00:00</output>
@@ -1340,6 +1356,36 @@
         <p id="study-progress-copy" class="study-progress-copy">Set a goal to see the effort remaining.</p>
         <p id="study-deadline-copy" class="study-deadline-copy"></p>
         <p class="study-mastery-note">Time tracks deliberate practice, not mastery. Your answers in chat are the evidence.</p>
+      </section>
+
+      <section class="study-card study-quick-card" aria-labelledby="study-quick-heading">
+        <div class="study-card-label" id="study-quick-heading">Train, don't just read</div>
+        <div id="study-quick-actions" class="study-quick-actions">
+          <button type="button" class="study-prompt-chip" data-study-prompt="Start with a short diagnostic. Ask one question at a time, find the first missing prerequisite, and do not reveal answers before I attempt.">Diagnose</button>
+          <button type="button" class="study-prompt-chip" data-study-prompt="Build a compact mastery map for this goal: the performance standard, prerequisite order, current evidence, and the highest-leverage next concept. Ask at most two diagnostic questions before we start training.">Mastery map</button>
+          <button type="button" class="study-prompt-chip" data-study-prompt="Run a closed-book recall sprint on the weakest due or unresolved idea in this workspace. Ask one question at a time, require my attempt, and give exact corrective feedback before the retry.">Recall sprint</button>
+          <button type="button" class="study-prompt-chip" data-study-prompt="Give me exactly one minimal hint for the problem we are on, then wait for my next attempt.">One hint</button>
+          <button type="button" class="study-prompt-chip" data-study-prompt="Make me teach the key idea back in my own words. Challenge any vague step with a precise follow-up question.">Teach-back</button>
+          <button type="button" class="study-prompt-chip" data-study-prompt="Give me an interleaved drill that mixes this idea with the most confusable related ideas. Make me choose the right principle before solving, one problem at a time, and do not reveal answers before I attempt.">Mixed drill</button>
+          <button type="button" class="study-prompt-chip" data-study-prompt="Give me a novel transfer problem that tests the same underlying idea in a different setting. Do not show the solution before I attempt.">Transfer test</button>
+          <button type="button" class="study-prompt-chip" data-study-prompt="Based only on evidence from my answers in this chat, summarize what is solid, what is weak, and the highest-leverage next practice. Then schedule a compact retrieval review plan.">Review plan</button>
+        </div>
+        <p class="study-quick-help">Choose a move, edit it if useful, then send. Your tutor stays evidence-led.</p>
+      </section>
+
+      <section class="study-card study-review-card" aria-labelledby="study-review-heading">
+        <div class="study-review-heading-row">
+          <div class="study-card-label" id="study-review-heading">Spaced mastery</div>
+          <strong id="study-review-status">No mastery evidence recorded yet</strong>
+        </div>
+        <p id="study-review-due" class="study-review-due">After a closed-book check, record the evidence here.</p>
+        <div id="study-review-actions" class="study-review-actions" aria-label="Record retrieval evidence" aria-describedby="study-review-help">
+          <button type="button" class="study-review-result" data-study-result="missed"><strong>Missed</strong><span>Bring it back soon</span></button>
+          <button type="button" class="study-review-result" data-study-result="hinted"><strong>With hint</strong><span>Review within a day</span></button>
+          <button type="button" class="study-review-result" data-study-result="clean"><strong>Clean</strong><span>Expand the interval</span></button>
+          <button type="button" class="study-review-result" data-study-result="transfer"><strong>Transfer</strong><span>Novel use succeeded</span></button>
+        </div>
+        <p id="study-review-help" class="study-quick-help">Record observed performance after Restia checks you—not how familiar the material feels.</p>
       </section>
 
       <section id="study-method" class="study-card study-method" aria-labelledby="study-method-heading">
@@ -2637,7 +2683,7 @@
 <script type="module" src="/static/js/settings.js"></script>
 <script type="module" src="/static/js/admin.js"></script>
 <script type="module" src="/static/js/assistant.js"></script>
-<script type="module" src="/static/app.js?v=20260714studyfix"></script>  <!-- app.js must be LAST -->
+<script type="module" src="/static/app.js?v=20260714masteryloop"></script>  <!-- app.js must be LAST -->
 <script type="module" src="/static/js/init.js"></script>
 <script type="module" src="/static/js/a11y.js"></script>
 <script type="module" src="/static/js/updateChecker.js"></script>

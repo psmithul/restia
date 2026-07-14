@@ -2,13 +2,51 @@
 // Section Management — collapse/expand + drag reorder
 // ============================================
 
+function _collapsedStateKey(Storage) {
+  return Storage?.KEYS?.SIDEBAR_COLLAPSED || 'sidebar-collapsed';
+}
+
+function _sectionLabel(section) {
+  const label = section?.querySelector?.('.section-title-label, .section-title, h4');
+  return String(label?.textContent || 'section').trim() || 'section';
+}
+
+function _syncCollapseControl(section, collapsed) {
+  const button = section?.querySelector?.('.section-collapse-btn');
+  if (!button) return;
+  const action = collapsed ? 'Expand' : 'Collapse';
+  const label = `${action} ${_sectionLabel(section)}`;
+  button.setAttribute('aria-expanded', String(!collapsed));
+  button.setAttribute('aria-label', label);
+  button.title = label;
+}
+
+/** Apply and persist a section state without playing the domino animation. */
+export function setSidebarSectionCollapsed(Storage, section, collapsed) {
+  if (!section?.id) return false;
+  const next = Boolean(collapsed);
+  const key = _collapsedStateKey(Storage);
+  const state = Storage.getJSON(key, {}) || {};
+  state[section.id] = next;
+  Storage.setJSON(key, state);
+
+  // Cancel callbacks from an in-flight title/chevron animation before an
+  // external control (for example the icon rail) applies authoritative state.
+  section._collapseGen = (section._collapseGen || 0) + 1;
+  section.classList.remove('section-just-expanded', 'section-just-collapsing');
+  section.classList.toggle('collapsed', next);
+  _syncCollapseControl(section, next);
+  return true;
+}
+
 /**
  * Initialize section collapse/expand with chevron buttons.
  * @param {Object} Storage - Storage module
  */
 export function initSectionCollapse(Storage) {
-  const _chevronHtml = '<button type="button" class="section-collapse-btn" title="Collapse section"><svg class="section-collapse-chevron" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg></button>';
-  const savedState = Storage.getJSON('section-collapsed') || {};
+  const _chevronHtml = '<button type="button" class="section-collapse-btn"><svg class="section-collapse-chevron" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg></button>';
+  const collapsedKey = _collapsedStateKey(Storage);
+  const savedState = Storage.getJSON(collapsedKey, {}) || {};
 
   document.querySelectorAll('.section .section-header-flex').forEach(header => {
     const section = header.closest('.section');
@@ -17,20 +55,25 @@ export function initSectionCollapse(Storage) {
     // Skip email section — it doesn't collapse (title opens popup instead)
     if (section.id === 'email-section') return;
 
-    // Add chevron (always visible — rotates when collapsed)
-    header.insertAdjacentHTML('beforeend', _chevronHtml);
+    // Add chevron (always visible — rotates when collapsed). Guard the control
+    // itself in case another initializer already supplied it.
+    if (!header.querySelector('.section-collapse-btn')) {
+      header.insertAdjacentHTML('beforeend', _chevronHtml);
+    }
 
     // Restore saved state
     if (savedState[section.id]) {
       section.classList.add('collapsed');
     }
+    _syncCollapseControl(section, section.classList.contains('collapsed'));
 
     function toggleCollapse() {
       const wasCollapsed = section.classList.contains('collapsed');
       const willCollapse = !wasCollapsed;
-      const state = Storage.getJSON('section-collapsed') || {};
+      const state = Storage.getJSON(collapsedKey, {}) || {};
       state[section.id] = willCollapse;
-      Storage.setJSON('section-collapsed', state);
+      Storage.setJSON(collapsedKey, state);
+      _syncCollapseControl(section, willCollapse);
 
       // Always clear any in-flight animation classes from a previous toggle
       // so back-to-back clicks restart cleanly. Bump a generation token so
@@ -57,6 +100,7 @@ export function initSectionCollapse(Storage) {
           if (section._collapseGen !== gen) return; // superseded by a newer toggle
           section.classList.remove('section-just-collapsing');
           section.classList.add('collapsed');
+          _syncCollapseControl(section, true);
         };
         // Only the domino-out keyframes gate the collapse — ignore unrelated
         // (and possibly infinite, e.g. spinners) animations in the subtree.
@@ -73,6 +117,7 @@ export function initSectionCollapse(Storage) {
       } else {
         // Expand path — remove .collapsed and replay the inbound domino.
         section.classList.remove('collapsed');
+        _syncCollapseControl(section, false);
         // eslint-disable-next-line no-unused-expressions
         section.offsetHeight;
         section.classList.add('section-just-expanded');

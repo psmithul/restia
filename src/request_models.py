@@ -132,6 +132,7 @@ class SessionResponse(BaseModel):
     model: str = Field(..., description="Model being used")
     rag: bool = Field(default=False, description="RAG enabled")
     archived: bool = Field(default=False, description="Whether session is archived")
+    mode: Optional[str] = Field(default=None, description="Persisted chat mode")
 
 
 class MemoryResponse(BaseModel):

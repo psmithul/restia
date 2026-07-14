@@ -15,6 +15,7 @@ from pathlib import Path
 
 
 _CHAT_ROUTES = Path(__file__).resolve().parents[1] / "routes" / "chat_routes.py"
+_CHAT_HELPERS = Path(__file__).resolve().parents[1] / "routes" / "chat_helpers.py"
 
 
 def _chat_stream_tree():
@@ -295,6 +296,24 @@ def test_study_mode_is_forwarded_to_context_and_persisted():
         parent = parents.get(parent)
     assert isinstance(parent, ast.If)
     assert "'study'" in ast.unparse(parent.test).replace('"', "'")
+
+
+def test_study_context_uses_the_current_chat_session_id():
+    source = _CHAT_HELPERS.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(_CHAT_HELPERS))
+    function = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "build_chat_context"
+    )
+    call = next(
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and _call_name(node) == "study_context_messages_for_owner"
+    )
+
+    assert [ast.unparse(argument) for argument in call.args] == ["user", "session_id"]
 
 
 def test_research_pending_auto_trigger_is_disabled_for_study_mode():
