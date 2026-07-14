@@ -68,6 +68,7 @@ def test_telegram_digest_seeded_hourly_and_registered():
     assert '"telegram_hourly_digest": "Send an hourly Telegram digest' in actions
     assert '"telegram_hourly_digest": {"name": "Telegram Hourly Digest"' in scheduler
     assert '"cron_expression": "0 * * * *"' in scheduler
+    assert '"telegram_hourly_digest": {"name": "Telegram Hourly Digest",  "schedule": "cron",  "scheduled_time": None,    "cron_expression": "0 * * * *", "ship_paused": True' in scheduler
 
 
 def test_telegram_digest_reads_local_email_index_not_imap():

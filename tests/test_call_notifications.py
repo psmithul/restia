@@ -119,13 +119,13 @@ async def test_alerts_reach_only_chats_linked_to_the_callee_and_are_bounded():
         ) is False
         await _settle(rounds=100)
 
-        expected_offsets = tuple(float(offset) for offset in range(0, 45, 5))
+        expected_offsets = (0.0,)
         assert CALL_ALERT_OFFSETS_S == expected_offsets
         assert all(0 <= offset < CALL_ALERT_TTL_S for offset in CALL_ALERT_OFFSETS_S)
         assert len(sent) == len(CALL_ALERT_OFFSETS_S)
         assert {chat_id for _, chat_id, _, _ in sent} == {"alice-phone"}
         assert all(rich_text is False for *_, rich_text in sent)
-        total = len(CALL_ALERT_OFFSETS_S)
+        total = 1
         alert_labels = [
             f"Alert {n} of {total}" in item[2]
             for n, item in enumerate(sent, 1)

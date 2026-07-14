@@ -30,6 +30,10 @@ _BOLD_RE = re.compile(r"(\*\*|__)([^\n]+?)\1")
 _STRIKE_RE = re.compile(r"~~([^\n]+?)~~")
 _HEADING_RE = re.compile(r"(?m)^(#{1,6})\s+(.+)$")
 _QUOTE_RE = re.compile(r"(?m)^&gt;\s?(.+)$")
+_telegram_rate_limit_lock = threading.RLock()
+_telegram_rate_limit_until: dict[str, float] = {}
+_TELEGRAM_RATE_LIMIT_FALLBACK_SECONDS = 30
+_TELEGRAM_RATE_LIMIT_MAX_SECONDS = 3600
 
 
 class TelegramDeliveryError(RuntimeError):
@@ -423,6 +427,19 @@ async def send_telegram_message(
 ) -> None:
     if not bot_token:
         raise ValueError("Telegram bot token is not configured")
+    cooldown_key = hashlib.sha256(
+        f"{bot_token}\0{chat_id}".encode("utf-8")
+    ).hexdigest()
+    now = time.monotonic()
+    with _telegram_rate_limit_lock:
+        blocked_until = _telegram_rate_limit_until.get(cooldown_key, 0.0)
+        if blocked_until <= now:
+            _telegram_rate_limit_until.pop(cooldown_key, None)
+            blocked_until = 0.0
+    if blocked_until:
+        bot_token = ""
+        raise TelegramDeliveryError("Telegram API rate limit cooldown is active") from None
+
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     token_filter, filter_targets = _install_telegram_log_filter(bot_token)
     failure: str | None = None
@@ -442,7 +459,27 @@ async def send_telegram_message(
                 response = await client.post(url, json=payload)
                 status = int(getattr(response, "status_code", 200))
                 if status < 200 or status >= 300:
-                    failure = f"Telegram API request failed with HTTP {status}"
+                    if status == 429:
+                        retry_after = _TELEGRAM_RATE_LIMIT_FALLBACK_SECONDS
+                        try:
+                            body = response.json()
+                            retry_after = int(
+                                ((body or {}).get("parameters") or {}).get("retry_after")
+                                or retry_after
+                            )
+                        except Exception:
+                            pass
+                        retry_after = max(
+                            1,
+                            min(retry_after, _TELEGRAM_RATE_LIMIT_MAX_SECONDS),
+                        )
+                        with _telegram_rate_limit_lock:
+                            _telegram_rate_limit_until[cooldown_key] = (
+                                time.monotonic() + retry_after
+                            )
+                        failure = "Telegram API rate limited; retry later"
+                    else:
+                        failure = f"Telegram API request failed with HTTP {status}"
                     break
                 first = False
     except httpx.HTTPError as exc:

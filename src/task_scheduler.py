@@ -248,7 +248,7 @@ HOUSEKEEPING_DEFAULTS = {
     "extract_email_events": {"name": "Email Calendar Events",    "schedule": "cron",  "scheduled_time": None,    "cron_expression": "0 */1 * * *", "ship_paused": True, "legacy_names": ["Email → Calendar Events"]},
     "classify_events":      {"name": "Calendar Classify Events", "schedule": "cron",  "scheduled_time": None,    "cron_expression": "0 6,18 * * *", "ship_paused": True, "legacy_names": ["Classify Calendar Events"]},
     "check_email_urgency":   {"name": "Email Tags",               "schedule": "cron",  "scheduled_time": None,    "cron_expression": "0 * * * *", "ship_paused": True, "old_cron_expressions": ["*/15 * * * *"], "legacy_names": ["Email Triage", "Urgent Email"]},
-    "telegram_hourly_digest": {"name": "Telegram Hourly Digest",  "schedule": "cron",  "scheduled_time": None,    "cron_expression": "0 * * * *", "legacy_names": ["Telegram Digest"]},
+    "telegram_hourly_digest": {"name": "Telegram Hourly Digest",  "schedule": "cron",  "scheduled_time": None,    "cron_expression": "0 * * * *", "ship_paused": True, "legacy_names": ["Telegram Digest"]},
     "audit_skills":          {"name": "Skills Audit",             "trigger_type": "event", "trigger_event": "skill_added", "trigger_count": 5, "schedule": None, "scheduled_time": None, "cron_expression": None, "legacy_names": ["Audit Skills"]},
 }
 
@@ -356,6 +356,7 @@ class TaskScheduler:
         self._run_semaphore = asyncio.Semaphore(1)
         self._concurrency_cap = 1
         self._task_handles = {}
+        self._scheduler_disabled_reason = None
 
     def _set_run_progress(self, run_id: str, message: str):
         """Persist short live progress text for Activity while a run is active."""
@@ -461,6 +462,28 @@ class TaskScheduler:
         return take
 
     async def start(self):
+        # Scheduled jobs can call external systems. Never start those side
+        # effects when SQLite cannot prove its own integrity: a corrupt task
+        # ledger can otherwise leave ``next_run`` overdue after a successful
+        # delivery and re-dispatch it on every scheduler tick.
+        try:
+            from core.database import engine
+
+            if engine.dialect.name == "sqlite":
+                with engine.connect() as connection:
+                    rows = connection.exec_driver_sql("PRAGMA quick_check").fetchmany(2)
+                if len(rows) != 1 or str(rows[0][0]).strip().lower() != "ok":
+                    raise RuntimeError("SQLite integrity check did not return ok")
+        except Exception:
+            self._running = False
+            self._scheduler_disabled_reason = "database_integrity"
+            logger.error(
+                "Task scheduler disabled: database integrity check failed; "
+                "outbound scheduled notifications will not run"
+            )
+            return False
+
+        self._scheduler_disabled_reason = None
         # On startup, mark any leftover "running" task_runs as errored. Without
         # this, a server crash leaves rows stuck running indefinitely and the
         # _executing in-memory set forgets them, so the UI shows phantoms.
@@ -486,7 +509,13 @@ class TaskScheduler:
             finally:
                 db.close()
         except Exception as e:
-            logger.warning(f"Could not clear stale task_runs on startup: {e}")
+            self._running = False
+            self._scheduler_disabled_reason = "task_ledger_unavailable"
+            logger.error(
+                "Task scheduler disabled: task ledger recovery failed; "
+                "outbound scheduled notifications will not run"
+            )
+            return False
 
         # Advance next_run for active tasks whose next_run is already in the
         # past. Without this, a restart hits _check_due_tasks() with an empty
@@ -513,7 +542,13 @@ class TaskScheduler:
             finally:
                 db.close()
         except Exception as e:
-            logger.warning(f"Could not advance overdue next_run on startup: {e}")
+            self._running = False
+            self._scheduler_disabled_reason = "schedule_checkpoint_unavailable"
+            logger.error(
+                "Task scheduler disabled: overdue schedule checkpoint failed; "
+                "outbound scheduled notifications will not run"
+            )
+            return False
 
         # Defense-in-depth dedupe sweep: for any owner with >1 rows where
         # is_default_assistant=True, keep the oldest and demote the rest +
@@ -592,6 +627,7 @@ class TaskScheduler:
                 db.close()
         except Exception as e:
             logger.debug(f"Cluster audit skipped: {e}")
+        return True
 
     async def stop(self):
         self._running = False
@@ -681,10 +717,18 @@ class TaskScheduler:
     async def _loop(self):
         await asyncio.sleep(10)
         while self._running:
+            check_failed = False
             try:
                 await self._check_due_tasks()
             except Exception:
+                check_failed = True
                 logger.exception("Error in task scheduler loop")
+            if check_failed:
+                # A stale due timestamp makes the normal wake-up calculation
+                # collapse to one second. Back off explicitly on persistence
+                # failures so an unhealthy ledger cannot become a busy loop.
+                await asyncio.sleep(60)
+                continue
             # Sleep until the next scheduled run, capped at 60s. A `* * * * *`
             # cron task previously fired up to ~60s late because we always
             # slept the full minute; now the loop wakes near the boundary.
@@ -726,19 +770,53 @@ class TaskScheduler:
                     ScheduledTask.next_run <= now,
                     ScheduledTask.id.notin_(executing_snapshot) if executing_snapshot else True,
                 ).all()
-                to_dispatch = []
+                claimed_ids = []
                 for task in due:
                     if task.id in self._executing:
                         continue
                     if foreground_active:
-                        task.next_run = now + timedelta(minutes=15)
+                        claimed_next_run = now + timedelta(minutes=15)
+                    elif (getattr(task, "trigger_type", None) or "schedule") == "schedule":
+                        claimed_next_run = compute_next_run(
+                            getattr(task, "schedule", None),
+                            getattr(task, "scheduled_time", None),
+                            getattr(task, "scheduled_day", None),
+                            getattr(task, "scheduled_date", None),
+                            after=now,
+                            cron_expression=getattr(task, "cron_expression", None),
+                            tz_name=_resolve_task_timezone(db, task),
+                        )
+                    else:
+                        # Deferred event tasks use next_run as a one-shot wakeup.
+                        claimed_next_run = None
+
+                    scheduled_for = task.next_run
+                    updated = db.query(ScheduledTask).filter(
+                        ScheduledTask.id == task.id,
+                        ScheduledTask.status == "active",
+                        ScheduledTask.next_run == scheduled_for,
+                    ).update(
+                        {ScheduledTask.next_run: claimed_next_run},
+                        synchronize_session=False,
+                    )
+                    if updated != 1:
                         continue
-                    self._executing.add(task.id)
-                    to_dispatch.append(task.id)
-                if foreground_active and due:
+                    if not foreground_active:
+                        claimed_ids.append(task.id)
+
+                # This commit is the durable occurrence claim. No task is put
+                # in the in-memory execution set and no external action starts
+                # unless the checkpoint is safely persisted. The conditional
+                # UPDATE also gives multiple Restia processes a single winner.
+                if due:
                     db.commit()
-            for task_id in to_dispatch:
+                for task_id in claimed_ids:
+                    self._executing.add(task_id)
+            for task_id in claimed_ids:
                 asyncio.create_task(self._execute_task(task_id))
+        except Exception:
+            db.rollback()
+            raise
         finally:
             db.close()
 
@@ -753,6 +831,7 @@ class TaskScheduler:
             self._task_handles[task_id] = current
         run_id = str(uuid.uuid4())
         _q_db = SessionLocal()
+        queued_persisted = False
         try:
             run = TaskRun(
                 id=run_id,
@@ -763,10 +842,23 @@ class TaskScheduler:
             )
             _q_db.add(run)
             _q_db.commit()
+            queued_persisted = True
         except Exception:
-            logger.exception(f"Failed to create queued run row for task {task_id}")
+            logger.exception(
+                "Failed to create queued run row for task %s; refusing to execute side effects",
+                task_id,
+            )
         finally:
             _q_db.close()
+
+        if not queued_persisted:
+            handle = self._task_handles.get(task_id)
+            if handle is current:
+                self._task_handles.pop(task_id, None)
+            if release_executing:
+                async with self._executing_lock:
+                    self._executing.discard(task_id)
+            return
 
         try:
             if bypass_model_slot or not self._task_needs_model_slot(task_id):
@@ -1096,6 +1188,14 @@ class TaskScheduler:
 
         except Exception as exec_exc:
             logger.exception(f"Task {task_id} execution error")
+            # SQLAlchemy sessions enter a failed transaction state after a
+            # flush/commit error. Roll back before any recovery query; without
+            # this every query below raises PendingRollbackError and skips the
+            # independent recovery transaction.
+            try:
+                db.rollback()
+            except Exception:
+                pass
             # Fetch the task's owner so the error notification reaches
             # the same user the success notification would have.
             _owner = None

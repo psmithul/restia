@@ -200,6 +200,39 @@ async def test_send_telegram_message_redacts_caught_http_status_error(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_send_telegram_message_opens_cooldown_after_rate_limit(monkeypatch):
+    import src.telegram_bot as telegram_bot
+
+    token = "test-only-token:rate-limit"
+    calls = 0
+    real_client = httpx.AsyncClient
+
+    async def handler(request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            429,
+            json={"ok": False, "parameters": {"retry_after": 90}},
+            request=request,
+        )
+
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(
+        "src.telegram_bot.httpx.AsyncClient",
+        lambda *args, **kwargs: real_client(*args, transport=transport, **kwargs),
+    )
+    telegram_bot._telegram_rate_limit_until.clear()
+
+    with pytest.raises(TelegramDeliveryError, match="rate limited"):
+        await send_telegram_message(token, "111", "hello")
+    with pytest.raises(TelegramDeliveryError, match="cooldown is active"):
+        await send_telegram_message(token, "111", "hello again")
+
+    assert calls == 1
+    telegram_bot._telegram_rate_limit_until.clear()
+
+
+@pytest.mark.asyncio
 async def test_send_telegram_message_redacts_caught_transport_error(monkeypatch):
     token = "test-only-token:transport-error"
     real_client = httpx.AsyncClient

@@ -1,16 +1,5 @@
-"""Validator + regression test for FINDING 6.2 — restart double-fires overdue
-scheduled tasks.
-
-Demonstrates the bug: TaskScheduler.start() aborts stale TaskRun rows but never
-advances ScheduledTask.next_run, so the in-memory _executing guard resets
-across a restart and _check_due_tasks will re-dispatch any task whose
-next_run is still in the past.
-
-After the fix (start() advances overdue next_run to now + 60s), the regression
-test asserts the opposite: the task fires at most once across two consecutive
-polls.
-"""
-import sys, types, asyncio
+"""Scheduler persistence and at-most-once occurrence claim regressions."""
+import asyncio
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 from sqlalchemy import create_engine, Column, String, DateTime, Integer, Boolean, Text
@@ -22,11 +11,10 @@ def _test_utcnow():
 
 
 def _stub_heavy():
-    for name in [
-        "src.builtin_actions", "src.ai_interaction", "src.endpoint_resolver",
-        "src.agent_loop", "src.session_manager",
-    ]:
-        sys.modules.setdefault(name, types.ModuleType(name))
+    # TaskScheduler imports heavyweight workers lazily inside execution paths;
+    # these persistence tests never enter them. Keeping fake modules in
+    # sys.modules leaked into later Telegram tests in the same pytest process.
+    return None
 
 
 def _setup_isolated_db():
@@ -40,6 +28,13 @@ def _setup_isolated_db():
         name = Column(String, default="t")
         prompt = Column(Text)
         task_type = Column(String, default="llm")
+        trigger_type = Column(String, default="schedule")
+        schedule = Column(String)
+        scheduled_time = Column(String)
+        scheduled_day = Column(Integer)
+        scheduled_date = Column(DateTime)
+        cron_expression = Column(String)
+        crew_member_id = Column(String)
         next_run = Column(DateTime, index=True)
         last_run = Column(DateTime)
         status = Column(String, default="active")
@@ -52,6 +47,7 @@ def _setup_isolated_db():
         started_at = Column(DateTime)
         finished_at = Column(DateTime)
         status = Column(String, default="queued")
+        result = Column(Text)
         error = Column(Text)
 
     eng = create_engine("sqlite:///:memory:")
@@ -100,6 +96,7 @@ def _drive_scheduler(monkeypatch, pre_start_setup=None):
     dispatched = []
     def _fake_create_task(coro):
         dispatched.append(coro)
+        coro.close()
         class _T:
             def cancel(self): pass
         return _T()
@@ -201,3 +198,150 @@ def test_startup_does_not_advance_paused_tasks(monkeypatch):
         f"Paused task's next_run was modified: "
         f"expected ~{one_hour_ago}, got {t.next_run}"
     )
+
+
+def test_due_occurrence_is_persistently_claimed_before_dispatch(monkeypatch):
+    """A fresh scheduler instance must see the advanced checkpoint, not replay."""
+    _stub_heavy()
+    cd, ScheduledTask, _ = _setup_isolated_db()
+    from src.task_scheduler import TaskScheduler
+
+    due_at = _test_utcnow() - timedelta(minutes=1)
+    db = cd.SessionLocal()
+    db.add(ScheduledTask(
+        id="telegram_digest", owner="alice", name="Telegram Hourly Digest",
+        task_type="action", trigger_type="schedule", schedule="cron",
+        cron_expression="0 * * * *", next_run=due_at, status="active",
+    ))
+    db.commit()
+    db.close()
+
+    dispatched = []
+
+    def _capture(coro):
+        dispatched.append(coro)
+        coro.close()
+
+        class _Done:
+            def done(self):
+                return True
+
+        return _Done()
+
+    monkeypatch.setattr("src.task_scheduler.asyncio.create_task", _capture)
+
+    async def _drive():
+        first = TaskScheduler(session_manager=None)
+        second = TaskScheduler(session_manager=None)
+        await asyncio.gather(
+            first._check_due_tasks(),
+            second._check_due_tasks(),
+        )
+
+    asyncio.run(_drive())
+
+    db = cd.SessionLocal()
+    task = db.query(ScheduledTask).filter(ScheduledTask.id == "telegram_digest").one()
+    db.close()
+    assert task.next_run > _test_utcnow()
+    assert len(dispatched) == 1
+
+
+def test_failed_occurrence_claim_dispatches_no_external_action(monkeypatch):
+    """If the durable checkpoint cannot commit, fail closed before execution."""
+    _stub_heavy()
+    cd, ScheduledTask, _ = _setup_isolated_db()
+    from src.task_scheduler import TaskScheduler
+
+    due_at = _test_utcnow() - timedelta(minutes=1)
+    db = cd.SessionLocal()
+    db.add(ScheduledTask(
+        id="telegram_digest", owner="alice", name="Telegram Hourly Digest",
+        task_type="action", trigger_type="schedule", schedule="cron",
+        cron_expression="0 * * * *", next_run=due_at, status="active",
+    ))
+    db.commit()
+    db.close()
+
+    real_factory = cd.SessionLocal
+
+    class _CommitFailure:
+        def __init__(self):
+            self._session = real_factory()
+
+        def __getattr__(self, name):
+            return getattr(self._session, name)
+
+        def commit(self):
+            raise RuntimeError("database checkpoint unavailable")
+
+    monkeypatch.setattr(cd, "SessionLocal", _CommitFailure)
+    dispatched = []
+    monkeypatch.setattr(
+        "src.task_scheduler.asyncio.create_task",
+        lambda coro: dispatched.append(coro),
+    )
+
+    scheduler = TaskScheduler(session_manager=None)
+    try:
+        asyncio.run(scheduler._check_due_tasks())
+    except RuntimeError as exc:
+        assert "checkpoint unavailable" in str(exc)
+    else:
+        raise AssertionError("claim failure should be surfaced")
+
+    assert dispatched == []
+
+
+def test_failed_run_row_write_refuses_to_execute_side_effects(monkeypatch):
+    """No durable TaskRun row means no action, even after a schedule claim."""
+    _stub_heavy()
+    cd, _, _ = _setup_isolated_db()
+    from src.task_scheduler import TaskScheduler
+
+    class _BrokenLedger:
+        def add(self, _row):
+            pass
+
+        def commit(self):
+            raise RuntimeError("task ledger is corrupt")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(cd, "SessionLocal", _BrokenLedger)
+    scheduler = TaskScheduler(session_manager=None)
+    scheduler._executing.add("telegram_digest")
+    executed = []
+
+    async def _must_not_run(*args, **kwargs):
+        executed.append((args, kwargs))
+
+    monkeypatch.setattr(scheduler, "_execute_task_locked", _must_not_run)
+    asyncio.run(scheduler._execute_task("telegram_digest", bypass_model_slot=True))
+
+    assert executed == []
+    assert "telegram_digest" not in scheduler._executing
+
+
+def test_start_fails_closed_when_sqlite_integrity_check_fails(monkeypatch):
+    _stub_heavy()
+    cd, _, _ = _setup_isolated_db()
+    from src.task_scheduler import TaskScheduler
+
+    class _BrokenConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def exec_driver_sql(self, _sql):
+            raise RuntimeError("database disk image is malformed")
+
+    monkeypatch.setattr(cd.engine, "connect", lambda: _BrokenConnection())
+    scheduler = TaskScheduler(session_manager=None)
+
+    assert asyncio.run(scheduler.start()) is False
+    assert scheduler._running is False
+    assert scheduler._scheduler_disabled_reason == "database_integrity"
