@@ -2,6 +2,7 @@
 // ES6 module — extracted from index.html inline scripts
 
 import Storage from './storage.js';
+import { syncSidebarSectionCollapseControl } from './section-management.js';
 
 function clearFreshComposerRestore() {
   const msgInput = document.getElementById('message');
@@ -99,6 +100,10 @@ window.addEventListener('pageshow', clearFreshComposerRestore);
     if (!id) return;
     const shouldCollapse = (id in saved) ? saved[id] : !!_defaultCollapsed[id];
     if (shouldCollapse) section.classList.add('collapsed');
+    else section.classList.remove('collapsed');
+    // app.js can initialize the controls before this module restores the
+    // canonical class. Reconcile the accessible name in either module order.
+    syncSidebarSectionCollapseControl(section);
   });
   // Sessions-section notification dot: clear when the section becomes
   // expanded. Watch the class with MutationObserver so we don't need a

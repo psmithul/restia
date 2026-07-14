@@ -1364,6 +1364,34 @@ body.bg-pattern-sparkles {
     .section-collapse-btn:hover .section-collapse-chevron { opacity: 0.6; }
     .section.collapsed .section-collapse-chevron { transform: rotate(-90deg); opacity: 0.5; }
     .section-header-flex:has(.section-header-btn) .section-collapse-btn { display: none; }
+    /* Chats has both Manage and Sort actions, but its expanded/collapsed state
+       is important navigation state in its own right. Keep the dedicated,
+       keyboard-labelled toggle available instead of making the title text the
+       only way to collapse the section. The fixed target also prevents the
+       action cluster from squeezing the chevron out at narrow sidebar widths. */
+    #sessions-section .section-collapse-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex: 0 0 28px;
+      width: 28px;
+      height: 28px;
+      margin-block: -8px;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    #sessions-section .section-collapse-btn:focus-visible {
+      outline: 2px solid var(--accent, var(--red));
+      outline-offset: 1px;
+    }
+    @media (max-width: 768px) {
+      #sessions-section .section-collapse-btn {
+        flex-basis: 44px;
+        width: 44px;
+        height: 44px;
+        margin-block: -12px;
+      }
+    }
     .section.collapsed .section-collapse-btn { display: inline-flex !important; }
 
     /* Collapsed state */

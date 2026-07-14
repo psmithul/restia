@@ -21,6 +21,13 @@ function _syncCollapseControl(section, collapsed) {
   button.title = label;
 }
 
+/** Reconcile a section toggle after another initializer restores its class. */
+export function syncSidebarSectionCollapseControl(section) {
+  if (!section) return false;
+  _syncCollapseControl(section, section.classList.contains('collapsed'));
+  return true;
+}
+
 /** Apply and persist a section state without playing the domino animation. */
 export function setSidebarSectionCollapsed(Storage, section, collapsed) {
   if (!section?.id) return false;

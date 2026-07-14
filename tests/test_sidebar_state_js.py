@@ -89,6 +89,42 @@ def test_rail_section_expansion_uses_canonical_state_and_updates_aria():
     }
 
 
+def test_restored_collapsed_section_reconciles_accessible_toggle_name():
+    values = _node_eval(
+        """
+        import { syncSidebarSectionCollapseControl } from './static/js/section-management.js';
+
+        const attributes = new Map();
+        const button = {
+          title: '',
+          setAttribute(name, value) { attributes.set(name, String(value)); },
+        };
+        const title = { textContent: 'Chats' };
+        const section = {
+          classList: { contains(name) { return name === 'collapsed'; } },
+          querySelector(selector) {
+            return selector === '.section-collapse-btn' ? button : title;
+          },
+        };
+
+        const changed = syncSidebarSectionCollapseControl(section);
+        console.log(JSON.stringify({
+          changed,
+          expanded: attributes.get('aria-expanded'),
+          label: attributes.get('aria-label'),
+          title: button.title,
+        }));
+        """
+    )
+
+    assert values == {
+        "changed": True,
+        "expanded": "false",
+        "label": "Expand Chats",
+        "title": "Expand Chats",
+    }
+
+
 def test_sidebar_uses_one_inclusive_mobile_breakpoint_and_migrates_legacy_state():
     layout = (ROOT / "static/js/sidebar-layout.js").read_text(encoding="utf-8")
     init = (ROOT / "static/js/init.js").read_text(encoding="utf-8")
@@ -100,3 +136,22 @@ def test_sidebar_uses_one_inclusive_mobile_breakpoint_and_migrates_legacy_state(
     assert "Storage.get(Storage.KEYS.SIDEBAR_SIDE) === 'right'" in layout
     assert "Storage.getJSON('section-collapsed', null)" in init
     assert "Storage.setJSON(KEY, saved)" in init
+
+
+def test_chats_collapse_control_stays_visible_beside_header_actions():
+    """Manage/sort controls must not hide the keyboard collapse target."""
+
+    css = (ROOT / "static/style.css").read_text(encoding="utf-8")
+    html = (ROOT / "static/index.html").read_text(encoding="utf-8")
+    service_worker = (ROOT / "static/sw.js").read_text(encoding="utf-8")
+
+    generic_hide = ".section-header-flex:has(.section-header-btn) .section-collapse-btn { display: none; }"
+    chats_override = "#sessions-section .section-collapse-btn {"
+    assert generic_hide in css
+    assert chats_override in css
+    assert css.index(chats_override) > css.index(generic_hide)
+    assert "flex: 0 0 28px" in css
+    assert "flex-basis: 44px" in css
+    assert "#sessions-section .section-collapse-btn:focus-visible" in css
+    assert "/static/style.css?v=20260714sidebarcontrol" in html
+    assert "const CACHE_NAME = 'restia-v353'" in service_worker
