@@ -865,6 +865,36 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
       }
     }
 
+    // A Study workspace derives its durable goal/title from the first real
+    // prompt. Persist that before the chat request builds tutor context. The
+    // streaming endpoint repeats the same idempotent initialization, so a
+    // transient preflight failure never eats the user's message.
+    const preparingSessionId = sessionModule.getCurrentSessionId();
+    if (window.studyModule?.prepareFirstPrompt) {
+      try {
+        _sendPerf.mark('study_initialize_begin');
+        await window.studyModule.prepareFirstPrompt(msg, { sessionId: preparingSessionId });
+        _sendPerf.mark('study_initialize_done');
+      } catch (error) {
+        console.error('Study workspace preflight failed:', error);
+        _sendPerf.mark('study_initialize_failed');
+      }
+    }
+
+    // The preflight can wait on storage or a slow connection. Never let a
+    // prompt prepared for one workspace leak into a chat the user selected
+    // while that request was in flight.
+    if (sessionModule.getCurrentSessionId() !== preparingSessionId) {
+      try {
+        uiModule.showToast?.(
+          'Study prompt not sent because the active workspace changed. Return to it and send again.',
+          6000,
+        );
+      } catch (_) {}
+      _releaseSendFlag();
+      return;
+    }
+
 
     const messageInput = el('message');
     const originalBtnText = submitBtn ? submitBtn.innerHTML : '';
@@ -1829,6 +1859,17 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                 if (spinner && spinner.element) spinner.destroy();
                 typewriterInto(roundHolder.querySelector('.body'), errMsg);
                 break;
+              }
+              if (json.type === 'study_initialized') {
+                try {
+                  const applied = window.studyModule?.applyServerInitialization?.(json.data, streamSessionId);
+                  if (applied?.catch) applied.catch(error => {
+                    console.error('Could not refresh the Study tracker from the chat stream:', error);
+                  });
+                } catch (error) {
+                  console.error('Could not apply the Study initialization event:', error);
+                }
+                continue;
               }
               if (json.delta || json.type === 'agent_prep' || json.type === 'tool_start' || json.type === 'tool_output' || json.type === 'tool_progress' || json.type === 'agent_step' || json.type === 'doc_stream_open' || json.type === 'doc_stream_delta' || json.type === 'research_progress') {
                 clearResponseTimeout();

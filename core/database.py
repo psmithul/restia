@@ -294,6 +294,11 @@ class StudyState(TimestampMixin, Base):
     current_session_seconds = Column(Integer, nullable=False, default=0)
     timer_started_at = Column(DateTime, nullable=True)
     timer_running = Column(Boolean, nullable=False, default=False)
+    # Durable one-time setup marker. Goal text cannot serve as this sentinel:
+    # a learner may intentionally save wording identical to the starter goal.
+    # False means the generated starter is still eligible for replacement by
+    # the first substantive prompt; every manual or derived goal sets it true.
+    setup_initialized = Column(Boolean, nullable=False, default=False)
     # Deterministic spaced-review state.  These fields deliberately track only
     # demonstrated review evidence; the focus timer remains an effort measure.
     review_level = Column(Integer, nullable=False, default=0)
@@ -1535,6 +1540,38 @@ def _migrate_add_study_review_columns():
                 pass
 
 
+def _migrate_add_study_setup_initialized_column():
+    """Add the durable first-prompt sentinel to existing Study databases."""
+
+    if not DATABASE_URL.startswith("sqlite:///"):
+        return
+    db_path = DATABASE_URL.replace("sqlite:///", "", 1)
+    if db_path == ":memory:" or not os.path.exists(db_path):
+        return
+
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(study_states)").fetchall()
+        }
+        if columns and "setup_initialized" not in columns:
+            conn.execute(
+                "ALTER TABLE study_states ADD COLUMN "
+                "setup_initialized BOOLEAN NOT NULL DEFAULT 0"
+            )
+            conn.commit()
+            logger.info("Migrated: added setup_initialized to study_states")
+    except Exception as exc:
+        logger.warning("study_states setup migration failed: %s", exc)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def _migrate_add_mode_column():
     """Add mode column to sessions table if it doesn't exist."""
     import sqlite3
@@ -2318,6 +2355,7 @@ def init_db():
     Base.metadata.create_all(bind=engine)
     harden_database_permissions()
     _migrate_add_study_review_columns()
+    _migrate_add_study_setup_initialized_column()
     _migrate_add_hidden_models_column()
     _migrate_add_cached_models_column()
     _migrate_add_pinned_models_column()

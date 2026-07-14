@@ -16,6 +16,7 @@ let currentSessionId = null;
 let _sessionNavToken = 0;
 let _skipAutoSelect = false;
 let _suppressNextSessionLoading = false;
+const STUDY_REQUEST_TIMEOUT_MS = 12000;
 const HISTORY_DISPLAY_CHAR_LIMIT = 160000;
 const HISTORY_DISPLAY_TAIL_CHARS = 20000;
 const HISTORY_PAGE_LIMIT_MOBILE = 8;
@@ -2176,22 +2177,45 @@ export function createDirectChat(url, modelId, endpointId) {
  * now keeps it visible after reload and gives every Study API an unambiguous
  * session id from the first interaction.
  */
+async function _fetchStudyWorkspace(url, options = {}, timeoutMs = STUDY_REQUEST_TIMEOUT_MS) {
+  const controller = new AbortController();
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (timedOut) {
+      throw new Error('Study workspace request timed out. Check the connection and retry.');
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 export async function createStudySession(name = 'New Study') {
+  const workspaceName = String(name || 'New Study').trim().slice(0, 200) || 'New Study';
   let defaults = {};
   try {
-    const response = await fetch(`${API_BASE}/api/default-chat`, { credentials: 'same-origin' });
+    const response = await _fetchStudyWorkspace(`${API_BASE}/api/default-chat`, {
+      credentials: 'same-origin',
+    });
     if (response.ok) defaults = await response.json();
   } catch (_) { /* A workspace can still be created before model setup. */ }
 
   const fd = new FormData();
-  fd.append('name', String(name || 'New Study').trim().slice(0, 200) || 'New Study');
+  fd.append('name', workspaceName);
   fd.append('endpoint_url', defaults.endpoint_url || '');
   fd.append('model', defaults.model || '');
   fd.append('skip_validation', 'true');
   fd.append('mode', 'study');
   if (defaults.endpoint_id) fd.append('endpoint_id', defaults.endpoint_id);
 
-  const response = await fetch(`${API_BASE}/api/session`, {
+  const response = await _fetchStudyWorkspace(`${API_BASE}/api/session`, {
     method: 'POST',
     body: fd,
     credentials: 'same-origin',
@@ -2204,13 +2228,27 @@ export async function createStudySession(name = 'New Study') {
     throw new Error(payload.detail || `Could not create Study workspace (${response.status})`);
   }
 
-  _suppressNextSessionLoading = true;
-  await loadSessions();
-  if (!sessions.some(session => String(session.id) === String(payload.id))) {
-    sessions.unshift({ ...payload, mode: 'study', message_count: 0 });
-    renderSessionList();
+  const now = new Date().toISOString();
+  const localSession = {
+    ...payload,
+    name: payload.name || workspaceName,
+    model: payload.model ?? defaults.model ?? '',
+    archived: Boolean(payload.archived),
+    mode: payload.mode || 'study',
+    message_count: Number(payload.message_count || 0),
+    created_at: payload.created_at || now,
+    updated_at: payload.updated_at || now,
+  };
+  const existingIndex = sessions.findIndex(session => String(session.id) === String(payload.id));
+  if (existingIndex >= 0) {
+    sessions[existingIndex] = { ...sessions[existingIndex], ...localSession };
+  } else {
+    sessions.unshift(localSession);
   }
-  return payload;
+  renderSessionList();
+  const sessionsSection = uiModule.el('sessions-section');
+  if (sessionsSection) sessionsSection.classList.remove('hidden');
+  return localSession;
 }
 
 /** Actually create the session in the DB. Called on first message send. */

@@ -108,6 +108,50 @@ def _ensure_current_request_is_latest_user(messages: List[Dict[str, Any]], curre
     return repaired
 
 
+def _initialize_study_turn(
+    session_manager,
+    sess,
+    owner: Optional[str],
+    session_id: str,
+    message: Any,
+) -> dict:
+    """Persist mode, first-prompt setup, and timer before tutor context exists."""
+
+    from src.study_mode import (
+        StudyWorkspaceNotFoundError,
+        initialize_study_workspace,
+    )
+
+    try:
+        initialized = initialize_study_workspace(
+            owner,
+            session_id,
+            message,
+            promote_to_study=True,
+        )
+    except StudyWorkspaceNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except Exception as exc:
+        logger.exception(
+            "Study initialization before tutoring failed for session %s: %s",
+            session_id,
+            exc,
+        )
+        raise HTTPException(
+            500, "Could not initialize Study workspace before tutoring."
+        ) from exc
+
+    # The DB title and StudyState were committed together. Keep the cached
+    # Session object coherent so the sidebar and generic auto-namer see it now.
+    sess.name = initialized["workspace_name"]
+    sess.mode = "study"
+    cached = getattr(session_manager, "sessions", {}).get(session_id)
+    if cached is not None:
+        cached.name = initialized["workspace_name"]
+        cached.mode = "study"
+    return initialized
+
+
 _WEB_FOLLOWUP_RE = re.compile(
     r"^\s*(?:(?:can|could|would|will)\s+you\s+)?"
     r"(?:check|try\s+again|look(?:\s+now|\s+it\s+up)?|search(?:\s+now|\s+online|\s+it)?|"
@@ -466,6 +510,11 @@ def setup_chat_routes(
         # non-streaming path can't be used to bypass).
         _enforce_chat_privileges(request, sess)
 
+        if study_mode:
+            _initialize_study_turn(
+                session_manager, sess, owner, session, message
+            )
+
         tool_policy = build_effective_tool_policy(last_user_message=message)
         allow_tool_preprocessing = not tool_policy.block_all_tool_calls
 
@@ -489,9 +538,6 @@ def setup_chat_routes(
             study_mode=study_mode,
             allow_tool_preprocessing=allow_tool_preprocessing,
         )
-
-        if study_mode:
-            set_session_mode(session, "study")
 
         # Research injection
         research_blocked_by_policy = (
@@ -757,6 +803,12 @@ def setup_chat_routes(
         # Admins always have full privileges via get_privileges (returns
         # ADMIN_PRIVILEGES wholesale) so this is a no-op for them.
         _enforce_chat_privileges(request, sess)
+
+        _study_setup = None
+        if study_mode:
+            _study_setup = _initialize_study_turn(
+                session_manager, sess, owner, session, message
+            )
 
         # Ensure session has auth headers
         resolve_session_auth(sess, session, owner=effective_owner(request))
@@ -1053,6 +1105,12 @@ def setup_chat_routes(
             # confinement that is not actually in effect.
             if workspace_rejected:
                 yield f"data: {json.dumps({'type': 'workspace_rejected', 'data': {'path': workspace_rejected}})}\n\n"
+
+            if _study_setup is not None:
+                # The UI can update the tracker/title before the first tutor
+                # token. API clients still get the same persistence because
+                # initialization happened before build_chat_context above.
+                yield f"data: {json.dumps({'type': 'study_initialized', 'data': _study_setup})}\n\n"
 
             if ctx.preprocessed.attachment_meta:
                 yield f"data: {json.dumps({'type': 'attachments', 'data': ctx.preprocessed.attachment_meta})}\n\n"

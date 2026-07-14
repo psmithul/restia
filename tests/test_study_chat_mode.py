@@ -298,6 +298,72 @@ def test_study_mode_is_forwarded_to_context_and_persisted():
     assert "'study'" in ast.unparse(parent.test).replace('"', "'")
 
 
+def test_study_initialization_precedes_tutor_context_on_both_chat_paths():
+    source = _CHAT_ROUTES.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(_CHAT_ROUTES))
+
+    for function_name in ("chat_endpoint", "chat_stream"):
+        function = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == function_name
+        )
+        initialize_call = next(
+            node
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and _call_name(node) == "_initialize_study_turn"
+        )
+        context_call = next(
+            node
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and _call_name(node) == "build_chat_context"
+        )
+        assert initialize_call.lineno < context_call.lineno
+
+        parents = _parents(function)
+        guard = parents.get(initialize_call)
+        while guard is not None and not isinstance(guard, ast.If):
+            guard = parents.get(guard)
+        assert isinstance(guard, ast.If)
+        assert ast.unparse(guard.test) == "study_mode"
+
+
+def test_stream_announces_initialized_tracker_before_any_tutor_tokens():
+    _, function = _chat_stream_tree()
+    stream_with_save = next(
+        node
+        for node in function.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "stream_with_save"
+    )
+    initialized_event = next(
+        node
+        for node in ast.walk(stream_with_save)
+        if isinstance(node, (ast.Yield, ast.YieldFrom))
+        and "study_initialized" in ast.unparse(node)
+    )
+    generation_calls = [
+        node
+        for node in ast.walk(stream_with_save)
+        if isinstance(node, ast.Call)
+        and _call_name(node) in {"stream_llm_with_fallback", "stream_agent_loop"}
+    ]
+
+    assert {_call_name(call) for call in generation_calls} == {
+        "stream_llm_with_fallback",
+        "stream_agent_loop",
+    }
+    assert all(initialized_event.lineno < call.lineno for call in generation_calls)
+
+    parents = _parents(stream_with_save)
+    guard = parents.get(initialized_event)
+    while guard is not None and not isinstance(guard, ast.If):
+        guard = parents.get(guard)
+    assert isinstance(guard, ast.If)
+    assert ast.unparse(guard.test) == "_study_setup is not None"
+
+
 def test_study_context_uses_the_current_chat_session_id():
     source = _CHAT_HELPERS.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(_CHAT_HELPERS))
@@ -336,3 +402,31 @@ def test_research_pending_auto_trigger_is_disabled_for_study_mode():
 
     assert isinstance(guard, ast.If)
     assert "not study_mode" in ast.unparse(guard.test)
+
+
+def test_chat_study_initialization_logs_failures_without_leaking_them_to_client():
+    source = _CHAT_ROUTES.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(_CHAT_ROUTES))
+    helper = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_initialize_study_turn"
+    )
+    general_handler = next(
+        handler
+        for node in ast.walk(helper)
+        if isinstance(node, ast.Try)
+        for handler in node.handlers
+        if isinstance(handler.type, ast.Name) and handler.type.id == "Exception"
+    )
+
+    assert any(
+        isinstance(call, ast.Call) and _call_name(call) == "exception"
+        for call in ast.walk(general_handler)
+    )
+    raised = next(
+        node for node in ast.walk(general_handler) if isinstance(node, ast.Raise)
+    )
+    detail = raised.exc.args[1]
+    assert isinstance(detail, ast.Constant)
+    assert detail.value == "Could not initialize Study workspace before tutoring."

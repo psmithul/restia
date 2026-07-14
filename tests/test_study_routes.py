@@ -78,13 +78,19 @@ def _client():
     return httpx.AsyncClient(transport=transport, base_url="http://study.test")
 
 
-def _add_study_session(factory, session_id: str, owner=None, mode: str = "study"):
+def _add_study_session(
+    factory,
+    session_id: str,
+    owner=None,
+    mode: str = "study",
+    name: str | None = None,
+):
     db = factory()
     db.add(
         DbSession(
             id=session_id,
             owner=owner,
-            name=f"Study {session_id}",
+            name=name if name is not None else f"Study {session_id}",
             endpoint_url="http://model.test/v1/chat/completions",
             model="test-model",
             mode=mode,
@@ -110,6 +116,51 @@ def _add_legacy_state(factory, *, owner, goal: str, minutes: int = 240):
     )
     db.commit()
     db.close()
+
+
+@pytest.mark.parametrize("topic", ["Calculus", "C++", "PID"])
+def test_single_concept_is_a_substantive_initial_study_prompt(topic):
+    setup = study.derive_study_setup(topic)
+
+    assert setup["workspace_name"] == topic
+    assert topic in setup["goal_text"]
+
+
+def test_setup_does_not_repeat_first_principles_in_the_title_and_goal():
+    setup = study.derive_study_setup(
+        "Master PID control from first principles in 5 hours"
+    )
+
+    assert setup["workspace_name"] == "PID control"
+    assert setup["target_minutes"] == 300
+    assert setup["goal_text"].count("from first principles") == 1
+
+
+@pytest.mark.parametrize(
+    ("prompt", "title"),
+    [
+        ("Teach me 量子力学", "量子力学"),
+        ("Learn क्वांटम यांत्रिकी", "क्वांटम यांत्रिकी"),
+        ("Study ديناميكا الموائع", "ديناميكا الموائع"),
+        ("Master квантовую механику", "Квантовую механику"),
+    ],
+)
+def test_non_latin_prompts_are_substantive_and_keep_a_readable_title(prompt, title):
+    setup = study.derive_study_setup(prompt)
+
+    assert setup["workspace_name"] == title
+    assert title in setup["goal_text"]
+
+
+def test_symbol_only_prompt_is_not_a_substantive_topic():
+    assert study.is_substantive_study_prompt("🚀✨") is False
+
+
+@pytest.mark.parametrize(
+    "filler", ["", "hello", "help me", "teach me", "continue", "okay"]
+)
+def test_conversational_filler_does_not_initialize_a_learning_goal(filler):
+    assert study.is_substantive_study_prompt(filler) is False
 
 
 async def test_goal_validation_persistence_and_owner_isolation(study_db):
@@ -297,10 +348,22 @@ async def test_study_routes_require_owned_study_session_and_session_id(study_db)
             _study_url("/api/study/state", "ordinary"),
             headers={"x-test-user": "alice"},
         )
+        cross_owner_initialize = await client.post(
+            _study_url("/api/study/initialize", "alice-study"),
+            headers={"x-test-user": "bob"},
+            json={"prompt": "Teach me dynamics"},
+        )
+        ordinary_initialize = await client.post(
+            _study_url("/api/study/initialize", "ordinary"),
+            headers={"x-test-user": "alice"},
+            json={"prompt": "Teach me dynamics"},
+        )
 
     assert missing_id.status_code == 422
     assert cross_owner.status_code == 404
     assert ordinary.status_code == 409
+    assert cross_owner_initialize.status_code == 404
+    assert ordinary_initialize.status_code == 409
     db = study_db()
     assert db.query(StudyState).count() == 0
     db.close()
@@ -399,6 +462,343 @@ async def test_auth_disabled_keeps_local_study_mode_working(study_db, monkeypatc
     assert saved.status_code == 200
     assert state.status_code == 200
     assert state.json()["goal_text"] == "Learn controls"
+
+
+async def test_initialize_starts_on_entry_then_derives_and_saves_first_prompt_once(
+    study_db, monkeypatch
+):
+    clock = _Clock(datetime(2026, 7, 14, 9, 0, 0))
+    monkeypatch.setattr(study, "_now", clock)
+    _add_study_session(
+        study_db, "alice-study", owner="alice", name="Study 1"
+    )
+    cached = SimpleNamespace(name="Study 1", mode=None)
+    manager = SimpleNamespace(sessions={"alice-study": cached})
+    monkeypatch.setattr(study, "get_session_manager_instance", lambda: manager)
+    headers = {"x-test-user": "alice"}
+
+    async with _client() as client:
+        entered = await client.post(
+            _study_url("/api/study/initialize", "alice-study"),
+            headers=headers,
+            json={"prompt": ""},
+        )
+        clock.advance(30)
+        first_prompt = await client.post(
+            _study_url("/api/study/initialize", "alice-study"),
+            headers=headers,
+            json={"prompt": "Teach me feedback control from scratch in 5 hours"},
+        )
+        clock.advance(15)
+        later_prompt = await client.post(
+            _study_url("/api/study/initialize", "alice-study"),
+            headers=headers,
+            json={"prompt": "Teach me thermodynamics in 2 hours"},
+        )
+
+    assert entered.status_code == 200
+    assert entered.json()["timer_running"] is True
+    assert entered.json()["goal_text"] == study.DEFAULT_STUDY_GOAL
+    assert entered.json()["goal_initialized"] is False
+    assert entered.json()["title_initialized"] is False
+
+    initialized = first_prompt.json()
+    assert first_prompt.status_code == 200
+    assert initialized["workspace_name"] == "Feedback control"
+    assert initialized["goal_text"] == (
+        "Explain Feedback control from first principles, complete 3 progressively "
+        "harder checks without hints, and demonstrate the skill in 1 novel application."
+    )
+    assert initialized["target_minutes"] == 300
+    assert initialized["timer_seconds"] == 30
+    assert initialized["goal_initialized"] is True
+    assert initialized["title_initialized"] is True
+
+    repeated = later_prompt.json()
+    assert later_prompt.status_code == 200
+    assert repeated["workspace_name"] == "Feedback control"
+    assert repeated["goal_text"] == initialized["goal_text"]
+    assert repeated["target_minutes"] == 300
+    assert repeated["timer_seconds"] == 45
+    assert repeated["goal_initialized"] is False
+    assert repeated["title_initialized"] is False
+    assert cached.name == "Feedback control"
+    assert cached.mode == "study"
+
+    db = study_db()
+    workspace = db.query(DbSession).filter_by(id="alice-study").one()
+    state = db.query(StudyState).filter_by(id="alice-study").one()
+    assert workspace.name == "Feedback control"
+    assert state.goal_text == initialized["goal_text"]
+    assert state.timer_started_at == datetime(2026, 7, 14, 9, 0, 0)
+    db.close()
+
+
+async def test_initialize_never_overwrites_an_intentional_title_or_manual_goal(
+    study_db,
+):
+    _add_study_session(
+        study_db,
+        "controls",
+        owner="alice",
+        name="Controls interview prep",
+    )
+    study.save_study_goal(
+        "alice", "controls", "Pass the controls whiteboard interview", 240, None
+    )
+
+    async with _client() as client:
+        response = await client.post(
+            _study_url("/api/study/initialize", "controls"),
+            headers={"x-test-user": "alice"},
+            json={"prompt": "Teach me rigid body dynamics from scratch"},
+        )
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["workspace_name"] == "Controls interview prep"
+    assert payload["goal_text"] == "Pass the controls whiteboard interview"
+    assert payload["target_minutes"] == 240
+    assert payload["timer_running"] is True
+    assert payload["goal_initialized"] is False
+    assert payload["title_initialized"] is False
+
+
+async def test_manual_goal_equal_to_starter_is_durably_established(study_db):
+    _add_study_session(study_db, "same-wording", owner="alice", name="Study 1")
+    saved = study.save_study_goal(
+        "alice",
+        "same-wording",
+        study.DEFAULT_STUDY_GOAL,
+        study.DEFAULT_TARGET_MINUTES,
+        None,
+    )
+
+    async with _client() as client:
+        response = await client.post(
+            _study_url("/api/study/initialize", "same-wording"),
+            headers={"x-test-user": "alice"},
+            json={"prompt": "Teach me thermodynamics from scratch"},
+        )
+
+    assert saved["setup_initialized"] is True
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["goal_text"] == study.DEFAULT_STUDY_GOAL
+    assert payload["workspace_name"] == "Study 1"
+    assert payload["goal_initialized"] is False
+    assert payload["title_initialized"] is False
+    assert payload["tracker"]["learning_goal"]["source"] == "established"
+
+    db = study_db()
+    state = db.query(StudyState).filter_by(id="same-wording").one()
+    assert state.setup_initialized is True
+    db.close()
+
+
+def test_atomic_chat_promotion_rolls_back_mode_and_state_on_commit_failure(
+    study_db, monkeypatch
+):
+    _add_study_session(
+        study_db, "promotion-fails", owner="alice", mode="chat", name="Chat"
+    )
+    cached = SimpleNamespace(name="Chat", mode="chat")
+    monkeypatch.setattr(
+        study,
+        "get_session_manager_instance",
+        lambda: SimpleNamespace(sessions={"promotion-fails": cached}),
+    )
+
+    failing_db = study_db()
+
+    def fail_commit():
+        raise RuntimeError("forced atomic commit failure")
+
+    failing_db.commit = fail_commit
+    monkeypatch.setattr(study, "SessionLocal", lambda: failing_db)
+
+    with pytest.raises(RuntimeError, match="forced atomic commit failure"):
+        study.initialize_study_workspace(
+            "alice",
+            "promotion-fails",
+            "Teach me control theory",
+            promote_to_study=True,
+        )
+
+    db = study_db()
+    workspace = db.query(DbSession).filter_by(id="promotion-fails").one()
+    assert workspace.mode == "chat"
+    assert db.query(StudyState).filter_by(id="promotion-fails").count() == 0
+    db.close()
+    assert cached.name == "Chat"
+    assert cached.mode == "chat"
+
+
+async def test_study_500_response_is_sanitized_and_exception_is_logged(
+    study_db, monkeypatch, caplog
+):
+    _add_study_session(study_db, "broken-state", owner="alice")
+    secret_detail = "database failed with password=do-not-return"
+
+    def fail_state(*_args, **_kwargs):
+        raise RuntimeError(secret_detail)
+
+    monkeypatch.setattr(study_routes, "get_study_state", fail_state)
+    caplog.set_level("ERROR", logger="routes.study_routes")
+
+    async with _client() as client:
+        response = await client.get(
+            _study_url("/api/study/state", "broken-state"),
+            headers={"x-test-user": "alice"},
+        )
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Could not load Study workspace state."}
+    assert secret_detail not in response.text
+    assert secret_detail in caplog.text
+
+
+async def test_automatic_title_derivation_cannot_run_again_after_goal_initialization(
+    study_db,
+):
+    _add_study_session(study_db, "study-once", owner="alice", name="Study 1")
+    headers = {"x-test-user": "alice"}
+    async with _client() as client:
+        first = await client.post(
+            _study_url("/api/study/initialize", "study-once"),
+            headers=headers,
+            json={"prompt": "Teach me feedback control"},
+        )
+
+        # Simulate an intentional later rename that happens to look like the
+        # original placeholder. An established goal is the durable one-time
+        # marker, so a later chat prompt must not auto-name the workspace again.
+        db = study_db()
+        db.query(DbSession).filter_by(id="study-once").one().name = "Study 1"
+        db.commit()
+        db.close()
+
+        second = await client.post(
+            _study_url("/api/study/initialize", "study-once"),
+            headers=headers,
+            json={"prompt": "Teach me thermodynamics"},
+        )
+
+    assert first.json()["title_initialized"] is True
+    assert second.status_code == 200
+    assert second.json()["workspace_name"] == "Study 1"
+    assert second.json()["goal_text"] == first.json()["goal_text"]
+    assert second.json()["title_initialized"] is False
+    assert second.json()["goal_initialized"] is False
+
+
+async def test_initializing_a_workspace_pauses_only_the_owners_other_timer(
+    study_db, monkeypatch
+):
+    clock = _Clock(datetime(2026, 7, 14, 9, 0, 0))
+    monkeypatch.setattr(study, "_now", clock)
+    _add_study_session(study_db, "alice-a", owner="alice", name="Study 1")
+    _add_study_session(study_db, "alice-b", owner="alice", name="Study 2")
+    _add_study_session(study_db, "bob-a", owner="bob", name="Study 1")
+
+    async with _client() as client:
+        assert (
+            await client.post(
+                _study_url("/api/study/initialize", "alice-a"),
+                headers={"x-test-user": "alice"},
+                json={},
+            )
+        ).status_code == 200
+        assert (
+            await client.post(
+                _study_url("/api/study/initialize", "bob-a"),
+                headers={"x-test-user": "bob"},
+                json={},
+            )
+        ).status_code == 200
+        clock.advance(90)
+        switched = await client.post(
+            _study_url("/api/study/initialize", "alice-b"),
+            headers={"x-test-user": "alice"},
+            json={},
+        )
+        clock.advance(10)
+        same_workspace = await client.post(
+            _study_url("/api/study/initialize", "alice-b"),
+            headers={"x-test-user": "alice"},
+            json={},
+        )
+        switched_back = await client.post(
+            _study_url("/api/study/initialize", "alice-a"),
+            headers={"x-test-user": "alice"},
+            json={},
+        )
+
+    assert switched.json()["timer_running"] is True
+    assert switched.json()["timer_seconds"] == 0
+    assert same_workspace.json()["timer_seconds"] == 10
+    assert switched_back.json()["timer_seconds"] == 90
+
+    db = study_db()
+    rows = {row.id: row for row in db.query(StudyState).all()}
+    db.close()
+    assert rows["alice-a"].timer_running is True
+    assert rows["alice-a"].current_session_seconds == 90
+    assert rows["alice-b"].timer_running is False
+    assert rows["alice-b"].current_session_seconds == 10
+    assert rows["bob-a"].timer_running is True
+    assert sum(row.timer_running for row in rows.values() if row.owner == "alice") == 1
+
+
+async def test_tracker_keeps_effort_and_mastery_evidence_distinct(study_db):
+    _add_study_session(study_db, "alice-study", owner="alice", name="Study 1")
+    headers = {"x-test-user": "alice"}
+
+    async with _client() as client:
+        initialized = await client.post(
+            _study_url("/api/study/initialize", "alice-study"),
+            headers=headers,
+            json={"prompt": "Learn state space control deeply"},
+        )
+        reviewed = await client.post(
+            _study_url("/api/study/review", "alice-study"),
+            headers=headers,
+            json={"outcome": "clean"},
+        )
+
+    tracker = initialized.json()["tracker"]
+    assert tracker["active_workspace"] == {
+        "session_id": "alice-study",
+        "title": "State space control",
+        "mode": "study",
+    }
+    assert tracker["effort"]["progress_percent"] == initialized.json()[
+        "progress_percent"
+    ]
+    assert tracker["mastery"]["status"] == "not_measured"
+    assert "progress_percent" not in tracker["mastery"]
+    assert "not timer time" in tracker["mastery"]["note"]
+    assert reviewed.json()["tracker"]["mastery"]["status"] == "clean_recall"
+    assert reviewed.json()["tracker"]["mastery"]["next_evidence"] == (
+        "Apply the skill to one novel transfer task."
+    )
+
+
+def test_tracker_does_not_overstate_legacy_review_rows_without_evidence():
+    tracker = study.build_study_tracker(
+        {
+            "session_id": "legacy",
+            "goal_text": "Learn controls",
+            "target_minutes": 60,
+            "review": {"count": 1, "level": 1, "last_result": None},
+        },
+        "Controls",
+    )
+
+    assert tracker["mastery"]["status"] == "evidence_pending"
+    assert tracker["mastery"]["next_evidence"] == (
+        "Complete one closed-book recall check."
+    )
 
 
 async def test_first_open_bootstraps_a_starter_goal_and_timer(study_db):
@@ -868,6 +1268,42 @@ def test_study_review_migration_is_idempotent_and_backfills_existing_rows(
         "next_review_at",
     } <= columns
     assert review == (0, 0, None, None, None)
+
+
+def test_study_setup_sentinel_migration_is_idempotent(tmp_path, monkeypatch):
+    db_path = tmp_path / "legacy-study-setup.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE study_states (
+            id TEXT PRIMARY KEY,
+            goal_text TEXT NOT NULL DEFAULT '',
+            target_minutes INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO study_states (id, goal_text, target_minutes) VALUES (?, ?, ?)",
+        ("legacy", study.DEFAULT_STUDY_GOAL, study.DEFAULT_TARGET_MINUTES),
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(cdb, "DATABASE_URL", f"sqlite:///{db_path}")
+    cdb._migrate_add_study_setup_initialized_column()
+    cdb._migrate_add_study_setup_initialized_column()
+
+    conn = sqlite3.connect(db_path)
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(study_states)").fetchall()
+    }
+    initialized = conn.execute(
+        "SELECT setup_initialized FROM study_states WHERE id = 'legacy'"
+    ).fetchone()
+    conn.close()
+
+    assert "setup_initialized" in columns
+    assert initialized == (0,)
 
 
 def test_session_create_accepts_and_returns_study_mode(monkeypatch):

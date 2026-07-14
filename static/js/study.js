@@ -12,8 +12,19 @@ const EMPTY_REVIEW = Object.freeze({
   status: 'not_scheduled',
 });
 
+const EMPTY_TRACKER = Object.freeze({
+  active_workspace: Object.freeze({ session_id: null, title: 'Study workspace', mode: 'study' }),
+  focus_block: Object.freeze({ running: false, elapsed_seconds: 0, completed_seconds: 0 }),
+  learning_goal: Object.freeze({ text: '', target_minutes: 0, target_date: null, source: 'starter' }),
+  effort: Object.freeze({ studied_seconds: 0, target_seconds: 0, remaining_seconds: 0, progress_percent: 0 }),
+  mastery: Object.freeze({ status: 'not_started', next_evidence: '', review_level: 0, review_count: 0 }),
+  review_due: EMPTY_REVIEW,
+});
+
 const EMPTY_STATE = Object.freeze({
   session_id: null,
+  workspace_name: 'Study workspace',
+  goal_initialized: false,
   goal_text: '',
   target_minutes: 0,
   target_date: null,
@@ -24,9 +35,11 @@ const EMPTY_STATE = Object.freeze({
   remaining_seconds: 0,
   progress_percent: 0,
   review: EMPTY_REVIEW,
+  tracker: EMPTY_TRACKER,
 });
 
 let API_BASE = '';
+const REQUEST_TIMEOUT_MS = 12000;
 let _initialized = false;
 let _active = false;
 let _activeSessionId = null;
@@ -37,6 +50,8 @@ let _ticker = null;
 let _stateController = null;
 let _mutationChain = Promise.resolve();
 let _busy = false;
+let _busyDepth = 0;
+let _busyMessage = '';
 let _closing = false;
 let _closePromise = null;
 let _goalDirty = false;
@@ -45,6 +60,13 @@ let _composerObserver = null;
 let _elements = {};
 let _previousChatUi = null;
 let _options = {};
+let _controlsOpen = false;
+let _controlsTrigger = null;
+let _lifecycleGeneration = 0;
+let _pendingWorkspaceTransition = null;
+const _suppressedWorkspaceOpens = new Map();
+let _inertBackground = [];
+const _initializingPrompt = new Map();
 
 const ids = [
   'study-panel', 'study-panel-body', 'study-panel-title',
@@ -58,6 +80,11 @@ const ids = [
   'study-workspace-switcher', 'study-workspace-count',
   'study-new-workspace', 'study-rename-workspace', 'study-quick-actions',
   'study-review-status', 'study-review-due', 'study-review-actions',
+  'study-chat-launcher', 'study-controls-open', 'study-controls-close',
+  'study-control-modal', 'study-control-dialog', 'study-control-loading',
+  'study-chat-workspace-name', 'study-tracker-workspace-name',
+  'study-tracker-workspace-count', 'study-tracker-alert', 'study-goal-summary',
+  'study-mastery-distance', 'study-control-focus-copy',
 ];
 
 function _number(value, fallback = 0) {
@@ -287,12 +314,19 @@ function _setText(element, value) {
 }
 
 function _showError(message) {
-  const error = _elements['study-error'];
-  if (!error) return;
   const text = String(message || '').trim();
-  error.textContent = text;
-  error.hidden = !text;
-  error.setAttribute('role', 'alert');
+  for (const error of [_elements['study-error'], _elements['study-tracker-alert']]) {
+    if (!error) continue;
+    error.textContent = text;
+    error.hidden = !text;
+    error.setAttribute('role', 'alert');
+  }
+}
+
+function _controlsTriggerTarget() {
+  const launcher = _elements['study-controls-open'];
+  if (launcher && !launcher.hidden && !launcher.closest?.('[hidden]')) return launcher;
+  return document.activeElement || _get('tool-study-btn') || _get('rail-study');
 }
 
 function _announce(message) {
@@ -312,6 +346,7 @@ function _syncControls(live = _liveState()) {
   const switcher = _elements['study-workspace-switcher'];
   const create = _elements['study-new-workspace'];
   const rename = _elements['study-rename-workspace'];
+  const hasLearningGoal = Boolean(live.goal_initialized && String(live.goal_text || '').trim());
   if (start) start.disabled = _busy || _closing || live.timer_running || _goalDirty;
   if (pause) pause.disabled = _busy || _closing || !live.timer_running;
   if (finish) finish.disabled = _busy || _closing || live.timer_seconds <= 0;
@@ -322,16 +357,83 @@ function _syncControls(live = _liveState()) {
   const reviewActions = _elements['study-review-actions'];
   if (reviewActions?.querySelectorAll) {
     reviewActions.querySelectorAll('[data-study-result]').forEach(button => {
-      button.disabled = _busy || _closing || !_activeSessionId;
+      button.disabled = _busy || _closing || !_activeSessionId || !hasLearningGoal;
+    });
+  }
+  const quickActions = _elements['study-quick-actions'];
+  if (quickActions?.querySelectorAll) {
+    quickActions.querySelectorAll('[data-study-prompt]').forEach(button => {
+      button.disabled = _busy || _closing || !_activeSessionId || !hasLearningGoal;
     });
   }
 }
 
 function _setBusy(value) {
-  _busy = Boolean(value);
+  if (value) _busyDepth += 1;
+  else _busyDepth = Math.max(0, _busyDepth - 1);
+  _busy = _busyDepth > 0;
   const panel = _elements['study-panel'];
   if (panel) panel.setAttribute('aria-busy', String(_busy));
+  const dialog = _elements['study-control-dialog'];
+  if (dialog) dialog.setAttribute('aria-busy', String(_busy));
+  _setText(_elements['study-control-loading'], _busy ? (_busyMessage || 'Updating Study workspace…') : '');
   _syncControls();
+}
+
+function _trackerFor(live) {
+  const tracker = live?.tracker && typeof live.tracker === 'object' ? live.tracker : EMPTY_TRACKER;
+  return {
+    ...EMPTY_TRACKER,
+    ...tracker,
+    active_workspace: { ...EMPTY_TRACKER.active_workspace, ...(tracker.active_workspace || {}) },
+    focus_block: { ...EMPTY_TRACKER.focus_block, ...(tracker.focus_block || {}) },
+    learning_goal: { ...EMPTY_TRACKER.learning_goal, ...(tracker.learning_goal || {}) },
+    effort: { ...EMPTY_TRACKER.effort, ...(tracker.effort || {}) },
+    mastery: { ...EMPTY_TRACKER.mastery, ...(tracker.mastery || {}) },
+    review_due: _review(tracker.review_due || live?.review),
+  };
+}
+
+function _renderTracker(live = _liveState()) {
+  const tracker = _trackerFor(live);
+  const stateTitle = String(live.workspace_name || '').trim();
+  const trackerTitle = String(tracker.active_workspace.title || '').trim();
+  const title = (stateTitle && stateTitle !== 'Study workspace')
+    ? stateTitle
+    : ((trackerTitle && trackerTitle !== 'Study workspace')
+      ? trackerTitle
+      : _workspaceName());
+  const workspaceCount = _studySessions().length;
+  const countLabel = `${workspaceCount} workspace${workspaceCount === 1 ? '' : 's'}`;
+  _setText(_elements['study-chat-workspace-name'], title);
+  _setText(_elements['study-tracker-workspace-name'], title);
+  _setText(_elements['study-tracker-workspace-count'], countLabel);
+
+  const goalText = String(live.goal_text || tracker.learning_goal.text || '').trim();
+  const hasServerTracker = Boolean(live?.tracker && live.tracker !== EMPTY_TRACKER);
+  const goalIsStarter = !goalText || (hasServerTracker && tracker.learning_goal.source === 'starter');
+  _setText(
+    _elements['study-goal-summary'],
+    goalIsStarter
+      ? 'Send your first real Study prompt. Restia will turn it into a measurable goal and save it here.'
+      : goalText,
+  );
+
+  const nextEvidence = String(tracker.mastery.next_evidence || '').trim();
+  _setText(
+    _elements['study-mastery-distance'],
+    nextEvidence
+      ? `Next mastery evidence: ${nextEvidence}`
+      : 'Mastery is measured by closed-book recall and transfer, not time alone.',
+  );
+  _setText(
+    _elements['study-control-focus-copy'],
+    live.timer_running
+      ? `Running now · ${formatDuration(live.timer_seconds)} in this focus block.`
+      : (live.timer_seconds
+        ? `Paused at ${formatDuration(live.timer_seconds)}. Resume when you are ready.`
+        : 'The timer starts automatically when this workspace opens.'),
+  );
 }
 
 function _renderLive() {
@@ -345,7 +447,7 @@ function _renderLive() {
       ? 'Set a learning goal to start'
       : (live.timer_running ? 'Focus timer running' : (live.timer_seconds ? 'Focus timer paused' : 'Ready to study')),
   );
-  _setText(_elements['study-session-total'], _humanTime(live.total_seconds));
+  _setText(_elements['study-session-total'], _humanTime(live.studied_seconds));
 
   const progress = _percent(live.progress_percent);
   const bar = _elements['study-progress-bar'];
@@ -377,6 +479,7 @@ function _renderLive() {
   }
   _setText(_elements['study-deadline-copy'], _deadlineText(live.target_date));
   _renderReview(live);
+  _renderTracker(live);
   _syncControls(live);
 }
 
@@ -394,7 +497,9 @@ function _renderWorkspaces() {
   const sessions = _studySessions();
   const switcher = _elements['study-workspace-switcher'];
   const count = _elements['study-workspace-count'];
-  if (count) count.textContent = `${sessions.length} workspace${sessions.length === 1 ? '' : 's'}`;
+  const countLabel = `${sessions.length} workspace${sessions.length === 1 ? '' : 's'}`;
+  if (count) count.textContent = countLabel;
+  _setText(_elements['study-tracker-workspace-count'], countLabel);
   if (!switcher) return;
 
   const previous = _sessionId(_activeSessionId || switcher.value);
@@ -411,6 +516,7 @@ function _renderWorkspaces() {
   switcher.setAttribute('aria-label', sessions.length
     ? `Current Study workspace: ${_workspaceName(previous)}`
     : 'Current Study workspace');
+  _renderTracker();
   _syncControls();
 }
 
@@ -442,26 +548,153 @@ async function _request(path, options = {}, sessionId = _activeSessionId) {
   const workspaceId = _sessionId(sessionId);
   if (!workspaceId) throw new Error('Choose or create a Study workspace first.');
   const separator = String(path).includes('?') ? '&' : '?';
-  const response = await fetch(`${API_BASE}${path}${separator}session_id=${encodeURIComponent(workspaceId)}`, {
-    credentials: 'same-origin',
-    ...options,
+  const externalSignal = options.signal;
+  const controller = new AbortController();
+  let timedOut = false;
+  const abortFromExternal = () => controller.abort();
+  if (externalSignal?.aborted) controller.abort();
+  else externalSignal?.addEventListener?.('abort', abortFromExternal, { once: true });
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${API_BASE}${path}${separator}session_id=${encodeURIComponent(workspaceId)}`, {
+      credentials: 'same-origin',
+      ...options,
+      signal: controller.signal,
+    });
+    const text = await response.text();
+    let payload = {};
+    if (text) {
+      try { payload = JSON.parse(text); }
+      catch (_) { payload = { detail: text }; }
+    }
+    if (!response.ok) {
+      throw new Error(payload.detail || payload.error || `Study request failed (${response.status})`);
+    }
+    return payload;
+  } catch (error) {
+    if (timedOut) throw new Error('Study request timed out. Check the connection and try again.');
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+    externalSignal?.removeEventListener?.('abort', abortFromExternal);
+  }
+}
+
+function _withTimeout(operation, message, timeoutMs = REQUEST_TIMEOUT_MS) {
+  let timeout = null;
+  const promise = typeof operation === 'function'
+    ? Promise.resolve().then(operation)
+    : Promise.resolve(operation);
+  const deadline = new Promise((_, reject) => {
+    timeout = setTimeout(() => reject(new Error(message)), timeoutMs);
   });
-  const text = await response.text();
-  let payload = {};
-  if (text) {
-    try { payload = JSON.parse(text); }
-    catch (_) { payload = { detail: text }; }
+  return Promise.race([promise, deadline]).finally(() => clearTimeout(timeout));
+}
+
+async function _fetchWithTimeout(url, options = {}, message = 'Study request timed out. Try again.') {
+  const controller = new AbortController();
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, REQUEST_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (timedOut) throw new Error(message);
+    throw error;
+  } finally {
+    clearTimeout(timeout);
   }
-  if (!response.ok) {
-    throw new Error(payload.detail || payload.error || `Study request failed (${response.status})`);
+}
+
+async function _refreshSessionList() {
+  if (typeof _options.reloadSessions !== 'function') return;
+  await _withTimeout(
+    () => _options.reloadSessions(),
+    'The Study workspace was saved, but refreshing the workspace list timed out. Reload the page to update it.',
+  );
+  _renderWorkspaces();
+}
+
+async function _initializeWorkspace({ prompt = '', sessionId = _activeSessionId, syncForm = true } = {}) {
+  const workspaceId = _sessionId(sessionId);
+  if (!workspaceId) {
+    _showError('Choose or create a Study workspace first.');
+    return null;
   }
-  return payload;
+  const cleanPrompt = String(prompt || '').trim();
+  const requestKey = `${workspaceId}\u0000${cleanPrompt}`;
+  if (_initializingPrompt.has(requestKey)) return _initializingPrompt.get(requestKey);
+
+  const operation = (async () => {
+    _busyMessage = cleanPrompt ? 'Saving your learning goal…' : 'Starting your focus timer…';
+    _setBusy(true);
+    _showError('');
+    try {
+      const state = await _queueMutation(() => _request('/initialize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: cleanPrompt }),
+      }, workspaceId));
+      if (_sessionId(_activeSessionId) === workspaceId) {
+        _applyState(state, { syncForm, sessionId: workspaceId });
+        _lastResyncMs = _monotonicNow();
+      }
+      if (state.title_initialized && typeof _options.reloadSessions === 'function') {
+        try {
+          await _refreshSessionList();
+        } catch (error) {
+          console.error('Study workspace saved, but the session list could not refresh:', error);
+          _showError('Your Study goal was saved, but the workspace list could not refresh. Reload the page to update it.');
+        }
+      }
+      if (state.goal_initialized) {
+        _announce(`Learning goal saved for ${state.workspace_name || 'this Study workspace'}.`);
+      }
+      return state;
+    } catch (error) {
+      if (error?.name !== 'AbortError') {
+        _showError(error?.message || 'Could not activate this Study workspace.');
+        _openControls({ trigger: _controlsTriggerTarget(), focusError: true });
+      }
+      return null;
+    } finally {
+      _busyMessage = '';
+      _setBusy(false);
+    }
+  })();
+  _initializingPrompt.set(requestKey, operation);
+  try {
+    return await operation;
+  } finally {
+    if (_initializingPrompt.get(requestKey) === operation) _initializingPrompt.delete(requestKey);
+  }
 }
 
 function _queueMutation(operation) {
   const queued = _mutationChain.then(operation, operation);
   _mutationChain = queued.catch(() => {});
   return queued;
+}
+
+function _lifecycleIsCurrent(generation, { requireActive = false } = {}) {
+  return generation === _lifecycleGeneration && !_closing && (!requireActive || _active);
+}
+
+function _invalidatePendingWorkspaceTransition() {
+  const transition = _pendingWorkspaceTransition;
+  if (!transition?.sessionId) return;
+  _suppressedWorkspaceOpens.set(String(transition.sessionId), transition.generation);
+  _pendingWorkspaceTransition = null;
+  setTimeout(() => {
+    if (_suppressedWorkspaceOpens.get(String(transition.sessionId)) === transition.generation) {
+      _suppressedWorkspaceOpens.delete(String(transition.sessionId));
+    }
+  }, REQUEST_TIMEOUT_MS * 3);
 }
 
 async function _loadState({ syncForm = true, sessionId = _activeSessionId } = {}) {
@@ -633,36 +866,60 @@ async function _askWorkspaceName({ current = '', create = false } = {}) {
 
 async function _createWorkspace({ askName = true } = {}) {
   if (_busy || _closing || typeof _options.createStudySession !== 'function') return null;
+  const generation = _lifecycleGeneration;
+  const startedWhileActive = _active;
   const suggested = `Study ${Math.max(1, _studySessions().length + 1)}`;
   const name = askName ? await _askWorkspaceName({ current: suggested, create: true }) : suggested;
   if (name == null || !String(name).trim()) return null;
+  if (!_lifecycleIsCurrent(generation, { requireActive: startedWhileActive })) return null;
 
   _setBusy(true);
   _showError('');
   let created = null;
+  let transition = null;
   try {
-    created = await _options.createStudySession(String(name).trim());
+    created = await _withTimeout(
+      () => _options.createStudySession(String(name).trim()),
+      'Creating the Study workspace timed out. Check the connection and try again.',
+    );
+    if (!_lifecycleIsCurrent(generation, { requireActive: startedWhileActive })) return null;
+    _renderWorkspaces();
+    if (created?.id && typeof _options.selectSession === 'function') {
+      transition = { generation, sessionId: String(created.id) };
+      _pendingWorkspaceTransition = transition;
+      const selected = await _withTimeout(
+        () => _options.selectSession(created.id, { keepSidebar: true, showLoading: false }),
+        'The workspace was created, but opening it timed out. Choose it from the workspace list to continue.',
+      );
+      if (!_lifecycleIsCurrent(generation, { requireActive: startedWhileActive })) return null;
+      if (selected === false) throw new Error('The new workspace was created but could not be opened.');
+      const opened = await open({ sessionId: created.id, focus: false, refresh: true, fromSession: true });
+      if (!_lifecycleIsCurrent(generation, { requireActive: true })) return null;
+      if (!opened) throw new Error('The new workspace was created but could not be activated.');
+    }
+    if (created?.id) _announce(`${String(name).trim()} created with separate chat, goal, and progress.`);
+    return created;
   } catch (error) {
     _showError(error?.message || 'Could not create a Study workspace.');
+    if (_lifecycleIsCurrent(generation)) {
+      _openControls({ trigger: _controlsTriggerTarget(), focusError: true });
+    }
     return null;
   } finally {
+    if (_pendingWorkspaceTransition === transition) _pendingWorkspaceTransition = null;
     _setBusy(false);
   }
-  _renderWorkspaces();
-  if (created?.id && typeof _options.selectSession === 'function') {
-    await _options.selectSession(created.id, { keepSidebar: true, showLoading: false });
-  }
-  if (created?.id) _announce(`${String(name).trim()} created with separate chat, goal, and progress.`);
-  return created;
 }
 
 async function _renameWorkspace() {
   const workspaceId = _sessionId();
   if (!workspaceId || _busy || _closing) return;
+  const generation = _lifecycleGeneration;
   const current = _workspaceName(workspaceId);
   const name = await _askWorkspaceName({ current, create: false });
   const cleaned = String(name || '').trim();
   if (!cleaned || cleaned === current) return;
+  if (!_lifecycleIsCurrent(generation, { requireActive: true })) return;
 
   _setBusy(true);
   _showError('');
@@ -670,16 +927,36 @@ async function _renameWorkspace() {
     const fd = new FormData();
     fd.append('name', cleaned);
     const origin = typeof window !== 'undefined' ? window.location.origin : '';
-    const response = await fetch(`${origin}/api/session/${encodeURIComponent(workspaceId)}`, {
+    const response = await _fetchWithTimeout(`${origin}/api/session/${encodeURIComponent(workspaceId)}`, {
       method: 'PATCH', body: fd, credentials: 'same-origin',
-    });
+    }, 'Renaming the Study workspace timed out. Check the connection and try again.');
     if (!response.ok) {
       const payload = await response.json().catch(() => ({}));
       throw new Error(payload.detail || `Could not rename workspace (${response.status})`);
     }
-    if (typeof _options.reloadSessions === 'function') await _options.reloadSessions();
+    if (!_lifecycleIsCurrent(generation, { requireActive: true })) return;
+    _state = {
+      ..._state,
+      workspace_name: cleaned,
+      tracker: {
+        ...(_state.tracker || {}),
+        active_workspace: {
+          ...(_state.tracker?.active_workspace || {}),
+          session_id: workspaceId,
+          title: cleaned,
+          mode: 'study',
+        },
+      },
+    };
     _renderWorkspaces();
+    _renderLive();
     _announce(`Study workspace renamed to ${cleaned}.`);
+    try {
+      await _refreshSessionList();
+    } catch (error) {
+      console.error('Study workspace renamed, but the session list could not refresh:', error);
+      _showError('The workspace was renamed, but refreshing the workspace list timed out. Reload the page to update it.');
+    }
   } catch (error) {
     _showError(error?.message || 'Could not rename the Study workspace.');
   } finally {
@@ -691,9 +968,28 @@ async function _switchWorkspace(event) {
   const workspaceId = _sessionId(event?.target?.value);
   if (!workspaceId || workspaceId === _sessionId() || _busy || _closing) return;
   if (typeof _options.selectSession !== 'function') return;
+  const generation = _lifecycleGeneration;
+  const transition = { generation, sessionId: workspaceId };
+  _pendingWorkspaceTransition = transition;
+  _setBusy(true);
   _showError('');
-  const selected = await _options.selectSession(workspaceId, { keepSidebar: true });
-  if (selected === false) _renderWorkspaces();
+  try {
+    const selected = await _withTimeout(
+      () => _options.selectSession(workspaceId, { keepSidebar: true }),
+      'Switching Study workspaces timed out. Check the connection and try again.',
+    );
+    if (!_lifecycleIsCurrent(generation, { requireActive: true })) return;
+    if (selected === false) {
+      _renderWorkspaces();
+      throw new Error('Could not switch Study workspaces.');
+    }
+    await open({ sessionId: workspaceId, focus: false, refresh: true, fromSession: true });
+  } catch (error) {
+    _showError(error?.message || 'Could not switch Study workspaces.');
+  } finally {
+    if (_pendingWorkspaceTransition === transition) _pendingWorkspaceTransition = null;
+    _setBusy(false);
+  }
 }
 
 function _fillStudyPrompt(button) {
@@ -702,8 +998,116 @@ function _fillStudyPrompt(button) {
   if (!prompt || !composer) return;
   composer.value = prompt;
   composer.dispatchEvent(new Event('input', { bubbles: true }));
+  _closeControls({ restoreFocus: false });
   try { composer.focus({ preventScroll: false }); } catch (_) { try { composer.focus(); } catch (_) {} }
   _announce(`${String(button.textContent || 'Study move').trim()} ready. Edit it or send when ready.`);
+}
+
+function _focusableControls() {
+  const dialog = _elements['study-control-dialog'];
+  if (!dialog?.querySelectorAll) return [];
+  return Array.from(dialog.querySelectorAll(
+    'button:not([disabled]), select:not([disabled]), textarea:not([disabled]), input:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+  )).filter(element => !element.hidden && element.getAttribute?.('aria-hidden') !== 'true');
+}
+
+function _setControlsBackgroundInert(enabled) {
+  if (!enabled) {
+    _inertBackground.forEach(({ element, inert }) => {
+      if (element) element.inert = inert;
+    });
+    _inertBackground = [];
+    return;
+  }
+  if (_inertBackground.length) return;
+  const modal = _elements['study-control-modal'];
+  let branch = modal;
+  while (branch?.parentElement) {
+    const parent = branch.parentElement;
+    Array.from(parent.children || []).forEach(element => {
+      if (element === branch || element === modal) return;
+      _inertBackground.push({ element, inert: Boolean(element.inert) });
+      element.inert = true;
+    });
+    if (parent === document.body) break;
+    branch = parent;
+  }
+}
+
+function _openControls({ trigger = null, focusError = false } = {}) {
+  const modal = _elements['study-control-modal'];
+  const dialog = _elements['study-control-dialog'];
+  if (!modal || !dialog) return false;
+  if (!_controlsOpen) {
+    _controlsTrigger = trigger || document.activeElement || _elements['study-controls-open'];
+  }
+  _controlsOpen = true;
+  modal.hidden = false;
+  modal.setAttribute('aria-hidden', 'false');
+  _elements['study-controls-open']?.setAttribute('aria-expanded', 'true');
+  _setControlsBackgroundInert(true);
+  document.body?.classList?.add('study-controls-open');
+  if (!_goalDirty) _renderForm();
+  _renderWorkspaces();
+  _renderLive();
+  const focusTarget = focusError && !_elements['study-error']?.hidden
+    ? _elements['study-error']
+    : (_focusableControls()[0] || dialog);
+  const focusDialog = () => {
+    if (!_controlsOpen) return;
+    if (focusTarget === _elements['study-error'] && !focusTarget.hasAttribute?.('tabindex')) {
+      focusTarget.setAttribute?.('tabindex', '-1');
+    }
+    try { focusTarget?.focus({ preventScroll: true }); }
+    catch (_) { try { dialog.focus(); } catch (_) {} }
+  };
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(focusDialog);
+  else focusDialog();
+  return true;
+}
+
+function _closeControls({ restoreFocus = true } = {}) {
+  const modal = _elements['study-control-modal'];
+  if (!modal || !_controlsOpen) return false;
+  _controlsOpen = false;
+  _setControlsBackgroundInert(false);
+  modal.hidden = true;
+  modal.setAttribute('aria-hidden', 'true');
+  _elements['study-controls-open']?.setAttribute('aria-expanded', 'false');
+  document.body?.classList?.remove('study-controls-open');
+  if (restoreFocus) {
+    const target = _controlsTrigger?.isConnected === false
+      ? _elements['study-controls-open']
+      : (_controlsTrigger || _elements['study-controls-open']);
+    try { target?.focus({ preventScroll: true }); } catch (_) { try { target?.focus(); } catch (_) {} }
+  }
+  _controlsTrigger = null;
+  return true;
+}
+
+function _handleControlsKeydown(event) {
+  if (!_controlsOpen) return;
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    _closeControls();
+    return;
+  }
+  if (event.key !== 'Tab') return;
+  const focusable = _focusableControls();
+  if (!focusable.length) {
+    event.preventDefault();
+    _elements['study-control-dialog']?.focus();
+    return;
+  }
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
 }
 
 function _syncDrawerClearance() {
@@ -878,6 +1282,11 @@ function _onSessionSelected(event) {
   const raw = event?.detail || {};
   const session = raw.session || raw;
   const sessionId = _sessionId(raw.sessionId || raw.id || session.id);
+  const suppressedGeneration = _suppressedWorkspaceOpens.get(sessionId);
+  if (suppressedGeneration != null && suppressedGeneration !== _lifecycleGeneration) {
+    _suppressedWorkspaceOpens.delete(sessionId);
+    return;
+  }
   if (mode === 'study') {
     void open({ focus: false, refresh: true, fromSession: true, sessionId });
   } else if (mode && _active) {
@@ -894,6 +1303,13 @@ function _wireEvents() {
   _elements['study-workspace-switcher']?.addEventListener('change', event => void _switchWorkspace(event));
   _elements['study-new-workspace']?.addEventListener('click', () => void _createWorkspace({ askName: true }));
   _elements['study-rename-workspace']?.addEventListener('click', () => void _renameWorkspace());
+  _elements['study-controls-open']?.addEventListener('click', event => {
+    _openControls({ trigger: event.currentTarget });
+  });
+  _elements['study-controls-close']?.addEventListener('click', () => _closeControls());
+  _elements['study-control-modal']?.querySelectorAll?.('[data-study-modal-close]').forEach(element => {
+    element.addEventListener('click', () => _closeControls());
+  });
   const quickActions = _elements['study-quick-actions'];
   if (quickActions?.querySelectorAll) {
     quickActions.querySelectorAll('[data-study-prompt]').forEach(button => {
@@ -915,6 +1331,7 @@ function _wireEvents() {
   window.addEventListener('focus', _refreshAuthoritativeState);
   window.addEventListener('resize', _syncDrawerClearance);
   document.addEventListener('visibilitychange', _refreshAuthoritativeState);
+  document.addEventListener('keydown', _handleControlsKeydown);
   if (typeof ResizeObserver !== 'undefined') {
     const composer = document.querySelector('.chat-input-bar');
     if (composer) {
@@ -941,6 +1358,13 @@ export function init(apiBase, options = {}) {
   const panel = _elements['study-panel'];
   panel.setAttribute('aria-labelledby', 'study-panel-title');
   panel.setAttribute('aria-hidden', 'true');
+  const modal = _elements['study-control-modal'];
+  if (modal) {
+    modal.hidden = true;
+    modal.setAttribute('aria-hidden', 'true');
+  }
+  if (_elements['study-chat-launcher']) _elements['study-chat-launcher'].hidden = true;
+  _elements['study-controls-open']?.setAttribute('aria-expanded', 'false');
   _elements['study-timer']?.setAttribute('aria-live', 'off');
   const live = _elements['study-live-status'];
   if (live) {
@@ -966,6 +1390,7 @@ export async function open(options = {}) {
   const requestedId = _sessionId(options.sessionId || _currentSessionId() || _activeSessionId);
   if (!requestedId) {
     _showError('Create a Study workspace before opening Study Mode.');
+    _openControls({ trigger: _controlsTriggerTarget(), focusError: true });
     return false;
   }
   if (_active) {
@@ -975,9 +1400,9 @@ export async function open(options = {}) {
       _setActiveSessionId(requestedId);
       _applyState(EMPTY_STATE, { syncForm: true, sessionId: requestedId });
     }
-    if (options.refresh || changed) await _loadState({ sessionId: requestedId });
+    const initialized = await _initializeWorkspace({ sessionId: requestedId, syncForm: !_goalDirty });
     if (options.focus !== false) focus();
-    return true;
+    return Boolean(initialized);
   }
 
   _setActiveSessionId(requestedId);
@@ -987,6 +1412,7 @@ export async function open(options = {}) {
   const panel = _elements['study-panel'];
   panel.hidden = false;
   panel.setAttribute('aria-hidden', 'false');
+  if (_elements['study-chat-launcher']) _elements['study-chat-launcher'].hidden = false;
   _activateNavigation(true);
   _enterChatShell();
   _forceChatMode();
@@ -994,9 +1420,9 @@ export async function open(options = {}) {
   _syncDrawerClearance();
   if (typeof requestAnimationFrame === 'function') requestAnimationFrame(_syncDrawerClearance);
   _renderWorkspaces();
-  await _loadState({ sessionId: requestedId });
+  const initialized = await _initializeWorkspace({ sessionId: requestedId, syncForm: true });
   if (options.focus !== false) focus();
-  return true;
+  return Boolean(initialized);
 }
 
 /** Enter the current/recent Study workspace, creating the first one if needed. */
@@ -1010,7 +1436,10 @@ export async function enter(options = {}) {
     workspaceId = _sessionId(created?.id);
     if (!workspaceId) return false;
   } else if (currentId !== workspaceId && typeof _options.selectSession === 'function') {
-    const selected = await _options.selectSession(workspaceId, { keepSidebar: true, showLoading: false });
+    const selected = await _withTimeout(
+      () => _options.selectSession(workspaceId, { keepSidebar: true, showLoading: false }),
+      'Opening the Study workspace timed out. Check the connection and try again.',
+    );
     if (selected === false) return false;
   }
   return open({ ...options, sessionId: workspaceId });
@@ -1035,7 +1464,10 @@ export async function beforeSessionSwitch(targetId, targetMode) {
     return true;
   } catch (error) {
     _showError(error?.message || 'Could not pause the current Study workspace.');
-    return false;
+    // Navigation must remain recoverable. Initializing the destination also
+    // pauses every other owned Study timer on the server.
+    console.warn('Study Mode could not pause before switching; continuing safely:', error);
+    return true;
   } finally {
     _setBusy(false);
   }
@@ -1047,6 +1479,8 @@ async function _close(options = {}) {
   const startFresh = manual
     && options.startFresh !== false
     && _options.startFreshOnManualClose !== false;
+  _lifecycleGeneration += 1;
+  _invalidatePendingWorkspaceTransition();
   _closing = true;
   const closingSessionId = _sessionId(_activeSessionId);
   if (_stateController) {
@@ -1070,9 +1504,14 @@ async function _close(options = {}) {
     const message = error?.message || 'Could not pause the focus timer while leaving Study Mode.';
     console.error('Study Mode close failed to pause the timer:', error);
     _showError(message);
-    _closing = false;
-    _setBusy(false);
-    return false;
+    try {
+      window.uiModule?.showToast?.(
+        `${message} Restia will reconcile the timer when Study Mode opens again.`,
+        6000,
+      );
+    } catch (_) {}
+    // Do not trap the user in Study Mode. The request is bounded, and the
+    // next Study initialization reconciles timers by pausing all others.
   }
 
   _active = false;
@@ -1085,9 +1524,12 @@ async function _close(options = {}) {
     panel.setAttribute('aria-hidden', 'true');
     panel.setAttribute('aria-busy', 'false');
   }
+  if (_elements['study-chat-launcher']) _elements['study-chat-launcher'].hidden = true;
+  _closeControls({ restoreFocus: false });
   _stopTicker();
-  _busy = false;
   _closing = false;
+  _busyDepth = 1;
+  _setBusy(false);
   _activateNavigation(false);
   _restoreChatShell({ manual });
   _leaveStudyRoute();
@@ -1116,12 +1558,42 @@ export function focus() {
   return Boolean(target);
 }
 
+/** Save the first substantive prompt before the chat request builds tutor context. */
+export async function prepareFirstPrompt(prompt, { sessionId = null } = {}) {
+  const workspaceId = _sessionId(sessionId || _currentSessionId() || _activeSessionId);
+  const isStudyWorkspace = _studySessions().some(session => String(session.id) === workspaceId);
+  if (!workspaceId || (!isStudyWorkspace && workspaceId !== _sessionId(_activeSessionId))) return true;
+  const state = await _initializeWorkspace({ prompt, sessionId: workspaceId, syncForm: !_goalDirty });
+  return Boolean(state);
+}
+
+/** Apply the backend's stream-time initialization event without touching another open chat. */
+export async function applyServerInitialization(payload, sessionId = null) {
+  const workspaceId = _sessionId(sessionId || payload?.session_id);
+  if (!workspaceId || !payload || typeof payload !== 'object') return false;
+  if (workspaceId === _sessionId(_activeSessionId)) {
+    _applyState(payload, { syncForm: !_goalDirty, sessionId: workspaceId });
+    _lastResyncMs = _monotonicNow();
+  }
+  if (payload.title_initialized && typeof _options.reloadSessions === 'function') {
+    try {
+      await _refreshSessionList();
+    } catch (error) {
+      console.error('Study goal saved, but the session list could not refresh:', error);
+      _showError('Your Study goal was saved, but refreshing the workspace list timed out. Reload the page to update it.');
+    }
+  }
+  return true;
+}
+
 const studyModule = {
   init,
   enter,
   open,
   close,
   beforeSessionSwitch,
+  prepareFirstPrompt,
+  applyServerInitialization,
   isActive,
   focus,
 };
