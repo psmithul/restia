@@ -93,6 +93,30 @@ def test_projects_module_is_wired_as_a_full_workspace():
     assert "comments_next_before" in projects_js
 
 
+def test_projects_frontend_wires_closed_home_link_federation_surfaces():
+    projects_js = PROJECTS_JS.read_text(encoding="utf-8")
+    css = PROJECTS_CSS.read_text(encoding="utf-8")
+
+    for endpoint in (
+        "/api/projects/linked-instances",
+        "/remote-invitations",
+        "/remote-grants/",
+        "/api/homelink/projects?include_archived=true",
+        "/api/homelink/projects/invitations",
+        "/api/homelink/projects/attachments/",
+    ):
+        assert endpoint in projects_js
+    assert "transport === PROJECT_SOURCES.HOME ? '/api/homelink/projects' : '/api/projects'" in projects_js
+    assert "On this Restia" in projects_js
+    assert "Linked projects" in projects_js
+    assert "Owning Restia" in projects_js
+    assert "kind: 'instance'" in projects_js
+    assert ".projects-invitations" in css
+    assert ".projects-linked-members" in css
+    assert ".projects-member-status--active" in css
+    assert ".projects-member-status--pending" in css
+
+
 def test_projects_assets_are_precached_and_respect_responsive_accessibility():
     service_worker = SW_JS.read_text(encoding="utf-8")
     css = PROJECTS_CSS.read_text(encoding="utf-8")
@@ -102,6 +126,14 @@ def test_projects_assets_are_precached_and_respect_responsive_accessibility():
     assert "max-width: 768px" in css
     assert "prefers-reduced-motion" in css
     assert ":focus-visible" in css
+
+
+def test_projects_drawer_toolbar_commands_cannot_overlap():
+    css = PROJECTS_CSS.read_text(encoding="utf-8")
+    assert ".projects-workspace.has-task-drawer .projects-toolbar" in css
+    assert "grid-template-columns: minmax(0, 1fr);" in css
+    assert ".projects-workspace.has-task-drawer .projects-toolbar__actions" in css
+    assert "overflow-x: auto;" in css
 
 
 def test_profile_json_transfer_does_not_promise_project_file_backup():

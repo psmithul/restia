@@ -87,8 +87,17 @@ TOKEN_TTL = 60 * 60 * 24 * 7  # 7 days
 RESERVED_USERNAMES = frozenset(
     {INTERNAL_TOOL_USER, "api", "demo", "system", "owner@localhost"}
 )
+RESERVED_USERNAME_PREFIXES = ("remote:", "remote-instance:")
 _SESSION_KEY_PREFIX = "sha256:"
 _BACKUP_KEY_PREFIX = "sha256:"
+
+
+def username_is_reserved(username: str | None) -> bool:
+    """Return whether a username collides with an internal principal."""
+    key = str(username or "").strip().lower()
+    return key in RESERVED_USERNAMES or any(
+        key.startswith(prefix) for prefix in RESERVED_USERNAME_PREFIXES
+    )
 
 
 def normalize_known_username(users: Dict[str, Any], username: str | None) -> Optional[str]:
@@ -259,7 +268,7 @@ class AuthManager:
         """Migrate old single-user format to multi-user format."""
         if "password_hash" in self._config and "users" not in self._config:
             old_user = str(self._config.get("username", "admin") or "admin").strip().lower()
-            if old_user in RESERVED_USERNAMES:
+            if username_is_reserved(old_user):
                 # Renaming only the credential row would orphan every external
                 # store still owned by the old username. Preserve the legacy
                 # source verbatim and keep first-run setup closed instead.
@@ -300,7 +309,7 @@ class AuthManager:
         collisions = sorted({
             str(username or "").strip().lower()
             for username in users
-            if str(username or "").strip().lower() in RESERVED_USERNAMES
+            if username_is_reserved(username)
         })
         if collisions:
             self._auth_load_failed = True
@@ -449,7 +458,7 @@ class AuthManager:
         username = username.strip().lower()
         if not username:
             return False
-        if username in RESERVED_USERNAMES or username in self.retired_usernames:
+        if username_is_reserved(username) or username in self.retired_usernames:
             logger.warning("Refused to create reserved username '%s'", username)
             return False
         with self._config_lock:
@@ -457,7 +466,7 @@ class AuthManager:
             # names must be re-checked while holding the same lock used by
             # delete/rename so a concurrent request cannot recycle identity.
             if (
-                username in RESERVED_USERNAMES
+                username_is_reserved(username)
                 or username in self.retired_usernames
                 or username in self.users
             ):
@@ -539,14 +548,14 @@ class AuthManager:
         requesting_user = (requesting_user or "").strip().lower()
         if not old_username or not new_username:
             return False
-        if new_username in RESERVED_USERNAMES or new_username in self.retired_usernames:
+        if username_is_reserved(new_username) or new_username in self.retired_usernames:
             logger.warning("Refused to rename '%s' into reserved username '%s'", old_username, new_username)
             return False
         with self._config_lock:
             if old_username not in self.users:
                 return False
             if (
-                new_username in RESERVED_USERNAMES
+                username_is_reserved(new_username)
                 or new_username in self.retired_usernames
                 or new_username in self.users
             ):

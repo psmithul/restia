@@ -21,10 +21,10 @@ installation, reused by its internal profiles. Set
 instance itself should do this so it doesn't offer a chat with itself.
 
 Security model, in one place:
-  - A guest is never a user account on the hub. The token's entire scope is
-    the one guest↔owner conversation; every other route still requires the
-    hub's own session auth (only /api/link/register|messages|summary are
-    auth-exempt in app.py).
+  - A guest is never a user account on the hub. Its bearer authenticates one
+    linked installation, not any local profile. It can reach the guest↔owner
+    conversation and the closed Projects namespace; every Projects operation
+    additionally requires an active, project-scoped owner grant.
   - Registration is approval-gated (pending → approved/blocked by an admin),
     rate-limited per real client IP (CF-Connecting-IP aware — behind the
     Cloudflare tunnel every request reaches uvicorn from loopback), and
@@ -47,28 +47,32 @@ import logging
 import os
 import re
 import secrets
+import tempfile
 import time
 from datetime import timedelta
 from functools import wraps
-from typing import Any, Dict, Optional
-from urllib.parse import urlparse
+from typing import Any, BinaryIO, Dict, Literal, Optional
+from urllib.parse import quote, unquote, urlparse
 
 import httpx
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictStr
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import load_only
 from starlette.concurrency import run_in_threadpool
 
 from core.auth import RESERVED_USERNAMES
 from core.database import (
-    DirectMessage, DirectMessageAttachment, HomeLink, LinkGuest, LinkInvite, RemoteBlock,
-    RemoteContactPref, SessionLocal, utcnow_naive,
+    DirectMessage, DirectMessageAttachment, HomeLink, LinkGuest, LinkInvite, Project,
+    ProjectRemoteGrant, ProjectWorkItem, RemoteBlock, RemoteContactPref, SessionLocal,
+    utcnow_naive,
 )
 from core.middleware import require_admin
+from core.project_upload_limit import PROJECT_ATTACHMENT_REQUEST_MAX_BYTES
 from src.auth_helpers import require_user
 from src.rate_limiter import RateLimiter
+from src.upload_limits import PROJECT_ATTACHMENT_MAX_BYTES
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +92,17 @@ MESSAGES_PAGE_LIMIT = 200
 SUMMARY_CACHE_TTL = 4
 MAX_HUB_RESPONSE_BYTES = 2 * 1024 * 1024  # refuse absurd payloads from a hub
 MAX_HUB_MEDIA_RESPONSE_BYTES = 3 * 1024 * 1024
+# Projects has intentionally large but finite response shapes.  The archived
+# board can contain 10,000 cards (each with a 240-character title and thirty
+# 40-character labels), while item detail/comment pages can contain 200
+# 50,000-character comments plus checklist and attachment metadata.  128 MiB
+# covers those legal maxima even under worst-case JSON string escaping while
+# still putting a hard boundary around a hostile or broken home server.
+MAX_PROJECT_PROXY_JSON_RESPONSE_BYTES = 128 * 1024 * 1024
+MAX_HUB_RESPONSE_CEILING_BYTES = max(
+    MAX_HUB_MEDIA_RESPONSE_BYTES,
+    MAX_PROJECT_PROXY_JSON_RESPONSE_BYTES,
+)
 MAX_PHOTOS_PER_MESSAGE = 1
 MAX_PHOTO_PIXELS = 12_000_000
 MAX_FEDERATED_PHOTO_BYTES = 2 * 1024 * 1024
@@ -108,6 +123,58 @@ _HOME_CALL_UPSTREAM_READY = ": upstream-connected\n\n"
 _home_call_watch_config_warned = False
 MAX_CALL_TARGET_LEN = 96
 MAX_CALL_KIND_LEN = 16
+MAX_PROJECT_PROXY_JSON_BYTES = 512 * 1024
+PROJECT_PROXY_UPLOAD_SPOOL_BYTES = 1024 * 1024
+PROJECT_MUTATION_INDETERMINATE_DETAIL = (
+    "Home server did not confirm this project change. It may have succeeded; "
+    "reload linked projects before retrying."
+)
+
+# Home Link's browser-facing Projects proxy is deliberately a closed protocol,
+# not a general-purpose forwarder. Each path segment is bounded and the allowed
+# method for every route shape is enumerated below.
+_PROJECT_PROXY_SEGMENT = (
+    r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+    r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
+)
+_PROJECT_PROXY_RULES = tuple(
+    (re.compile(pattern), frozenset(methods))
+    for pattern, methods in (
+        (r"", ("GET",)),
+        (r"overview", ("GET",)),
+        (r"invitations", ("GET",)),
+        (rf"invitations/{_PROJECT_PROXY_SEGMENT}/respond", ("POST",)),
+        (rf"attachments/{_PROJECT_PROXY_SEGMENT}/download", ("GET",)),
+        (rf"{_PROJECT_PROXY_SEGMENT}", ("GET", "PATCH")),
+        (rf"{_PROJECT_PROXY_SEGMENT}/(?:overview|board|stages|items|activity)", ("GET",)),
+        (rf"{_PROJECT_PROXY_SEGMENT}/stages", ("POST",)),
+        (rf"{_PROJECT_PROXY_SEGMENT}/stages/order", ("PUT",)),
+        (rf"{_PROJECT_PROXY_SEGMENT}/stages/{_PROJECT_PROXY_SEGMENT}", ("PATCH", "DELETE")),
+        (rf"{_PROJECT_PROXY_SEGMENT}/items", ("POST",)),
+        (rf"{_PROJECT_PROXY_SEGMENT}/items/order", ("PUT",)),
+        (rf"{_PROJECT_PROXY_SEGMENT}/items/{_PROJECT_PROXY_SEGMENT}", ("GET", "PATCH", "DELETE")),
+        (rf"{_PROJECT_PROXY_SEGMENT}/items/{_PROJECT_PROXY_SEGMENT}/(?:move|archive|restore)", ("POST",)),
+        (rf"{_PROJECT_PROXY_SEGMENT}/items/{_PROJECT_PROXY_SEGMENT}/checklist", ("POST",)),
+        (rf"{_PROJECT_PROXY_SEGMENT}/items/{_PROJECT_PROXY_SEGMENT}/checklist/{_PROJECT_PROXY_SEGMENT}", ("PATCH", "DELETE")),
+        (rf"{_PROJECT_PROXY_SEGMENT}/items/{_PROJECT_PROXY_SEGMENT}/comments", ("GET", "POST")),
+        (rf"{_PROJECT_PROXY_SEGMENT}/items/{_PROJECT_PROXY_SEGMENT}/comments/{_PROJECT_PROXY_SEGMENT}", ("PATCH", "DELETE")),
+        (rf"{_PROJECT_PROXY_SEGMENT}/items/{_PROJECT_PROXY_SEGMENT}/attachments", ("GET", "POST")),
+        (rf"{_PROJECT_PROXY_SEGMENT}/attachments/{_PROJECT_PROXY_SEGMENT}", ("DELETE",)),
+    )
+)
+_PROJECT_PROXY_QUERY_KEYS = frozenset({
+    "archived",
+    "assignee",
+    "before",
+    "include_archived",
+    "limit",
+    "move_to_stage_id",
+    "offset",
+    "q",
+    "stage_id",
+    "version",
+    "work_item_id",
+})
 
 GUEST_PENDING = "pending"
 GUEST_APPROVED = "approved"
@@ -125,6 +192,8 @@ PENDING = "link_pending"               # registered, awaiting owner approval
 REVOKE_REQUIRED = "home_revoke_required"
 
 _home_link_lifecycle_lock = asyncio.Lock()
+_project_remote_limiter = RateLimiter(max_requests=600, window_seconds=60)
+_project_remote_invalid_limiter = RateLimiter(max_requests=60, window_seconds=60)
 
 
 def _serialized_home_link_lifecycle(fn):
@@ -177,6 +246,13 @@ class RedeemHomeRequest(BaseModel):
 
 class DisconnectHomeRequest(BaseModel):
     force_local: bool = False
+
+
+class ProjectInvitationResponseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["accept", "decline"]
+    version: int = Field(ge=1)
 
 
 class GuestActionRequest(BaseModel):
@@ -247,6 +323,21 @@ def _client_ip(request: Request) -> str:
         if v:
             return v
     return getattr(getattr(request, "client", None), "host", "") or "unknown"
+
+
+def _raw_client_ip(request: Request) -> str:
+    """Return the transport peer without trusting caller-controlled headers.
+
+    Home Link's public registration and messaging endpoints retain their
+    Cloudflare-aware limiter key above. Projects needs a different boundary:
+    before a bearer has authenticated, forwarding headers are attacker input.
+    Once authenticated, requests are keyed by the durable guest identity instead
+    of any network address, so legitimate instances behind one tunnel/NAT do not
+    throttle each other.
+    """
+
+    value = str(getattr(getattr(request, "client", None), "host", "") or "").strip()
+    return value[:128] or "unknown"
 
 
 # ── Hub side ────────────────────────────────────────────────────────────────
@@ -517,8 +608,69 @@ def _pair_filter(a: str, b: str):
     )
 
 
+def _revoke_guest_project_grants(
+    db,
+    guest: LinkGuest,
+    *,
+    project_owner: Optional[str] = None,
+) -> int:
+    """Detach this guest's project capabilities, optionally for one owner.
+
+    Admin block/purge is installation-global. ``/me/block`` is explicitly a
+    per-profile action, so it must only revoke grants on projects that profile
+    owns and must leave the bearer usable for other project owners.
+    """
+    guest_id = getattr(guest, "id", None)
+    if guest_id is None:
+        return 0
+    now = utcnow_naive()
+    grant_query = db.query(ProjectRemoteGrant.id).filter(
+        ProjectRemoteGrant.guest_id == int(guest_id)
+    )
+    normalized_owner = _norm(project_owner)
+    if normalized_owner:
+        grant_query = grant_query.join(
+            Project, Project.id == ProjectRemoteGrant.project_id
+        ).filter(func.lower(Project.owner) == normalized_owner)
+    grant_ids = [
+        str(grant_id).strip().lower()
+        for (grant_id,) in grant_query.all()
+    ]
+    if not grant_ids:
+        return 0
+    principals = [f"remote:{grant_id}" for grant_id in grant_ids]
+    db.query(ProjectWorkItem).filter(
+        ProjectWorkItem.assignee.in_(principals)
+    ).update(
+        {
+            ProjectWorkItem.assignee: None,
+            ProjectWorkItem.version: ProjectWorkItem.version + 1,
+            ProjectWorkItem.updated_at: now,
+        },
+        synchronize_session=False,
+    )
+    return int(
+        db.query(ProjectRemoteGrant)
+        .filter(ProjectRemoteGrant.id.in_(grant_ids))
+        .update(
+            {
+                ProjectRemoteGrant.guest_id: None,
+                ProjectRemoteGrant.status: "revoked",
+                ProjectRemoteGrant.revoked_at: now,
+                ProjectRemoteGrant.version: ProjectRemoteGrant.version + 1,
+            },
+            synchronize_session=False,
+        )
+        or 0
+    )
+
+
 def _purge_guest_identity(db, guest: LinkGuest) -> str:
     """Delete one guest and all handle-keyed history before handle reuse."""
+    # Null the immutable guest association before deleting the credential row.
+    # The handle snapshot remains audit-only and can never authorize a later
+    # guest who happens to register the same spelling.
+    _revoke_guest_project_grants(db, guest)
     gname = guest_username(guest.handle)
     message_ids = [
         row_id for (row_id,) in db.query(DirectMessage.id).filter(
@@ -598,6 +750,216 @@ def _ser(msg: DirectMessage, me: str, attachments=None,
         "read": msg.read_at is not None,
         "attachments": [_attachment_meta(row) for row in (attachments or [])],
     }
+
+
+def _project_invitation_dict(
+    grant: ProjectRemoteGrant,
+    project: Project,
+) -> dict[str, Any]:
+    """Return the only project metadata exposed before a grant is accepted."""
+    return {
+        "id": str(grant.id),
+        "role": str(grant.role),
+        "status": str(grant.status),
+        "version": int(grant.version or 1),
+        "invited_at": (
+            grant.invited_at.isoformat() + "Z" if grant.invited_at else None
+        ),
+        "responded_at": (
+            grant.responded_at.isoformat() + "Z" if grant.responded_at else None
+        ),
+        "project": {
+            "id": str(project.id),
+            "key": str(project.key),
+            "name": str(project.name),
+            "description": str(project.description or ""),
+            "color": str(project.color),
+            "icon": str(project.icon) if project.icon else None,
+            "archived": bool(project.archived),
+        },
+    }
+
+
+async def require_link_project_remote(request: Request) -> str:
+    """Authenticate and project-scope one public Home Link Projects request."""
+    _require_hub()
+    db = SessionLocal()
+    try:
+        try:
+            guest = _guest_from_bearer(request, db)
+        except HTTPException as exc:
+            if exc.status_code == 401 and not _project_remote_invalid_limiter.check(
+                _raw_client_ip(request)
+            ):
+                raise HTTPException(429, "Too many requests — slow down") from exc
+            raise
+        if not _project_remote_limiter.check(f"guest:{int(guest.id)}"):
+            raise HTTPException(429, "Too many requests — slow down")
+        _require_approved(guest)
+        request_path = str(getattr(getattr(request, "url", None), "path", "") or "")
+        prefix = "/api/link/projects"
+        if request_path != prefix and not request_path.startswith(prefix + "/"):
+            raise HTTPException(404, "Project route not found")
+        remote_path = request_path[len(prefix):].strip("/")
+        _project_proxy_kind(request.method, remote_path)
+        grant_id = None
+        project_id = request.path_params.get("project_id")
+        if project_id:
+            row = (
+                db.query(ProjectRemoteGrant, Project)
+                .join(Project, Project.id == ProjectRemoteGrant.project_id)
+                .filter(
+                    ProjectRemoteGrant.project_id == str(project_id),
+                    ProjectRemoteGrant.guest_id == int(guest.id),
+                    ProjectRemoteGrant.status == "active",
+                )
+                .first()
+            )
+            if row is None:
+                # Do not reveal whether the project exists to a different
+                # linked installation.
+                raise HTTPException(404, "Project not found")
+            grant, project = row
+            if _is_blocked(db, project.owner, guest.handle):
+                raise HTTPException(404, "Project not found")
+            grant_id = str(grant.id)
+        from routes.project_routes import set_remote_project_context
+
+        principal = set_remote_project_context(
+            request,
+            guest_id=int(guest.id),
+            grant_id=grant_id,
+        )
+        request.state.project_remote_handle = str(guest.handle)
+        guest.last_seen = utcnow_naive()
+        db.commit()
+        return principal
+    finally:
+        db.close()
+
+
+def setup_link_project_invitation_routes() -> APIRouter:
+    """Bearer-only invitation inbox for a linked installation."""
+    router = APIRouter(
+        prefix="/api/link/projects",
+        tags=["link-projects"],
+        dependencies=[Depends(require_link_project_remote)],
+    )
+
+    @router.get("/invitations")
+    async def list_project_invitations(request: Request):
+        guest_id = getattr(request.state, "project_remote_guest_id", None)
+        if guest_id is None:
+            raise HTTPException(401, "Invalid project credential")
+        db = SessionLocal()
+        try:
+            handle = str(getattr(request.state, "project_remote_handle", "") or "")
+            rows = (
+                db.query(ProjectRemoteGrant, Project)
+                .join(Project, Project.id == ProjectRemoteGrant.project_id)
+                .filter(
+                    ProjectRemoteGrant.guest_id == int(guest_id),
+                    ProjectRemoteGrant.status == "pending",
+                )
+                .order_by(ProjectRemoteGrant.invited_at.asc())
+                .all()
+            )
+            rows = [
+                (grant, project)
+                for grant, project in rows
+                if handle and not _is_blocked(db, project.owner, handle)
+            ]
+            return {
+                "invitations": [
+                    _project_invitation_dict(grant, project)
+                    for grant, project in rows
+                ]
+            }
+        finally:
+            db.close()
+
+    @router.post("/invitations/{grant_id}/respond")
+    async def respond_to_project_invitation(
+        grant_id: str,
+        body: ProjectInvitationResponseRequest,
+        request: Request,
+    ):
+        guest_id = getattr(request.state, "project_remote_guest_id", None)
+        if guest_id is None:
+            raise HTTPException(401, "Invalid project credential")
+        next_status = "active" if body.action == "accept" else "declined"
+        now = utcnow_naive()
+        db = SessionLocal()
+        try:
+            invitation = (
+                db.query(ProjectRemoteGrant, Project)
+                .join(Project, Project.id == ProjectRemoteGrant.project_id)
+                .filter(
+                    ProjectRemoteGrant.id == str(grant_id),
+                    ProjectRemoteGrant.guest_id == int(guest_id),
+                )
+                .first()
+            )
+            handle = str(getattr(request.state, "project_remote_handle", "") or "")
+            if invitation is None or not handle:
+                raise HTTPException(404, "Invitation not found")
+            _, invitation_project = invitation
+            if _is_blocked(db, invitation_project.owner, handle):
+                raise HTTPException(404, "Invitation not found")
+            changed = (
+                db.query(ProjectRemoteGrant)
+                .filter(
+                    ProjectRemoteGrant.id == str(grant_id),
+                    ProjectRemoteGrant.guest_id == int(guest_id),
+                    ProjectRemoteGrant.status == "pending",
+                    ProjectRemoteGrant.version == int(body.version),
+                )
+                .update(
+                    {
+                        ProjectRemoteGrant.status: next_status,
+                        ProjectRemoteGrant.responded_at: now,
+                        ProjectRemoteGrant.version: ProjectRemoteGrant.version + 1,
+                    },
+                    synchronize_session=False,
+                )
+            )
+            if changed != 1:
+                visible = (
+                    db.query(ProjectRemoteGrant.id)
+                    .filter(
+                        ProjectRemoteGrant.id == str(grant_id),
+                        ProjectRemoteGrant.guest_id == int(guest_id),
+                    )
+                    .first()
+                )
+                db.rollback()
+                if visible is None:
+                    raise HTTPException(404, "Invitation not found")
+                raise HTTPException(409, "Invitation changed; refresh and try again")
+            db.commit()
+            row = (
+                db.query(ProjectRemoteGrant, Project)
+                .join(Project, Project.id == ProjectRemoteGrant.project_id)
+                .filter(
+                    ProjectRemoteGrant.id == str(grant_id),
+                    ProjectRemoteGrant.guest_id == int(guest_id),
+                )
+                .first()
+            )
+            if row is None:
+                raise HTTPException(409, "Invitation changed; refresh and try again")
+            grant, project = row
+            return {"invitation": _project_invitation_dict(grant, project)}
+        except HTTPException:
+            db.rollback()
+            raise
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    return router
 
 
 def setup_link_hub_routes():
@@ -984,6 +1346,7 @@ def setup_link_hub_routes():
             else:
                 g.status = GUEST_APPROVED if action == "approve" else GUEST_BLOCKED
                 if action == "block":
+                    _revoke_guest_project_grants(db, g)
                     revoked_credential = str(g.token_hash)
             db.commit()
             if revoked_credential:
@@ -1133,22 +1496,17 @@ def setup_link_hub_routes():
             raise HTTPException(400, "handle required")
         db = SessionLocal()
         try:
-            guest_credential = None
-            if action == "block" and me == _owner_username(request):
+            if action == "block":
                 guest_row = db.query(LinkGuest).filter(LinkGuest.handle == handle).first()
                 if guest_row is not None:
-                    guest_credential = str(guest_row.token_hash)
+                    _revoke_guest_project_grants(db, guest_row, project_owner=me)
             existing = db.query(RemoteBlock).filter(
                 RemoteBlock.local_user == me, RemoteBlock.handle == handle).first()
             if action == "block" and not existing:
                 db.add(RemoteBlock(local_user=me, handle=handle, created_at=utcnow_naive()))
-                db.commit()
             elif action == "unblock" and existing:
                 db.delete(existing)
-                db.commit()
-            if guest_credential:
-                from routes import call_routes
-                call_routes.revoke_federated_credential(guest_credential)
+            db.commit()
             return {"ok": True, "handle": handle, "blocked": action == "block"}
         finally:
             db.close()
@@ -1560,11 +1918,49 @@ def _validated_home_base(base_url: Optional[str]) -> str:
     return f"{parsed.scheme}://{display_host}{port_part}"
 
 
+def _raise_hub_response_error(
+    status_code: int,
+    content: bytes,
+    *,
+    allow_not_found: bool = False,
+) -> None:
+    """Map a bounded upstream error without exposing its URL or credential."""
+    try:
+        parsed = json.loads(content)
+        detail = parsed.get("detail") if isinstance(parsed, dict) else None
+    except Exception:
+        detail = None
+    # A rejected token means we're effectively not connected. Surface the
+    # connect-card sentinel instead of 401: a raw 401 would trip the browser's
+    # redirect-to-/login behavior.
+    if status_code == 401:
+        raise HTTPException(409, NOT_CONNECTED)
+    if status_code == 403:
+        if detail == PENDING:
+            raise HTTPException(403, PENDING)
+        raise HTTPException(
+            403,
+            detail
+            if isinstance(detail, str) and len(detail) <= 300
+            else "Home server refused the request",
+        )
+    if status_code in (400, 409, 429) or (allow_not_found and status_code == 404):
+        raise HTTPException(
+            status_code,
+            detail
+            if isinstance(detail, str) and len(detail) <= 300
+            else "Home server refused the request",
+        )
+    raise HTTPException(502, f"Home server error ({status_code})")
+
+
 async def _hub_call(method: str, path: str, *, token: Optional[str] = None,
                     json_body: Optional[dict] = None,
                     params: Optional[dict] = None,
                     base_url: Optional[str] = None,
-                    max_response_bytes: int = MAX_HUB_RESPONSE_BYTES) -> dict:
+                    max_response_bytes: int = MAX_HUB_RESPONSE_BYTES,
+                    allow_not_found: bool = False,
+                    indeterminate_mutation: bool = False) -> dict:
     """One HTTP round-trip to the home server, with errors mapped to local
     HTTP errors. Kept as a single seam so tests can monkeypatch it."""
     headers = {"Authorization": f"Bearer {token}"} if token else {}
@@ -1573,7 +1969,7 @@ async def _hub_call(method: str, path: str, *, token: Optional[str] = None,
         response_limit = int(max_response_bytes)
     except (TypeError, ValueError):
         response_limit = MAX_HUB_RESPONSE_BYTES
-    response_limit = max(1024, min(response_limit, MAX_HUB_MEDIA_RESPONSE_BYTES))
+    response_limit = max(1024, min(response_limit, MAX_HUB_RESPONSE_CEILING_BYTES))
     try:
         async with httpx.AsyncClient(
             timeout=10,
@@ -1590,39 +1986,44 @@ async def _hub_call(method: str, path: str, *, token: Optional[str] = None,
                 content = bytearray()
                 async for chunk in resp.aiter_bytes():
                     if len(content) + len(chunk) > response_limit:
+                        if indeterminate_mutation:
+                            raise HTTPException(
+                                502,
+                                PROJECT_MUTATION_INDETERMINATE_DETAIL,
+                            )
                         raise HTTPException(502, "Home server response too large")
                     content.extend(chunk)
                 status_code = resp.status_code
     except httpx.HTTPError as e:
+        if indeterminate_mutation:
+            raise HTTPException(
+                502,
+                PROJECT_MUTATION_INDETERMINATE_DETAIL,
+            ) from e
         raise HTTPException(502, f"Home server unreachable ({e.__class__.__name__})")
     if status_code >= 400:
-        try:
-            parsed = json.loads(bytes(content))
-            detail = parsed.get("detail") if isinstance(parsed, dict) else None
-        except Exception:
-            detail = None
-        # A rejected token means we're effectively not connected. Surface the
-        # connect-card sentinel instead of 401: a raw 401 would trip the
-        # front-end fetch wrapper's redirect-to-/login behavior.
-        if status_code == 401:
-            raise HTTPException(409, NOT_CONNECTED)
-        # Awaiting (or denied) approval — the front-end shows the waiting card.
-        if status_code == 403:
-            if detail == PENDING:
-                raise HTTPException(403, PENDING)
-            # e.g. an invalid/expired invite code — surface the reason, don't 502.
-            raise HTTPException(403, detail if isinstance(detail, str) and len(detail) <= 300
-                                else "Home server refused the request")
-        if status_code in (400, 409, 429):
-            raise HTTPException(status_code,
-                                detail if isinstance(detail, str) and len(detail) <= 300
-                                else "Home server refused the request")
-        raise HTTPException(502, f"Home server error ({status_code})")
+        _raise_hub_response_error(
+            status_code,
+            bytes(content),
+            allow_not_found=allow_not_found,
+        )
     try:
         data = json.loads(bytes(content))
-    except Exception:
+    except Exception as exc:
+        if indeterminate_mutation:
+            raise HTTPException(
+                502,
+                PROJECT_MUTATION_INDETERMINATE_DETAIL,
+            ) from exc
         raise HTTPException(502, "Home server returned malformed data")
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        if indeterminate_mutation:
+            raise HTTPException(
+                502,
+                PROJECT_MUTATION_INDETERMINATE_DETAIL,
+            )
+        return {}
+    return data
 
 
 def _require_link(db, me: str) -> HomeLink:
@@ -1630,6 +2031,382 @@ def _require_link(db, me: str) -> HomeLink:
     if not link:
         raise HTTPException(409, NOT_CONNECTED)
     return link
+
+
+def _project_proxy_kind(method: str, remote_path: str) -> str:
+    """Validate one relative Projects route and classify its transport."""
+    normalized_method = str(method or "").upper()
+    normalized_path = str(remote_path or "").strip("/")
+    path_matched = False
+    for pattern, methods in _PROJECT_PROXY_RULES:
+        if pattern.fullmatch(normalized_path):
+            path_matched = True
+            if normalized_method not in methods:
+                # Some route shapes intentionally have separate read and write
+                # rules (for example GET and POST on ``/{project}/items``).
+                # Keep looking before deciding the path rejects this method.
+                continue
+            if normalized_path.endswith("/download"):
+                return "download"
+            if normalized_method == "POST" and normalized_path.endswith("/attachments"):
+                return "upload"
+            return "json"
+    if path_matched:
+        raise HTTPException(405, "Method not allowed")
+    raise HTTPException(404, "Project route not found")
+
+
+def _project_proxy_params(request: Request) -> dict[str, str]:
+    params: dict[str, str] = {}
+    for key, value in request.query_params.multi_items():
+        if key not in _PROJECT_PROXY_QUERY_KEYS:
+            raise HTTPException(400, f"Unsupported project query parameter: {key}")
+        if key in params:
+            raise HTTPException(400, f"Duplicate project query parameter: {key}")
+        if len(value) > 300:
+            raise HTTPException(400, f"Project query parameter is too long: {key}")
+        params[key] = value
+    return params
+
+
+async def _project_proxy_json_body(request: Request) -> Optional[dict]:
+    if request.method.upper() in ("GET", "DELETE"):
+        return None
+    declared = request.headers.get("content-length")
+    if declared:
+        try:
+            if int(declared) > MAX_PROJECT_PROXY_JSON_BYTES:
+                raise HTTPException(413, "Project request body is too large")
+        except ValueError:
+            raise HTTPException(400, "Invalid Content-Length")
+    body = await request.body()
+    if len(body) > MAX_PROJECT_PROXY_JSON_BYTES:
+        raise HTTPException(413, "Project request body is too large")
+    if not body:
+        return None
+    try:
+        value = json.loads(body)
+    except Exception:
+        raise HTTPException(400, "Project request body must be valid JSON")
+    if not isinstance(value, dict):
+        raise HTTPException(400, "Project request body must be an object")
+    return value
+
+
+async def _run_project_spool_io(function, *args):
+    """Finish one worker-thread file operation before propagating cancellation."""
+    operation = asyncio.create_task(asyncio.to_thread(function, *args))
+    try:
+        return await asyncio.shield(operation)
+    except asyncio.CancelledError:
+        # Cancelling ``to_thread`` does not stop its worker. Waiting here keeps a
+        # route-level finally from closing the spool under an in-flight read or
+        # write, which can otherwise corrupt the stream or crash the worker.
+        while not operation.done():
+            try:
+                await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                # Repeated client/task cancellation must not cancel the wrapper
+                # Task while its underlying thread is still using the spool.
+                continue
+            except BaseException:
+                break
+        if operation.done():
+            try:
+                operation.result()
+            except BaseException:
+                pass
+        raise
+
+
+async def _stage_project_proxy_upload(
+    request: Request,
+) -> tuple[BinaryIO, str, int]:
+    """Bound and spool a raw multipart body before taking the lifecycle lock."""
+    content_type = request.headers.get("content-type") or ""
+    if not content_type.lower().startswith("multipart/form-data;"):
+        raise HTTPException(415, "Project attachment upload must be multipart/form-data")
+    declared = request.headers.get("content-length")
+    if declared:
+        try:
+            declared_size = int(declared)
+        except ValueError:
+            raise HTTPException(400, "Invalid Content-Length")
+        if declared_size < 0:
+            raise HTTPException(400, "Invalid Content-Length")
+        if declared_size > PROJECT_ATTACHMENT_REQUEST_MAX_BYTES:
+            raise HTTPException(413, "Project attachment request body is too large")
+
+    staged = tempfile.SpooledTemporaryFile(
+        max_size=PROJECT_PROXY_UPLOAD_SPOOL_BYTES,
+        mode="w+b",
+    )
+    received = 0
+    try:
+        async for chunk in request.stream():
+            received += len(chunk)
+            if received > PROJECT_ATTACHMENT_REQUEST_MAX_BYTES:
+                raise HTTPException(413, "Project attachment request body is too large")
+            if chunk:
+                await _run_project_spool_io(staged.write, chunk)
+        await _run_project_spool_io(staged.seek, 0)
+        return staged, content_type, received
+    except BaseException:
+        staged.close()
+        raise
+
+
+async def _iter_staged_project_upload(staged: BinaryIO):
+    while True:
+        chunk = await _run_project_spool_io(
+            staged.read,
+            PROJECT_PROXY_UPLOAD_SPOOL_BYTES,
+        )
+        if not chunk:
+            return
+        yield chunk
+
+
+def _require_home_project_link_snapshot(request: Request) -> dict[str, Any]:
+    """Authorize a same-origin Projects proxy call and pin its credential."""
+    if bool(getattr(request.state, "api_token", False)):
+        raise HTTPException(403, "A signed-in browser session is required")
+    me = _require_local_profile(request)
+    is_admin = False
+    try:
+        require_admin(request)
+        is_admin = True
+    except HTTPException:
+        pass
+    db = SessionLocal()
+    try:
+        link = _require_link(db, me)
+        owner = _norm(link.owner)
+        if not is_admin and (not owner or owner != me):
+            raise HTTPException(
+                403,
+                "Only an admin or the Home Link owner can access linked projects",
+            )
+        token = str(link.token)
+        base_url = _validated_home_base(link.home_url)
+        return {
+            "link_identity": int(link.id),
+            "owner": owner,
+            "token": token,
+            "token_fingerprint": _hash_token(token),
+            "base_url": base_url,
+        }
+    finally:
+        db.close()
+
+
+def _assert_home_project_link_current(
+    snapshot: dict[str, Any],
+    *,
+    mutation: bool = False,
+) -> None:
+    if not _home_call_link_still_current(
+        snapshot["link_identity"],
+        snapshot["owner"],
+        snapshot["token_fingerprint"],
+        snapshot["base_url"],
+    ):
+        detail = (
+            "Home Link changed while the project operation was completing. "
+            "It may have succeeded on the previous link; reload linked projects before retrying."
+            if mutation
+            else "Home Link changed; retry"
+        )
+        raise HTTPException(409, detail)
+
+
+async def _read_bounded_upstream_response(
+    response: httpx.Response,
+    *,
+    limit: int = MAX_HUB_RESPONSE_BYTES,
+) -> bytes:
+    content = bytearray()
+    async for chunk in response.aiter_bytes():
+        if len(content) + len(chunk) > limit:
+            raise HTTPException(502, "Home server response too large")
+        content.extend(chunk)
+    return bytes(content)
+
+
+async def _proxy_home_project_upload(
+    staged_upload: tuple[BinaryIO, str, int],
+    remote_path: str,
+    snapshot: dict[str, Any],
+) -> dict:
+    """Stream one staged, bounded multipart request to the pinned hub."""
+    staged, content_type, content_length = staged_upload
+    headers = {
+        "Authorization": f"Bearer {snapshot['token']}",
+        "Content-Type": content_type,
+        "Content-Length": str(content_length),
+    }
+    target = snapshot["base_url"] + "/api/link/projects/" + remote_path
+    try:
+        timeout = httpx.Timeout(connect=10, read=60, write=60, pool=10)
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
+            async with client.stream(
+                "POST",
+                target,
+                headers=headers,
+                content=_iter_staged_project_upload(staged),
+            ) as response:
+                try:
+                    content = await _read_bounded_upstream_response(response)
+                except HTTPException as exc:
+                    raise HTTPException(
+                        502,
+                        PROJECT_MUTATION_INDETERMINATE_DETAIL,
+                    ) from exc
+                status_code = response.status_code
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            502,
+            PROJECT_MUTATION_INDETERMINATE_DETAIL,
+        ) from exc
+    if status_code >= 400:
+        _raise_hub_response_error(status_code, content, allow_not_found=True)
+    try:
+        value = json.loads(content)
+    except Exception as exc:
+        raise HTTPException(
+            502,
+            PROJECT_MUTATION_INDETERMINATE_DETAIL,
+        ) from exc
+    if not isinstance(value, dict):
+        raise HTTPException(502, PROJECT_MUTATION_INDETERMINATE_DETAIL)
+    _assert_home_project_link_current(snapshot, mutation=True)
+    return value
+
+
+def _safe_project_download_headers(response: httpx.Response) -> dict[str, str]:
+    headers = {
+        "Cache-Control": "private, no-store",
+        "Pragma": "no-cache",
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "default-src 'none'; sandbox",
+    }
+    content_type = response.headers.get("content-type")
+    if content_type and len(content_type) <= 200:
+        headers["Content-Type"] = content_type
+    content_length = response.headers.get("content-length")
+    if not content_length:
+        # The authoritative Restia endpoint is a FileResponse and always knows
+        # the stored byte count. Refuse an unbounded/chunked upstream before
+        # downstream headers are sent; silently truncating a 200 response at
+        # the streaming limit would produce a corrupt deliverable.
+        raise HTTPException(502, "Home server omitted attachment size")
+    try:
+        size = int(content_length)
+    except ValueError:
+        raise HTTPException(502, "Home server returned invalid attachment metadata")
+    if size < 0 or size > PROJECT_ATTACHMENT_MAX_BYTES:
+        raise HTTPException(502, "Home server returned an invalid attachment size")
+    headers["Content-Length"] = str(size)
+    disposition = response.headers.get("content-disposition") or ""
+    encoded_match = re.search(r"filename\*=utf-8''([^;]+)", disposition, re.IGNORECASE)
+    plain_match = re.search(r'filename="?([^";]+)', disposition, re.IGNORECASE)
+    raw_name = encoded_match.group(1) if encoded_match else (
+        plain_match.group(1) if plain_match else "attachment"
+    )
+    name = unquote(raw_name)
+    name = re.sub(r"[\x00-\x1f\x7f]+", "", os.path.basename(name))[:180]
+    name = name.replace('"', "_").replace("\\", "_") or "attachment"
+    fallback = re.sub(r"[^A-Za-z0-9._ ()-]+", "_", name) or "attachment"
+    headers["Content-Disposition"] = (
+        f'attachment; filename="{fallback}"; filename*=UTF-8\'\'{quote(name, safe="")}'
+    )
+    return headers
+
+
+async def _proxy_home_project_download(
+    remote_path: str,
+    snapshot: dict[str, Any],
+) -> StreamingResponse:
+    """Open a bounded, redirect-free attachment stream from the pinned hub."""
+    target = snapshot["base_url"] + "/api/link/projects/" + remote_path
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=10, read=60, write=60, pool=10),
+        follow_redirects=False,
+        trust_env=False,
+    )
+    response = None
+    try:
+        upstream_request = client.build_request(
+            "GET",
+            target,
+            headers={
+                "Authorization": f"Bearer {snapshot['token']}",
+                # httpx transparently decodes gzip/br by default.  The proxy
+                # forwards the upstream Content-Length, so transformed bytes
+                # would otherwise be truncated or rejected by the downstream
+                # HTTP server.  Require an identity representation instead.
+                "Accept-Encoding": "identity",
+            },
+        )
+        response = await client.send(upstream_request, stream=True)
+        content_encoding = (response.headers.get("content-encoding") or "").strip().lower()
+        if content_encoding and content_encoding != "identity":
+            raise HTTPException(
+                502,
+                "Home server returned an encoded attachment unexpectedly",
+            )
+        if response.status_code >= 400:
+            content = await _read_bounded_upstream_response(response)
+            await response.aclose()
+            await client.aclose()
+            _raise_hub_response_error(
+                response.status_code,
+                content,
+                allow_not_found=True,
+            )
+        if response.status_code != 200:
+            await response.aclose()
+            await client.aclose()
+            raise HTTPException(502, f"Home server error ({response.status_code})")
+        headers = _safe_project_download_headers(response)
+        _assert_home_project_link_current(snapshot)
+    except httpx.HTTPError as exc:
+        if response is not None:
+            await response.aclose()
+        await client.aclose()
+        raise HTTPException(
+            502,
+            f"Home server unreachable ({exc.__class__.__name__})",
+        )
+    except BaseException:
+        if response is not None:
+            await response.aclose()
+        await client.aclose()
+        raise
+
+    async def body():
+        received = 0
+        try:
+            async for chunk in response.aiter_bytes():
+                received += len(chunk)
+                if received > PROJECT_ATTACHMENT_MAX_BYTES:
+                    logger.warning("Home Link project attachment exceeded its declared limit")
+                    return
+                yield chunk
+        finally:
+            await response.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        body(),
+        status_code=200,
+        headers=headers,
+        media_type=headers.get("Content-Type", "application/octet-stream"),
+    )
 
 
 # Conversation-list / badge polls hit the hub at most once per TTL, per user.
@@ -2500,5 +3277,98 @@ def setup_home_link_routes():
             media_type="text/event-stream",
             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
         )
+
+    async def proxy_projects(request: Request, remote_path: str):
+        normalized_path = str(remote_path or "").strip("/")
+        kind = _project_proxy_kind(request.method, normalized_path)
+        params = _project_proxy_params(request)
+        if kind != "json" and params:
+            raise HTTPException(400, "This project route does not accept query parameters")
+        is_mutation = request.method.upper() != "GET"
+        has_body_intake = kind == "upload" or (
+            kind == "json" and request.method.upper() not in ("GET", "DELETE")
+        )
+        # Authenticate and pin the intended link before accepting a potentially
+        # large or slow body. The same snapshot is revalidated under the lock,
+        # so a reconnect during staging cannot reroute the mutation to a new hub.
+        staged_snapshot = (
+            _require_home_project_link_snapshot(request)
+            if has_body_intake
+            else None
+        )
+        # Client body intake must never hold the installation-wide lifecycle
+        # lock. A slow or disconnected browser would otherwise prevent even an
+        # emergency Home Link disconnect. Uploads retain the same hard ASGI
+        # limit and are additionally bounded here before being spooled.
+        body = await _project_proxy_json_body(request) if kind == "json" else None
+        staged_upload = (
+            await _stage_project_proxy_upload(request)
+            if kind == "upload"
+            else None
+        )
+
+        async def execute_against_current_link():
+            snapshot = staged_snapshot or _require_home_project_link_snapshot(request)
+            if staged_snapshot is not None:
+                # Nothing has been sent yet, so this is a definite stale-link
+                # failure rather than an indeterminate mutation result.
+                _assert_home_project_link_current(snapshot)
+            if kind == "upload":
+                assert staged_upload is not None
+                return await _proxy_home_project_upload(
+                    staged_upload,
+                    normalized_path,
+                    snapshot,
+                )
+            if kind == "download":
+                return await _proxy_home_project_download(normalized_path, snapshot)
+            remote_api_path = "/api/link/projects"
+            if normalized_path:
+                remote_api_path += "/" + normalized_path
+            data = await _hub_call(
+                request.method.upper(),
+                remote_api_path,
+                token=snapshot["token"],
+                json_body=body,
+                params=params or None,
+                base_url=snapshot["base_url"],
+                max_response_bytes=MAX_PROJECT_PROXY_JSON_RESPONSE_BYTES,
+                allow_not_found=True,
+                # Once sent, transport/read/size/shape failures are completion-
+                # ambiguous. The hub may have committed before its response was
+                # lost, so these failures must never invite a blind retry.
+                indeterminate_mutation=is_mutation,
+            )
+            # A disconnect/reconnect in another process while the request was
+            # in flight must not let an old bearer response repopulate the new
+            # link's UI.
+            _assert_home_project_link_current(snapshot, mutation=is_mutation)
+            return data
+
+        try:
+            if is_mutation:
+                # Connect/redeem/disconnect use this same lock. In the normal
+                # single-process deployment a link cannot be replaced between
+                # the upstream commit and our snapshot check.
+                async with _home_link_lifecycle_lock:
+                    return await execute_against_current_link()
+            return await execute_against_current_link()
+        finally:
+            if staged_upload is not None:
+                staged_upload[0].close()
+
+    @router.api_route(
+        "/projects",
+        methods=["GET", "POST", "PATCH", "PUT", "DELETE"],
+    )
+    async def proxy_projects_root(request: Request):
+        return await proxy_projects(request, "")
+
+    @router.api_route(
+        "/projects/{remote_path:path}",
+        methods=["GET", "POST", "PATCH", "PUT", "DELETE"],
+    )
+    async def proxy_projects_path(remote_path: str, request: Request):
+        return await proxy_projects(request, remote_path)
 
     return router

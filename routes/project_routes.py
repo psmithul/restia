@@ -2,18 +2,24 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import hmac
 import logging
 import os
 import re
+import tempfile
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import date, datetime, timedelta
-from typing import Any, Literal, Optional
+from pathlib import Path
+from threading import Lock
+from typing import Any, BinaryIO, Callable, Literal, Optional
+from urllib.parse import quote
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, func, or_, text, update
 from sqlalchemy.exc import IntegrityError
@@ -26,9 +32,12 @@ from core.database import (
     ProjectChecklistItem,
     ProjectComment,
     ProjectMember,
+    ProjectRemoteGrant,
     ProjectQuotaLock,
     ProjectStage,
     ProjectWorkItem,
+    LinkGuest,
+    RemoteBlock,
     SessionLocal,
     project_owner_quota_lock_key,
     utcnow_naive,
@@ -70,6 +79,11 @@ FALLBACK_PROJECT_OWNER = EXPLICIT_PROJECT_FALLBACK_OWNER or FIRST_RUN_PROJECT_OW
 PROJECT_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]{1,11}$")
 PROJECT_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{3}(?:[0-9A-Fa-f]{3}(?:[0-9A-Fa-f]{2})?)?$")
 PROJECT_ROLES = {"viewer": 1, "editor": 2, "owner": 3}
+REMOTE_GRANT_ROLES = {"viewer", "editor"}
+REMOTE_GRANT_STATUSES = {"pending", "active", "declined", "revoked"}
+REMOTE_GRANT_PRINCIPAL_PREFIX = "remote:"
+REMOTE_INSTANCE_PRINCIPAL_PREFIX = "remote-instance:"
+REMOTE_GRANT_TOMBSTONE_LIMIT = 100
 STAGE_CATEGORIES = {"backlog", "todo", "in_progress", "review", "done"}
 ITEM_TYPES = {"task", "story", "bug", "epic", "subtask"}
 PRIORITIES = {"lowest", "low", "medium", "high", "highest", "critical"}
@@ -77,8 +91,42 @@ ATTACHMENT_KINDS = {"reference", "draft", "deliverable"}
 MAX_ACTIVITY_LIMIT = 200
 ITEM_LIST_MAX_LIMIT = min(PROJECT_MAX_ITEMS, 2_000)
 ITEM_DETAIL_COMMENT_LIMIT = min(PROJECT_MAX_COMMENTS_PER_ITEM, 200)
+ATTACHMENT_INTEGRITY_CHUNK_BYTES = 1024 * 1024
+
+
+def _bounded_download_concurrency_env(name: str, default: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if not 1 <= value <= maximum:
+        raise ValueError(f"{name} must be between 1 and {maximum}")
+    return value
+
+
+PROJECT_ATTACHMENT_DOWNLOAD_CONCURRENCY = _bounded_download_concurrency_env(
+    "RESTIA_PROJECT_ATTACHMENT_DOWNLOAD_CONCURRENCY",
+    8,
+    64,
+)
+PROJECT_ATTACHMENT_DOWNLOAD_PER_PRINCIPAL = _bounded_download_concurrency_env(
+    "RESTIA_PROJECT_ATTACHMENT_DOWNLOAD_PER_PRINCIPAL",
+    2,
+    16,
+)
+if (
+    PROJECT_ATTACHMENT_DOWNLOAD_PER_PRINCIPAL
+    > PROJECT_ATTACHMENT_DOWNLOAD_CONCURRENCY
+):
+    raise ValueError(
+        "RESTIA_PROJECT_ATTACHMENT_DOWNLOAD_PER_PRINCIPAL cannot exceed "
+        "RESTIA_PROJECT_ATTACHMENT_DOWNLOAD_CONCURRENCY"
+    )
 _PROJECT_AUTH_CONTEXT: ContextVar[Optional[tuple[Request, str]]] = ContextVar(
     "project_auth_context", default=None
+)
+_PROJECT_REMOTE_CONTEXT: ContextVar[Optional[dict[str, Any]]] = ContextVar(
+    "project_remote_context", default=None
 )
 
 PROJECT_TEMPLATES: dict[str, list[tuple[str, str, str]]] = {
@@ -166,6 +214,16 @@ class MemberUpdate(BaseModel):
 
 class ProjectTransfer(BaseModel):
     username: str = Field(min_length=1, max_length=160)
+    version: int = Field(ge=1)
+
+
+class RemoteInvitationCreate(BaseModel):
+    handle: str = Field(min_length=1, max_length=32)
+    role: Literal["editor", "viewer"] = "viewer"
+
+
+class RemoteGrantUpdate(BaseModel):
+    role: Literal["editor", "viewer"]
     version: int = Field(ge=1)
 
 
@@ -263,7 +321,137 @@ def _iso(value: Optional[datetime]) -> Optional[str]:
     return value.isoformat() + "Z" if value else None
 
 
+def remote_grant_principal(grant_id: str) -> str:
+    return f"{REMOTE_GRANT_PRINCIPAL_PREFIX}{str(grant_id or '').strip().lower()}"
+
+
+def remote_instance_principal(guest_id: int) -> str:
+    return f"{REMOTE_INSTANCE_PRINCIPAL_PREFIX}{int(guest_id)}"
+
+
+def set_remote_project_context(
+    request: Request,
+    guest_id: int,
+    grant_id: Optional[str] = None,
+) -> str:
+    """Mark a request as explicitly authenticated by the Home Link gateway.
+
+    This helper is the sole bridge between the bearer dependency and Projects.
+    Merely supplying a username-like string never enables the remote path.
+    Project authorization still rechecks the active grant in the transaction.
+    """
+
+    try:
+        normalized_guest_id = int(guest_id)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(401, "Invalid remote project identity") from exc
+    if normalized_guest_id < 1:
+        raise HTTPException(401, "Invalid remote project identity")
+    normalized_grant_id = str(grant_id or "").strip().lower() or None
+    if normalized_grant_id and len(normalized_grant_id) > 36:
+        raise HTTPException(401, "Invalid remote project grant")
+    principal = (
+        remote_grant_principal(normalized_grant_id)
+        if normalized_grant_id
+        else remote_instance_principal(normalized_guest_id)
+    )
+    request.state.project_remote = True
+    request.state.project_remote_guest_id = normalized_guest_id
+    request.state.project_remote_grant_id = normalized_grant_id
+    request.state.project_remote_principal = principal
+    request.state.current_user = principal
+    _PROJECT_REMOTE_CONTEXT.set({
+        "guest_id": normalized_guest_id,
+        "grant_id": normalized_grant_id,
+        "grant_ids": {normalized_grant_id} if normalized_grant_id else set(),
+    })
+    return principal
+
+
+def _remote_context() -> Optional[dict[str, Any]]:
+    context = _PROJECT_REMOTE_CONTEXT.get()
+    return context if isinstance(context, dict) else None
+
+
+def _remote_guest_id(actor: Optional[str] = None) -> Optional[int]:
+    context = _remote_context()
+    if context is None:
+        return None
+    try:
+        return int(context.get("guest_id"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _remote_grant_id(actor: Optional[str] = None) -> Optional[str]:
+    context = _remote_context()
+    if context is None:
+        return None
+    context_id = str(context.get("grant_id") or "").strip().lower()
+    if context_id:
+        return context_id
+    value = str(actor or "").strip().lower()
+    if value.startswith(REMOTE_GRANT_PRINCIPAL_PREFIX):
+        candidate = value[len(REMOTE_GRANT_PRINCIPAL_PREFIX):] or None
+        if candidate in set(context.get("grant_ids") or set()):
+            return candidate
+    return None
+
+
+def _is_remote_actor(actor: Optional[str] = None) -> bool:
+    return _remote_context() is not None
+
+
+def _remember_remote_grant(grant: ProjectRemoteGrant) -> None:
+    context = _remote_context()
+    if context is None:
+        return
+    grant_ids = set(context.get("grant_ids") or set())
+    grant_ids.add(str(grant.id).lower())
+    updated = {**context, "grant_ids": grant_ids}
+    _PROJECT_REMOTE_CONTEXT.set(updated)
+
+
+def _remote_identity(value: Optional[str]) -> Optional[str]:
+    if value is None or not _remote_context():
+        return value
+    normalized = str(value).strip().lower()
+    if normalized.startswith(REMOTE_GRANT_PRINCIPAL_PREFIX):
+        grant_id = normalized[len(REMOTE_GRANT_PRINCIPAL_PREFIX):]
+        if grant_id in set((_remote_context() or {}).get("grant_ids") or set()):
+            return "me"
+        return normalized
+    if normalized.startswith(REMOTE_INSTANCE_PRINCIPAL_PREFIX):
+        return "me"
+    return "instance"
+
+
+def _canonical_actor(actor: str) -> str:
+    if _is_remote_actor(actor):
+        grant_id = _remote_grant_id(actor)
+        if grant_id:
+            return remote_grant_principal(grant_id)
+    return str(actor or "").strip().lower()
+
+
+def _response_actor() -> str:
+    context = _PROJECT_AUTH_CONTEXT.get()
+    actor = context[1] if context else ""
+    canonical = _canonical_actor(actor)
+    return str(_remote_identity(canonical) or canonical)
+
+
 def _actor(request: Request) -> str:
+    if bool(getattr(request.state, "project_remote", False)):
+        actor = set_remote_project_context(
+            request,
+            getattr(request.state, "project_remote_guest_id", None),
+            getattr(request.state, "project_remote_grant_id", None),
+        )
+        _PROJECT_AUTH_CONTEXT.set((request, actor))
+        return actor
+
+    _PROJECT_REMOTE_CONTEXT.set(None)
     # require_user is the security gate. It returns "" only for explicitly
     # admitted auth-disabled/single-user modes, where a stable non-null owner is
     # needed for unique project keys and deterministic filtering.
@@ -366,18 +554,19 @@ def _db_session(*, write: bool = True):
         context = _PROJECT_AUTH_CONTEXT.get() if write else None
         if context:
             request, actor = context
+            remote_request = bool(getattr(request.state, "project_remote", False))
             auth_manager = getattr(request.app.state, "auth_manager", None)
             candidate_lock = getattr(auth_manager, "_config_lock", None)
-            if candidate_lock is not None:
+            if candidate_lock is not None and not remote_request:
                 candidate_lock.acquire()
                 auth_lock = candidate_lock
-            if getattr(auth_manager, "_identity_migrations", None):
+            if not remote_request and getattr(auth_manager, "_identity_migrations", None):
                 raise HTTPException(
                     409,
                     "A profile identity migration is in progress. Retry this project change shortly.",
                 )
             configured_users = getattr(auth_manager, "users", None)
-            if isinstance(configured_users, dict) and configured_users:
+            if not remote_request and isinstance(configured_users, dict) and configured_users:
                 configured_names = {
                     str(name).strip().lower() for name in configured_users if str(name).strip()
                 }
@@ -488,7 +677,48 @@ def _validate_date(value: Optional[str], field: str) -> Optional[str]:
         raise HTTPException(400, f"{field} must be YYYY-MM-DD")
 
 
+def _remote_handle_blocked(db, project_owner: str, handle: str) -> bool:
+    normalized_owner = str(project_owner or "").strip().lower()
+    normalized_handle = str(handle or "").strip().lower()
+    if not normalized_owner or not normalized_handle:
+        return True
+    return db.query(RemoteBlock.id).filter(
+        func.lower(RemoteBlock.local_user) == normalized_owner,
+        func.lower(RemoteBlock.handle) == normalized_handle,
+    ).first() is not None
+
+
+def _remote_guest_blocked(db, project: Project, guest_id: int) -> bool:
+    handle = db.query(LinkGuest.handle).filter(
+        LinkGuest.id == int(guest_id),
+        LinkGuest.status == "approved",
+    ).scalar()
+    return not handle or _remote_handle_blocked(db, project.owner, handle)
+
+
 def _project_role(db, project: Project, actor: str) -> Optional[str]:
+    if _is_remote_actor(actor):
+        guest_id = _remote_guest_id(actor)
+        grant_id = _remote_grant_id(actor)
+        if guest_id is None:
+            return None
+        if _remote_guest_blocked(db, project, guest_id):
+            return None
+        query = db.query(ProjectRemoteGrant).join(
+            LinkGuest, LinkGuest.id == ProjectRemoteGrant.guest_id
+        ).filter(
+            ProjectRemoteGrant.project_id == project.id,
+            ProjectRemoteGrant.guest_id == guest_id,
+            ProjectRemoteGrant.status == "active",
+            LinkGuest.status == "approved",
+        )
+        if grant_id:
+            query = query.filter(ProjectRemoteGrant.id == grant_id)
+        grant = query.first()
+        if not grant or grant.role not in REMOTE_GRANT_ROLES:
+            return None
+        _remember_remote_grant(grant)
+        return grant.role
     if project.owner == actor:
         return "owner"
     member = db.query(ProjectMember).filter(
@@ -534,6 +764,44 @@ def _get_item(db, project_id: str, item_id: str, *, writable: bool = False) -> P
     return item
 
 
+def _get_remote_grant(db, project_id: str, grant_id: str) -> ProjectRemoteGrant:
+    grant = db.query(ProjectRemoteGrant).filter(
+        ProjectRemoteGrant.id == str(grant_id or "").strip().lower(),
+        ProjectRemoteGrant.project_id == project_id,
+    ).first()
+    if not grant:
+        raise HTTPException(404, "Remote project grant not found")
+    return grant
+
+
+def _prune_remote_grant_tombstones(db, project_id: str) -> int:
+    """Bound detached audit rows while preserving the newest history."""
+    stale_ids = [
+        row_id
+        for (row_id,) in db.query(ProjectRemoteGrant.id)
+        .filter(
+            ProjectRemoteGrant.project_id == project_id,
+            ProjectRemoteGrant.guest_id.is_(None),
+            ProjectRemoteGrant.status.in_(("declined", "revoked")),
+        )
+        .order_by(
+            ProjectRemoteGrant.revoked_at.desc(),
+            ProjectRemoteGrant.invited_at.desc(),
+            ProjectRemoteGrant.id.desc(),
+        )
+        .offset(REMOTE_GRANT_TOMBSTONE_LIMIT)
+        .all()
+    ]
+    if not stale_ids:
+        return 0
+    return int(
+        db.query(ProjectRemoteGrant)
+        .filter(ProjectRemoteGrant.id.in_(stale_ids))
+        .delete(synchronize_session=False)
+        or 0
+    )
+
+
 def _check_version(row: Any, expected: Optional[int]) -> None:
     if expected is not None and int(row.version or 0) != int(expected):
         raise HTTPException(409, "This item changed in another tab. Refresh and retry.")
@@ -569,6 +837,7 @@ def _activity(
     work_item_id: Optional[str] = None,
     payload: Optional[dict[str, Any]] = None,
 ) -> ProjectActivity:
+    actor = _canonical_actor(actor)
     # Flush the business mutation before taking the activity-stream mutex. This
     # keeps the lock order consistent: domain rows first, retention row last.
     db.flush()
@@ -616,7 +885,7 @@ def _activity(
 def _project_dict(project: Project) -> dict[str, Any]:
     return {
         "id": project.id,
-        "owner": project.owner,
+        "owner": _remote_identity(project.owner),
         "key": project.key,
         "name": project.name,
         "description": project.description or "",
@@ -632,10 +901,34 @@ def _project_dict(project: Project) -> dict[str, Any]:
 
 def _member_dict(member: ProjectMember) -> dict[str, Any]:
     return {
-        "username": member.username,
+        "username": _remote_identity(member.username),
+        "kind": "profile",
         "role": member.role,
-        "added_by": member.added_by,
+        "added_by": _remote_identity(member.added_by),
         "joined_at": _iso(member.joined_at),
+    }
+
+
+def _remote_grant_dict(row: ProjectRemoteGrant) -> dict[str, Any]:
+    remote = bool(_remote_context())
+    principal = remote_grant_principal(row.id)
+    username = _remote_identity(principal) if remote else principal
+    return {
+        "id": row.id,
+        "grant_id": row.id,
+        "username": username,
+        "kind": "instance",
+        "handle": username if remote else row.handle_snapshot,
+        "name": username if remote else row.handle_snapshot,
+        "display_name": username if remote else row.handle_snapshot,
+        "role": row.role,
+        "status": row.status,
+        "version": int(row.version or 1),
+        "invited_by": _remote_identity(row.invited_by),
+        "invited_at": _iso(row.invited_at),
+        "responded_at": _iso(row.responded_at),
+        "revoked_at": _iso(row.revoked_at),
+        "joined_at": _iso(row.responded_at or row.invited_at),
     }
 
 
@@ -669,8 +962,8 @@ def _item_dict(item: ProjectWorkItem, project_key: str) -> dict[str, Any]:
         "description": item.description or "",
         "priority": item.priority,
         "labels": list(item.labels or []),
-        "reporter": item.reporter,
-        "assignee": item.assignee,
+        "reporter": _remote_identity(item.reporter),
+        "assignee": _remote_identity(item.assignee),
         "start_date": item.start_date,
         "due_date": item.due_date,
         "estimate_minutes": int(item.estimate_minutes or 0),
@@ -703,8 +996,8 @@ def _item_card_dict(item: ProjectWorkItem, project_key: str) -> dict[str, Any]:
         "title": item.title,
         "priority": item.priority,
         "labels": list(item.labels or []),
-        "reporter": item.reporter,
-        "assignee": item.assignee,
+        "reporter": _remote_identity(item.reporter),
+        "assignee": _remote_identity(item.assignee),
         "start_date": item.start_date,
         "due_date": item.due_date,
         "estimate_minutes": int(item.estimate_minutes or 0),
@@ -727,7 +1020,7 @@ def _checklist_dict(row: ProjectChecklistItem) -> dict[str, Any]:
         "text": row.text,
         "done": bool(row.is_done),
         "position": int(row.position or 0),
-        "created_by": row.created_by,
+        "created_by": _remote_identity(row.created_by),
         "completed_at": _iso(row.completed_at),
         "created_at": _iso(row.created_at),
         "updated_at": _iso(row.updated_at),
@@ -738,7 +1031,7 @@ def _comment_dict(row: ProjectComment) -> dict[str, Any]:
     return {
         "id": row.id,
         "work_item_id": row.work_item_id,
-        "author": row.author,
+        "author": _remote_identity(row.author),
         "body": row.body,
         "edited_at": _iso(row.edited_at),
         "created_at": _iso(row.created_at),
@@ -750,7 +1043,7 @@ def _attachment_dict(row: ProjectAttachment) -> dict[str, Any]:
     return {
         "id": row.id,
         "work_item_id": row.work_item_id,
-        "uploader": row.uploader,
+        "uploader": _remote_identity(row.uploader),
         "kind": row.kind,
         "description": row.description or "",
         "name": row.original_name,
@@ -760,19 +1053,233 @@ def _attachment_dict(row: ProjectAttachment) -> dict[str, Any]:
         "status": row.status,
         "supersedes_id": row.supersedes_id,
         "created_at": _iso(row.created_at),
-        "download_url": f"/api/projects/attachments/{row.id}/download",
+        "download_url": (
+            f"/api/link/projects/attachments/{row.id}/download"
+            if _remote_context()
+            else f"/api/projects/attachments/{row.id}/download"
+        ),
     }
 
 
+def _verified_attachment_snapshot(
+    path: Path,
+    expected_size: object,
+    expected_sha256: object,
+) -> Optional[tuple[BinaryIO, int]]:
+    """Return a verified immutable snapshot without retaining the storage path.
+
+    Download responses must not verify one pathname and then reopen it later:
+    an atomic replacement in between would serve bytes that were never hashed.
+    The spooled snapshot also keeps large attachments off the Python heap.
+    """
+
+    try:
+        size = int(expected_size)
+    except (TypeError, ValueError):
+        return None
+    digest_text = str(expected_sha256 or "").strip().lower()
+    if size < 1 or not re.fullmatch(r"[0-9a-f]{64}", digest_text):
+        return None
+
+    snapshot: Optional[BinaryIO] = None
+    try:
+        snapshot = tempfile.SpooledTemporaryFile(
+            max_size=ATTACHMENT_INTEGRITY_CHUNK_BYTES,
+            mode="w+b",
+        )
+        digest = hashlib.sha256()
+        bytes_read = 0
+        with path.open("rb") as handle:
+            if os.fstat(handle.fileno()).st_size != size:
+                snapshot.close()
+                return None
+            while True:
+                chunk = handle.read(ATTACHMENT_INTEGRITY_CHUNK_BYTES)
+                if not chunk:
+                    break
+                bytes_read += len(chunk)
+                if bytes_read > size:
+                    snapshot.close()
+                    return None
+                digest.update(chunk)
+                snapshot.write(chunk)
+            if os.fstat(handle.fileno()).st_size != size:
+                snapshot.close()
+                return None
+    except OSError:
+        if snapshot is not None:
+            snapshot.close()
+        return None
+    if bytes_read != size or not hmac.compare_digest(digest.hexdigest(), digest_text):
+        snapshot.close()
+        return None
+    snapshot.seek(0)
+    return snapshot, size
+
+
+class _AttachmentDownloadGate:
+    """Fail-fast process-local cap for verified attachment snapshots.
+
+    Restia's default launch is one worker. Multi-worker operators get the same
+    bounded allowance in each worker instead of one unbounded global pool.
+    """
+
+    def __init__(self, total_limit: int, principal_limit: int):
+        self.total_limit = int(total_limit)
+        self.principal_limit = int(principal_limit)
+        self._lock = Lock()
+        self._active = 0
+        self._by_principal: dict[str, int] = {}
+
+    def try_acquire(self, principal: str) -> Optional[Callable[[], None]]:
+        key = str(principal or "unknown")[:200]
+        with self._lock:
+            principal_active = self._by_principal.get(key, 0)
+            if (
+                self._active >= self.total_limit
+                or principal_active >= self.principal_limit
+            ):
+                return None
+            self._active += 1
+            self._by_principal[key] = principal_active + 1
+
+        released = False
+
+        def release() -> None:
+            nonlocal released
+            with self._lock:
+                if released:
+                    return
+                released = True
+                self._active = max(0, self._active - 1)
+                remaining = self._by_principal.get(key, 0) - 1
+                if remaining > 0:
+                    self._by_principal[key] = remaining
+                else:
+                    self._by_principal.pop(key, None)
+
+        return release
+
+    def active_counts(self) -> tuple[int, dict[str, int]]:
+        """Return a test/diagnostic snapshot without exposing mutable state."""
+
+        with self._lock:
+            return self._active, dict(self._by_principal)
+
+
+_attachment_download_gate = _AttachmentDownloadGate(
+    PROJECT_ATTACHMENT_DOWNLOAD_CONCURRENCY,
+    PROJECT_ATTACHMENT_DOWNLOAD_PER_PRINCIPAL,
+)
+
+
+def _attachment_download_principal(actor: str) -> str:
+    guest_id = _remote_guest_id()
+    if guest_id is not None:
+        return f"guest:{guest_id}"
+    return f"profile:{_canonical_actor(actor)}"
+
+
+async def _stream_verified_attachment(snapshot: BinaryIO):
+    while True:
+        chunk = await asyncio.to_thread(
+            snapshot.read,
+            ATTACHMENT_INTEGRITY_CHUNK_BYTES,
+        )
+        if not chunk:
+            break
+        yield chunk
+
+
+class _VerifiedAttachmentResponse(StreamingResponse):
+    """Own and close a verified snapshot even when the ASGI send is aborted."""
+
+    def __init__(
+        self,
+        snapshot: BinaryIO,
+        *args,
+        on_close: Optional[Callable[[], None]] = None,
+        **kwargs,
+    ):
+        self._verified_snapshot = snapshot
+        self._verified_on_close = on_close
+        super().__init__(_stream_verified_attachment(snapshot), *args, **kwargs)
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # SpooledTemporaryFile.close() only releases memory or a local file
+            # descriptor; doing it here guarantees cleanup even when Starlette
+            # exits the body iterator because the client disconnected.
+            try:
+                self._verified_snapshot.close()
+            finally:
+                if self._verified_on_close is not None:
+                    on_close, self._verified_on_close = self._verified_on_close, None
+                    on_close()
+
+
+async def _prepare_verified_attachment_snapshot(
+    path: Path,
+    expected_size: object,
+    expected_sha256: object,
+) -> Optional[tuple[BinaryIO, int]]:
+    task = asyncio.create_task(
+        asyncio.to_thread(
+            _verified_attachment_snapshot,
+            path,
+            expected_size,
+            expected_sha256,
+        )
+    )
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # ``to_thread`` cannot cancel work already running. Keep this request
+        # (and its concurrency slot) alive until the worker stops touching the
+        # spool, even under repeated cancellation, then close its late result.
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        if task.done():
+            try:
+                verified = task.result()
+            except BaseException:
+                verified = None
+            if verified is not None:
+                verified[0].close()
+        raise
+
+
+def _attachment_content_disposition(filename: object) -> str:
+    name = str(filename or "attachment").replace("\r", "_").replace("\n", "_")
+    fallback = re.sub(r"[^A-Za-z0-9._-]", "_", name).strip("._")[:180]
+    fallback = fallback or "attachment"
+    return (
+        f'attachment; filename="{fallback}"; '
+        f"filename*=UTF-8''{quote(name, safe='')}"
+    )
+
+
 def _activity_dict(row: ProjectActivity) -> dict[str, Any]:
+    remote = bool(_remote_context())
     return {
         "id": row.id,
         "project_id": row.project_id,
         "work_item_id": row.work_item_id,
-        "actor": row.actor,
+        "actor": _remote_identity(row.actor),
         "event_type": row.event_type,
-        "summary": row.summary,
-        "payload": row.payload or {},
+        "summary": (
+            str(row.event_type or "project_activity").replace("_", " ").capitalize()
+            if remote
+            else row.summary
+        ),
+        "payload": {} if remote else (row.payload or {}),
         "created_at": _iso(row.created_at),
     }
 
@@ -780,19 +1287,32 @@ def _activity_dict(row: ProjectActivity) -> dict[str, Any]:
 def _role_members(db, project: Project) -> list[dict[str, Any]]:
     members = [
         {
-            "username": project.owner,
+            "username": _remote_identity(project.owner),
+            "kind": "profile" if not _remote_context() else "instance",
             "role": "owner",
-            "added_by": project.owner,
+            "added_by": _remote_identity(project.owner),
             "joined_at": _iso(project.created_at),
         }
     ]
-    members.extend(
-        _member_dict(row)
-        for row in db.query(ProjectMember)
-        .filter(ProjectMember.project_id == project.id)
-        .order_by(ProjectMember.joined_at.asc(), ProjectMember.username.asc())
+    if not _remote_context():
+        members.extend(
+            _member_dict(row)
+            for row in db.query(ProjectMember)
+            .filter(ProjectMember.project_id == project.id)
+            .order_by(ProjectMember.joined_at.asc(), ProjectMember.username.asc())
+            .all()
+        )
+    visible_statuses = ("active",) if _remote_context() else ("active", "pending")
+    grants = (
+        db.query(ProjectRemoteGrant)
+        .filter(
+            ProjectRemoteGrant.project_id == project.id,
+            ProjectRemoteGrant.status.in_(visible_statuses),
+        )
+        .order_by(ProjectRemoteGrant.invited_at.asc(), ProjectRemoteGrant.id.asc())
         .all()
     )
+    members.extend(_remote_grant_dict(row) for row in grants)
     return members
 
 
@@ -881,6 +1401,7 @@ def _project_payload(db, project: Project, role: str) -> dict[str, Any]:
         .all()
     )
     return {
+        "actor": _response_actor(),
         "project": {**_project_dict(project), "role": role},
         "stages": [_stage_dict(stage) for stage in stages],
         "members": _role_members(db, project),
@@ -899,6 +1420,22 @@ def _member_names(db, project: Project) -> set[str]:
         )
         .all()
     )
+    remote_editors = (
+        db.query(ProjectRemoteGrant.id, LinkGuest.handle)
+        .join(LinkGuest, LinkGuest.id == ProjectRemoteGrant.guest_id)
+        .filter(
+            ProjectRemoteGrant.project_id == project.id,
+            ProjectRemoteGrant.role == "editor",
+            ProjectRemoteGrant.status == "active",
+            LinkGuest.status == "approved",
+        )
+        .all()
+    )
+    names.update(
+        remote_grant_principal(grant_id)
+        for grant_id, handle in remote_editors
+        if not _remote_handle_blocked(db, project.owner, handle)
+    )
     return names
 
 
@@ -906,9 +1443,55 @@ def _validate_assignee(db, project: Project, username: Optional[str]) -> Optiona
     if username in (None, ""):
         return None
     normalized = _clean_text(username, field="Assignee", max_length=160, required=True).lower()
+    if _remote_context():
+        if normalized == "me":
+            grant_id = _remote_grant_id()
+            if not grant_id:
+                raise HTTPException(400, "Remote project grant is unavailable")
+            normalized = remote_grant_principal(grant_id)
+        elif normalized == "instance":
+            normalized = project.owner
+        elif not normalized.startswith(REMOTE_GRANT_PRINCIPAL_PREFIX):
+            raise HTTPException(400, "Assignee must be an available project collaborator")
     if normalized not in _member_names(db, project):
         raise HTTPException(400, "Assignee must be the project owner or an editor")
     return normalized
+
+
+def _assignee_filter_values(db, project: Project, value: str) -> tuple[str, ...]:
+    normalized = _clean_text(
+        value,
+        field="Assignee filter",
+        max_length=160,
+        required=True,
+    ).lower()
+    if not _remote_context():
+        return (normalized,)
+    if normalized == "instance":
+        local_profiles = {str(project.owner).strip().lower()}
+        local_profiles.update(
+            str(username).strip().lower()
+            for (username,) in db.query(ProjectMember.username)
+            .filter(ProjectMember.project_id == project.id)
+            .all()
+            if str(username or "").strip()
+        )
+        return tuple(sorted(local_profiles))
+    if normalized == "me":
+        grant_id = _remote_grant_id()
+        if not grant_id:
+            raise HTTPException(400, "Remote project grant is unavailable")
+        return (remote_grant_principal(grant_id),)
+    if normalized.startswith(REMOTE_GRANT_PRINCIPAL_PREFIX):
+        # Opaque active remote principals are visible project collaborators;
+        # raw local usernames never are. This closes an assignee-count oracle
+        # against the identities redacted to ``instance`` in responses.
+        if normalized in _member_names(db, project):
+            return (normalized,)
+    raise HTTPException(
+        400,
+        "Remote assignee filters must reference this Restia or a visible linked instance",
+    )
 
 
 def _unassign_member_work(db, project_id: str, username: str) -> int:
@@ -1293,6 +1876,48 @@ def _guard_child_row_quota(
 
 
 def _accessible_projects(db, actor: str, *, include_archived: bool = False) -> list[Project]:
+    if _is_remote_actor(actor):
+        guest_id = _remote_guest_id(actor)
+        if guest_id is None:
+            return []
+        guest_handle = db.query(LinkGuest.handle).filter(
+            LinkGuest.id == guest_id,
+            LinkGuest.status == "approved",
+        ).scalar()
+        if not guest_handle:
+            return []
+        blocked_owners = {
+            str(owner).strip().lower()
+            for (owner,) in db.query(RemoteBlock.local_user)
+            .filter(func.lower(RemoteBlock.handle) == str(guest_handle).strip().lower())
+            .all()
+            if str(owner or "").strip()
+        }
+        grant_query = (
+            db.query(ProjectRemoteGrant)
+            .join(LinkGuest, LinkGuest.id == ProjectRemoteGrant.guest_id)
+            .join(Project, Project.id == ProjectRemoteGrant.project_id)
+            .filter(
+                ProjectRemoteGrant.guest_id == guest_id,
+                ProjectRemoteGrant.status == "active",
+                LinkGuest.status == "approved",
+            )
+        )
+        if blocked_owners:
+            grant_query = grant_query.filter(
+                ~func.lower(Project.owner).in_(blocked_owners)
+            )
+        grants = grant_query.all()
+        context = _remote_context()
+        if context is not None:
+            _PROJECT_REMOTE_CONTEXT.set({
+                **context,
+                "grant_ids": {str(row.id).lower() for row in grants},
+            })
+        query = db.query(Project).filter(Project.id.in_([row.project_id for row in grants]))
+        if not include_archived:
+            query = query.filter(Project.archived.is_(False))
+        return query.order_by(Project.updated_at.desc(), Project.created_at.desc()).all()
     membership_ids = db.query(ProjectMember.project_id).filter(
         func.lower(ProjectMember.username) == actor
     )
@@ -1304,26 +1929,37 @@ def _accessible_projects(db, actor: str, *, include_archived: bool = False) -> l
     return query.order_by(Project.updated_at.desc(), Project.created_at.desc()).all()
 
 
-def setup_project_routes(file_store: Optional[ProjectFileStore] = None) -> APIRouter:
-    router = APIRouter(prefix="/api/projects", tags=["projects"])
+def setup_project_routes(
+    file_store: Optional[ProjectFileStore] = None,
+    *,
+    prefix: str = "/api/projects",
+    remote_only: bool = False,
+    dependencies: Optional[list[Any]] = None,
+) -> APIRouter:
+    router = APIRouter(
+        prefix=prefix,
+        tags=["projects"],
+        dependencies=list(dependencies or []),
+    )
     store = file_store or ProjectFileStore()
     # One bounded startup/setup pass repairs leftovers from a killed process
     # before normal requests begin. Reconciliation is best-effort: an audit
     # problem is loud in logs but must not make the entire Restia UI unavailable.
-    reconciliation_db = None
-    try:
-        reconciliation_db = SessionLocal()
-        referenced_keys = (
-            row[0]
-            for row in reconciliation_db.query(ProjectAttachment.storage_key)
-            .yield_per(1_000)
-        )
-        store.reconcile(referenced_keys)
-    except Exception:
-        logger.exception("Project attachment startup reconciliation failed")
-    finally:
-        if reconciliation_db is not None:
-            reconciliation_db.close()
+    if not remote_only:
+        reconciliation_db = None
+        try:
+            reconciliation_db = SessionLocal()
+            referenced_keys = (
+                row[0]
+                for row in reconciliation_db.query(ProjectAttachment.storage_key)
+                .yield_per(1_000)
+            )
+            store.reconcile(referenced_keys)
+        except Exception:
+            logger.exception("Project attachment startup reconciliation failed")
+        finally:
+            if reconciliation_db is not None:
+                reconciliation_db.close()
 
     @router.get("/templates")
     async def list_templates(request: Request):
@@ -1341,6 +1977,209 @@ def setup_project_routes(file_store: Optional[ProjectFileStore] = None) -> APIRo
                 for template_id, stages in PROJECT_TEMPLATES.items()
             ]
         }
+
+    def _require_local_grant_admin(actor: str) -> None:
+        if remote_only or _is_remote_actor(actor):
+            raise HTTPException(403, "Remote project access cannot manage linked instances")
+
+    @router.get("/linked-instances")
+    async def linked_instances(request: Request):
+        actor = _actor(request)
+        _require_local_grant_admin(actor)
+        enabled = os.getenv("LINK_HUB_ENABLED", "false").strip().lower() == "true"
+        with _db_session(write=False) as db:
+            blocked_handles = {
+                str(handle).strip().lower()
+                for (handle,) in db.query(RemoteBlock.handle)
+                .filter(func.lower(RemoteBlock.local_user) == actor)
+                .all()
+                if str(handle or "").strip()
+            }
+            query = db.query(LinkGuest).filter(LinkGuest.status == "approved")
+            if blocked_handles:
+                query = query.filter(~func.lower(LinkGuest.handle).in_(blocked_handles))
+            rows = (
+                query
+                .order_by(LinkGuest.handle.asc(), LinkGuest.id.asc())
+                .all()
+            )
+            instances = [
+                {
+                    "id": int(row.id),
+                    "handle": row.handle,
+                    "status": row.status,
+                    "last_seen": _iso(row.last_seen),
+                }
+                for row in rows
+            ]
+            return {
+                "hub_enabled": enabled,
+                "instances": instances,
+                "handles": [row["handle"] for row in instances],
+            }
+
+    @router.post("/{project_id}/remote-invitations", status_code=201)
+    async def create_remote_invitation(
+        project_id: str,
+        request: Request,
+        body: RemoteInvitationCreate,
+    ):
+        actor = _actor(request)
+        _require_local_grant_admin(actor)
+        handle = _clean_text(
+            body.handle, field="Home Link handle", max_length=32, required=True
+        ).lower()
+        with _db_session() as db:
+            project, _ = _get_project(
+                db, project_id, actor, minimum="owner", writable=True
+            )
+            guest = db.query(LinkGuest).filter(
+                func.lower(LinkGuest.handle) == handle,
+                LinkGuest.status == "approved",
+            ).first()
+            if not guest:
+                raise HTTPException(404, "Approved linked instance not found")
+            if _remote_handle_blocked(db, project.owner, guest.handle):
+                raise HTTPException(
+                    409,
+                    "Unblock this linked instance before inviting it to the project",
+                )
+            # Serialize invitation creation by project even on databases with
+            # row-level locking. This covers both first insert and re-invite,
+            # so concurrent requests cannot return conflicting 201 responses.
+            if not _is_sqlite(db):
+                db.query(Project.id).filter(
+                    Project.id == project.id
+                ).with_for_update().one()
+            grant = db.query(ProjectRemoteGrant).filter(
+                ProjectRemoteGrant.project_id == project.id,
+                ProjectRemoteGrant.guest_id == guest.id,
+            ).first()
+            now = utcnow_naive()
+            if grant:
+                if grant.status not in {"declined", "revoked"}:
+                    raise HTTPException(409, "This linked instance already has an invitation")
+                grant.handle_snapshot = guest.handle
+                grant.role = body.role
+                grant.status = "pending"
+                grant.invited_by = actor
+                grant.invited_at = now
+                grant.responded_at = None
+                grant.revoked_at = None
+                grant.version = int(grant.version or 1) + 1
+            else:
+                _prune_remote_grant_tombstones(db, project.id)
+                grant = ProjectRemoteGrant(
+                    id=str(uuid.uuid4()),
+                    project_id=project.id,
+                    guest_id=guest.id,
+                    handle_snapshot=guest.handle,
+                    role=body.role,
+                    status="pending",
+                    invited_by=actor,
+                    invited_at=now,
+                    version=1,
+                )
+                db.add(grant)
+                try:
+                    db.flush()
+                except IntegrityError as exc:
+                    raise HTTPException(
+                        409,
+                        "This linked instance already has an invitation",
+                    ) from exc
+            project.updated_at = now
+            _activity(
+                db,
+                project.id,
+                actor,
+                "remote_instance_invited",
+                f"Invited linked instance {guest.handle} as {body.role}",
+                payload={"grant_id": grant.id, "role": body.role},
+            )
+            db.flush()
+            return {"grant": _remote_grant_dict(grant)}
+
+    @router.patch("/{project_id}/remote-grants/{grant_id}")
+    async def update_remote_grant(
+        project_id: str,
+        grant_id: str,
+        request: Request,
+        body: RemoteGrantUpdate,
+    ):
+        actor = _actor(request)
+        _require_local_grant_admin(actor)
+        with _db_session() as db:
+            project, _ = _get_project(
+                db, project_id, actor, minimum="owner", writable=True
+            )
+            grant = _get_remote_grant(db, project.id, grant_id)
+            if grant.status not in {"pending", "active"}:
+                raise HTTPException(409, "Re-invite this linked instance before changing its role")
+            _claim_version(db, grant, body.version)
+            old_role = grant.role
+            grant.role = body.role
+            unassigned = (
+                _unassign_member_work(db, project.id, remote_grant_principal(grant.id))
+                if body.role == "viewer"
+                else 0
+            )
+            project.updated_at = utcnow_naive()
+            _activity(
+                db,
+                project.id,
+                actor,
+                "remote_instance_updated",
+                f"Changed linked instance {grant.handle_snapshot} to {body.role}",
+                payload={
+                    "grant_id": grant.id,
+                    "from": old_role,
+                    "to": body.role,
+                    "unassigned_items": unassigned,
+                },
+            )
+            db.flush()
+            return {
+                "grant": _remote_grant_dict(grant),
+                "unassigned_items": unassigned,
+            }
+
+    @router.delete("/{project_id}/remote-grants/{grant_id}")
+    async def revoke_remote_grant(
+        project_id: str,
+        grant_id: str,
+        request: Request,
+        version: int = Query(..., ge=1),
+    ):
+        actor = _actor(request)
+        _require_local_grant_admin(actor)
+        with _db_session() as db:
+            project, _ = _get_project(
+                db, project_id, actor, minimum="owner", writable=True
+            )
+            grant = _get_remote_grant(db, project.id, grant_id)
+            _claim_version(db, grant, version)
+            now = utcnow_naive()
+            grant.status = "revoked"
+            grant.responded_at = grant.responded_at or now
+            grant.revoked_at = now
+            unassigned = _unassign_member_work(
+                db, project.id, remote_grant_principal(grant.id)
+            )
+            project.updated_at = now
+            _activity(
+                db,
+                project.id,
+                actor,
+                "remote_instance_revoked",
+                f"Revoked linked instance {grant.handle_snapshot}",
+                payload={"grant_id": grant.id, "unassigned_items": unassigned},
+            )
+            db.flush()
+            return {
+                "grant": _remote_grant_dict(grant),
+                "unassigned_items": unassigned,
+            }
 
     @router.get("/overview")
     async def global_overview(request: Request):
@@ -1443,6 +2282,8 @@ def setup_project_routes(file_store: Optional[ProjectFileStore] = None) -> APIRo
     @router.post("", status_code=201)
     async def create_project(request: Request, body: ProjectCreate):
         actor = _actor(request)
+        if remote_only or _is_remote_actor(actor):
+            raise HTTPException(403, "Remote project access cannot create projects")
         name = _clean_text(body.name, field="Project name", max_length=160, required=True)
         template = str(body.template or "general").strip().lower()
         if template not in PROJECT_TEMPLATES:
@@ -1613,6 +2454,7 @@ def setup_project_routes(file_store: Optional[ProjectFileStore] = None) -> APIRo
                 for stage in stages
             }
             return {
+                "actor": _response_actor(),
                 "project": {**_project_dict(project), "role": role},
                 "stages": [_stage_dict(stage, item_count=counts[stage.id]) for stage in stages],
                 "items": [_item_card_dict(item, project.key) for item in items],
@@ -2001,7 +2843,11 @@ def setup_project_routes(file_store: Optional[ProjectFileStore] = None) -> APIRo
                 _get_stage(db, project.id, stage_id)
                 query = query.filter(ProjectWorkItem.stage_id == stage_id)
             if assignee:
-                query = query.filter(func.lower(ProjectWorkItem.assignee) == assignee.strip().lower())
+                query = query.filter(
+                    func.lower(ProjectWorkItem.assignee).in_(
+                        _assignee_filter_values(db, project, assignee)
+                    )
+                )
             if q:
                 term = f"%{q.strip()}%"
                 query = query.filter(
@@ -2072,7 +2918,7 @@ def setup_project_routes(file_store: Optional[ProjectFileStore] = None) -> APIRo
                 description=_clean_text(body.description, field="Description", max_length=100_000),
                 priority=priority,
                 labels=_normalize_labels(body.labels),
-                reporter=actor,
+                reporter=_canonical_actor(actor),
                 assignee=_validate_assignee(db, project, body.assignee),
                 start_date=start_date,
                 due_date=due_date,
@@ -2401,7 +3247,7 @@ def setup_project_routes(file_store: Optional[ProjectFileStore] = None) -> APIRo
                 text=_clean_text(body.text, field="Checklist text", max_length=500, required=True),
                 is_done=False,
                 position=position,
-                created_by=actor,
+                created_by=_canonical_actor(actor),
             )
             db.add(checklist_item)
             project.updated_at = utcnow_naive()
@@ -2546,7 +3392,7 @@ def setup_project_routes(file_store: Optional[ProjectFileStore] = None) -> APIRo
             comment = ProjectComment(
                 id=str(uuid.uuid4()),
                 work_item_id=item.id,
-                author=actor,
+                author=_canonical_actor(actor),
                 body=_clean_text(body.body, field="Comment", max_length=50_000, required=True),
             )
             db.add(comment)
@@ -2576,7 +3422,7 @@ def setup_project_routes(file_store: Optional[ProjectFileStore] = None) -> APIRo
             ).first()
             if not comment:
                 raise HTTPException(404, "Comment not found")
-            if comment.author != actor and role != "owner":
+            if comment.author != _canonical_actor(actor) and role != "owner":
                 raise HTTPException(403, "Only the comment author or project owner can edit it")
             comment.body = _clean_text(body.body, field="Comment", max_length=50_000, required=True)
             comment.edited_at = utcnow_naive()
@@ -2605,7 +3451,7 @@ def setup_project_routes(file_store: Optional[ProjectFileStore] = None) -> APIRo
             ).first()
             if not comment:
                 raise HTTPException(404, "Comment not found")
-            if comment.author != actor and role != "owner":
+            if comment.author != _canonical_actor(actor) and role != "owner":
                 raise HTTPException(403, "Only the comment author or project owner can delete it")
             db.delete(comment)
             project.updated_at = utcnow_naive()
@@ -2714,7 +3560,7 @@ def setup_project_routes(file_store: Optional[ProjectFileStore] = None) -> APIRo
                 attachment = ProjectAttachment(
                     id=attachment_id,
                     work_item_id=item.id,
-                    uploader=actor,
+                    uploader=_canonical_actor(actor),
                     kind=normalized_kind,
                     description=clean_description,
                     original_name=attachment_name,
@@ -2780,7 +3626,7 @@ def setup_project_routes(file_store: Optional[ProjectFileStore] = None) -> APIRo
             ).first()
             if not row:
                 raise HTTPException(404, "Attachment not found")
-            if row.uploader != actor and role != "owner":
+            if row.uploader != _canonical_actor(actor) and role != "owner":
                 raise HTTPException(403, "Only the uploader or project owner can delete this attachment")
             item = _get_item(db, project.id, row.work_item_id, writable=True)
             storage_key = row.storage_key
@@ -2808,20 +3654,63 @@ def setup_project_routes(file_store: Optional[ProjectFileStore] = None) -> APIRo
             project, _ = _get_project(db, item.project_id, actor)
             # Resolve only after the owner/member check, preventing filesystem
             # existence from becoming an authorization side channel.
-            path = store.resolve(row.storage_key)
+            try:
+                path = store.resolve(row.storage_key)
+            except (HTTPException, OSError) as exc:
+                logger.error(
+                    "Project attachment %s failed integrity verification: stored file is missing or unsafe",
+                    attachment_id,
+                )
+                raise HTTPException(
+                    500, "Stored attachment failed integrity verification"
+                ) from exc
+            expected_size = row.size
+            expected_sha256 = row.sha256
             mime = row.mime
             filename = row.original_name
-        return FileResponse(
-            path,
-            media_type=mime,
-            filename=filename,
-            headers={
-                "Cache-Control": "private, no-store",
-                "Pragma": "no-cache",
-                "X-Content-Type-Options": "nosniff",
-                "Content-Security-Policy": "default-src 'none'; sandbox",
-            },
+        release_download = _attachment_download_gate.try_acquire(
+            _attachment_download_principal(actor)
         )
+        if release_download is None:
+            raise HTTPException(
+                429,
+                "Too many project attachment downloads are already active",
+                headers={"Retry-After": "2"},
+            )
+        snapshot: Optional[BinaryIO] = None
+        try:
+            verified = await _prepare_verified_attachment_snapshot(
+                path,
+                expected_size,
+                expected_sha256,
+            )
+            if verified is None:
+                logger.error(
+                    "Project attachment %s failed integrity verification: size or SHA-256 mismatch",
+                    attachment_id,
+                )
+                raise HTTPException(
+                    500, "Stored attachment failed integrity verification"
+                )
+            snapshot, verified_size = verified
+            return _VerifiedAttachmentResponse(
+                snapshot,
+                on_close=release_download,
+                media_type=mime,
+                headers={
+                    "Content-Length": str(verified_size),
+                    "Content-Disposition": _attachment_content_disposition(filename),
+                    "Cache-Control": "private, no-store",
+                    "Pragma": "no-cache",
+                    "X-Content-Type-Options": "nosniff",
+                    "Content-Security-Policy": "default-src 'none'; sandbox",
+                },
+            )
+        except BaseException:
+            if snapshot is not None:
+                snapshot.close()
+            release_download()
+            raise
 
     @router.get("/{project_id}/activity")
     async def project_activity(

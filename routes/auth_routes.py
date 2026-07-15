@@ -14,7 +14,7 @@ import re
 from pathlib import Path
 
 from core.atomic_io import atomic_write_json, atomic_write_text
-from core.auth import AuthManager, RESERVED_USERNAMES, SetAdminResult, TOKEN_TTL
+from core.auth import AuthManager, SetAdminResult, TOKEN_TTL, username_is_reserved
 from routes.link_routes import GUEST_SUFFIX
 from src.constants import DEEP_RESEARCH_DIR, MEMORY_FILE, PASSWORD_MIN_LENGTH, SKILLS_DIR
 from src.rate_limiter import RateLimiter
@@ -93,7 +93,7 @@ def username_reserved(name: str) -> bool:
     account named 'alice@remote' could impersonate a remote guest
     (see routes/link_routes.py)."""
     key = (name or "").strip().lower()
-    return key in RESERVED_USERNAMES or key.endswith(GUEST_SUFFIX)
+    return username_is_reserved(key) or key.endswith(GUEST_SUFFIX)
 
 
 def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
@@ -500,7 +500,7 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
             from core.database import (
                 Base, DirectMessage, HomeLink, LinkInvite, RemoteBlock,
                 RemoteContactPref, SessionLocal, StatusPost, StatusView,
-                UserKey, UserProfile, Project, ProjectMember,
+                UserKey, UserProfile, Project, ProjectMember, ProjectRemoteGrant,
                 ProjectWorkItem, ProjectChecklistItem, ProjectComment,
                 ProjectAttachment, ProjectActivity, ProjectQuotaLock,
                 project_owner_quota_lock_key,
@@ -524,6 +524,7 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
                     (Project, Project.owner),
                     (ProjectMember, ProjectMember.username),
                     (ProjectMember, ProjectMember.added_by),
+                    (ProjectRemoteGrant, ProjectRemoteGrant.invited_by),
                     (ProjectWorkItem, ProjectWorkItem.reporter),
                     (ProjectWorkItem, ProjectWorkItem.assignee),
                     (ProjectChecklistItem, ProjectChecklistItem.created_by),

@@ -32,6 +32,7 @@ def _fresh_auth_manager(tmp_path):
     "name",
     [
         "internal-tool", "api", "demo", "system", "owner@localhost",
+        "remote:grant-id", "remote-instance:1", "REMOTE:Anything", " Remote-Instance:42 ",
         "INTERNAL-TOOL", " Internal-Tool ", "Api", "SYSTEM", " Owner@Localhost ",
     ],
 )
@@ -64,6 +65,16 @@ def test_rename_into_reserved_username_is_blocked(tmp_path):
     assert "bob" in mgr.users
 
 
+@pytest.mark.parametrize("name", ["remote:anything", "remote-instance:7"])
+def test_rename_into_remote_principal_namespace_is_blocked(tmp_path, name):
+    mgr = _fresh_auth_manager(tmp_path)
+    assert mgr.create_user("admin", "pw-123456", is_admin=True) is True
+    assert mgr.create_user("bob", "pw-123456") is True
+    assert mgr.rename_user("bob", name, "admin") is False
+    assert name not in mgr.users
+    assert "bob" in mgr.users
+
+
 def test_legacy_reserved_username_store_is_preserved_and_locked(tmp_path):
     auth_path = tmp_path / "auth.json"
     auth_path.write_text(
@@ -78,6 +89,21 @@ def test_legacy_reserved_username_store_is_preserved_and_locked(tmp_path):
     assert mgr.status(None)["auth_store_error"] is True
     assert mgr.is_configured is True
     assert "internal-tool" in auth_path.read_text(encoding="utf-8")
+
+
+def test_legacy_remote_principal_username_store_is_preserved_and_locked(tmp_path):
+    auth_path = tmp_path / "auth.json"
+    auth_path.write_text(
+        '{"users": {"remote-instance:7": {"password_hash": "unused", '
+        '"is_admin": false}, "admin": {"password_hash": "unused", '
+        '"is_admin": true}}}',
+        encoding="utf-8",
+    )
+    mgr = _fresh_auth_manager(tmp_path)
+
+    assert "remote-instance:7" in mgr.users
+    assert mgr.status(None)["auth_store_error"] is True
+    assert "remote-instance:7" in auth_path.read_text(encoding="utf-8")
 
 
 def test_legacy_reserved_username_session_cannot_authenticate(tmp_path):

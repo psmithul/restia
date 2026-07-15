@@ -8,6 +8,7 @@ from sqlalchemy.orm import sessionmaker
 
 from core.database import (
     Base,
+    LinkGuest,
     Note,
     Project,
     ProjectActivity,
@@ -16,6 +17,7 @@ from core.database import (
     ProjectComment,
     ProjectMember,
     ProjectQuotaLock,
+    ProjectRemoteGrant,
     ProjectStage,
     ProjectWorkItem,
 )
@@ -55,6 +57,13 @@ def test_wipe_projects_removes_all_project_rows_and_files_only(monkeypatch, tmp_
     # when the whole graph is staged at once.
     db.add(project)
     db.flush()
+    guest = LinkGuest(
+        handle="remote-one",
+        token_hash="b" * 64,
+        status="approved",
+    )
+    db.add(guest)
+    db.flush()
     db.add(stage)
     db.flush()
     db.add(item)
@@ -66,6 +75,15 @@ def test_wipe_projects_removes_all_project_rows_and_files_only(monkeypatch, tmp_
                 username="bob",
                 role="editor",
                 added_by="alice",
+            ),
+            ProjectRemoteGrant(
+                id="grant-1",
+                project_id=project.id,
+                guest_id=guest.id,
+                handle_snapshot=guest.handle,
+                role="editor",
+                status="active",
+                invited_by="alice",
             ),
             ProjectChecklistItem(
                 id="check-1",
@@ -141,9 +159,11 @@ def test_wipe_projects_removes_all_project_rows_and_files_only(monkeypatch, tmp_
         ProjectWorkItem,
         ProjectStage,
         ProjectMember,
+        ProjectRemoteGrant,
         Project,
     )
     assert all(db.query(model).count() == 0 for model in project_models)
+    assert db.query(LinkGuest).filter(LinkGuest.handle == "remote-one").count() == 1
     assert db.query(Note).filter(Note.id == "unrelated-note").count() == 1
     db.close()
     engine.dispose()

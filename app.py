@@ -58,7 +58,7 @@ from datetime import datetime, timezone
 from typing import Dict
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import Depends, FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -313,6 +313,10 @@ if AUTH_ENABLED:
         # approved Home Link bearer. Keep this exact: no admin/me endpoint and
         # no arbitrary /api/link/calls/* suffix is session-auth exempt.
         _re.compile(r"^/api/link/calls/(signal|stream)/?$"),
+        # Every route under this exact namespace has a router-level Home Link
+        # bearer dependency. The similarly named local same-origin proxy stays
+        # under /api/homelink/projects and therefore keeps session auth.
+        _re.compile(r"^/api/link/projects(?:/.*)?$"),
     ]
 
     def _is_auth_exempt(path: str) -> bool:
@@ -823,10 +827,13 @@ app.include_router(setup_messaging_routes())
 # Home Link (chat with the developer from a self-hosted instance)
 from routes.link_routes import (
     home_call_alert_watcher,
+    require_link_project_remote,
     setup_link_hub_routes,
+    setup_link_project_invitation_routes,
     setup_home_link_routes,
 )
 app.include_router(setup_link_hub_routes())
+app.include_router(setup_link_project_invitation_routes())
 app.include_router(setup_home_link_routes())
 
 # End-to-end encryption key store (identity keys for encrypted DMs)
@@ -864,6 +871,11 @@ app.include_router(setup_task_routes(task_scheduler))
 # Multi-project workflow boards, durable deliverables, and task activity.
 from routes.project_routes import setup_project_routes
 app.include_router(setup_project_routes())
+app.include_router(setup_project_routes(
+    prefix="/api/link/projects",
+    remote_only=True,
+    dependencies=[Depends(require_link_project_remote)],
+))
 
 from routes.assistant_routes import setup_assistant_routes
 app.include_router(setup_assistant_routes(task_scheduler))

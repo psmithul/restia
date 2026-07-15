@@ -34,6 +34,7 @@ from core.database import (
     Project,
     ProjectQuotaLock,
     ProjectMember,
+    ProjectRemoteGrant,
     ProjectStage,
     ProjectWorkItem,
     ProjectChecklistItem,
@@ -139,6 +140,7 @@ def setup_admin_wipe_routes(session_manager):
                 db.query(ProjectWorkItem).delete()
                 db.query(ProjectStage).delete()
                 db.query(ProjectMember).delete()
+                db.query(ProjectRemoteGrant).delete()
                 db.query(Project).delete()
                 db.commit()
                 _rmtree_quiet(PROJECT_FILES_DIR)

@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import io
+import tempfile
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from threading import Barrier
+from threading import Barrier, Event
 from types import SimpleNamespace
 
 import httpx
 import pytest
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
@@ -81,6 +82,33 @@ async def _create_project(client, *, key="ENG", template="general"):
     )
     assert response.status_code == 201, response.text
     return response.json()
+
+
+def _mount_remote_projects(app_wrapper, factory, store, guest_id: int):
+    async def remote_identity(request: Request):
+        project_id = request.path_params.get("project_id")
+        grant_id = None
+        if project_id:
+            db = factory()
+            try:
+                grant = db.query(cdb.ProjectRemoteGrant).filter(
+                    cdb.ProjectRemoteGrant.project_id == project_id,
+                    cdb.ProjectRemoteGrant.guest_id == guest_id,
+                    cdb.ProjectRemoteGrant.status == "active",
+                ).first()
+                grant_id = grant.id if grant else None
+            finally:
+                db.close()
+        project_routes.set_remote_project_context(request, guest_id, grant_id)
+
+    app_wrapper.app.include_router(
+        project_routes.setup_project_routes(
+            store,
+            prefix="/api/link/projects",
+            remote_only=True,
+            dependencies=[Depends(remote_identity)],
+        )
+    )
 
 
 def _docx_bytes() -> bytes:
@@ -213,6 +241,420 @@ async def test_project_templates_members_and_owner_scoping(project_env):
         assert handed_off.json()["item"]["assignee"] is None
         assert handed_off.json()["item"]["version"] == 2
         assert (await client.get(f"/api/projects/{project_id}", headers=_headers("alice"))).status_code == 404
+
+
+async def test_remote_grant_lifecycle_authorization_and_safe_serialization(project_env):
+    app, factory, store = project_env
+    db = factory()
+    approved = cdb.LinkGuest(
+        handle="remote-one",
+        token_hash="b" * 64,
+        status="approved",
+    )
+    pending = cdb.LinkGuest(
+        handle="not-approved",
+        token_hash="c" * 64,
+        status="pending",
+    )
+    db.add_all([approved, pending])
+    db.commit()
+    approved_id = approved.id
+    db.close()
+    _mount_remote_projects(app, factory, store, approved_id)
+
+    async with _client(app) as client:
+        created = await _create_project(client)
+        project_id = created["project"]["id"]
+        first_stage = created["stages"][0]["id"]
+        added_editor = await client.post(
+            f"/api/projects/{project_id}/members",
+            headers=_headers("alice"),
+            json={"username": "bob", "role": "editor"},
+        )
+        assert added_editor.status_code == 201, added_editor.text
+
+        linked = await client.get(
+            "/api/projects/linked-instances", headers=_headers("alice")
+        )
+        assert linked.status_code == 200
+        assert linked.json()["handles"] == ["remote-one"]
+
+        unapproved = await client.post(
+            f"/api/projects/{project_id}/remote-invitations",
+            headers=_headers("alice"),
+            json={"handle": "not-approved", "role": "editor"},
+        )
+        assert unapproved.status_code == 404
+
+        invited = await client.post(
+            f"/api/projects/{project_id}/remote-invitations",
+            headers=_headers("alice"),
+            json={"handle": "remote-one", "role": "editor"},
+        )
+        assert invited.status_code == 201, invited.text
+        grant = invited.json()["grant"]
+        assert grant["kind"] == "instance"
+        assert grant["handle"] == "remote-one"
+        assert grant["status"] == "pending"
+
+        pending_list = await client.get("/api/link/projects")
+        assert pending_list.status_code == 200
+        assert pending_list.json()["projects"] == []
+        assert (await client.post(
+            "/api/link/projects",
+            json={"name": "Forbidden", "key": "NO"},
+        )).status_code == 403
+
+        db = factory()
+        active = db.query(cdb.ProjectRemoteGrant).filter_by(id=grant["id"]).one()
+        active.status = "active"
+        active.responded_at = cdb.utcnow_naive()
+        active.version += 1
+        peer = cdb.LinkGuest(
+            handle="remote-two",
+            token_hash="e" * 64,
+            status="approved",
+        )
+        db.add(peer)
+        db.flush()
+        peer_grant = cdb.ProjectRemoteGrant(
+            id="99999999-9999-9999-9999-999999999999",
+            project_id=project_id,
+            guest_id=peer.id,
+            handle_snapshot=peer.handle,
+            role="editor",
+            status="active",
+            invited_by="alice",
+            responded_at=cdb.utcnow_naive(),
+        )
+        db.add(peer_grant)
+        db.commit()
+        active_version = active.version
+        peer_principal = project_routes.remote_grant_principal(peer_grant.id)
+        db.close()
+
+        # Internal Home Link principal strings are never authentication. Even
+        # a legacy/manually injected local profile with the exact same name
+        # must stay on the ordinary local authorization path.
+        spoofed_users = [
+            project_routes.remote_instance_principal(approved_id),
+            project_routes.remote_grant_principal(grant["id"]),
+        ]
+        for spoofed_user in spoofed_users:
+            app.app.state.auth_manager.users[spoofed_user] = {"is_admin": False}
+            spoofed_board = await client.get(
+                f"/api/projects/{project_id}/board",
+                headers=_headers(spoofed_user),
+            )
+            assert spoofed_board.status_code == 404
+            spoofed_create = await client.post(
+                f"/api/projects/{project_id}/items",
+                headers=_headers(spoofed_user),
+                json={"title": "Principal spoof", "stage_id": first_stage},
+            )
+            assert spoofed_create.status_code == 404
+
+        owner_assigned = await client.post(
+            f"/api/projects/{project_id}/items",
+            headers=_headers("alice"),
+            json={
+                "title": "Owner-only identity",
+                "stage_id": first_stage,
+                "assignee": "alice",
+            },
+        )
+        assert owner_assigned.status_code == 201
+        editor_assigned = await client.post(
+            f"/api/projects/{project_id}/items",
+            headers=_headers("alice"),
+            json={
+                "title": "Other local identity",
+                "stage_id": first_stage,
+                "assignee": "bob",
+            },
+        )
+        assert editor_assigned.status_code == 201
+        peer_assigned = await client.post(
+            f"/api/projects/{project_id}/items",
+            headers=_headers("alice"),
+            json={
+                "title": "Other linked identity",
+                "stage_id": first_stage,
+                "assignee": peer_principal,
+            },
+        )
+        assert peer_assigned.status_code == 201
+        for hidden_guess in ("alice", "bob", "future-signup"):
+            hidden_filter = await client.get(
+                f"/api/link/projects/{project_id}/items?assignee={hidden_guess}"
+            )
+            assert hidden_filter.status_code == 400
+        owner_alias = await client.get(
+            f"/api/link/projects/{project_id}/items?assignee=instance"
+        )
+        assert owner_alias.status_code == 200
+        assert {row["id"] for row in owner_alias.json()["items"]} == {
+            owner_assigned.json()["item"]["id"],
+            editor_assigned.json()["item"]["id"],
+        }
+        assert {row["assignee"] for row in owner_alias.json()["items"]} == {
+            "instance"
+        }
+
+        remote_list = await client.get("/api/link/projects")
+        assert remote_list.status_code == 200, remote_list.text
+        assert [row["id"] for row in remote_list.json()["projects"]] == [project_id]
+        assert remote_list.json()["projects"][0]["owner"] == "instance"
+
+        board = await client.get(f"/api/link/projects/{project_id}/board")
+        assert board.status_code == 200, board.text
+        board_body = board.json()
+        assert board_body["actor"] == "me"
+        assert board_body["project"]["owner"] == "instance"
+        assert {row["username"] for row in board_body["members"]} == {
+            "instance",
+            "me",
+            peer_principal,
+        }
+        assert all(row.get("handle") != "remote-one" for row in board_body["members"])
+
+        created_item = await client.post(
+            f"/api/link/projects/{project_id}/items",
+            json={"title": "Remote work", "stage_id": first_stage, "assignee": "me"},
+        )
+        assert created_item.status_code == 201, created_item.text
+        item = created_item.json()["item"]
+        assert item["reporter"] == "me"
+        assert item["assignee"] == "me"
+        mine = await client.get(
+            f"/api/link/projects/{project_id}/items?assignee=me"
+        )
+        assert mine.status_code == 200
+        assert [row["id"] for row in mine.json()["items"]] == [item["id"]]
+        principal = project_routes.remote_grant_principal(grant["id"])
+        exact_remote = await client.get(
+            f"/api/link/projects/{project_id}/items",
+            params={"assignee": peer_principal},
+        )
+        assert exact_remote.status_code == 200
+        assert [row["id"] for row in exact_remote.json()["items"]] == [
+            peer_assigned.json()["item"]["id"]
+        ]
+
+        db = factory()
+        stored_item = db.query(cdb.ProjectWorkItem).filter_by(id=item["id"]).one()
+        assert stored_item.reporter == principal
+        assert stored_item.assignee == principal
+        db.close()
+
+        downgraded = await client.patch(
+            f"/api/projects/{project_id}/remote-grants/{grant['id']}",
+            headers=_headers("alice"),
+            json={"role": "viewer", "version": active_version},
+        )
+        assert downgraded.status_code == 200, downgraded.text
+        assert downgraded.json()["unassigned_items"] == 1
+        viewer_version = downgraded.json()["grant"]["version"]
+        forbidden = await client.post(
+            f"/api/link/projects/{project_id}/items",
+            json={"title": "Viewer write", "stage_id": first_stage},
+        )
+        assert forbidden.status_code == 403
+        assert (await client.get(f"/api/link/projects/{project_id}/board")).status_code == 200
+
+        revoked = await client.delete(
+            f"/api/projects/{project_id}/remote-grants/{grant['id']}?version={viewer_version}",
+            headers=_headers("alice"),
+        )
+        assert revoked.status_code == 200, revoked.text
+        assert revoked.json()["grant"]["status"] == "revoked"
+        assert (await client.get(f"/api/link/projects/{project_id}/board")).status_code == 404
+
+        reinvited = await client.post(
+            f"/api/projects/{project_id}/remote-invitations",
+            headers=_headers("alice"),
+            json={"handle": "remote-one", "role": "editor"},
+        )
+        assert reinvited.status_code == 201, reinvited.text
+        assert reinvited.json()["grant"]["id"] == grant["id"]
+        assert reinvited.json()["grant"]["status"] == "pending"
+
+
+async def test_remote_project_list_keeps_each_projects_own_role(project_env):
+    app, factory, store = project_env
+    db = factory()
+    guest = cdb.LinkGuest(
+        handle="multi-project",
+        token_hash="d" * 64,
+        status="approved",
+    )
+    db.add(guest)
+    db.commit()
+    guest_id = guest.id
+    db.close()
+    _mount_remote_projects(app, factory, store, guest_id)
+
+    async with _client(app) as client:
+        first = await _create_project(client, key="ONE")
+        second = await _create_project(client, key="TWO")
+        for project, role in ((first, "editor"), (second, "viewer")):
+            invited = await client.post(
+                f"/api/projects/{project['project']['id']}/remote-invitations",
+                headers=_headers("alice"),
+                json={"handle": "multi-project", "role": role},
+            )
+            assert invited.status_code == 201, invited.text
+
+        db = factory()
+        grants = db.query(cdb.ProjectRemoteGrant).filter_by(guest_id=guest_id).all()
+        assert len(grants) == 2
+        for grant in grants:
+            grant.status = "active"
+            grant.responded_at = cdb.utcnow_naive()
+            grant.version += 1
+        db.commit()
+        db.close()
+
+        response = await client.get("/api/link/projects")
+        assert response.status_code == 200, response.text
+        roles_by_key = {
+            project["key"]: project["role"]
+            for project in response.json()["projects"]
+        }
+        assert roles_by_key == {"ONE": "editor", "TWO": "viewer"}
+
+
+async def test_project_owner_cannot_invite_a_personally_blocked_instance(project_env):
+    app, factory, _ = project_env
+    db = factory()
+    guest = cdb.LinkGuest(
+        handle="blocked-instance",
+        token_hash="e" * 64,
+        status="approved",
+    )
+    db.add(guest)
+    db.add(cdb.RemoteBlock(local_user="alice", handle=guest.handle))
+    db.commit()
+    db.close()
+
+    async with _client(app) as client:
+        created = await _create_project(client)
+        project_id = created["project"]["id"]
+        linked = await client.get(
+            "/api/projects/linked-instances", headers=_headers("alice")
+        )
+        assert linked.status_code == 200
+        assert linked.json()["instances"] == []
+        denied = await client.post(
+            f"/api/projects/{project_id}/remote-invitations",
+            headers=_headers("alice"),
+            json={"handle": "blocked-instance", "role": "editor"},
+        )
+        assert denied.status_code == 409
+        assert "unblock" in denied.json()["detail"].lower()
+
+
+async def test_remote_grant_tombstones_are_pruned_before_new_invite(
+    project_env,
+    monkeypatch,
+):
+    app, factory, _ = project_env
+    monkeypatch.setattr(project_routes, "REMOTE_GRANT_TOMBSTONE_LIMIT", 3)
+    db = factory()
+    guest = cdb.LinkGuest(
+        handle="fresh-instance",
+        token_hash="f" * 64,
+        status="approved",
+    )
+    db.add(guest)
+    db.commit()
+    guest_id = guest.id
+    db.close()
+
+    async with _client(app) as client:
+        created = await _create_project(client)
+        project_id = created["project"]["id"]
+        db = factory()
+        for index in range(6):
+            db.add(cdb.ProjectRemoteGrant(
+                id=f"dead-{index}",
+                project_id=project_id,
+                guest_id=None,
+                handle_snapshot=f"retired-{index}",
+                role="viewer",
+                status="revoked",
+                invited_by="alice",
+                revoked_at=cdb.utcnow_naive(),
+            ))
+        db.commit()
+        db.close()
+
+        invited = await client.post(
+            f"/api/projects/{project_id}/remote-invitations",
+            headers=_headers("alice"),
+            json={"handle": "fresh-instance", "role": "viewer"},
+        )
+        assert invited.status_code == 201, invited.text
+
+    db = factory()
+    assert db.query(cdb.ProjectRemoteGrant).filter(
+        cdb.ProjectRemoteGrant.project_id == project_id,
+        cdb.ProjectRemoteGrant.guest_id.is_(None),
+    ).count() == 3
+    assert db.query(cdb.ProjectRemoteGrant).filter(
+        cdb.ProjectRemoteGrant.project_id == project_id,
+        cdb.ProjectRemoteGrant.guest_id == guest_id,
+        cdb.ProjectRemoteGrant.status == "pending",
+    ).count() == 1
+    db.close()
+
+
+def test_concurrent_remote_invitations_are_serialized(project_env):
+    app, factory, _ = project_env
+
+    async def seed():
+        async with _client(app) as client:
+            created = await _create_project(client)
+            return created["project"]["id"]
+
+    project_id = asyncio.run(seed())
+    db = factory()
+    guest = cdb.LinkGuest(
+        handle="race-instance",
+        token_hash="9" * 64,
+        status="approved",
+    )
+    db.add(guest)
+    db.commit()
+    guest_id = guest.id
+    db.close()
+    barrier = Barrier(2)
+
+    def invite(role):
+        async def request_invite():
+            async with _client(app) as client:
+                response = await client.post(
+                    f"/api/projects/{project_id}/remote-invitations",
+                    headers=_headers("alice"),
+                    json={"handle": "race-instance", "role": role},
+                )
+                return response.status_code
+
+        barrier.wait()
+        return asyncio.run(request_invite())
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        statuses = sorted(pool.map(invite, ("viewer", "editor")))
+    assert statuses == [201, 409]
+    db = factory()
+    grants = db.query(cdb.ProjectRemoteGrant).filter(
+        cdb.ProjectRemoteGrant.project_id == project_id,
+        cdb.ProjectRemoteGrant.guest_id == guest_id,
+    ).all()
+    assert len(grants) == 1
+    assert grants[0].status == "pending"
+    assert grants[0].role in {"viewer", "editor"}
+    db.close()
 
 
 async def test_workflow_wip_versions_hierarchy_and_tracking(project_env):
@@ -540,6 +982,300 @@ async def test_durable_submissions_download_security_and_cleanup(project_env):
         db = factory()
         assert db.query(cdb.Project).filter(cdb.Project.id == project_id).count() == 0
         db.close()
+
+
+@pytest.mark.parametrize("download_source", ["local", "linked"])
+@pytest.mark.parametrize("damage", ["same_size", "truncated", "missing"])
+async def test_attachment_download_fails_closed_on_storage_integrity_damage(
+    project_env,
+    download_source,
+    damage,
+):
+    app, factory, store = project_env
+    guest_id = None
+    if download_source == "linked":
+        db = factory()
+        guest = cdb.LinkGuest(
+            handle=f"integrity-{damage.replace('_', '-')}",
+            token_hash="d" * 64,
+            status="approved",
+        )
+        db.add(guest)
+        db.commit()
+        guest_id = guest.id
+        db.close()
+        _mount_remote_projects(app, factory, store, guest_id)
+
+    pdf = b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n"
+    async with _client(app) as client:
+        created = await _create_project(client)
+        project_id = created["project"]["id"]
+        item = (
+            await client.post(
+                f"/api/projects/{project_id}/items",
+                headers=_headers("alice"),
+                json={
+                    "title": "Integrity check",
+                    "stage_id": created["stages"][0]["id"],
+                },
+            )
+        ).json()["item"]
+        uploaded = await client.post(
+            f"/api/projects/{project_id}/items/{item['id']}/attachments",
+            headers=_headers("alice"),
+            files={"file": ("integrity.pdf", pdf, "application/pdf")},
+        )
+        assert uploaded.status_code == 201, uploaded.text
+        attachment = uploaded.json()["attachment"]
+
+        if guest_id is not None:
+            db = factory()
+            db.add(
+                cdb.ProjectRemoteGrant(
+                    id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                    project_id=project_id,
+                    guest_id=guest_id,
+                    handle_snapshot=f"integrity-{damage.replace('_', '-')}",
+                    role="editor",
+                    status="active",
+                    invited_by="alice",
+                )
+            )
+            db.commit()
+            db.close()
+            download_url = (
+                f"/api/link/projects/attachments/{attachment['id']}/download"
+            )
+            download_headers = {}
+        else:
+            download_url = attachment["download_url"]
+            download_headers = _headers("alice")
+
+        clean = await client.get(download_url, headers=download_headers)
+        assert clean.status_code == 200, clean.text
+        assert clean.content == pdf
+
+        db = factory()
+        row = db.query(cdb.ProjectAttachment).filter_by(id=attachment["id"]).one()
+        path = store.resolve(row.storage_key)
+        db.close()
+        if damage == "same_size":
+            tampered = bytearray(pdf)
+            tampered[len(tampered) // 2] ^= 1
+            path.write_bytes(tampered)
+            assert path.stat().st_size == len(pdf)
+        elif damage == "truncated":
+            path.write_bytes(pdf[:-7])
+        else:
+            path.unlink()
+
+        if download_source == "local":
+            unauthorized = await client.get(
+                download_url,
+                headers=_headers("bob"),
+            )
+            assert unauthorized.status_code == 404
+
+        rejected = await client.get(download_url, headers=download_headers)
+        assert rejected.status_code == 500
+        assert rejected.json() == {
+            "detail": "Stored attachment failed integrity verification"
+        }
+        assert pdf not in rejected.content
+
+
+async def test_attachment_download_streams_the_verified_snapshot_after_path_replacement(
+    project_env,
+    monkeypatch,
+):
+    app, factory, store = project_env
+    pdf = b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n"
+    async with _client(app) as client:
+        created = await _create_project(client)
+        project_id = created["project"]["id"]
+        item = (
+            await client.post(
+                f"/api/projects/{project_id}/items",
+                headers=_headers("alice"),
+                json={"title": "Snapshot check", "stage_id": created["stages"][0]["id"]},
+            )
+        ).json()["item"]
+        uploaded = await client.post(
+            f"/api/projects/{project_id}/items/{item['id']}/attachments",
+            headers=_headers("alice"),
+            files={"file": ("snapshot.pdf", pdf, "application/pdf")},
+        )
+        assert uploaded.status_code == 201, uploaded.text
+        attachment = uploaded.json()["attachment"]
+
+        db = factory()
+        row = db.query(cdb.ProjectAttachment).filter_by(id=attachment["id"]).one()
+        path = store.resolve(row.storage_key)
+        db.close()
+
+        original_snapshot = project_routes._verified_attachment_snapshot
+
+        def snapshot_then_replace(*args, **kwargs):
+            verified = original_snapshot(*args, **kwargs)
+            assert verified is not None
+            replacement = path.with_name(f"{path.name}.replacement")
+            replacement.write_bytes(b"X" * len(pdf))
+            replacement.replace(path)
+            return verified
+
+        monkeypatch.setattr(
+            project_routes,
+            "_verified_attachment_snapshot",
+            snapshot_then_replace,
+        )
+        download = await client.get(
+            attachment["download_url"],
+            headers=_headers("alice"),
+        )
+        assert download.status_code == 200, download.text
+        assert download.content == pdf
+        assert path.read_bytes() == b"X" * len(pdf)
+
+
+async def test_verified_attachment_response_closes_snapshot_on_client_disconnect():
+    snapshot = tempfile.SpooledTemporaryFile(max_size=1, mode="w+b")
+    snapshot.write(b"verified bytes")
+    snapshot.seek(0)
+    response = project_routes._VerifiedAttachmentResponse(
+        snapshot,
+        media_type="application/octet-stream",
+    )
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    async def disconnected_send(message):
+        if message["type"] == "http.response.body":
+            raise OSError("client disconnected")
+
+    with pytest.raises(Exception) as exc_info:
+        await response(
+            {"type": "http", "method": "GET", "path": "/", "asgi": {"spec_version": "2.4"}},
+            receive,
+            disconnected_send,
+        )
+    assert exc_info.type.__name__ == "ClientDisconnect"
+    assert snapshot.closed
+
+
+async def test_cancelled_attachment_verification_closes_the_late_worker_result(
+    monkeypatch,
+    tmp_path,
+):
+    started = Event()
+    worker_release = Event()
+    gate = project_routes._AttachmentDownloadGate(total_limit=1, principal_limit=1)
+    gate_release = gate.try_acquire("guest:42")
+    assert gate_release is not None
+    snapshot = tempfile.SpooledTemporaryFile(max_size=1, mode="w+b")
+    snapshot.write(b"verified bytes")
+    snapshot.seek(0)
+
+    def delayed_snapshot(*_args, **_kwargs):
+        started.set()
+        assert worker_release.wait(timeout=5)
+        return snapshot, len(b"verified bytes")
+
+    monkeypatch.setattr(
+        project_routes,
+        "_verified_attachment_snapshot",
+        delayed_snapshot,
+    )
+    preparation = asyncio.create_task(
+        project_routes._prepare_verified_attachment_snapshot(
+            tmp_path / "unused",
+            1,
+            "0" * 64,
+        )
+    )
+    assert await asyncio.to_thread(started.wait, 2)
+    preparation.cancel()
+    await asyncio.sleep(0)
+    assert not preparation.done()
+    assert gate.active_counts() == (1, {"guest:42": 1})
+    worker_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await preparation
+    gate_release()
+    assert snapshot.closed
+    assert gate.active_counts() == (0, {})
+
+
+def test_attachment_download_gate_bounds_global_and_per_principal_slots():
+    gate = project_routes._AttachmentDownloadGate(total_limit=2, principal_limit=1)
+    release_a = gate.try_acquire("guest:1")
+    assert release_a is not None
+    assert gate.try_acquire("guest:1") is None
+    release_b = gate.try_acquire("guest:2")
+    assert release_b is not None
+    assert gate.try_acquire("guest:3") is None
+    assert gate.active_counts() == (2, {"guest:1": 1, "guest:2": 1})
+
+    release_a()
+    release_a()  # Response cleanup is deliberately idempotent.
+    release_c = gate.try_acquire("guest:3")
+    assert release_c is not None
+    release_b()
+    release_c()
+    assert gate.active_counts() == (0, {})
+
+
+async def test_attachment_download_route_fails_fast_at_concurrency_limit(
+    project_env,
+    monkeypatch,
+):
+    app, _, _ = project_env
+    gate = project_routes._AttachmentDownloadGate(total_limit=1, principal_limit=1)
+    monkeypatch.setattr(project_routes, "_attachment_download_gate", gate)
+    pdf = b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n"
+
+    async with _client(app) as client:
+        created = await _create_project(client)
+        project_id = created["project"]["id"]
+        item = (
+            await client.post(
+                f"/api/projects/{project_id}/items",
+                headers=_headers("alice"),
+                json={"title": "Bound downloads", "stage_id": created["stages"][0]["id"]},
+            )
+        ).json()["item"]
+        uploaded = await client.post(
+            f"/api/projects/{project_id}/items/{item['id']}/attachments",
+            headers=_headers("alice"),
+            files={"file": ("bounded.pdf", pdf, "application/pdf")},
+        )
+        assert uploaded.status_code == 201, uploaded.text
+        download_url = uploaded.json()["attachment"]["download_url"]
+
+        release = gate.try_acquire("profile:alice")
+        assert release is not None
+        limited = await client.get(download_url, headers=_headers("alice"))
+        assert limited.status_code == 429
+        assert limited.headers["retry-after"] == "2"
+        assert "already active" in limited.json()["detail"]
+        release()
+
+        downloaded = await client.get(download_url, headers=_headers("alice"))
+        assert downloaded.status_code == 200
+        assert downloaded.content == pdf
+        assert gate.active_counts() == (0, {})
+
+
+def test_attachment_download_principal_collapses_remote_grants_to_one_guest():
+    token = project_routes._PROJECT_REMOTE_CONTEXT.set(
+        {"guest_id": 42, "grant_id": "grant-a", "grant_ids": {"grant-a"}}
+    )
+    try:
+        assert project_routes._attachment_download_principal(
+            "remote:grant-a"
+        ) == "guest:42"
+    finally:
+        project_routes._PROJECT_REMOTE_CONTEXT.reset(token)
 
 
 async def test_attachment_pagination_and_project_storage_quota(project_env, monkeypatch):

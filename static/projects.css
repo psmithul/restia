@@ -140,6 +140,7 @@ body.hamburger-right .projects-workspace {
   background: var(--panel);
   font-size: 12px;
   font-weight: 600;
+  white-space: nowrap;
   transition: border-color 150ms ease, background 150ms ease, transform 150ms ease;
 }
 
@@ -231,6 +232,40 @@ body.hamburger-right .projects-workspace {
   padding: 0 4px;
 }
 
+.projects-navigator-group + .projects-navigator-group { margin-top: 14px; }
+.projects-invitations {
+  margin: 0 0 16px;
+  padding: 9px;
+  border: 1px solid color-mix(in srgb, var(--red) 36%, var(--border));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--red) 6%, var(--panel));
+}
+.projects-invitations__status {
+  display: flex;
+  min-height: 34px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--fg-muted, #888);
+  font-size: 10px;
+  line-height: 1.45;
+}
+.projects-invitations__list { display: flex; flex-direction: column; gap: 8px; }
+.projects-invitation-card {
+  display: flex;
+  min-width: 0;
+  padding: 9px;
+  flex-direction: column;
+  gap: 4px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--bg) 72%, var(--panel));
+}
+.projects-invitation-card h3 { margin: 0; overflow-wrap: anywhere; font-size: 11px; line-height: 1.35; }
+.projects-invitation-card > span { color: var(--fg-muted, #888); font-size: 9px; line-height: 1.4; }
+.projects-invitation-card__actions { display: grid; margin-top: 5px; grid-template-columns: 1fr 1fr; gap: 8px; }
+.projects-invitation-card__actions .projects-btn { min-width: 0; padding-inline: 7px; }
+
 .projects-text-btn,
 .projects-row-action,
 .projects-column__add {
@@ -309,6 +344,39 @@ body.hamburger-right .projects-workspace {
   gap: 2px;
 }
 
+.projects-project-row__title,
+.projects-toolbar__title-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+}
+.projects-project-row__title strong { min-width: 0; flex: 1; }
+.projects-source-badge,
+.projects-instance-badge,
+.projects-member-status {
+  display: inline-flex;
+  width: fit-content;
+  max-width: 100%;
+  min-height: 20px;
+  padding: 2px 6px;
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--fg-muted, #888);
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
+  font-size: 8px;
+  font-weight: 650;
+  line-height: 1.25;
+  white-space: nowrap;
+}
+.projects-source-badge,
+.projects-instance-badge {
+  color: color-mix(in srgb, var(--red) 72%, var(--fg));
+  border-color: color-mix(in srgb, var(--red) 34%, var(--border));
+  background: color-mix(in srgb, var(--red) 8%, transparent);
+}
+
 .projects-project-row__copy strong,
 .projects-project-row__copy small {
   overflow: hidden;
@@ -347,6 +415,30 @@ body.hamburger-right .projects-workspace {
 .projects-toolbar__title h2,
 .projects-toolbar__title p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .projects-toolbar__title h2 { margin-bottom: 3px; font-size: 15px; }
+
+/* The task drawer deliberately narrows the board. Give navigation and task
+   commands their own rows instead of allowing three grid tracks to collide. */
+.projects-workspace.has-task-drawer .projects-toolbar {
+  min-height: 96px;
+  padding: 9px 12px;
+  grid-template-columns: minmax(0, 1fr);
+  align-content: center;
+  justify-items: start;
+  gap: 6px;
+}
+.projects-workspace.has-task-drawer .projects-toolbar__title { display: none; }
+.projects-workspace.has-task-drawer .projects-toolbar__actions {
+  width: 100%;
+  min-width: 0;
+  padding-bottom: 2px;
+  justify-content: flex-start;
+  gap: 5px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+.projects-workspace.has-task-drawer .projects-toolbar__actions .projects-btn {
+  padding-inline: 9px;
+}
 
 .projects-view-tabs {
   display: inline-flex;
@@ -417,6 +509,29 @@ body.hamburger-right .projects-workspace {
   overflow: auto;
   overscroll-behavior: contain;
   scrollbar-width: thin;
+}
+
+.projects-remote-access-notice {
+  position: sticky;
+  top: 0;
+  z-index: 6;
+  display: flex;
+  min-height: 42px;
+  padding: 9px 14px;
+  align-items: center;
+  gap: 9px;
+  border-bottom: 1px solid color-mix(in srgb, var(--color-warning, #e5b567) 42%, var(--border));
+  color: var(--fg);
+  background: color-mix(in srgb, var(--color-warning, #e5b567) 10%, var(--panel));
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.projects-remote-access-notice strong { flex: 0 0 auto; }
+.projects-remote-access-notice span { color: var(--fg-muted, #888); }
+.projects-remote-access-notice.is-removed {
+  border-bottom-color: color-mix(in srgb, var(--color-error, #ef6b73) 42%, var(--border));
+  background: color-mix(in srgb, var(--color-error, #ef6b73) 9%, var(--panel));
 }
 
 .projects-board {
@@ -514,6 +629,14 @@ body.hamburger-right .projects-workspace {
   font-size: 10px;
   line-height: 1.45;
   text-align: center;
+}
+
+.projects-empty-inline--error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  text-align: left;
 }
 
 .projects-card {
@@ -950,6 +1073,24 @@ body.hamburger-right .projects-workspace {
 
 .projects-members { padding: 15px; }
 .projects-members > p { margin: 0 0 12px; color: var(--fg-muted, #888); font-size: 10px; line-height: 1.55; }
+.projects-member-section { min-width: 0; }
+.projects-member-section + .projects-member-section {
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border);
+}
+.projects-member-section h3 {
+  margin: 0 0 10px;
+  font-size: 12px;
+  line-height: 1.3;
+}
+.projects-linked-members__copy {
+  max-width: 66ch;
+  margin: -3px 0 12px;
+  color: var(--fg-muted, #888);
+  font-size: 10px;
+  line-height: 1.55;
+}
 .projects-members__list { display: flex; margin: 0 0 14px; padding: 0; flex-direction: column; gap: 6px; list-style: none; }
 .projects-member-row {
   display: grid;
@@ -963,12 +1104,47 @@ body.hamburger-right .projects-workspace {
   background: color-mix(in srgb, var(--bg) 66%, transparent);
 }
 .projects-member-row--owner { grid-template-columns: minmax(140px, 1fr) auto; }
+.projects-member-row--remote { grid-template-columns: minmax(180px, 1fr) 110px auto; }
 .projects-member-row > div { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
 .projects-member-row strong,
 .projects-member-row small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .projects-member-row strong { font-size: 11px; }
 .projects-member-row small { color: var(--fg-muted, #888); font-size: 9px; }
-.projects-member-add { display: grid; grid-template-columns: minmax(160px, 1fr) 120px auto; gap: 7px; }
+.projects-member-badges { display: flex; min-width: 0; flex-wrap: wrap; gap: 5px; }
+.projects-member-badges .projects-instance-badge {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.projects-member-status--active {
+  color: var(--color-success, #76c893);
+  border-color: color-mix(in srgb, var(--color-success, #76c893) 42%, var(--border));
+}
+.projects-member-status--pending {
+  color: var(--color-warning, #e5b567);
+  border-color: color-mix(in srgb, var(--color-warning, #e5b567) 42%, var(--border));
+}
+.projects-member-status--revoked { color: var(--color-error, #ef6b73); }
+.projects-member-add,
+.projects-remote-invite {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) 120px auto;
+  align-items: end;
+  gap: 7px;
+}
+.projects-linked-members__status {
+  display: flex;
+  min-height: 42px;
+  margin: 0 0 9px;
+  padding: 8px 9px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  color: var(--fg-muted, #888);
+  font-size: 10px;
+  line-height: 1.45;
+}
 
 .projects-archived-tasks { padding: 15px; }
 .projects-archived-tasks > p { margin: 0 0 12px; color: var(--fg-muted, #888); font-size: 10px; line-height: 1.55; }
@@ -1059,6 +1235,9 @@ body.hamburger-right .projects-workspace {
     gap: 7px;
     border-bottom: 1px solid var(--border);
   }
+  .projects-invitations--mobile { grid-column: 1 / -1; margin: 0; }
+  .projects-linked-projects-error--mobile { grid-column: 1 / -1; }
+  .projects-invitation-card__actions .projects-btn { min-height: 44px; }
   .projects-field--compact { gap: 3px; }
   .projects-field--compact select { width: 100%; }
 
@@ -1171,13 +1350,19 @@ body.hamburger-right .projects-workspace {
   .projects-stage-create select,
   .projects-stage-create .projects-btn { min-height: 44px; }
   .projects-member-row,
-  .projects-member-row--owner { grid-template-columns: minmax(0, 1fr) auto; }
+  .projects-member-row--owner,
+  .projects-member-row--remote { grid-template-columns: minmax(0, 1fr) auto; }
   .projects-member-row select { grid-column: 1 / -1; min-height: 44px; }
   .projects-member-row .projects-row-action { min-height: 44px; }
-  .projects-member-add { grid-template-columns: 1fr; }
+  .projects-member-add,
+  .projects-remote-invite { grid-template-columns: 1fr; }
   .projects-member-add input,
   .projects-member-add select,
-  .projects-member-add .projects-btn { min-height: 44px; }
+  .projects-member-add .projects-btn,
+  .projects-remote-invite input,
+  .projects-remote-invite select,
+  .projects-remote-invite .projects-btn,
+  .projects-linked-members__status .projects-text-btn { min-height: 44px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

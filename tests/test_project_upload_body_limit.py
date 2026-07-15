@@ -105,14 +105,22 @@ def test_middleware_rejects_non_finite_timeout_arguments(argument, value):
 
 
 def test_attachment_upload_matcher_is_exact_and_shared_with_timeout_policy():
-    assert is_project_attachment_upload(
-        "POST", "/api/projects/project-1/items/item-1/attachments"
-    )
+    for prefix in ("/api/projects", "/api/link/projects", "/api/homelink/projects"):
+        assert is_project_attachment_upload(
+            "POST", f"{prefix}/project-1/items/item-1/attachments"
+        )
     assert not is_project_attachment_upload(
         "GET", "/api/projects/project-1/items/item-1/attachments"
     )
     assert not is_project_attachment_upload(
         "POST", "/api/projects/project-1/items/item-1/attachments/extra"
+    )
+    assert not is_project_attachment_upload(
+        "POST", "/api/link/projects/project-1/items/item-1/attachments/download"
+    )
+    assert not is_project_attachment_upload(
+        "POST", "/api/homelink/projects/project-1/items/item-1/attachments"
+        "/attachment-1"
     )
     app_source = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")
     assert "or is_project_attachment_upload(request.method, path)" in app_source

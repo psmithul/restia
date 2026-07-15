@@ -60,7 +60,12 @@ PROJECT_UPLOAD_BODY_TOTAL_TIMEOUT_SECONDS = _positive_timeout_env(
 PROJECT_UPLOAD_SEMAPHORE = asyncio.Semaphore(PROJECT_UPLOAD_CONCURRENCY)
 
 _ATTACHMENT_UPLOAD_PATH = re.compile(
-    r"^/api/projects/[^/]+/items/[^/]+/attachments/?$"
+    # The same durable upload can be reached directly, through the bearer-
+    # authenticated hub namespace, or through the signed-in same-origin Home
+    # Link proxy. Keep this exact so unrelated link/proxy request bodies do not
+    # inherit the large body allowance or long request timeout.
+    r"^/api/(?:projects|link/projects|homelink/projects)/"
+    r"[^/]+/items/[^/]+/attachments/?$"
 )
 
 

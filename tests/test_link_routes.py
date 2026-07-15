@@ -453,6 +453,8 @@ def test_guest_message_body_is_validated():
 def test_local_accounts_cannot_take_remote_names():
     assert username_reserved("visitor@remote") is True
     assert username_reserved("Visitor@REMOTE  ") is True
+    assert username_reserved("remote:grant-id") is True
+    assert username_reserved(" Remote-Instance:5 ") is True
     assert username_reserved("visitor") is False
 
 

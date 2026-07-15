@@ -361,6 +361,10 @@ class Project(TimestampMixin, Base):
         "ProjectMember", back_populates="project", cascade="all, delete-orphan",
         passive_deletes=True,
     )
+    remote_grants = relationship(
+        "ProjectRemoteGrant", back_populates="project", cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
     stages = relationship(
         "ProjectStage", back_populates="project", cascade="all, delete-orphan",
         passive_deletes=True,
@@ -417,6 +421,51 @@ class ProjectMember(Base):
 
     __table_args__ = (
         Index("ix_project_members_username", "username", "project_id"),
+    )
+
+
+class ProjectRemoteGrant(Base):
+    """A project-scoped role granted to one approved Home Link instance.
+
+    Local profiles continue to use :class:`ProjectMember`.  A remote grant has
+    its own immutable UUID so project attribution never relies on a reusable
+    Home Link handle.  Revoked/declined rows are retained for audit display and
+    may be safely re-invited for the same still-existing ``LinkGuest`` identity.
+    """
+
+    __tablename__ = "project_remote_grants"
+
+    id = Column(String(36), primary_key=True)
+    project_id = Column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False,
+    )
+    guest_id = Column(
+        Integer, ForeignKey("link_guests.id", ondelete="SET NULL"), nullable=True,
+    )
+    handle_snapshot = Column(String(32), nullable=False)
+    role = Column(String(16), nullable=False, default="viewer")
+    status = Column(String(16), nullable=False, default="pending")
+    invited_by = Column(String, nullable=False)
+    invited_at = Column(DateTime, nullable=False, default=utcnow_naive)
+    responded_at = Column(DateTime, nullable=True)
+    revoked_at = Column(DateTime, nullable=True)
+    version = Column(Integer, nullable=False, default=1)
+
+    project = relationship("Project", back_populates="remote_grants")
+    guest = relationship("LinkGuest")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id", "guest_id", name="uq_project_remote_grants_project_guest"
+        ),
+        Index(
+            "ix_project_remote_grants_project_status",
+            "project_id", "status", "invited_at",
+        ),
+        Index(
+            "ix_project_remote_grants_guest_status",
+            "guest_id", "status", "project_id",
+        ),
     )
 
 
@@ -1019,11 +1068,11 @@ class LinkGuest(Base):
     the guest's bearer token is stored; the plaintext token lives on the
     guest's instance. Guests appear in direct_messages as '<handle>@remote'.
 
-    A guest is never a user account: no login, no privileges, no data access —
-    the token only unlocks the one guest↔owner conversation, and only once the
-    owner has approved the request (status 'approved'). New registrations
-    start 'pending' and can't send or read anything; 'blocked' keeps the
-    handle reserved so a spammer can't re-register it."""
+    A guest is never a user account: no login and no local profile privileges.
+    Once approved, the token unlocks the guest↔owner conversation and may
+    accept explicit, project-scoped ``ProjectRemoteGrant`` capabilities. New
+    registrations start 'pending' and can't send, read, or accept project work;
+    'blocked' keeps the handle reserved so a spammer can't re-register it."""
     __tablename__ = "link_guests"
 
     id         = Column(Integer, primary_key=True, autoincrement=True)
