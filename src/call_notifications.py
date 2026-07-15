@@ -19,10 +19,11 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping, Optional
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote
 from uuid import UUID
 
 from src.settings import load_settings
+from src.public_origin import canonical_shared_origin
 from src.telegram_bot import (
     TelegramConfig,
     load_telegram_config,
@@ -109,31 +110,10 @@ def _https_public_origin(settings: Mapping[str, Any]) -> str:
     Link requests are remote-controlled, and a forged host would become a
     phishing link delivered by the trusted Restia Telegram bot.
     """
-    raw = str((settings or {}).get("app_public_url") or "").strip()
-    if not raw or len(raw) > 2048 or any(ord(ch) < 33 for ch in raw):
-        return ""
-    try:
-        parsed = urlsplit(raw)
-        if (
-            parsed.scheme.lower() != "https"
-            or not parsed.hostname
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.path not in ("", "/")
-            or parsed.query
-            or parsed.fragment
-        ):
-            return ""
-        host = parsed.hostname.encode("idna").decode("ascii").lower()
-        port = parsed.port
-    except (UnicodeError, ValueError):
-        return ""
-    if not host or any(ch in host for ch in ("/", "\\", "@")):
-        return ""
-    rendered_host = f"[{host}]" if ":" in host else host
-    if port is not None and port != 443:
-        rendered_host = f"{rendered_host}:{port}"
-    return f"https://{rendered_host}"
+    return canonical_shared_origin(
+        (settings or {}).get("app_public_url"),
+        allow_loopback_http=False,
+    )
 
 
 def build_restia_call_link(peer: str, settings: Optional[Mapping[str, Any]] = None) -> str:

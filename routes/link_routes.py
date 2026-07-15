@@ -58,15 +58,15 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictStr
-from sqlalchemy import and_, func, or_
+from sqlalchemy import and_, func, or_, text
 from sqlalchemy.orm import load_only
 from starlette.concurrency import run_in_threadpool
 
 from core.auth import RESERVED_USERNAMES
 from core.database import (
     DirectMessage, DirectMessageAttachment, HomeLink, LinkGuest, LinkInvite, Project,
-    ProjectRemoteGrant, ProjectWorkItem, RemoteBlock, RemoteContactPref, SessionLocal,
-    utcnow_naive,
+    ProjectRemoteGrant, ProjectWorkItem, RemoteBlock, RemoteContactPref,
+    SessionLocal, utcnow_naive,
 )
 from core.middleware import require_admin
 from core.project_upload_limit import PROJECT_ATTACHMENT_REQUEST_MAX_BYTES
@@ -211,6 +211,18 @@ def _max_pending() -> int:
 
 def _max_guests() -> int:
     return int(os.getenv("LINK_MAX_GUESTS", "500"))
+
+
+def _serialize_guest_admission(db) -> None:
+    """Reserve the durable guest-cap admission lane before count-then-insert."""
+
+    dialect = db.get_bind().dialect.name
+    if dialect == "sqlite":
+        # SQLite's writer reservation is cross-thread and cross-process.
+        db.execute(text("BEGIN IMMEDIATE"))
+    elif dialect == "postgresql":
+        # Stable transaction-scoped advisory key for LinkGuest admissions.
+        db.execute(text("SELECT pg_advisory_xact_lock(57962613968965)"))
 
 
 class RegisterRequest(BaseModel):
@@ -992,6 +1004,7 @@ def setup_link_hub_routes():
         token = secrets.token_urlsafe(32)
         db = SessionLocal()
         try:
+            _serialize_guest_admission(db)
             # Same detail as the local-account collision above: the response
             # must not reveal whether a handle clashes with a guest or with a
             # real account name (that would enumerate the hub's users).
@@ -1037,7 +1050,9 @@ def setup_link_hub_routes():
         token = secrets.token_urlsafe(32)
         db = SessionLocal()
         try:
-            if not _valid_invite(db, code):
+            _serialize_guest_admission(db)
+            inv = _valid_invite(db, code)
+            if not inv:
                 # Generic on purpose: never reveal whether the code was wrong,
                 # expired, revoked, or already spent.
                 raise HTTPException(403, "Invalid or expired invite code")
@@ -1056,9 +1071,14 @@ def setup_link_hub_routes():
             if not consumed:
                 raise HTTPException(403, "Invalid or expired invite code")
             inv = db.query(LinkInvite).filter(LinkInvite.code_hash == _hash_code(code)).first()
-            db.add(LinkGuest(handle=handle, token_hash=_hash_token(token),
-                             status=GUEST_APPROVED, created_at=utcnow_naive(),
-                             invite_id=inv.id if inv else None, pubkey=pubkey))
+            db.add(LinkGuest(
+                handle=handle,
+                token_hash=_hash_token(token),
+                status=GUEST_APPROVED,
+                created_at=utcnow_naive(),
+                invite_id=inv.id if inv else None,
+                pubkey=pubkey,
+            ))
             db.commit()
         finally:
             db.close()

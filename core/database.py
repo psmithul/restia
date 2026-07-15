@@ -1107,6 +1107,12 @@ class LinkInvite(Base):
     max_uses   = Column(Integer, nullable=False, default=1)
     uses       = Column(Integer, nullable=False, default=0)
     revoked    = Column(Boolean, nullable=False, default=False)
+    # Project pairing codes remain ordinary Home Link invitations, but retain
+    # enough context for the owner UI to identify the exact installation that
+    # redeemed the code. Project access is still a separate, explicit grant.
+    project_id   = Column(String(36), nullable=True, index=True)
+    project_role = Column(String(16), nullable=True)
+    hub_url      = Column(String(2048), nullable=True)
 
 
 class RemoteContactPref(Base):
@@ -1446,10 +1452,70 @@ def _migrate_add_dm_feature_columns():
 
 
 def _migrate_add_link_invite_columns():
-    """Add the invite/E2EE columns to link_guests for databases created before
-    invite-code onboarding. The link_invites / remote_contact_prefs /
-    remote_blocks tables themselves are created by create_all; only the
-    in-place column adds need a guarded migration. Idempotent."""
+    """Add Home Link invite columns introduced after invite-code onboarding.
+
+    The tables themselves are created by ``create_all``. Existing installs
+    still need guarded in-place column additions because ``create_all`` never
+    alters a table. This migration is intentionally idempotent.
+    """
+    if not DATABASE_URL.startswith("sqlite:///"):
+        from sqlalchemy import inspect as sqlalchemy_inspect
+
+        try:
+            with engine.begin() as connection:
+                inspector = sqlalchemy_inspect(connection)
+                table_names = set(inspector.get_table_names())
+                additions = {
+                    "link_guests": {
+                        "invite_id": "INTEGER",
+                        "pubkey": "TEXT",
+                    },
+                    "link_invites": {
+                        "project_id": "VARCHAR(36)",
+                        "project_role": "VARCHAR(16)",
+                        "hub_url": "VARCHAR(2048)",
+                    },
+                }
+                for table_name, columns in additions.items():
+                    if table_name not in table_names:
+                        continue
+                    existing = {
+                        str(column["name"]) for column in inspector.get_columns(table_name)
+                    }
+                    for column_name, column_type in columns.items():
+                        if column_name not in existing:
+                            connection.exec_driver_sql(
+                                f"ALTER TABLE {table_name} ADD COLUMN "
+                                f"{column_name} {column_type}"
+                            )
+                if "link_guests" in table_names:
+                    guest_indexes = {
+                        str(index["name"]) for index in inspector.get_indexes("link_guests")
+                    }
+                    if "ix_link_guests_invite_id" not in guest_indexes:
+                        connection.exec_driver_sql(
+                            "CREATE INDEX ix_link_guests_invite_id "
+                            "ON link_guests(invite_id)"
+                        )
+                if "link_invites" in table_names:
+                    invite_indexes = {
+                        str(index["name"]) for index in inspector.get_indexes("link_invites")
+                    }
+                    if "ix_link_invites_project_id" not in invite_indexes:
+                        connection.exec_driver_sql(
+                            "CREATE INDEX ix_link_invites_project_id "
+                            "ON link_invites(project_id)"
+                        )
+            return
+        except Exception as exc:
+            logging.getLogger(__name__).exception(
+                "Home Link invite-columns migration failed on %s",
+                engine.dialect.name,
+            )
+            raise RuntimeError(
+                "Could not migrate Home Link project-pairing columns"
+            ) from exc
+
     import sqlite3
     db_path = DATABASE_URL.replace("sqlite:///", "")
     if not os.path.exists(db_path):
@@ -1463,9 +1529,24 @@ def _migrate_add_link_invite_columns():
                 conn.execute("ALTER TABLE link_guests ADD COLUMN invite_id INTEGER")
             if "pubkey" not in cols:
                 conn.execute("ALTER TABLE link_guests ADD COLUMN pubkey TEXT")
-            conn.commit()
+        invite_cols = [
+            row[1]
+            for row in conn.execute("PRAGMA table_info(link_invites)").fetchall()
+        ]
+        if invite_cols:
+            if "project_id" not in invite_cols:
+                conn.execute("ALTER TABLE link_invites ADD COLUMN project_id VARCHAR(36)")
+            if "project_role" not in invite_cols:
+                conn.execute("ALTER TABLE link_invites ADD COLUMN project_role VARCHAR(16)")
+            if "hub_url" not in invite_cols:
+                conn.execute("ALTER TABLE link_invites ADD COLUMN hub_url VARCHAR(2048)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_link_invites_project_id "
+                "ON link_invites(project_id)"
+            )
+        conn.commit()
     except Exception as e:
-        logging.getLogger(__name__).warning(f"link_guests invite-columns migration failed: {e}")
+        logging.getLogger(__name__).warning(f"Home Link invite-columns migration failed: {e}")
     finally:
         try:
             conn.close()

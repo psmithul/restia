@@ -70,7 +70,7 @@ def test_projects_launchers_and_customization_controls_are_semantic_and_unique()
     assert 'data-ui-key="tool-projects"' in html
     assert "'/projects': 'Projects — Restia'" in html
     assert "'/projects':" in html
-    assert '/static/projects.css?v=20260715projects' in html
+    assert '/static/projects.css?v=20260715instances' in html
 
 
 def test_projects_module_is_wired_as_a_full_workspace():
@@ -98,7 +98,8 @@ def test_projects_frontend_wires_closed_home_link_federation_surfaces():
     css = PROJECTS_CSS.read_text(encoding="utf-8")
 
     for endpoint in (
-        "/api/projects/linked-instances",
+        "/linked-instances",
+        "/pairing-invitations",
         "/remote-invitations",
         "/remote-grants/",
         "/api/homelink/projects?include_archived=true",
@@ -115,6 +116,7 @@ def test_projects_frontend_wires_closed_home_link_federation_surfaces():
     assert ".projects-linked-members" in css
     assert ".projects-member-status--active" in css
     assert ".projects-member-status--pending" in css
+    assert ".projects-pairing" in css
 
 
 def test_projects_assets_are_precached_and_respect_responsive_accessibility():

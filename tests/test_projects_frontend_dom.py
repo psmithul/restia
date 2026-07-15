@@ -113,6 +113,78 @@ def test_request_gate_rejects_stale_project_responses():
     }
 
 
+def test_instance_pairing_state_never_retains_a_redeemed_plaintext_code():
+    result = run_node(
+        """
+        let state = __test.emptyInstancePairing();
+        state = __test.reduceInstancePairing(state, {
+          type:'creating', projectId:'project-1', role:'editor'
+        });
+        state = __test.reduceInstancePairing(state, {type:'created', pairing:{
+          id:7, project_id:'project-1', role:'editor', status:'waiting',
+          code:'one-time-secret', hub_url:'https://hub.example',
+        }});
+        const waiting = {...state};
+        state = __test.reduceInstancePairing(state, {type:'status', pairing:{
+          id:7, status:'paired', handle:'robot-lab', role:'editor',
+        }});
+        console.log(JSON.stringify({
+          waiting:{status:waiting.status,code:waiting.code,projectId:waiting.projectId},
+          redeemed:{status:state.status,code:state.code,handle:state.handle,
+                    grant:state.grant,role:state.role},
+        }));
+        """
+    )
+    assert result == {
+        "waiting": {
+            "status": "waiting",
+            "code": "one-time-secret",
+            "projectId": "project-1",
+        },
+        "redeemed": {
+            "status": "paired",
+            "code": "",
+            "handle": "robot-lab",
+            "grant": None,
+            "role": "editor",
+        },
+    }
+
+
+def test_instance_pairing_cancel_clears_create_and_invite_busy_states():
+    result = run_node(
+        """
+        let creating = __test.reduceInstancePairing(__test.emptyInstancePairing(), {
+          type:'creating', projectId:'project-1', role:'editor'
+        });
+        creating = __test.reduceInstancePairing(creating, {type:'cancel-operation'});
+        let paired = __test.reduceInstancePairing(__test.emptyInstancePairing(), {
+          type:'created', pairing:{id:9, project_id:'project-1', status:'paired',
+            role:'viewer', handle:'lab'}
+        });
+        paired = __test.reduceInstancePairing(paired, {type:'inviting'});
+        const busy = paired.inviting;
+        paired = __test.reduceInstancePairing(paired, {type:'cancel-operation'});
+        console.log(JSON.stringify({
+          createStatus:creating.status,
+          createId:creating.id,
+          busy,
+          inviteStatus:paired.status,
+          inviteId:paired.id,
+          inviting:paired.inviting,
+        }));
+        """
+    )
+    assert result == {
+        "createStatus": "idle",
+        "createId": "",
+        "busy": True,
+        "inviteStatus": "paired",
+        "inviteId": "9",
+        "inviting": False,
+    }
+
+
 def test_unconfigured_home_link_is_an_empty_optional_surface():
     result = run_node(
         """
@@ -751,7 +823,14 @@ def test_archived_tasks_and_subtasks_have_complete_recovery_and_creation_paths()
 
 def test_cross_instance_dom_contract_is_accessible_and_never_expands_local_membership():
     source = PROJECTS_JS.read_text(encoding="utf-8")
-    assert "'/api/projects/linked-instances'" in source
+    assert "projectPath(projectId, '/linked-instances', PROJECT_SOURCES.LOCAL)" in source
+    assert "'/pairing-invitations'" in source
+    assert "function reduceInstancePairing" in source
+    assert "'invite-paired-instance'" in source
+    assert "'review-instance-pairing'" in source
+    assert "function invitePairedInstance" in source
+    assert "pairing_invite_id: Number(pairing.id)" in source
+    assert "verify the installation handle, then explicitly send its project invitation" in source
     assert "'/remote-invitations'" in source
     assert "`/remote-grants/${encodeURIComponent(id)}`" in source
     assert "'/api/homelink/projects?include_archived=true'" in source
@@ -818,6 +897,39 @@ def test_cross_instance_dom_contract_is_accessible_and_never_expands_local_membe
     )[0]
     assert "dataset: { form: 'member-add' }" in local_dialog
     assert "Local profiles" in local_dialog
+    assert "content.append(renderLinkedMembersSection(), localSection)" in local_dialog
+    assert "Project access" in local_dialog
+    pairing_poll = source.split("async function pollInstancePairing", 1)[1].split(
+        "async function createInstancePairing", 1
+    )[0]
+    assert "const changed = instancePairingFingerprint(next) !== previousFingerprint" in pairing_poll
+    assert "if (changed)" in pairing_poll
+    assert "renderAll()" not in pairing_poll
+    pairing_create = source.split("async function createInstancePairing", 1)[1].split(
+        "function pairingSetupText", 1
+    )[0]
+    assert "state.instancePairingGate.next()" in pairing_create
+    assert "!state.open" in pairing_create
+    assert "instancePairingCreateController" in pairing_create
+    pairing_invite = source.split("async function invitePairedInstance", 1)[1].split(
+        "async function inviteRemoteProjectMember", 1
+    )[0]
+    assert "state.instancePairingGate.next()" in pairing_invite
+    assert "instancePairingInviteController" in pairing_invite
+    assert "pairing_invite_id: Number(pairing.id)" in pairing_invite
+    assert "!state.open" in pairing_invite
+    pairing_revoke = source.split("async function revokeInstancePairing", 1)[1].split(
+        "function reviewInstancePairing", 1
+    )[0]
+    assert "stopLinkedInstancesLoad()" in pairing_revoke
+    assert "state.instancePairingGate.next()" in pairing_revoke
+    assert "instancePairingRevokeController" in pairing_revoke
+    assert "activeProjectMatches(pairing.projectId, PROJECT_SOURCES.LOCAL)" in pairing_revoke
+    reset_pairing = source.split("case 'reset-instance-pairing':", 1)[1].split(
+        "case 'manage-stages':", 1
+    )[0]
+    assert "stopInstancePairingOperations()" in reset_pairing
+    assert "stopLinkedInstancesLoad()" in reset_pairing
 
 
 def test_css_is_namespaced_themed_accessible_and_mobile_is_single_column():
@@ -839,3 +951,4 @@ def test_css_is_namespaced_themed_accessible_and_mobile_is_single_column():
     assert ".projects-invitations--mobile" in mobile
     assert ".projects-member-row--remote" in mobile
     assert ".projects-remote-invite" in mobile
+    assert ".projects-pairing__steps li { overflow-wrap: anywhere; }" in css

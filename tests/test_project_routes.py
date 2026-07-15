@@ -57,6 +57,7 @@ def project_env(monkeypatch, tmp_path):
     app.state.auth_manager = SimpleNamespace(
         is_configured=True,
         users={"alice": {"is_admin": True}, "bob": {"is_admin": False}},
+        is_admin=lambda user: user == "alice",
     )
     app.include_router(project_routes.setup_project_routes(store))
     yield _Identity(app), factory, store
@@ -274,7 +275,7 @@ async def test_remote_grant_lifecycle_authorization_and_safe_serialization(proje
         assert added_editor.status_code == 201, added_editor.text
 
         linked = await client.get(
-            "/api/projects/linked-instances", headers=_headers("alice")
+            f"/api/projects/{project_id}/linked-instances", headers=_headers("alice")
         )
         assert linked.status_code == 200
         assert linked.json()["handles"] == ["remote-one"]
@@ -541,7 +542,7 @@ async def test_project_owner_cannot_invite_a_personally_blocked_instance(project
         created = await _create_project(client)
         project_id = created["project"]["id"]
         linked = await client.get(
-            "/api/projects/linked-instances", headers=_headers("alice")
+            f"/api/projects/{project_id}/linked-instances", headers=_headers("alice")
         )
         assert linked.status_code == 200
         assert linked.json()["instances"] == []

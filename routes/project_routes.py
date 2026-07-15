@@ -8,6 +8,7 @@ import hmac
 import logging
 import os
 import re
+import secrets
 import tempfile
 import uuid
 from contextlib import contextmanager
@@ -25,6 +26,7 @@ from sqlalchemy import and_, func, or_, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import defer
 
+from core.middleware import require_admin
 from core.database import (
     Project,
     ProjectActivity,
@@ -37,12 +39,15 @@ from core.database import (
     ProjectStage,
     ProjectWorkItem,
     LinkGuest,
+    LinkInvite,
     RemoteBlock,
     SessionLocal,
     project_owner_quota_lock_key,
     utcnow_naive,
 )
 from src.auth_helpers import effective_owner, require_user
+from src.public_origin import canonical_shared_origin, is_loopback_origin
+from src.settings import get_setting
 from src.project_storage import (
     ProjectFileStore,
     read_project_attachment,
@@ -92,6 +97,7 @@ MAX_ACTIVITY_LIMIT = 200
 ITEM_LIST_MAX_LIMIT = min(PROJECT_MAX_ITEMS, 2_000)
 ITEM_DETAIL_COMMENT_LIMIT = min(PROJECT_MAX_COMMENTS_PER_ITEM, 200)
 ATTACHMENT_INTEGRITY_CHUNK_BYTES = 1024 * 1024
+PROJECT_PAIRING_EXPIRY_MINUTES = 30
 
 
 def _bounded_download_concurrency_env(name: str, default: int, maximum: int) -> int:
@@ -220,6 +226,12 @@ class ProjectTransfer(BaseModel):
 class RemoteInvitationCreate(BaseModel):
     handle: str = Field(min_length=1, max_length=32)
     role: Literal["editor", "viewer"] = "viewer"
+    pairing_invite_id: Optional[int] = Field(default=None, ge=1)
+
+
+class ProjectPairingCreate(BaseModel):
+    role: Literal["editor", "viewer"] = "viewer"
+    hub_url: Optional[str] = Field(default=None, max_length=2048)
 
 
 class RemoteGrantUpdate(BaseModel):
@@ -546,6 +558,49 @@ def _actor(request: Request) -> str:
     return actor
 
 
+def _request_is_admin(request: Request) -> bool:
+    try:
+        require_admin(request)
+    except HTTPException:
+        return False
+    return True
+
+
+def _pairing_hub_url(request: Request, supplied: Optional[str] = None) -> str:
+    candidate = str(supplied or "").strip()
+    if candidate:
+        return canonical_shared_origin(candidate, allow_loopback_http=True)
+    configured = canonical_shared_origin(
+        get_setting("app_public_url", ""),
+        allow_loopback_http=False,
+    )
+    if configured:
+        return configured
+    fallback = canonical_shared_origin(
+        str(request.base_url).rstrip("/"),
+        allow_loopback_http=True,
+    )
+    # Host is caller-controlled unless deployment middleware explicitly pins
+    # it. It is safe as a convenience only for loopback development; remote
+    # installs must use the configured Public App URL or an explicit address.
+    return fallback if is_loopback_origin(fallback) else ""
+
+
+def _revoke_unused_project_pairings(db, project_id: str) -> int:
+    """Revoke unredeemed installation trust codes tied to project ownership."""
+
+    return int(
+        db.query(LinkInvite)
+        .filter(
+            LinkInvite.project_id == str(project_id),
+            LinkInvite.revoked.is_(False),
+            LinkInvite.uses == 0,
+        )
+        .update({LinkInvite.revoked: True}, synchronize_session=False)
+        or 0
+    )
+
+
 @contextmanager
 def _db_session(*, write: bool = True):
     db = SessionLocal()
@@ -728,8 +783,19 @@ def _project_role(db, project: Project, actor: str) -> Optional[str]:
     return member.role if member else None
 
 
-def _get_project(db, project_id: str, actor: str, *, minimum: str = "viewer", writable: bool = False) -> tuple[Project, str]:
-    project = db.query(Project).filter(Project.id == project_id).first()
+def _get_project(
+    db,
+    project_id: str,
+    actor: str,
+    *,
+    minimum: str = "viewer",
+    writable: bool = False,
+    lock: bool = False,
+) -> tuple[Project, str]:
+    query = db.query(Project).filter(Project.id == project_id)
+    if (writable or lock) and not _is_sqlite(db):
+        query = query.with_for_update()
+    project = query.first()
     if not project:
         raise HTTPException(404, "Project not found")
     role = _project_role(db, project, actor)
@@ -1982,16 +2048,69 @@ def setup_project_routes(
         if remote_only or _is_remote_actor(actor):
             raise HTTPException(403, "Remote project access cannot manage linked instances")
 
-    @router.get("/linked-instances")
-    async def linked_instances(request: Request):
+    def _pairing_status(
+        db,
+        invite: LinkInvite,
+    ) -> tuple[str, Optional[LinkGuest], Optional[ProjectRemoteGrant]]:
+        guest = (
+            db.query(LinkGuest)
+            .filter(LinkGuest.invite_id == int(invite.id))
+            .order_by(LinkGuest.id.asc())
+            .first()
+        )
+        if guest is not None and str(guest.status or "").lower() != "approved":
+            return "blocked", guest, None
+        grant = None
+        if guest is not None and invite.project_id:
+            grant = db.query(ProjectRemoteGrant).filter(
+                ProjectRemoteGrant.project_id == str(invite.project_id),
+                ProjectRemoteGrant.guest_id == int(guest.id),
+            ).first()
+        if grant is not None:
+            return str(grant.status or "pending"), guest, grant
+        if guest is not None:
+            return "paired", guest, None
+        if invite.revoked:
+            return "revoked", guest, None
+        if invite.expires_at is not None and invite.expires_at <= utcnow_naive():
+            return "expired", guest, None
+        if int(invite.uses or 0) >= int(invite.max_uses or 1):
+            return "used", guest, None
+        return "waiting", guest, None
+
+    def _pairing_dict(
+        db,
+        invite: LinkInvite,
+        *,
+        include_code: Optional[str] = None,
+    ) -> dict[str, Any]:
+        status, guest, grant = _pairing_status(db, invite)
+        payload: dict[str, Any] = {
+            "id": int(invite.id),
+            "project_id": str(invite.project_id or ""),
+            "role": str(invite.project_role or "viewer"),
+            "status": status,
+            "handle": str(guest.handle) if guest is not None else None,
+            "expires_at": _iso(invite.expires_at),
+            "grant": _remote_grant_dict(grant) if grant is not None else None,
+            "hub_url": str(invite.hub_url or ""),
+            "hub_url_loopback": is_loopback_origin(invite.hub_url),
+        }
+        if include_code is not None:
+            payload["code"] = include_code
+        return payload
+
+    @router.get("/{project_id}/linked-instances")
+    async def linked_instances(project_id: str, request: Request):
         actor = _actor(request)
         _require_local_grant_admin(actor)
         enabled = os.getenv("LINK_HUB_ENABLED", "false").strip().lower() == "true"
         with _db_session(write=False) as db:
+            project, _ = _get_project(db, project_id, actor, minimum="owner")
             blocked_handles = {
                 str(handle).strip().lower()
                 for (handle,) in db.query(RemoteBlock.handle)
-                .filter(func.lower(RemoteBlock.local_user) == actor)
+                .filter(func.lower(RemoteBlock.local_user) == project.owner)
                 .all()
                 if str(handle or "").strip()
             }
@@ -2012,11 +2131,183 @@ def setup_project_routes(
                 }
                 for row in rows
             ]
+            now = utcnow_naive()
+            recent_pairings = (
+                db.query(LinkInvite)
+                .outerjoin(LinkGuest, LinkGuest.invite_id == LinkInvite.id)
+                .outerjoin(
+                    ProjectRemoteGrant,
+                    and_(
+                        ProjectRemoteGrant.project_id == str(project.id),
+                        ProjectRemoteGrant.guest_id == LinkGuest.id,
+                    ),
+                )
+                .filter(
+                    LinkInvite.project_id == str(project.id),
+                    or_(
+                        and_(
+                            LinkInvite.revoked.is_(False),
+                            LinkInvite.uses == 0,
+                            or_(
+                                LinkInvite.expires_at.is_(None),
+                                LinkInvite.expires_at > now,
+                            ),
+                        ),
+                        and_(
+                            LinkGuest.id.is_not(None),
+                            LinkGuest.status == "approved",
+                            or_(
+                                ProjectRemoteGrant.id.is_(None),
+                                ProjectRemoteGrant.status == "pending",
+                            ),
+                        ),
+                    ),
+                )
+                .order_by(LinkInvite.created_at.desc(), LinkInvite.id.desc())
+                .all()
+            )
+            pairing_payloads = []
+            for candidate in recent_pairings:
+                latest_status, _, _ = _pairing_status(db, candidate)
+                if latest_status in {"waiting", "paired", "pending"}:
+                    pairing_payloads.append(_pairing_dict(db, candidate))
+            hub_url = _pairing_hub_url(request)
             return {
                 "hub_enabled": enabled,
+                "can_create_pairing": enabled and _request_is_admin(request),
+                "hub_url": hub_url,
+                "hub_url_loopback": is_loopback_origin(hub_url),
+                "pairing": pairing_payloads[0] if pairing_payloads else None,
+                "pairings": pairing_payloads,
                 "instances": instances,
                 "handles": [row["handle"] for row in instances],
             }
+
+    @router.post("/{project_id}/pairing-invitations", status_code=201)
+    async def create_project_pairing(
+        project_id: str,
+        body: ProjectPairingCreate,
+        request: Request,
+    ):
+        actor = _actor(request)
+        _require_local_grant_admin(actor)
+        require_admin(request)
+        if os.getenv("LINK_HUB_ENABLED", "false").strip().lower() != "true":
+            raise HTTPException(
+                409,
+                "Enable LINK_HUB_ENABLED on this Restia before pairing another installation",
+            )
+        with _db_session() as db:
+            project, _ = _get_project(
+                db, project_id, actor, minimum="owner", writable=True
+            )
+            now = utcnow_naive()
+            hub_url = _pairing_hub_url(request, body.hub_url)
+            if not hub_url:
+                raise HTTPException(
+                    400,
+                    "Enter a reachable HTTPS Restia address or configure Public App URL",
+                )
+            # Plaintext codes cannot be recovered. Require explicit revocation
+            # before reissuing so closing/reloading cannot silently orphan or
+            # invalidate a code that may already be in transit to another Restia.
+            outstanding = db.query(LinkInvite.id).filter(
+                LinkInvite.project_id == str(project.id),
+                LinkInvite.revoked.is_(False),
+                LinkInvite.uses == 0,
+                or_(
+                    LinkInvite.expires_at.is_(None),
+                    LinkInvite.expires_at > now,
+                ),
+            ).first()
+            if outstanding is not None:
+                raise HTTPException(
+                    409,
+                    "An unused pairing code already exists; revoke it before creating another",
+                )
+            code = secrets.token_urlsafe(24)
+            invite = LinkInvite(
+                code_hash=hashlib.sha256(code.encode("utf-8")).hexdigest(),
+                created_by=actor,
+                label=f"Project {project.key} · {project.name}"[:100],
+                created_at=now,
+                expires_at=now + timedelta(minutes=PROJECT_PAIRING_EXPIRY_MINUTES),
+                max_uses=1,
+                uses=0,
+                revoked=False,
+                project_id=project.id,
+                project_role=body.role,
+                hub_url=hub_url,
+            )
+            db.add(invite)
+            db.flush()
+            return {
+                "pairing": _pairing_dict(
+                    db,
+                    invite,
+                    include_code=code,
+                )
+            }
+
+    @router.get("/{project_id}/pairing-invitations/{invite_id}")
+    async def get_project_pairing(
+        project_id: str,
+        invite_id: int,
+        request: Request,
+    ):
+        actor = _actor(request)
+        _require_local_grant_admin(actor)
+        require_admin(request)
+        with _db_session(write=False) as db:
+            _get_project(db, project_id, actor, minimum="owner")
+            invite = db.query(LinkInvite).filter(
+                LinkInvite.id == int(invite_id),
+                LinkInvite.project_id == str(project_id),
+            ).first()
+            if invite is None:
+                raise HTTPException(404, "Pairing invitation not found")
+            return {"pairing": _pairing_dict(db, invite)}
+
+    @router.delete("/{project_id}/pairing-invitations/{invite_id}")
+    async def revoke_project_pairing(
+        project_id: str,
+        invite_id: int,
+        request: Request,
+    ):
+        actor = _actor(request)
+        _require_local_grant_admin(actor)
+        require_admin(request)
+        with _db_session() as db:
+            _get_project(db, project_id, actor, minimum="owner", writable=True)
+            invite_query = db.query(LinkInvite).filter(
+                LinkInvite.id == int(invite_id),
+                LinkInvite.project_id == str(project_id),
+            )
+            invite = invite_query.first()
+            if invite is None:
+                raise HTTPException(404, "Pairing invitation not found")
+            changed = invite_query.filter(
+                LinkInvite.revoked.is_(False),
+                LinkInvite.uses == 0,
+            ).update({LinkInvite.revoked: True}, synchronize_session=False)
+            if changed == 1:
+                db.expire_all()
+                invite = invite_query.first()
+                return {"pairing": _pairing_dict(db, invite)}
+
+            db.expire_all()
+            invite = invite_query.first()
+            if invite is not None and invite.revoked:
+                return {"pairing": _pairing_dict(db, invite)}
+            status, _, grant = _pairing_status(db, invite)
+            if grant is not None or status in {
+                "paired", "pending", "active", "declined", "blocked", "used"
+            }:
+                raise HTTPException(
+                    409,
+                    "This Restia already redeemed the code; manage its project access instead",
+                )
+            raise HTTPException(409, "This pairing code can no longer be revoked")
 
     @router.post("/{project_id}/remote-invitations", status_code=201)
     async def create_remote_invitation(
@@ -2033,12 +2324,25 @@ def setup_project_routes(
             project, _ = _get_project(
                 db, project_id, actor, minimum="owner", writable=True
             )
-            guest = db.query(LinkGuest).filter(
+            guest_query = db.query(LinkGuest).filter(
                 func.lower(LinkGuest.handle) == handle,
                 LinkGuest.status == "approved",
-            ).first()
+            )
+            if not _is_sqlite(db):
+                guest_query = guest_query.with_for_update()
+            guest = guest_query.first()
             if not guest:
                 raise HTTPException(404, "Approved linked instance not found")
+            if body.pairing_invite_id is not None:
+                pairing = db.query(LinkInvite).filter(
+                    LinkInvite.id == int(body.pairing_invite_id),
+                    LinkInvite.project_id == str(project.id),
+                ).first()
+                if pairing is None or int(guest.invite_id or 0) != int(pairing.id):
+                    raise HTTPException(
+                        409,
+                        "The paired installation changed; verify it and pair again",
+                    )
             if _remote_handle_blocked(db, project.owner, guest.handle):
                 raise HTTPException(
                     409,
@@ -2381,9 +2685,12 @@ def setup_project_routes(
     async def archive_project(project_id: str, request: Request, body: VersionRequest):
         actor = _actor(request)
         with _db_session() as db:
-            project, _ = _get_project(db, project_id, actor, minimum="owner")
+            project, _ = _get_project(
+                db, project_id, actor, minimum="owner", lock=True
+            )
             _claim_version(db, project, body.version)
             if not project.archived:
+                _revoke_unused_project_pairings(db, project.id)
                 project.archived = True
                 project.updated_at = utcnow_naive()
                 _activity(db, project.id, actor, "project_archived", f"Archived project {project.key}")
@@ -2394,7 +2701,9 @@ def setup_project_routes(
     async def restore_project(project_id: str, request: Request, body: VersionRequest):
         actor = _actor(request)
         with _db_session() as db:
-            project, _ = _get_project(db, project_id, actor, minimum="owner")
+            project, _ = _get_project(
+                db, project_id, actor, minimum="owner", lock=True
+            )
             _claim_version(db, project, body.version)
             if project.archived:
                 project.archived = False
@@ -2411,9 +2720,12 @@ def setup_project_routes(
     ):
         actor = _actor(request)
         with _db_session() as db:
-            project, _ = _get_project(db, project_id, actor, minimum="owner")
+            project, _ = _get_project(
+                db, project_id, actor, minimum="owner", lock=True
+            )
             if _normalize_key(confirm_key) != project.key:
                 raise HTTPException(400, "confirm_key must match the project key")
+            _revoke_unused_project_pairings(db, project.id)
             db.delete(project)
             db.flush()
         store.delete_project(project_id)
@@ -2526,6 +2838,7 @@ def setup_project_routes(
                     "The target profile does not have enough Project storage quota for this transfer",
                 )
             _claim_version(db, project, body.version)
+            _revoke_unused_project_pairings(db, project.id)
             db.delete(target_member)
             previous_owner_member = db.query(ProjectMember).filter(
                 ProjectMember.project_id == project.id,

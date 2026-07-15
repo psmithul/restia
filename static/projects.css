@@ -1123,6 +1123,10 @@ body.hamburger-right .projects-workspace {
   color: var(--color-warning, #e5b567);
   border-color: color-mix(in srgb, var(--color-warning, #e5b567) 42%, var(--border));
 }
+.projects-member-status--declined {
+  color: var(--color-warning, #e5b567);
+  border-color: color-mix(in srgb, var(--color-warning, #e5b567) 42%, var(--border));
+}
 .projects-member-status--revoked { color: var(--color-error, #ef6b73); }
 .projects-member-add,
 .projects-remote-invite {
@@ -1145,6 +1149,86 @@ body.hamburger-right .projects-workspace {
   font-size: 10px;
   line-height: 1.45;
 }
+.projects-pairing {
+  display: flex;
+  margin-top: 12px;
+  padding: 12px;
+  flex-direction: column;
+  gap: 10px;
+  border: 1px solid color-mix(in srgb, var(--red) 34%, var(--border));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--red) 5%, var(--panel));
+}
+.projects-pairing__heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.projects-pairing__heading > div { min-width: 0; }
+.projects-pairing__heading h4 { margin: 0 0 3px; font-size: 13px; line-height: 1.35; }
+.projects-pairing__heading p,
+.projects-pairing__warning,
+.projects-pairing__replacement-warning {
+  margin: 0;
+  color: var(--fg-muted, #888);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.projects-pairing__warning,
+.projects-pairing__replacement-warning {
+  padding-left: 9px;
+  border-left: 2px solid color-mix(in srgb, var(--color-warning, #e5b567) 70%, var(--border));
+}
+.projects-pairing__create {
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) auto;
+  align-items: end;
+  gap: 8px;
+}
+.projects-pairing .projects-field small { font-size: 11px; line-height: 1.45; }
+.projects-pairing__error { grid-column: 1 / -1; margin: 0; color: var(--color-error, #ef6b73); font-size: 12px; line-height: 1.45; }
+.projects-pairing__notice,
+.projects-pairing__result,
+.projects-pairing__status {
+  display: flex;
+  min-height: 42px;
+  padding: 9px 10px;
+  align-items: flex-start;
+  justify-content: center;
+  flex-direction: column;
+  gap: 2px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--bg) 72%, transparent);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.projects-pairing__notice span { color: var(--fg-muted, #888); }
+.projects-pairing__result--active { border-color: color-mix(in srgb, var(--color-success, #76c893) 48%, var(--border)); }
+.projects-pairing__details { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.projects-pairing__value {
+  display: flex;
+  min-width: 0;
+  padding: 9px 10px;
+  flex-direction: column;
+  gap: 5px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--bg) 76%, transparent);
+}
+.projects-pairing__value span { color: var(--fg-muted, #888); font-size: 10px; font-weight: 600; }
+.projects-pairing__value code {
+  overflow: auto;
+  color: var(--fg);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+.projects-pairing__steps { margin: 0; padding-left: 22px; color: var(--fg-muted, #888); font-size: 12px; line-height: 1.55; }
+.projects-pairing__steps li { overflow-wrap: anywhere; }
+.projects-pairing__steps li + li { margin-top: 4px; }
+.projects-pairing__actions { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
 
 .projects-archived-tasks { padding: 15px; }
 .projects-archived-tasks > p { margin: 0 0 12px; color: var(--fg-muted, #888); font-size: 10px; line-height: 1.55; }
@@ -1355,14 +1439,23 @@ body.hamburger-right .projects-workspace {
   .projects-member-row select { grid-column: 1 / -1; min-height: 44px; }
   .projects-member-row .projects-row-action { min-height: 44px; }
   .projects-member-add,
-  .projects-remote-invite { grid-template-columns: 1fr; }
+  .projects-remote-invite,
+  .projects-pairing__create,
+  .projects-pairing__details { grid-template-columns: 1fr; }
   .projects-member-add input,
   .projects-member-add select,
   .projects-member-add .projects-btn,
   .projects-remote-invite input,
   .projects-remote-invite select,
   .projects-remote-invite .projects-btn,
-  .projects-linked-members__status .projects-text-btn { min-height: 44px; }
+  .projects-linked-members__status .projects-text-btn,
+  .projects-pairing__create .projects-btn,
+  .projects-pairing__actions .projects-btn,
+  .projects-pairing__actions .projects-text-btn { min-height: 44px; }
+  .projects-pairing { padding: 11px; }
+  .projects-pairing__heading { flex-direction: column; }
+  .projects-pairing__actions { align-items: stretch; flex-direction: column; }
+  .projects-pairing__actions > * { width: 100%; }
 }
 
 @media (prefers-reduced-motion: reduce) {

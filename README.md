@@ -94,6 +94,17 @@ never exposes or routes to individual profile names, roles, or keys. Codes
 expire, are use-capped, and are revocable, so a leaked code has a bounded
 blast radius.
 
+**Shared projects.** A project owner who is also a Restia admin can open
+Projects → Project access → **Connect another Restia**. Restia creates a
+30-minute, single-use code bound to that project and the selected Viewer or
+Editor role. On the other installation, set `RESTIA_HOME_SERVER` to the
+project owner's Restia, restart, then enter a unique handle and the code in
+Messages → Home Link. The project owner then verifies the new installation
+handle and explicitly sends the project invitation; the other Restia must
+accept it. One host can collaborate with many inbound Restia installations;
+each client installation currently has one outbound Home Link,
+so connecting it to a different host replaces its previous link.
+
 **Calls.** Voice and video media is peer-to-peer and encrypted by WebRTC. The
 Restia servers relay only signaling; they never proxy the audio or video.
 STUN-only calls can work on a LAN or friendly NAT, but reliable calling across

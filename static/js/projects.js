@@ -11,7 +11,8 @@ const PRIORITIES = Object.freeze(['lowest', 'low', 'medium', 'high', 'highest', 
 const PROJECT_TEMPLATES = Object.freeze(['general', 'personal', 'research', 'software', 'content', 'coursework', 'gtm']);
 const STAGE_CATEGORIES = Object.freeze(['backlog', 'todo', 'in_progress', 'review', 'done']);
 const PROJECT_SOURCES = Object.freeze({ LOCAL: 'local', HOME: 'home' });
-const REMOTE_MEMBER_STATUSES = new Set(['pending', 'active', 'revoked']);
+const REMOTE_MEMBER_STATUSES = new Set(['pending', 'active', 'declined', 'revoked']);
+const INSTANCE_PAIRING_POLL_MS = 2500;
 const ACCEPTED_ATTACHMENT_EXTENSIONS = new Set([
   'pdf', 'docx', 'xlsx', 'pptx', 'zip',
   'png', 'jpg', 'jpeg', 'webp', 'gif',
@@ -32,6 +33,87 @@ const DEFAULT_FILTERS = Object.freeze({
   due: '',
   attachments: '',
 });
+
+function emptyInstancePairing() {
+  return {
+    projectId: '',
+    id: '',
+    status: 'idle',
+    role: 'viewer',
+    code: '',
+    hubUrl: '',
+    hubUrlLoopback: false,
+    expiresAt: '',
+    handle: '',
+    grant: null,
+    inviting: false,
+    error: '',
+  };
+}
+
+function reduceInstancePairing(current = emptyInstancePairing(), event = {}) {
+  switch (event.type) {
+    case 'reset': return emptyInstancePairing();
+    case 'creating': return {
+      ...emptyInstancePairing(),
+      projectId: asId(event.projectId),
+      role: event.role === 'editor' ? 'editor' : 'viewer',
+      status: 'creating',
+    };
+    case 'created': {
+      const pairing = event.pairing || {};
+      return {
+        ...current,
+        projectId: asId(pairing.project_id || current.projectId),
+        id: asId(pairing.id),
+        status: String(pairing.status || 'waiting').toLowerCase(),
+        role: pairing.role === 'editor' ? 'editor' : 'viewer',
+        code: String(pairing.code || ''),
+        hubUrl: String(pairing.hub_url || ''),
+        hubUrlLoopback: Boolean(pairing.hub_url_loopback),
+        expiresAt: String(pairing.expires_at || ''),
+        handle: String(pairing.handle || ''),
+        grant: pairing.grant || null,
+        inviting: false,
+        error: '',
+      };
+    }
+    case 'status': {
+      const pairing = event.pairing || {};
+      const status = String(pairing.status || current.status || 'waiting').toLowerCase();
+      return {
+        ...current,
+        status,
+        role: pairing.role === 'editor' ? 'editor' : current.role,
+        expiresAt: String(pairing.expires_at || current.expiresAt || ''),
+        hubUrl: String(pairing.hub_url || current.hubUrl || ''),
+        hubUrlLoopback: pairing.hub_url_loopback === undefined
+          ? current.hubUrlLoopback : Boolean(pairing.hub_url_loopback),
+        handle: String(pairing.handle || current.handle || ''),
+        grant: Object.prototype.hasOwnProperty.call(pairing, 'grant')
+          ? pairing.grant
+          : current.grant,
+        inviting: Object.prototype.hasOwnProperty.call(pairing, 'inviting')
+          ? Boolean(pairing.inviting)
+          : current.inviting,
+        // The plaintext has served its purpose once the target redeems it.
+        code: status === 'waiting' ? current.code : '',
+        error: '',
+      };
+    }
+    case 'inviting': return { ...current, inviting: true, error: '' };
+    case 'cancel-operation': return current.status === 'creating'
+      ? emptyInstancePairing()
+      : { ...current, inviting: false };
+    case 'error': return {
+      ...current,
+      status: current.id ? current.status : 'error',
+      inviting: event.preserveInviting ? current.inviting : false,
+      error: String(event.error || 'Could not pair this Restia'),
+    };
+    default: return current;
+  }
+}
 
 let API_BASE = typeof window !== 'undefined' ? window.location.origin : '';
 let dependencies = {};
@@ -132,6 +214,8 @@ const state = {
   linkedInstancesMeta: null,
   linkedInstancesLoading: false,
   linkedInstancesError: '',
+  instancePairing: emptyInstancePairing(),
+  instancePairingPollTimer: null,
   overview: null,
   activity: [],
   activityLoaded: false,
@@ -157,6 +241,7 @@ const state = {
   activityGate: createRequestGate(),
   invitationGate: createRequestGate(),
   linkedInstancesGate: createRequestGate(),
+  instancePairingGate: createRequestGate(),
   projectController: null,
   remoteProjectController: null,
   boardController: null,
@@ -164,6 +249,10 @@ const state = {
   activityController: null,
   invitationController: null,
   linkedInstancesController: null,
+  instancePairingCreateController: null,
+  instancePairingInviteController: null,
+  instancePairingRevokeController: null,
+  instancePairingStatusController: null,
   moveVersions: new Map(),
   movingTasks: new Set(),
   submittingTasks: new Set(),
@@ -1995,12 +2084,24 @@ async function selectProject(projectId, { force = false, source = null } = {}) {
     project.id === id && (!source || project.source === normalizeProjectSource(source)) && !project.archived
   ));
   const projectSource = normalizeProjectSource(selected?.source ?? source);
+  const projectChanged = !activeProjectMatches(id, projectSource);
   if (!id || !selected || (!force && activeProjectMatches(id, projectSource) && state.project)) return;
   if (state.selectedItem && !activeProjectMatches(id, projectSource)) {
     const closed = await closeTaskDetail();
     if (!closed) return;
   }
   saveProjectUiState();
+  if (projectChanged) {
+    state.linkedInstancesGate.invalidate();
+    try { state.linkedInstancesController?.abort(); } catch (_) {}
+    state.linkedInstancesController = null;
+    state.linkedInstancesLoading = false;
+    state.linkedInstances = [];
+    state.linkedInstancesMeta = null;
+    state.linkedInstancesError = '';
+    stopInstancePairingOperations();
+    state.instancePairing = reduceInstancePairing(state.instancePairing, { type: 'reset' });
+  }
   // Activity is fetched independently from the board. Invalidate it before
   // changing project identity so a late local/Home Link response cannot mark
   // the newly selected project's timeline as loaded.
@@ -2743,6 +2844,11 @@ function trapDialogTab(event) {
   if (!focusable.length) return false;
   const first = focusable[0];
   const last = focusable[focusable.length - 1];
+  if (!dialog.contains(document.activeElement)) {
+    event.preventDefault();
+    (event.shiftKey ? last : first).focus();
+    return true;
+  }
   if (event.shiftKey && document.activeElement === first) {
     event.preventDefault(); last.focus(); return true;
   }
@@ -3113,9 +3219,12 @@ async function deleteStage(stageId) {
 
 function openMembersDialog() {
   if (!canManageProject()) return;
+  if (state.instancePairing.projectId && state.instancePairing.projectId !== state.activeProjectId) {
+    state.instancePairing = reduceInstancePairing(state.instancePairing, { type: 'reset' });
+  }
   const content = make('div', { className: 'projects-members' });
   content.appendChild(make('p', {
-    text: 'Editors can create and update work. Viewers can follow progress and download deliverables. Only the owner can manage the project workflow and membership.',
+    text: 'Share this project with an entire Restia installation or add profiles from this Restia. Editors can update work; viewers can follow progress and download deliverables.',
   }));
   const localSection = make('section', {
     className: 'projects-member-section', attrs: { 'aria-labelledby': 'projects-local-members-title' },
@@ -3147,9 +3256,14 @@ function openMembersDialog() {
     make('button', { type: 'submit', className: 'projects-btn projects-btn--primary', text: 'Add profile' }),
   );
   localSection.appendChild(form);
-  content.append(localSection, renderLinkedMembersSection());
-  openDialog('Project members', content);
+  content.append(renderLinkedMembersSection(), localSection);
+  openDialog('Project access', content, { onClose: stopInstancePairingOperations });
   void loadLinkedInstances();
+  if (state.instancePairing.id && state.instancePairing.status === 'paired') {
+    void pollInstancePairing();
+  } else {
+    scheduleInstancePairingPoll();
+  }
 }
 
 function renderMemberRow(member) {
@@ -3188,6 +3302,7 @@ function mergeRemoteMember(member) {
 
 function remoteStatusLabel(status) {
   if (status === 'active') return 'Active';
+  if (status === 'declined') return 'Declined';
   if (status === 'revoked') return 'Revoked';
   return 'Pending acceptance';
 }
@@ -3233,11 +3348,243 @@ function approvedLinkedInstances() {
       .map((member) => String(member.handle || member.instance_name || '').trim().toLowerCase())
       .filter(Boolean),
   );
+  const pairingHandles = new Set(asArray(state.linkedInstancesMeta?.pairings)
+    .filter((pairing) => String(pairing?.status || '').toLowerCase() === 'paired')
+    .map((pairing) => String(pairing?.handle || '').trim().toLowerCase())
+    .filter(Boolean));
+  if (state.instancePairing.status === 'paired' && state.instancePairing.handle) {
+    pairingHandles.add(state.instancePairing.handle.trim().toLowerCase());
+  }
   return state.linkedInstances.filter((instance) => (
     instance.handle &&
     (instance.status === 'approved' || instance.status === 'active') &&
+    !pairingHandles.has(instance.handle.toLowerCase()) &&
     !invitedHandles.has(instance.handle.toLowerCase())
   ));
+}
+
+function renderInstancePairingPanel() {
+  const pairing = state.instancePairing;
+  const panel = make('div', {
+    className: `projects-pairing projects-pairing--${pairing.status}`,
+    attrs: { 'aria-labelledby': 'projects-pairing-title' },
+  });
+  panel.append(
+    make('div', { className: 'projects-pairing__heading' }, [
+      make('div', {}, [
+        make('h4', { id: 'projects-pairing-title', text: 'Connect another Restia' }),
+        make('p', { text: 'Create a private, single-use code for one other Restia installation.' }),
+      ]),
+      make('span', { className: 'projects-instance-badge', text: 'Installation access' }),
+    ]),
+    make('p', {
+      className: 'projects-pairing__warning',
+      text: 'Home Link connects the whole installation for linked features. Project access stays separate and is limited to the Viewer or Editor role you choose here.',
+    }),
+  );
+
+  const reviewablePairings = asArray(state.linkedInstancesMeta?.pairings).filter(
+    (candidate) => (
+      asId(candidate?.id) !== pairing.id &&
+      String(candidate?.status || '').toLowerCase() === 'paired' &&
+      candidate?.handle
+    ),
+  );
+  if (
+    reviewablePairings.length &&
+    !['creating', 'waiting'].includes(pairing.status) &&
+    !pairing.inviting
+  ) {
+    const actions = make('div', { className: 'projects-pairing__actions' });
+    reviewablePairings.forEach((candidate) => actions.appendChild(actionButton(
+      `Review ${candidate.handle} · ${candidate.role === 'editor' ? 'Editor' : 'Viewer'}`,
+      'review-instance-pairing',
+      {
+        className: 'projects-btn projects-btn--quiet',
+        dataset: { pairingId: candidate.id },
+      },
+    )));
+    panel.appendChild(make('div', {
+      className: 'projects-pairing__notice',
+      attrs: { role: 'status' },
+    }, [
+      make('strong', { text: 'Other Restias are waiting for project confirmation' }),
+      make('span', { text: 'Review each exact installation before sending its project invitation.' }),
+      actions,
+    ]));
+  }
+
+  if (state.linkedInstancesMeta?.hub_enabled === false) {
+    panel.appendChild(make('div', {
+      className: 'projects-pairing__notice', attrs: { role: 'status' },
+    }, [
+      make('strong', { text: 'Home Link hub is off' }),
+      make('span', { text: 'Set LINK_HUB_ENABLED=true on this Restia and restart it before creating a pairing code.' }),
+    ]));
+    return panel;
+  }
+
+  if (pairing.status === 'idle' || pairing.status === 'error') {
+    if (state.linkedInstancesMeta?.can_create_pairing === false) {
+      panel.appendChild(make('div', {
+        className: 'projects-pairing__notice', attrs: { role: 'status' },
+      }, [
+        make('strong', { text: 'Restia admin required' }),
+        make('span', { text: 'Ask a Restia admin who also owns this project to create the installation pairing.' }),
+      ]));
+      return panel;
+    }
+    const form = make('form', {
+      className: 'projects-pairing__create', dataset: { form: 'instance-pairing-create' },
+    });
+    const role = make('select', { name: 'role', attrs: { 'aria-label': 'New Restia project access' } }, [
+      selectOption('viewer', 'Viewer', pairing.role),
+      selectOption('editor', 'Editor', pairing.role),
+    ]);
+    const hubUrl = make('input', {
+      type: 'url', name: 'hub_url',
+      value: pairing.hubUrl || state.linkedInstancesMeta?.hub_url || '',
+      placeholder: 'https://your-restia.example',
+      attrs: { required: 'true', maxlength: '2048', autocomplete: 'url' },
+    });
+    form.append(
+      field('Reachable Restia address', hubUrl, {
+        wide: true,
+        hint: 'Use an HTTPS address reachable from the other Restia. Loopback works only in the same network namespace; separate Docker containers need HTTPS.',
+      }),
+      field('Project access', role),
+      make('button', {
+        type: 'submit', className: 'projects-btn projects-btn--primary',
+        text: 'Create one-time code',
+      }),
+    );
+    if (pairing.error) form.appendChild(make('p', {
+      className: 'projects-pairing__error', text: pairing.error, attrs: { role: 'alert' },
+    }));
+    panel.appendChild(form);
+    return panel;
+  }
+
+  if (pairing.status === 'creating') {
+    panel.appendChild(make('div', {
+      className: 'projects-pairing__notice',
+      text: 'Creating a protected one-time code…',
+      attrs: { role: 'status', 'aria-live': 'polite' },
+    }));
+    return panel;
+  }
+
+  if (pairing.status === 'waiting') {
+    if (!pairing.code) {
+      panel.append(
+        make('div', {
+          className: 'projects-pairing__notice', attrs: { role: 'status', 'aria-live': 'polite' },
+        }, [
+          make('strong', { text: 'A one-time code is still active' }),
+          make('span', {
+            text: 'For security it cannot be shown again after a reload. If you already shared it, wait for the other Restia; otherwise replace or revoke it.',
+          }),
+        ]),
+        make('div', { className: 'projects-pairing__actions' }, [
+          actionButton('Check now', 'refresh-instance-pairing', { className: 'projects-text-btn' }),
+          actionButton('Revoke code', 'revoke-instance-pairing', {
+            className: 'projects-btn projects-btn--danger',
+          }),
+        ]),
+      );
+      return panel;
+    }
+    const details = make('div', { className: 'projects-pairing__details' });
+    details.append(
+      make('div', { className: 'projects-pairing__value' }, [
+        make('span', { text: 'This Restia address' }),
+        make('code', { text: pairing.hubUrl }),
+      ]),
+      make('div', { className: 'projects-pairing__value' }, [
+        make('span', { text: 'One-time code' }),
+        make('code', { text: pairing.code }),
+      ]),
+    );
+    const actions = make('div', { className: 'projects-pairing__actions' }, [
+      actionButton('Copy code', 'copy-pairing-code', { className: 'projects-btn projects-btn--quiet' }),
+      actionButton('Copy setup steps', 'copy-pairing-details', { className: 'projects-btn projects-btn--primary' }),
+      actionButton('Check now', 'refresh-instance-pairing', { className: 'projects-text-btn' }),
+      actionButton('Revoke code', 'revoke-instance-pairing', { className: 'projects-text-btn projects-row-action--danger' }),
+    ]);
+    const steps = make('ol', { className: 'projects-pairing__steps' }, [
+      make('li', { text: `On the other Restia, set RESTIA_HOME_SERVER=${pairing.hubUrl || 'this Restia address'} and restart it.` }),
+      make('li', { text: 'Open Messages → Home Link on that Restia.' }),
+      make('li', { text: 'Enter a unique installation handle and this one-time code, then connect.' }),
+      make('li', { text: 'Return here, verify the installation handle, then explicitly send its project invitation.' }),
+    ]);
+    panel.append(
+      make('div', {
+        className: 'projects-pairing__status',
+        text: `Waiting for the other Restia…${pairing.expiresAt ? ` Code expires ${formatDate(pairing.expiresAt, { includeTime: true })}.` : ''}`,
+        attrs: { role: 'status', 'aria-live': 'polite', 'aria-atomic': 'true' },
+      }),
+      details,
+      steps,
+      ...(pairing.hubUrlLoopback ? [make('p', {
+        className: 'projects-pairing__error',
+        text: 'This is a loopback address. It works only in the same network namespace or native host; separate Docker containers need a reachable HTTPS address.',
+        attrs: { role: 'status' },
+      })] : []),
+      make('p', {
+        className: 'projects-pairing__replacement-warning',
+        text: 'A Restia can currently have one outbound Home Link. If the other installation is already linked elsewhere, connecting here requires replacing that link.',
+      }),
+      actions,
+    );
+    if (pairing.error) panel.appendChild(make('p', {
+      className: 'projects-pairing__error', text: pairing.error, attrs: { role: 'alert' },
+    }));
+    return panel;
+  }
+
+  const pairedName = pairing.handle || 'The other Restia';
+  const copy = pairing.inviting
+    ? `Sending the ${pairing.role} project invitation to ${pairedName}…`
+    : pairing.status === 'active'
+    ? `${pairedName} accepted and now has ${pairing.role} access.`
+    : pairing.status === 'pending'
+      ? `${pairedName} received the project invitation and is waiting to accept it.`
+      : pairing.status === 'paired'
+        ? `${pairedName} is linked. Confirm the handle before sharing this project.`
+      : pairing.status === 'declined'
+        ? `${pairedName} declined this project invitation.`
+        : pairing.status === 'blocked'
+          ? `${pairedName} is no longer an approved linked installation.`
+        : pairing.status === 'expired'
+          ? 'This pairing code expired before it was used.'
+          : pairing.status === 'revoked'
+            ? 'This pairing code was revoked.'
+            : 'This pairing could not be completed. Create a new one-time code.';
+  panel.append(
+    make('div', {
+      className: `projects-pairing__result projects-pairing__result--${pairing.status}`,
+      text: copy,
+      attrs: { role: 'status', 'aria-live': 'polite', 'aria-atomic': 'true' },
+    }),
+  );
+  const terminalActions = make('div', { className: 'projects-pairing__actions' });
+  if (pairing.status === 'paired') {
+    terminalActions.appendChild(actionButton(
+      pairing.inviting
+        ? 'Sending invitation…'
+        : `Send ${pairing.role === 'editor' ? 'Editor' : 'Viewer'} invitation`,
+      'invite-paired-instance',
+      { className: 'projects-btn projects-btn--primary', disabled: pairing.inviting },
+    ));
+  }
+  terminalActions.appendChild(actionButton('Pair another Restia', 'reset-instance-pairing', {
+    className: 'projects-btn projects-btn--quiet', disabled: pairing.inviting,
+  }));
+  panel.appendChild(terminalActions);
+  if (pairing.error) panel.appendChild(make('p', {
+    className: 'projects-pairing__error', text: pairing.error, attrs: { role: 'alert' },
+  }));
+  return panel;
 }
 
 function renderLinkedMembersSection() {
@@ -3246,7 +3593,7 @@ function renderLinkedMembersSection() {
     attrs: { 'aria-labelledby': 'projects-linked-members-title' },
   });
   section.append(
-    make('h3', { id: 'projects-linked-members-title', text: 'Linked Restia' }),
+    make('h3', { id: 'projects-linked-members-title', text: 'Restia installations' }),
     make('p', {
       className: 'projects-linked-members__copy',
       text: 'Granting access shares this whole project—its board, activity, and task files—with the selected Restia installation, not one local profile.',
@@ -3256,7 +3603,7 @@ function renderLinkedMembersSection() {
   if (remoteMembers.length) {
     const list = make('ul', {
       className: 'projects-members__list projects-members__list--remote',
-      attrs: { 'aria-label': 'Linked Restia project access' },
+      attrs: { 'aria-label': 'Restia installation project access' },
     });
     remoteMembers.forEach((member) => list.appendChild(renderRemoteMemberRow(member)));
     section.appendChild(list);
@@ -3268,80 +3615,463 @@ function renderLinkedMembersSection() {
   });
   if (state.linkedInstancesLoading) {
     status.textContent = 'Loading approved Restia instances…';
-    section.appendChild(status);
-    return section;
-  }
-  if (state.linkedInstancesError) {
+  } else if (state.linkedInstancesError) {
     status.append(
       make('span', { text: `Linked instances unavailable: ${state.linkedInstancesError}` }),
       actionButton('Retry', 'retry-linked-instances', { className: 'projects-text-btn' }),
     );
-    section.appendChild(status);
-    return section;
+  } else {
+    const instances = approvedLinkedInstances();
+    if (!instances.length) {
+      status.textContent = state.linkedInstancesMeta?.hub_enabled === false
+        ? 'Home Link is not enabled on this Restia.'
+        : 'No other approved Restia installations are waiting to be invited.';
+    } else {
+      status.textContent = `${instances.length} approved Restia instance${instances.length === 1 ? '' : 's'} available.`;
+      const form = make('form', {
+        className: 'projects-remote-invite', dataset: { form: 'remote-member-invite' },
+      });
+      const instanceSelect = make('select', { name: 'handle', attrs: { required: 'true' } });
+      instances.forEach((instance) => instanceSelect.appendChild(selectOption(
+        instance.handle,
+        `${instance.name}${instance.contact ? ` · ${instance.contact}` : ''}`,
+        '',
+      )));
+      const role = make('select', { name: 'role' }, [
+        selectOption('viewer', 'Viewer', 'viewer'),
+        selectOption('editor', 'Editor', 'viewer'),
+      ]);
+      form.append(
+        field('Already linked Restia', instanceSelect),
+        field('Project access', role),
+        make('button', { type: 'submit', className: 'projects-btn projects-btn--primary', text: 'Invite Restia' }),
+      );
+      section.append(status, form, renderInstancePairingPanel());
+      return section;
+    }
   }
-  const instances = approvedLinkedInstances();
-  if (!instances.length) {
-    const contact = String(state.linkedInstancesMeta?.contact || '').trim();
-    const guidance = state.linkedInstancesMeta?.hub_enabled === false
-      ? 'Home Link is not enabled on this Restia.'
-      : 'No approved inbound Restia instances are available yet.';
-    status.textContent = contact ? `${guidance} Home Link contact: ${contact}.` : guidance;
-    section.appendChild(status);
-    return section;
-  }
-
-  status.textContent = `${instances.length} approved Restia instance${instances.length === 1 ? '' : 's'} available.`;
-  section.appendChild(status);
-  const form = make('form', {
-    className: 'projects-remote-invite', dataset: { form: 'remote-member-invite' },
-  });
-  const instanceSelect = make('select', { name: 'handle', attrs: { required: 'true' } });
-  instances.forEach((instance) => instanceSelect.appendChild(selectOption(
-    instance.handle,
-    `${instance.name}${instance.contact ? ` · ${instance.contact}` : ''}`,
-    '',
-  )));
-  const role = make('select', { name: 'role' }, [
-    selectOption('viewer', 'Viewer', 'viewer'),
-    selectOption('editor', 'Editor', 'viewer'),
-  ]);
-  form.append(
-    field('Restia instance', instanceSelect),
-    field('Project access', role),
-    make('button', { type: 'submit', className: 'projects-btn projects-btn--primary', text: 'Invite Restia' }),
-  );
-  section.appendChild(form);
+  section.append(status, renderInstancePairingPanel());
   return section;
 }
 
-function refreshLinkedMembersSection() {
+function refreshLinkedMembersSection({ preserveFocus = true } = {}) {
   const current = refs.dialogHost?.querySelector?.('.projects-linked-members');
-  if (current) current.replaceWith(renderLinkedMembersSection());
+  if (!current) return;
+  const active = preserveFocus && current.contains(document.activeElement)
+    ? document.activeElement : null;
+  const action = active?.dataset?.action || '';
+  const grantId = active?.dataset?.grantId || '';
+  const username = active?.dataset?.username || '';
+  const name = active?.getAttribute?.('name') || '';
+  const formKey = active?.closest?.('form')?.dataset?.form || '';
+  const replacement = renderLinkedMembersSection();
+  current.replaceWith(replacement);
+  const candidates = action
+    ? [...replacement.querySelectorAll('[data-action]')].filter(
+      (candidate) => candidate.dataset.action === action,
+    )
+    : name
+      ? [...replacement.querySelectorAll('[name]')].filter(
+        (candidate) => candidate.getAttribute('name') === name,
+      )
+      : [];
+  const target = candidates.find((candidate) => (
+    !candidate.disabled &&
+    (!grantId || candidate.dataset.grantId === grantId) &&
+    (!username || candidate.dataset.username === username) &&
+    (!formKey || candidate.closest?.('form')?.dataset?.form === formKey)
+  )) || (active
+    ? replacement.querySelector('.projects-pairing button:not([disabled]), .projects-pairing input:not([disabled]), .projects-pairing select:not([disabled])') ||
+      refs.dialogHost?.querySelector?.('.projects-dialog__header button:not([disabled])')
+    : null);
+  try { target?.focus?.({ preventScroll: true }); } catch (_) { try { target?.focus?.(); } catch (_) {} }
 }
 
-async function loadLinkedInstances() {
-  if (!canManageProject() || state.linkedInstancesLoading) return;
+async function loadLinkedInstances({ silent = false } = {}) {
+  if (
+    !canManageProject() || state.linkedInstancesLoading ||
+    state.instancePairing.status === 'creating' || state.instancePairing.inviting
+  ) return;
+  const projectId = state.activeProjectId;
   state.linkedInstancesLoading = true;
   state.linkedInstancesError = '';
-  refreshLinkedMembersSection();
+  if (!silent) refreshLinkedMembersSection();
   const token = state.linkedInstancesGate.next();
   const signal = abortController('linkedInstancesController');
   try {
-    const payload = await request('/api/projects/linked-instances', { signal });
-    if (!state.linkedInstancesGate.current(token) || !state.open) return;
+    const payload = await request(projectPath(projectId, '/linked-instances', PROJECT_SOURCES.LOCAL), { signal });
+    if (!state.linkedInstancesGate.current(token) || !activeProjectMatches(projectId, PROJECT_SOURCES.LOCAL)) {
+      return;
+    }
     state.linkedInstances = asArray(
       payload.instances || payload.linked_instances || payload.items || payload,
     ).map(normalizeLinkedInstance).filter((instance) => instance.handle);
     state.linkedInstancesMeta = payload && typeof payload === 'object' && !Array.isArray(payload)
       ? payload
       : null;
+    const recoveredPairings = asArray(payload?.pairings);
+    const recovered = recoveredPairings.find(
+      (candidate) => asId(candidate?.id) === state.instancePairing.id,
+    ) || payload?.pairing || recoveredPairings[0];
+    if (recovered && asId(recovered.project_id) === projectId) {
+      state.instancePairing = reduceInstancePairing(state.instancePairing, {
+        type: state.instancePairing.id === asId(recovered.id) ? 'status' : 'created',
+        pairing: recovered,
+      });
+      scheduleInstancePairingPoll();
+    }
     state.linkedInstancesLoading = false;
-    refreshLinkedMembersSection();
+    if (!silent) refreshLinkedMembersSection();
   } catch (error) {
-    if (error?.name === 'AbortError' || !state.linkedInstancesGate.current(token)) return;
+    if (error?.name === 'AbortError' || !state.linkedInstancesGate.current(token)) {
+      return;
+    }
     state.linkedInstancesLoading = false;
     state.linkedInstancesError = error?.message || 'Could not load linked instances';
+    if (!silent) refreshLinkedMembersSection();
+  }
+}
+
+function stopLinkedInstancesLoad() {
+  state.linkedInstancesGate.invalidate();
+  try { state.linkedInstancesController?.abort(); } catch (_) {}
+  state.linkedInstancesController = null;
+  state.linkedInstancesLoading = false;
+}
+
+function stopInstancePairingPoll() {
+  if (state.instancePairingPollTimer) clearTimeout(state.instancePairingPollTimer);
+  state.instancePairingPollTimer = null;
+  try { state.instancePairingStatusController?.abort(); } catch (_) {}
+  state.instancePairingStatusController = null;
+}
+
+function stopInstancePairingOperations() {
+  stopInstancePairingPoll();
+  state.instancePairingGate.invalidate();
+  try { state.instancePairingCreateController?.abort(); } catch (_) {}
+  state.instancePairingCreateController = null;
+  try { state.instancePairingInviteController?.abort(); } catch (_) {}
+  state.instancePairingInviteController = null;
+  try { state.instancePairingRevokeController?.abort(); } catch (_) {}
+  state.instancePairingRevokeController = null;
+  if (state.instancePairing.status === 'creating' || state.instancePairing.inviting) {
+    state.instancePairing = reduceInstancePairing(state.instancePairing, {
+      type: 'cancel-operation',
+    });
+  }
+}
+
+function scheduleInstancePairingPoll() {
+  stopInstancePairingPoll();
+  const pairing = state.instancePairing;
+  if (!pairing.id || !['waiting', 'pending'].includes(pairing.status)) return;
+  if (!refs.dialogHost?.querySelector?.('.projects-linked-members')) return;
+  state.instancePairingPollTimer = setTimeout(() => {
+    state.instancePairingPollTimer = null;
+    void pollInstancePairing();
+  }, INSTANCE_PAIRING_POLL_MS);
+}
+
+function mergePairingGrant(pairing) {
+  if (!pairing?.grant) return;
+  mergeRemoteMember(pairing.grant);
+}
+
+function clearUnavailablePairingGrant(previous, next) {
+  if (
+    !previous?.grant || next?.grant ||
+    !['blocked', 'revoked'].includes(String(next?.status || '').toLowerCase())
+  ) return;
+  const grantId = remoteMemberKey(previous.grant);
+  if (!grantId) return;
+  state.members = state.members.filter(
+    (member) => member.kind !== 'instance' || remoteMemberKey(member) !== grantId,
+  );
+}
+
+function instancePairingFingerprint(pairing) {
+  return JSON.stringify([
+    pairing?.status || '', pairing?.handle || '', pairing?.role || '',
+    pairing?.grant?.id || pairing?.grant?.grant_id || '',
+    pairing?.grant?.status || '', pairing?.grant?.version || 0,
+    pairing?.error || '',
+  ]);
+}
+
+async function pollInstancePairing({ announceErrors = false } = {}) {
+  const current = state.instancePairing;
+  const projectId = current.projectId;
+  const operationGeneration = state.instancePairingGate.value();
+  if (!current.id || !activeProjectMatches(projectId, PROJECT_SOURCES.LOCAL)) return;
+  const signal = abortController('instancePairingStatusController');
+  try {
+    const payload = await request(projectPath(
+      projectId,
+      `/pairing-invitations/${encodeURIComponent(current.id)}`,
+      PROJECT_SOURCES.LOCAL,
+    ), { signal });
+    if (
+      !activeProjectMatches(projectId, PROJECT_SOURCES.LOCAL) ||
+      state.instancePairing.id !== current.id ||
+      state.instancePairingGate.value() !== operationGeneration
+    ) return;
+    const previousFingerprint = instancePairingFingerprint(state.instancePairing);
+    const next = reduceInstancePairing(state.instancePairing, {
+      type: 'status', pairing: payload.pairing || payload,
+    });
+    const changed = instancePairingFingerprint(next) !== previousFingerprint;
+    clearUnavailablePairingGrant(state.instancePairing, next);
+    state.instancePairing = next;
+    if (changed) {
+      mergePairingGrant(state.instancePairing);
+      if (state.instancePairing.handle) await loadLinkedInstances({ silent: true });
+      refreshLinkedMembersSection();
+    }
+    scheduleInstancePairingPoll();
+  } catch (error) {
+    if (
+      error?.name === 'AbortError' || state.instancePairing.id !== current.id ||
+      state.instancePairingGate.value() !== operationGeneration
+    ) return;
+    const previousFingerprint = instancePairingFingerprint(state.instancePairing);
+    const next = reduceInstancePairing(state.instancePairing, {
+      type: 'error',
+      error: error?.message || 'Could not check pairing status',
+      preserveInviting: true,
+    });
+    const changed = instancePairingFingerprint(next) !== previousFingerprint;
+    state.instancePairing = next;
+    if (changed) refreshLinkedMembersSection();
+    if (announceErrors) announce(next.error, 'assertive');
+    scheduleInstancePairingPoll();
+  }
+}
+
+async function createInstancePairing(form) {
+  if (!canManageProject()) return;
+  const projectId = state.activeProjectId;
+  const role = String(form.elements.namedItem('role')?.value || 'viewer') === 'editor'
+    ? 'editor' : 'viewer';
+  const hubUrl = String(form.elements.namedItem('hub_url')?.value || '').trim();
+  stopLinkedInstancesLoad();
+  state.instancePairing = reduceInstancePairing(state.instancePairing, {
+    type: 'creating', projectId, role,
+  });
+  state.instancePairing.hubUrl = hubUrl;
+  refreshLinkedMembersSection();
+  const token = state.instancePairingGate.next();
+  const signal = abortController('instancePairingCreateController');
+  try {
+    const payload = await request(projectPath(
+      projectId, '/pairing-invitations', PROJECT_SOURCES.LOCAL,
+    ), { method: 'POST', body: { role, hub_url: hubUrl }, signal });
+    if (
+      !state.open ||
+      !state.instancePairingGate.current(token) ||
+      !activeProjectMatches(projectId, PROJECT_SOURCES.LOCAL) ||
+      !refs.dialogHost?.querySelector?.('.projects-linked-members')
+    ) return;
+    state.instancePairing = reduceInstancePairing(state.instancePairing, {
+      type: 'created', pairing: payload.pairing || payload,
+    });
     refreshLinkedMembersSection();
+    announce('One-time Restia pairing code created');
+    scheduleInstancePairingPoll();
+  } catch (error) {
+    if (
+      error?.name === 'AbortError' ||
+      !state.open ||
+      !state.instancePairingGate.current(token) ||
+      !activeProjectMatches(projectId, PROJECT_SOURCES.LOCAL)
+    ) return;
+    state.instancePairing = reduceInstancePairing(state.instancePairing, {
+      type: 'error', error: error?.message || 'Could not create a pairing code',
+    });
+    refreshLinkedMembersSection();
+    if (error?.status === 409 && /unused pairing code/i.test(String(error?.message || ''))) {
+      await loadLinkedInstances();
+    }
+  }
+}
+
+function pairingSetupText() {
+  const pairing = state.instancePairing;
+  const hubUrl = pairing.hubUrl;
+  return [
+    `Connect another Restia to ${state.project?.name || 'this project'}`,
+    '',
+    `1. On the other Restia, set RESTIA_HOME_SERVER=${hubUrl}`,
+    '2. Restart that Restia, then open Messages → Home Link.',
+    '3. Choose a unique installation handle.',
+    `4. Enter this one-time code: ${pairing.code}`,
+    '5. Connect, then return here, verify the installation handle, and explicitly send the project invitation.',
+    '6. On the other Restia, open Projects and accept that project invitation.',
+    '',
+    `Project role: ${pairing.role === 'editor' ? 'Editor' : 'Viewer'}`,
+    'Note: connecting replaces any existing outbound Home Link on the other Restia.',
+  ].join('\n');
+}
+
+async function copyInstancePairing(kind) {
+  const value = kind === 'details' ? pairingSetupText() : state.instancePairing.code;
+  if (!value) return;
+  const copy = dependencies.uiModule?.copyToClipboard || dependencies.copyToClipboard;
+  if (typeof copy !== 'function') {
+    showToast('Clipboard access is unavailable', 'error');
+    return;
+  }
+  await copy(value);
+  announce(kind === 'details' ? 'Pairing setup steps copied' : 'Pairing code copied');
+}
+
+async function revokeInstancePairing() {
+  const pairing = state.instancePairing;
+  if (!pairing.id || !pairing.projectId) return;
+  const accepted = await confirmAction('Revoke this unused one-time pairing code?', {
+    confirmText: 'Revoke code', danger: true,
+  });
+  if (!accepted) return;
+  if (
+    !state.open || state.instancePairing.id !== pairing.id ||
+    !activeProjectMatches(pairing.projectId, PROJECT_SOURCES.LOCAL)
+  ) return;
+  stopInstancePairingPoll();
+  stopLinkedInstancesLoad();
+  const token = state.instancePairingGate.next();
+  const signal = abortController('instancePairingRevokeController');
+  try {
+    const payload = await request(projectPath(
+      pairing.projectId,
+      `/pairing-invitations/${encodeURIComponent(pairing.id)}`,
+      PROJECT_SOURCES.LOCAL,
+    ), { method: 'DELETE', signal });
+    if (
+      !state.open || !state.instancePairingGate.current(token) ||
+      !activeProjectMatches(pairing.projectId, PROJECT_SOURCES.LOCAL) ||
+      state.instancePairing.id !== pairing.id
+    ) return;
+    state.instancePairing = reduceInstancePairing(state.instancePairing, {
+      type: 'status', pairing: payload.pairing || payload,
+    });
+    refreshLinkedMembersSection();
+    announce('Pairing code revoked');
+  } catch (error) {
+    if (
+      error?.name === 'AbortError' || !state.open ||
+      !state.instancePairingGate.current(token) ||
+      !activeProjectMatches(pairing.projectId, PROJECT_SOURCES.LOCAL) ||
+      state.instancePairing.id !== pairing.id
+    ) return;
+    state.instancePairing = reduceInstancePairing(state.instancePairing, {
+      type: 'error', error: error?.message || 'Could not revoke pairing code',
+    });
+    refreshLinkedMembersSection();
+    scheduleInstancePairingPoll();
+  } finally {
+    if (state.instancePairingGate.current(token)) {
+      state.instancePairingRevokeController = null;
+    }
+  }
+}
+
+function reviewInstancePairing(pairingId) {
+  const pairing = asArray(state.linkedInstancesMeta?.pairings).find(
+    (candidate) => asId(candidate?.id) === asId(pairingId),
+  );
+  if (!pairing || String(pairing.status || '').toLowerCase() !== 'paired') return;
+  stopInstancePairingPoll();
+  state.instancePairing = reduceInstancePairing(state.instancePairing, {
+    type: 'created', pairing,
+  });
+  refreshLinkedMembersSection();
+  announce(`Review ${pairing.handle} before sharing this project`);
+}
+
+async function invitePairedInstance() {
+  const pairing = state.instancePairing;
+  if (
+    pairing.status !== 'paired' || pairing.inviting || !pairing.id ||
+    !pairing.handle || !pairing.projectId
+  ) return;
+  const accepted = await confirmAction(
+    `Share “${state.project?.name || 'this project'}” with the Restia installation “${pairing.handle}” as ${pairing.role}?`,
+    { confirmText: 'Send project invitation' },
+  );
+  if (!accepted) return;
+  if (
+    !state.open || state.instancePairing.id !== pairing.id ||
+    state.instancePairing.status !== 'paired' || state.instancePairing.inviting
+  ) return;
+  stopInstancePairingPoll();
+  stopLinkedInstancesLoad();
+  const token = state.instancePairingGate.next();
+  const signal = abortController('instancePairingInviteController');
+  state.instancePairing = reduceInstancePairing(state.instancePairing, { type: 'inviting' });
+  refreshLinkedMembersSection();
+  try {
+    const result = await request(projectPath(
+      pairing.projectId, '/remote-invitations', PROJECT_SOURCES.LOCAL,
+    ), {
+      method: 'POST',
+      body: {
+        handle: pairing.handle,
+        role: pairing.role,
+        pairing_invite_id: Number(pairing.id),
+      },
+      signal,
+    });
+    if (
+      !state.open ||
+      !state.instancePairingGate.current(token) ||
+      !activeProjectMatches(pairing.projectId, PROJECT_SOURCES.LOCAL) ||
+      state.instancePairing.id !== pairing.id
+    ) return;
+    const grant = result.grant || result.member || result.invitation;
+    state.instancePairing = reduceInstancePairing(state.instancePairing, {
+      type: 'status', pairing: { ...pairing, status: 'pending', grant },
+    });
+    if (state.linkedInstancesMeta?.pairings) {
+      state.linkedInstancesMeta.pairings = asArray(state.linkedInstancesMeta.pairings).map(
+        (candidate) => asId(candidate?.id) === pairing.id
+          ? { ...candidate, status: 'pending', grant }
+          : candidate,
+      );
+      if (asId(state.linkedInstancesMeta.pairing?.id) === pairing.id) {
+        state.linkedInstancesMeta.pairing = {
+          ...state.linkedInstancesMeta.pairing,
+          status: 'pending',
+          grant,
+        };
+      }
+    }
+    mergePairingGrant(state.instancePairing);
+    await loadLinkedInstances({ silent: true });
+    if (
+      !state.open || !state.instancePairingGate.current(token) ||
+      !activeProjectMatches(pairing.projectId, PROJECT_SOURCES.LOCAL)
+    ) return;
+    refreshLinkedMembersSection();
+    renderAll();
+    announce(`${pairing.handle} received the project invitation`);
+    scheduleInstancePairingPoll();
+  } catch (error) {
+    if (
+      error?.name === 'AbortError' ||
+      !state.open ||
+      !state.instancePairingGate.current(token) ||
+      !activeProjectMatches(pairing.projectId, PROJECT_SOURCES.LOCAL) ||
+      state.instancePairing.id !== pairing.id
+    ) return;
+    state.instancePairing = reduceInstancePairing(state.instancePairing, {
+      type: 'error', error: error?.message || 'Could not send the project invitation',
+    });
+    refreshLinkedMembersSection();
+    showToast(`Could not invite Restia: ${state.instancePairing.error}`, 'error');
+  } finally {
+    if (state.instancePairingGate.current(token)) {
+      state.instancePairingInviteController = null;
+    }
   }
 }
 
@@ -3990,6 +4720,18 @@ async function onWorkspaceClick(event) {
       break;
     case 'manage-members': openMembersDialog(); break;
     case 'retry-linked-instances': await loadLinkedInstances(); break;
+    case 'copy-pairing-code': await copyInstancePairing('code'); break;
+    case 'copy-pairing-details': await copyInstancePairing('details'); break;
+    case 'refresh-instance-pairing': await pollInstancePairing({ announceErrors: true }); break;
+    case 'revoke-instance-pairing': await revokeInstancePairing(); break;
+    case 'review-instance-pairing': reviewInstancePairing(control.dataset.pairingId); break;
+    case 'invite-paired-instance': await invitePairedInstance(); break;
+    case 'reset-instance-pairing':
+      stopInstancePairingOperations();
+      stopLinkedInstancesLoad();
+      state.instancePairing = reduceInstancePairing(state.instancePairing, { type: 'reset' });
+      refreshLinkedMembersSection();
+      break;
     case 'manage-stages': openStageManager(); break;
     case 'show-archived-tasks': openArchivedTasksDialog(); break;
     case 'open-archived-task': {
@@ -4082,6 +4824,7 @@ async function onWorkspaceSubmit(event) {
     case 'stage-create': await createStage(form); break;
     case 'member-add': await addProjectMember(form); break;
     case 'remote-member-invite': await inviteRemoteProjectMember(form); break;
+    case 'instance-pairing-create': await createInstancePairing(form); break;
     case 'checklist': await addChecklistItem(form); break;
     case 'comment': await addComment(form); break;
     case 'submit-work': await submitWork(form); break;
@@ -4092,6 +4835,13 @@ async function onWorkspaceSubmit(event) {
 async function onWorkspaceChange(event) {
   const target = event.target;
   if (!(target instanceof Element)) return;
+  if (target.closest('form[data-form="instance-pairing-create"]')) {
+    if (target.getAttribute('name') === 'role') {
+      state.instancePairing.role = target.value === 'editor' ? 'editor' : 'viewer';
+    } else if (target.getAttribute('name') === 'hub_url') {
+      state.instancePairing.hubUrl = String(target.value || '').trim();
+    }
+  }
   if (target.dataset.filter) {
     state.filters[target.dataset.filter] = target.value;
     renderCurrentView();
@@ -4150,6 +4900,13 @@ async function onWorkspaceChange(event) {
 function onWorkspaceInput(event) {
   const target = event.target;
   if (!(target instanceof Element)) return;
+  if (
+    target.getAttribute('name') === 'hub_url' &&
+    target.closest('form[data-form="instance-pairing-create"]')
+  ) {
+    state.instancePairing.hubUrl = String(target.value || '');
+    return;
+  }
   if (target.dataset.filter) {
     state.filters[target.dataset.filter] = target.value;
     renderCurrentView();
@@ -4233,6 +4990,9 @@ function onDragEnd() {
 
 function onGlobalKeydown(event) {
   if (!state.open) return;
+  if (document.querySelector(
+    '#styled-confirm-overlay:not(.hidden), #styled-prompt-overlay:not(.hidden)',
+  )) return;
   if (event.key === 'Tab' && state.dialogClose) {
     trapDialogTab(event);
     return;
@@ -4289,6 +5049,7 @@ export async function close({ force = false } = {}) {
   state.open = false;
   state.projectGate.invalidate(); state.remoteProjectGate.invalidate(); state.boardGate.invalidate(); state.detailGate.invalidate(); state.activityGate.invalidate();
   state.invitationGate.invalidate(); state.linkedInstancesGate.invalidate();
+  stopInstancePairingOperations();
   [
     'projectController', 'remoteProjectController', 'boardController', 'detailController', 'activityController',
     'invitationController', 'linkedInstancesController',
@@ -4312,6 +5073,7 @@ export async function close({ force = false } = {}) {
   state.activityLoading = false;
   state.remoteInvitationsLoading = false;
   state.linkedInstancesLoading = false;
+  state.instancePairing = reduceInstancePairing(state.instancePairing, { type: 'reset' });
   state.respondingInvitations.clear();
   refs = {};
   try {
@@ -4340,6 +5102,8 @@ export function focus() {
 export const __test = Object.freeze({
   AttachmentQueueStore,
   createRequestGate,
+  emptyInstancePairing,
+  reduceInstancePairing,
   homeLinkSurfaceError,
   remoteProjectAccessState,
   taskScopeKey,
