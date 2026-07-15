@@ -218,8 +218,8 @@
       if (k) k.addEventListener('load', function(){ k.media = 'all'; }, { once: true });
     })();
   </script>
-  <link rel="stylesheet" href="/static/style.css?v=20260714studyworkspace">
-  <link rel="modulepreload" href="/static/app.js?v=20260714studyworkspace">
+  <link rel="stylesheet" href="/static/style.css?v=20260715studyprompttimer">
+  <link rel="modulepreload" href="/static/app.js?v=20260715studyprompttimer">
   <link rel="modulepreload" href="/static/js/chat.js">
   <link rel="modulepreload" href="/static/js/ui.js">
   <link rel="modulepreload" href="/static/js/sessions.js">
@@ -1247,12 +1247,11 @@
             <div class="study-control-card-heading">
               <div>
                 <div class="study-card-label" id="study-focus-controls-heading">Focus block</div>
-                <p id="study-control-focus-copy">The timer starts automatically when this workspace opens.</p>
+                <p id="study-control-focus-copy">Send a Study prompt to start the timer. It pauses after 10 minutes without another prompt.</p>
               </div>
-              <span class="study-auto-badge">Auto-start</span>
+              <span class="study-auto-badge">Prompt-powered</span>
             </div>
             <div class="study-timer-actions">
-              <button type="button" id="study-timer-start" class="study-action study-action-primary">Resume</button>
               <button type="button" id="study-timer-pause" class="study-action">Pause</button>
               <button type="button" id="study-timer-finish" class="study-action">Finish block</button>
             </div>
@@ -1438,7 +1437,7 @@
       <section class="study-card study-focus-card" aria-labelledby="study-focus-heading">
         <div class="study-card-label" id="study-focus-heading">Current focus block</div>
         <output id="study-timer" class="study-timer" role="timer" aria-label="Current study time">00:00:00</output>
-        <div id="study-timer-status" class="study-timer-status">Starting automatically…</div>
+        <div id="study-timer-status" class="study-timer-status">Send a Study prompt to start</div>
         <div class="study-session-total"><span>Logged effort</span><strong id="study-session-total">0m</strong></div>
       </section>
 
@@ -2732,7 +2731,7 @@
 <script type="module" src="/static/js/chatRenderer.js?v=20260630toolmetrics"></script>
 <script type="module" src="/static/js/codeRunner.js"></script>
 <script type="module" src="/static/js/chatStream.js"></script>
-<script type="module" src="/static/js/chat.js?v=20260714studyworkspace"></script>
+<script type="module" src="/static/js/chat.js?v=20260715studyprompttimer"></script>
 <script type="module" src="/static/js/cookbook.js"></script>
 <script src="/static/js/cookbookSchedule.js"></script>
 <script type="module" src="/static/js/search-chat.js"></script>
@@ -2742,7 +2741,7 @@
 <script type="module" src="/static/js/settings.js"></script>
 <script type="module" src="/static/js/admin.js"></script>
 <script type="module" src="/static/js/assistant.js"></script>
-<script type="module" src="/static/app.js?v=20260714studyworkspace"></script>  <!-- app.js must be LAST -->
+<script type="module" src="/static/app.js?v=20260715studyprompttimer"></script>  <!-- app.js must be LAST -->
 <script type="module" src="/static/js/init.js"></script>
 <script type="module" src="/static/js/a11y.js"></script>
 <script type="module" src="/static/js/updateChecker.js"></script>

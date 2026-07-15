@@ -18,6 +18,7 @@ import core.database as cdb
 import core.session_manager as session_manager_module
 from core.database import Session as DbSession, StudyState
 from core.session_manager import SessionManager
+import routes.chat_routes as chat_routes
 import routes.session_routes as session_routes
 import routes.study_routes as study_routes
 import src.study_mode as study
@@ -62,6 +63,7 @@ def study_db(monkeypatch, tmp_path):
     factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
     monkeypatch.setattr(study, "SessionLocal", factory)
     monkeypatch.setattr(study_routes, "SessionLocal", factory)
+    monkeypatch.setattr(chat_routes, "SessionLocal", factory)
     yield factory
     engine.dispose()
 
@@ -102,6 +104,17 @@ def _add_study_session(
 
 def _study_url(path: str, session_id: str) -> str:
     return f"{path}?session_id={session_id}"
+
+
+def _accept_study_prompt(owner, session_id: str, prompt: str = "continue") -> dict:
+    """Mirror the accepted chat-turn transaction, not the UI preflight."""
+
+    return study.initialize_study_workspace(
+        owner,
+        session_id,
+        prompt,
+        record_prompt_activity=True,
+    )
 
 
 def _add_legacy_state(factory, *, owner, goal: str, minutes: int = 240):
@@ -232,11 +245,8 @@ async def test_same_owner_study_sessions_keep_goals_and_timers_isolated(
             )
             assert response.status_code == 200
 
-        assert (
-            await client.post(
-                _study_url("/api/study/timer/start", "dynamics"), headers=headers
-            )
-        ).status_code == 200
+        started = _accept_study_prompt("alice", "dynamics")
+        assert started["timer_running"] is True
         clock.advance(90)
         dynamics = (
             await client.get(
@@ -464,7 +474,7 @@ async def test_auth_disabled_keeps_local_study_mode_working(study_db, monkeypatc
     assert state.json()["goal_text"] == "Learn controls"
 
 
-async def test_initialize_starts_on_entry_then_derives_and_saves_first_prompt_once(
+async def test_initialize_starts_on_first_prompt_then_derives_and_saves_setup_once(
     study_db, monkeypatch
 ):
     clock = _Clock(datetime(2026, 7, 14, 9, 0, 0))
@@ -484,42 +494,67 @@ async def test_initialize_starts_on_entry_then_derives_and_saves_first_prompt_on
             json={"prompt": ""},
         )
         clock.advance(30)
-        first_prompt = await client.post(
+        first_prompt_preflight = await client.post(
             _study_url("/api/study/initialize", "alice-study"),
             headers=headers,
             json={"prompt": "Teach me feedback control from scratch in 5 hours"},
         )
+        first_prompt = _accept_study_prompt(
+            "alice", "alice-study", "Teach me feedback control from scratch in 5 hours"
+        )
         clock.advance(15)
-        later_prompt = await client.post(
+        later_prompt_preflight = await client.post(
             _study_url("/api/study/initialize", "alice-study"),
             headers=headers,
             json={"prompt": "Teach me thermodynamics in 2 hours"},
         )
+        later_prompt = _accept_study_prompt(
+            "alice", "alice-study", "Teach me thermodynamics in 2 hours"
+        )
 
     assert entered.status_code == 200
-    assert entered.json()["timer_running"] is True
+    assert entered.json()["timer_running"] is False
+    assert entered.json()["last_prompt_at"] is None
+    assert entered.json()["idle_pause_at"] is None
     assert entered.json()["goal_text"] == study.DEFAULT_STUDY_GOAL
     assert entered.json()["goal_initialized"] is False
     assert entered.json()["title_initialized"] is False
 
-    initialized = first_prompt.json()
-    assert first_prompt.status_code == 200
+    preflight = first_prompt_preflight.json()
+    assert first_prompt_preflight.status_code == 200
+    assert preflight["goal_initialized"] is True
+    assert preflight["title_initialized"] is True
+    assert preflight["timer_running"] is False
+    assert preflight["last_prompt_at"] is None
+
+    initialized = first_prompt
     assert initialized["workspace_name"] == "Feedback control"
     assert initialized["goal_text"] == (
         "Explain Feedback control from first principles, complete 3 progressively "
         "harder checks without hints, and demonstrate the skill in 1 novel application."
     )
     assert initialized["target_minutes"] == 300
-    assert initialized["timer_seconds"] == 30
-    assert initialized["goal_initialized"] is True
-    assert initialized["title_initialized"] is True
+    assert initialized["timer_running"] is True
+    assert initialized["timer_seconds"] == 0
+    assert initialized["last_prompt_at"] == "2026-07-14T09:00:30Z"
+    assert initialized["idle_pause_at"] == "2026-07-14T09:10:30Z"
+    assert initialized["idle_seconds_remaining"] == 600
+    assert initialized["goal_initialized"] is False
+    assert initialized["title_initialized"] is False
 
-    repeated = later_prompt.json()
-    assert later_prompt.status_code == 200
+    unrefreshed = later_prompt_preflight.json()
+    assert unrefreshed["timer_seconds"] == 15
+    assert unrefreshed["last_prompt_at"] == "2026-07-14T09:00:30Z"
+    assert unrefreshed["idle_seconds_remaining"] == 585
+
+    repeated = later_prompt
     assert repeated["workspace_name"] == "Feedback control"
     assert repeated["goal_text"] == initialized["goal_text"]
     assert repeated["target_minutes"] == 300
-    assert repeated["timer_seconds"] == 45
+    assert repeated["timer_seconds"] == 15
+    assert repeated["last_prompt_at"] == "2026-07-14T09:00:45Z"
+    assert repeated["idle_pause_at"] == "2026-07-14T09:10:45Z"
+    assert repeated["idle_seconds_remaining"] == 600
     assert repeated["goal_initialized"] is False
     assert repeated["title_initialized"] is False
     assert cached.name == "Feedback control"
@@ -530,8 +565,147 @@ async def test_initialize_starts_on_entry_then_derives_and_saves_first_prompt_on
     state = db.query(StudyState).filter_by(id="alice-study").one()
     assert workspace.name == "Feedback control"
     assert state.goal_text == initialized["goal_text"]
-    assert state.timer_started_at == datetime(2026, 7, 14, 9, 0, 0)
+    assert state.timer_started_at == datetime(2026, 7, 14, 9, 0, 30)
+    assert state.last_prompt_at == datetime(2026, 7, 14, 9, 0, 45)
     db.close()
+
+
+def test_accepted_chat_initializer_commits_prompt_before_provider_failure(
+    study_db, monkeypatch
+):
+    clock = _Clock(datetime(2026, 7, 14, 9, 0, 0, 123456))
+    monkeypatch.setattr(study, "_now", clock)
+    _add_study_session(study_db, "alice-study", owner="alice", name="Study 1")
+    sess = SimpleNamespace(name="Study 1", mode="study")
+    manager = SimpleNamespace(sessions={"alice-study": sess})
+    monkeypatch.setattr(study, "get_session_manager_instance", lambda: manager)
+
+    initialized = chat_routes._initialize_study_turn(
+        manager,
+        sess,
+        "alice",
+        "alice-study",
+        "continue",
+    )
+
+    assert initialized["timer_running"] is True
+    assert initialized["last_prompt_at"] == "2026-07-14T09:00:00.123456Z"
+    assert initialized["idle_pause_at"] == "2026-07-14T09:10:00.123456Z"
+    # The provider runs only after this helper returns. A later provider error
+    # must not roll back the already-accepted user turn's focus lease.
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        raise RuntimeError("provider unavailable")
+
+    persisted = study.get_study_state("alice", "alice-study")
+    assert persisted["timer_running"] is True
+    assert persisted["last_prompt_at"] == initialized["last_prompt_at"]
+
+
+def test_accepted_chat_uses_persisted_unowned_workspace_in_local_mode(
+    study_db, monkeypatch
+):
+    clock = _Clock(datetime(2026, 7, 14, 9, 0, 0))
+    monkeypatch.setattr(study, "_now", clock)
+    _add_study_session(study_db, "local-study", owner=None, name="Study 1")
+    sess = SimpleNamespace(name="Study 1", mode="study")
+    manager = SimpleNamespace(sessions={"local-study": sess})
+    monkeypatch.setattr(study, "get_session_manager_instance", lambda: manager)
+
+    # AUTH_ENABLED=false can still resolve a configured single-user profile
+    # for the request while newly created chat rows remain intentionally
+    # unowned. The persisted workspace owner is authoritative after the chat
+    # route's ownership check.
+    initialized = chat_routes._initialize_study_turn(
+        manager,
+        sess,
+        "configured-profile",
+        "local-study",
+        "Teach me orbital mechanics",
+    )
+
+    assert initialized["timer_running"] is True
+    assert initialized["last_prompt_at"] == "2026-07-14T09:00:00Z"
+    persisted = study.get_study_state(None, "local-study")
+    assert persisted["timer_running"] is True
+    assert persisted["last_prompt_at"] == initialized["last_prompt_at"]
+
+    clock.advance(30)
+    refreshed = chat_routes._refresh_study_turn_for_stream(
+        "configured-profile", "local-study", initialized
+    )
+    assert refreshed["timer_seconds"] == 30
+    assert refreshed["idle_seconds_remaining"] == 570
+
+
+async def test_attachment_only_accepted_turn_starts_and_refreshes_prompt_lease(
+    study_db, monkeypatch
+):
+    clock = _Clock(datetime(2026, 7, 14, 9, 0, 0))
+    monkeypatch.setattr(study, "_now", clock)
+    _add_study_session(study_db, "alice-study", owner="alice", name="Study 1")
+    headers = {"x-test-user": "alice"}
+
+    async with _client() as client:
+        public_setup = await client.post(
+            _study_url("/api/study/initialize", "alice-study"),
+            headers=headers,
+            json={"prompt": ""},
+        )
+        accepted = study.initialize_study_workspace(
+            "alice",
+            "alice-study",
+            "",
+            record_prompt_activity=True,
+        )
+        clock.advance(30)
+        public_preflight = await client.post(
+            _study_url("/api/study/initialize", "alice-study"),
+            headers=headers,
+            json={"prompt": ""},
+        )
+        refreshed = study.initialize_study_workspace(
+            "alice",
+            "alice-study",
+            "",
+            record_prompt_activity=True,
+        )
+
+    assert public_setup.json()["timer_running"] is False
+    assert public_setup.json()["last_prompt_at"] is None
+    assert accepted["timer_running"] is True
+    assert accepted["last_prompt_at"] == "2026-07-14T09:00:00Z"
+    assert accepted["idle_seconds_remaining"] == 600
+    assert public_preflight.json()["timer_seconds"] == 30
+    assert public_preflight.json()["last_prompt_at"] == accepted["last_prompt_at"]
+    assert public_preflight.json()["idle_seconds_remaining"] == 570
+    assert refreshed["timer_seconds"] == 30
+    assert refreshed["last_prompt_at"] == "2026-07-14T09:00:30Z"
+    assert refreshed["idle_seconds_remaining"] == 600
+
+
+def test_delayed_stream_event_keeps_original_prompt_deadline(study_db, monkeypatch):
+    clock = _Clock(datetime(2026, 7, 14, 9, 0, 0))
+    monkeypatch.setattr(study, "_now", clock)
+    _add_study_session(study_db, "alice-study", owner="alice", name="Study 1")
+    sess = SimpleNamespace(name="Study 1", mode="study")
+    manager = SimpleNamespace(sessions={"alice-study": sess})
+    monkeypatch.setattr(study, "get_session_manager_instance", lambda: manager)
+    accepted = chat_routes._initialize_study_turn(
+        manager, sess, "alice", "alice-study", "continue"
+    )
+
+    # Simulate slow attachment/context preprocessing before the first SSE
+    # event. The refreshed event ages the existing lease; it does not renew it.
+    clock.advance(75)
+    event = chat_routes._refresh_study_turn_for_stream(
+        "alice", "alice-study", accepted
+    )
+
+    assert event["timer_running"] is True
+    assert event["timer_seconds"] == 75
+    assert event["last_prompt_at"] == "2026-07-14T09:00:00Z"
+    assert event["idle_pause_at"] == "2026-07-14T09:10:00Z"
+    assert event["idle_seconds_remaining"] == 525
 
 
 async def test_initialize_never_overwrites_an_intentional_title_or_manual_goal(
@@ -559,7 +733,7 @@ async def test_initialize_never_overwrites_an_intentional_title_or_manual_goal(
     assert payload["workspace_name"] == "Controls interview prep"
     assert payload["goal_text"] == "Pass the controls whiteboard interview"
     assert payload["target_minutes"] == 240
-    assert payload["timer_running"] is True
+    assert payload["timer_running"] is False
     assert payload["goal_initialized"] is False
     assert payload["title_initialized"] is False
 
@@ -692,7 +866,7 @@ async def test_automatic_title_derivation_cannot_run_again_after_goal_initializa
     assert second.json()["goal_initialized"] is False
 
 
-async def test_initializing_a_workspace_pauses_only_the_owners_other_timer(
+async def test_switching_workspace_pauses_owner_timer_without_starting_on_entry(
     study_db, monkeypatch
 ):
     clock = _Clock(datetime(2026, 7, 14, 9, 0, 0))
@@ -700,28 +874,17 @@ async def test_initializing_a_workspace_pauses_only_the_owners_other_timer(
     _add_study_session(study_db, "alice-a", owner="alice", name="Study 1")
     _add_study_session(study_db, "alice-b", owner="alice", name="Study 2")
     _add_study_session(study_db, "bob-a", owner="bob", name="Study 1")
+    assert _accept_study_prompt("alice", "alice-a")["timer_running"] is True
+    assert _accept_study_prompt("bob", "bob-a")["timer_running"] is True
 
     async with _client() as client:
-        assert (
-            await client.post(
-                _study_url("/api/study/initialize", "alice-a"),
-                headers={"x-test-user": "alice"},
-                json={},
-            )
-        ).status_code == 200
-        assert (
-            await client.post(
-                _study_url("/api/study/initialize", "bob-a"),
-                headers={"x-test-user": "bob"},
-                json={},
-            )
-        ).status_code == 200
         clock.advance(90)
         switched = await client.post(
             _study_url("/api/study/initialize", "alice-b"),
             headers={"x-test-user": "alice"},
             json={},
         )
+        started_after_prompt = _accept_study_prompt("alice", "alice-b")
         clock.advance(10)
         same_workspace = await client.post(
             _study_url("/api/study/initialize", "alice-b"),
@@ -734,20 +897,22 @@ async def test_initializing_a_workspace_pauses_only_the_owners_other_timer(
             json={},
         )
 
-    assert switched.json()["timer_running"] is True
+    assert switched.json()["timer_running"] is False
     assert switched.json()["timer_seconds"] == 0
+    assert started_after_prompt["timer_running"] is True
     assert same_workspace.json()["timer_seconds"] == 10
     assert switched_back.json()["timer_seconds"] == 90
+    assert switched_back.json()["timer_running"] is False
 
     db = study_db()
     rows = {row.id: row for row in db.query(StudyState).all()}
     db.close()
-    assert rows["alice-a"].timer_running is True
+    assert rows["alice-a"].timer_running is False
     assert rows["alice-a"].current_session_seconds == 90
     assert rows["alice-b"].timer_running is False
     assert rows["alice-b"].current_session_seconds == 10
     assert rows["bob-a"].timer_running is True
-    assert sum(row.timer_running for row in rows.values() if row.owner == "alice") == 1
+    assert sum(row.timer_running for row in rows.values() if row.owner == "alice") == 0
 
 
 async def test_tracker_keeps_effort_and_mastery_evidence_distinct(study_db):
@@ -801,7 +966,7 @@ def test_tracker_does_not_overstate_legacy_review_rows_without_evidence():
     )
 
 
-async def test_first_open_bootstraps_a_starter_goal_and_timer(study_db):
+async def test_first_open_bootstraps_goal_but_manual_timer_start_is_rejected(study_db):
     _add_study_session(study_db, "alice-study", owner="alice")
     async with _client() as client:
         initial = await client.get(
@@ -816,8 +981,11 @@ async def test_first_open_bootstraps_a_starter_goal_and_timer(study_db):
     assert initial.status_code == 200
     assert initial.json()["goal_text"] == study.DEFAULT_STUDY_GOAL
     assert initial.json()["target_minutes"] == study.DEFAULT_TARGET_MINUTES
-    assert response.status_code == 200
-    assert response.json()["timer_running"] is True
+    assert initial.json()["timer_running"] is False
+    assert response.status_code == 400
+    assert response.json() == {
+        "detail": "Send a Study prompt to start or resume focus time."
+    }
     db = study_db()
     row = db.query(StudyState).filter_by(id="alice-study", owner="alice").one()
     db.close()
@@ -831,11 +999,9 @@ async def test_timer_http_lifecycle_survives_reload(study_db, monkeypatch):
     headers = {"x-test-user": "alice"}
     _add_study_session(study_db, "alice-study", owner="alice")
 
+    started = _accept_study_prompt("alice", "alice-study")
+    assert started["timer_running"] is True
     async with _client() as client:
-        started = await client.post(
-            _study_url("/api/study/timer/start", "alice-study"), headers=headers
-        )
-        assert started.status_code == 200
         clock.advance(65)
         running = await client.get(
             _study_url("/api/study/state", "alice-study"), headers=headers
@@ -860,6 +1026,104 @@ async def test_timer_http_lifecycle_survives_reload(study_db, monkeypatch):
     assert reloaded.json()["timer_seconds"] == 65
     assert finished.json()["timer_seconds"] == 0
     assert finished.json()["total_seconds"] == 65
+
+
+async def test_prompt_lease_auto_pauses_at_ten_minutes_and_resumes_without_idle_gap(
+    study_db, monkeypatch
+):
+    clock = _Clock(datetime(2026, 7, 14, 9, 0, 0))
+    monkeypatch.setattr(study, "_now", clock)
+    headers = {"x-test-user": "alice"}
+    _add_study_session(study_db, "alice-study", owner="alice")
+
+    async with _client() as client:
+        entered = await client.post(
+            _study_url("/api/study/initialize", "alice-study"),
+            headers=headers,
+            json={"prompt": ""},
+        )
+        clock.advance(30)
+        prompted = _accept_study_prompt("alice", "alice-study")
+        clock.advance(599)
+        almost_idle = await client.get(
+            _study_url("/api/study/state", "alice-study"), headers=headers
+        )
+        clock.advance(1)
+        idle = await client.get(
+            _study_url("/api/study/state", "alice-study"), headers=headers
+        )
+        clock.advance(3_600)
+        after_closed_tab_gap = await client.get(
+            _study_url("/api/study/state", "alice-study"), headers=headers
+        )
+        resumed = _accept_study_prompt("alice", "alice-study", "okay")
+        clock.advance(30)
+        finished = await client.post(
+            _study_url("/api/study/timer/finish", "alice-study"), headers=headers
+        )
+
+    assert entered.json()["timer_running"] is False
+    assert prompted["last_prompt_at"] == "2026-07-14T09:00:30Z"
+    assert prompted["idle_pause_at"] == "2026-07-14T09:10:30Z"
+    assert almost_idle.json()["timer_running"] is True
+    assert almost_idle.json()["timer_seconds"] == 599
+    assert almost_idle.json()["idle_seconds_remaining"] == 1
+    assert idle.json()["timer_running"] is False
+    assert idle.json()["timer_seconds"] == 600
+    assert idle.json()["idle_pause_at"] is None
+    assert idle.json()["idle_seconds_remaining"] is None
+    assert after_closed_tab_gap.json()["timer_seconds"] == 600
+    assert resumed["timer_running"] is True
+    assert resumed["timer_seconds"] == 600
+    assert resumed["last_prompt_at"] == "2026-07-14T10:10:30Z"
+    assert finished.json()["timer_running"] is False
+    assert finished.json()["total_seconds"] == 630
+
+    db = study_db()
+    row = db.query(StudyState).filter_by(id="alice-study").one()
+    assert row.timer_running is False
+    assert row.timer_started_at is None
+    assert row.current_session_seconds == 0
+    assert row.total_seconds == 630
+    db.close()
+
+
+def test_legacy_entry_started_timer_without_prompt_clock_pauses_without_new_time(
+    study_db, monkeypatch
+):
+    clock = _Clock(datetime(2026, 7, 14, 12, 0, 0))
+    monkeypatch.setattr(study, "_now", clock)
+    db = study_db()
+    db.add(
+        StudyState(
+            id="legacy-study",
+            owner="alice",
+            goal_text="Controls",
+            target_minutes=60,
+            timer_running=True,
+            timer_started_at=datetime(2026, 7, 14, 9, 0, 0),
+            last_prompt_at=None,
+        )
+    )
+    db.commit()
+    legacy = db.query(StudyState).filter_by(id="legacy-study").one()
+    serialized = study.serialize_study_state(legacy, now=clock.value)
+    db.close()
+
+    assert serialized["timer_running"] is False
+    assert serialized["timer_seconds"] == 0
+
+    state = study.get_study_state("alice", "legacy-study")
+
+    assert state["timer_running"] is False
+    assert state["timer_seconds"] == 0
+    assert state["last_prompt_at"] is None
+    db = study_db()
+    row = db.query(StudyState).filter_by(id="legacy-study").one()
+    assert row.timer_running is False
+    assert row.timer_started_at is None
+    assert row.current_session_seconds == 0
+    db.close()
 
 
 @pytest.mark.parametrize(
@@ -1023,18 +1287,26 @@ def test_concurrent_first_open_is_idempotent(study_db):
     assert len(rows) == 1
 
 
-def test_timer_start_pause_resume_finish_and_idempotence(study_db, monkeypatch):
+def test_prompt_start_pause_resume_finish_and_idempotence(study_db, monkeypatch):
     clock = _Clock(datetime(2026, 7, 14, 9, 0, 0))
     monkeypatch.setattr(study, "_now", clock)
+    _add_study_session(study_db, "alice-study", owner="alice")
     study.save_study_goal("alice", "alice-study", "Dynamics", 15, None)
 
-    started = study.start_study_timer("alice", "alice-study")
+    started = _accept_study_prompt("alice", "alice-study")
     assert started["timer_running"] is True
     assert started["timer_seconds"] == 0
 
     clock.advance(90)
-    started_again = study.start_study_timer("alice", "alice-study")
+    started_again = _accept_study_prompt("alice", "alice-study", "okay")
     assert started_again["timer_seconds"] == 90
+    assert started_again["idle_seconds_remaining"] == 600
+
+    with pytest.raises(
+        study.StudyGoalRequiredError,
+        match="Send a Study prompt to start or resume focus time",
+    ):
+        study.start_study_timer("alice", "alice-study")
 
     db = study_db()
     row = db.query(StudyState).filter_by(id="alice-study").one()
@@ -1049,7 +1321,7 @@ def test_timer_start_pause_resume_finish_and_idempotence(study_db, monkeypatch):
     still_paused = study.get_study_state("alice", "alice-study")
     assert still_paused["timer_seconds"] == 90
 
-    resumed = study.start_study_timer("alice", "alice-study")
+    resumed = _accept_study_prompt("alice", "alice-study")
     assert resumed["timer_running"] is True
     assert resumed["timer_seconds"] == 90
 
@@ -1139,8 +1411,9 @@ def test_reused_old_username_gets_a_distinct_study_row_after_rename(study_db):
 def test_backward_clock_drift_never_creates_negative_time(study_db, monkeypatch):
     clock = _Clock(datetime(2026, 7, 14, 12, 0, 0))
     monkeypatch.setattr(study, "_now", clock)
+    _add_study_session(study_db, "alice-study", owner="alice")
     study.save_study_goal("alice", "alice-study", "Controls", 15, None)
-    study.start_study_timer("alice", "alice-study")
+    _accept_study_prompt("alice", "alice-study")
 
     clock.advance(-300)
     live = study.get_study_state("alice", "alice-study")
@@ -1304,6 +1577,34 @@ def test_study_setup_sentinel_migration_is_idempotent(tmp_path, monkeypatch):
 
     assert "setup_initialized" in columns
     assert initialized == (0,)
+
+
+def test_study_prompt_activity_migration_is_idempotent(tmp_path, monkeypatch):
+    db_path = tmp_path / "legacy-study-prompt-activity.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE study_states (
+            id TEXT PRIMARY KEY,
+            timer_started_at DATETIME,
+            timer_running BOOLEAN NOT NULL DEFAULT 0
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(cdb, "DATABASE_URL", f"sqlite:///{db_path}")
+    cdb._migrate_add_study_last_prompt_at_column()
+    cdb._migrate_add_study_last_prompt_at_column()
+
+    conn = sqlite3.connect(db_path)
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(study_states)").fetchall()
+    }
+    conn.close()
+
+    assert "last_prompt_at" in columns
 
 
 def test_session_create_accepts_and_returns_study_mode(monkeypatch):

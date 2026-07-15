@@ -155,5 +155,5 @@ def test_chats_collapse_control_stays_visible_beside_header_actions():
     assert "#sessions-section .section-collapse-btn:focus-visible" in css
     # Any shell release that changes Study/sidebar CSS must advance both cache
     # layers; otherwise an installed app can combine new markup with old rules.
-    assert "/static/style.css?v=20260714studyworkspace" in html
-    assert "const CACHE_NAME = 'restia-v354'" in service_worker
+    assert "/static/style.css?v=20260715studyprompttimer" in html
+    assert "const CACHE_NAME = 'restia-v355'" in service_worker

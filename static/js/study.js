@@ -30,6 +30,9 @@ const EMPTY_STATE = Object.freeze({
   target_date: null,
   timer_running: false,
   timer_seconds: 0,
+  last_prompt_at: null,
+  idle_pause_at: null,
+  idle_seconds_remaining: null,
   total_seconds: 0,
   studied_seconds: 0,
   remaining_seconds: 0,
@@ -40,6 +43,7 @@ const EMPTY_STATE = Object.freeze({
 
 let API_BASE = '';
 const REQUEST_TIMEOUT_MS = 12000;
+const PROMPT_IDLE_SECONDS = 10 * 60;
 let _initialized = false;
 let _active = false;
 let _activeSessionId = null;
@@ -47,6 +51,9 @@ let _collapsed = false;
 let _state = { ...EMPTY_STATE };
 let _syncClockMs = 0;
 let _ticker = null;
+let _idlePauseTimeout = null;
+let _idlePauseGeneration = 0;
+let _idleDeadlineTrusted = false;
 let _stateController = null;
 let _mutationChain = Promise.resolve();
 let _busy = false;
@@ -71,8 +78,8 @@ const _initializingPrompt = new Map();
 const ids = [
   'study-panel', 'study-panel-body', 'study-panel-title',
   'study-panel-collapse', 'study-panel-close',
-  'study-timer', 'study-timer-status', 'study-timer-start',
-  'study-timer-pause', 'study-timer-finish', 'study-session-total',
+  'study-timer', 'study-timer-status', 'study-timer-pause',
+  'study-timer-finish', 'study-session-total',
   'study-goal-form', 'study-goal-text', 'study-target-hours',
   'study-target-date', 'study-goal-save', 'study-progress-bar',
   'study-progress-value', 'study-progress-copy', 'study-deadline-copy',
@@ -130,7 +137,16 @@ export function formatDuration(value) {
  * `elapsedSeconds` is time elapsed since the state response was received.
  */
 export function deriveLiveProgress(state = EMPTY_STATE, elapsedSeconds = 0) {
-  const runningDelta = state.timer_running ? _seconds(elapsedSeconds) : 0;
+  const elapsed = _seconds(elapsedSeconds);
+  const idleAtSync = state.idle_seconds_remaining == null
+    ? null
+    : Math.min(PROMPT_IDLE_SECONDS, _seconds(state.idle_seconds_remaining));
+  const runningDelta = state.timer_running
+    ? Math.min(elapsed, idleAtSync == null ? elapsed : idleAtSync)
+    : 0;
+  const idleExpired = Boolean(
+    state.timer_running && idleAtSync != null && elapsed >= idleAtSync,
+  );
   const timerSeconds = _seconds(state.timer_seconds) + runningDelta;
   const totalSeconds = _seconds(state.total_seconds);
   const studiedSeconds = totalSeconds + timerSeconds;
@@ -148,8 +164,14 @@ export function deriveLiveProgress(state = EMPTY_STATE, elapsedSeconds = 0) {
     goal_text: String(state.goal_text || ''),
     target_minutes: targetMinutes,
     target_date: state.target_date || null,
-    timer_running: Boolean(state.timer_running),
+    timer_running: Boolean(state.timer_running) && !idleExpired,
     timer_seconds: timerSeconds,
+    last_prompt_at: state.last_prompt_at || null,
+    idle_pause_at: state.idle_pause_at || null,
+    idle_seconds_remaining: state.timer_running && idleAtSync != null
+      ? Math.max(0, idleAtSync - runningDelta)
+      : null,
+    idle_expired: idleExpired,
     total_seconds: totalSeconds,
     studied_seconds: studiedSeconds,
     remaining_seconds: remainingSeconds,
@@ -302,7 +324,12 @@ function _deadlineText(dateValue) {
 
 function _elapsedSinceSync() {
   if (!_state.timer_running || !_syncClockMs) return 0;
-  return Math.max(0, Math.floor((_monotonicNow() - _syncClockMs) / 1000));
+  const elapsed = Math.max(0, Math.floor((_monotonicNow() - _syncClockMs) / 1000));
+  const deadline = _idleDeadlineTrusted ? _reviewTimestamp(_state.idle_pause_at) : null;
+  if (deadline && deadline.getTime() <= Date.now() && _state.idle_seconds_remaining != null) {
+    return Math.max(elapsed, _seconds(_state.idle_seconds_remaining));
+  }
+  return elapsed;
 }
 
 function _liveState() {
@@ -339,7 +366,6 @@ function _announce(message) {
 }
 
 function _syncControls(live = _liveState()) {
-  const start = _elements['study-timer-start'];
   const pause = _elements['study-timer-pause'];
   const finish = _elements['study-timer-finish'];
   const save = _elements['study-goal-save'];
@@ -347,7 +373,6 @@ function _syncControls(live = _liveState()) {
   const create = _elements['study-new-workspace'];
   const rename = _elements['study-rename-workspace'];
   const hasLearningGoal = Boolean(live.goal_initialized && String(live.goal_text || '').trim());
-  if (start) start.disabled = _busy || _closing || live.timer_running || _goalDirty;
   if (pause) pause.disabled = _busy || _closing || !live.timer_running;
   if (finish) finish.disabled = _busy || _closing || live.timer_seconds <= 0;
   if (save) save.disabled = _busy || _closing;
@@ -429,10 +454,10 @@ function _renderTracker(live = _liveState()) {
   _setText(
     _elements['study-control-focus-copy'],
     live.timer_running
-      ? `Running now · ${formatDuration(live.timer_seconds)} in this focus block.`
+      ? `Running now · ${formatDuration(live.timer_seconds)} in this focus block. It pauses after 10 minutes without another prompt.`
       : (live.timer_seconds
-        ? `Paused at ${formatDuration(live.timer_seconds)}. Resume when you are ready.`
-        : 'The timer starts automatically when this workspace opens.'),
+        ? `Paused at ${formatDuration(live.timer_seconds)}. Send another Study prompt to resume.`
+        : 'Send a Study prompt to start the timer. It pauses after 10 minutes without another prompt.'),
   );
 }
 
@@ -441,11 +466,13 @@ function _renderLive() {
   _setText(_elements['study-timer'], formatDuration(live.timer_seconds));
   _setText(
     _elements['study-timer-status'],
-    _goalDirty && !live.timer_running
-      ? 'Save goal changes before starting'
-      : !live.goal_text
-      ? 'Set a learning goal to start'
-      : (live.timer_running ? 'Focus timer running' : (live.timer_seconds ? 'Focus timer paused' : 'Ready to study')),
+    live.timer_running
+      ? 'Focus timer running · prompt activity keeps it active'
+      : (live.idle_expired
+        ? 'Paused locally · awaiting server sync'
+        : (live.timer_seconds
+          ? 'Paused · send a Study prompt to resume'
+          : 'Send a Study prompt to start')),
   );
   _setText(_elements['study-session-total'], _humanTime(live.studied_seconds));
 
@@ -524,10 +551,25 @@ function _applyState(payload, { syncForm = false, sessionId = _activeSessionId }
   if (_sessionId(sessionId) && _sessionId(sessionId) !== _sessionId(_activeSessionId)) return false;
   _state = deriveLiveProgress(payload || EMPTY_STATE, 0);
   _syncClockMs = _monotonicNow();
+  const deadline = _reviewTimestamp(_state.idle_pause_at);
+  const deadlineDelay = deadline ? deadline.getTime() - Date.now() : null;
+  const relativeDelay = _state.idle_seconds_remaining == null
+    ? null
+    : _number(_state.idle_seconds_remaining) * 1000;
+  // Restia is local-first, so the absolute server deadline is normally on the
+  // same clock as the browser. Reject clearly skewed clocks and fall back to
+  // the relative duration; otherwise the deadline removes SSE/preprocess lag.
+  _idleDeadlineTrusted = Boolean(
+    _state.timer_running
+    && deadlineDelay != null
+    && relativeDelay != null
+    && Math.abs(deadlineDelay - relativeDelay) <= 5000,
+  );
   if (syncForm) _renderForm();
   _renderWorkspaces();
   _renderLive();
   _syncTicker();
+  _syncIdlePauseTimer();
   return true;
 }
 
@@ -542,6 +584,84 @@ function _syncTicker() {
   _stopTicker();
   if (!_active || !_state.timer_running) return;
   _ticker = setInterval(_renderLive, 1000);
+}
+
+function _stopIdlePauseTimer() {
+  _idlePauseGeneration += 1;
+  if (_idlePauseTimeout !== null) {
+    clearTimeout(_idlePauseTimeout);
+    _idlePauseTimeout = null;
+  }
+}
+
+function _idlePauseDelayMs() {
+  const live = _liveState();
+  if (!_state.timer_running) return null;
+  const deadline = _idleDeadlineTrusted ? _reviewTimestamp(_state.idle_pause_at) : null;
+  if (deadline) return Math.max(0, deadline.getTime() - Date.now());
+  if (live.idle_seconds_remaining != null) {
+    return Math.max(0, _number(live.idle_seconds_remaining) * 1000);
+  }
+  const lastPrompt = _reviewTimestamp(_state.last_prompt_at);
+  return lastPrompt
+    ? Math.max(0, lastPrompt.getTime() + (PROMPT_IDLE_SECONDS * 1000) - Date.now())
+    : null;
+}
+
+async function _refreshExpiredPromptLease(workspaceId, generation) {
+  if (
+    generation !== _idlePauseGeneration
+    || !_active
+    || _closing
+    || workspaceId !== _sessionId(_activeSessionId)
+    || !_state.timer_running
+  ) return;
+
+  const live = _liveState();
+  const deadline = _idleDeadlineTrusted ? _reviewTimestamp(_state.idle_pause_at) : null;
+  const deadlineReached = Boolean(deadline && deadline.getTime() <= Date.now());
+  if (!deadlineReached && live.idle_seconds_remaining != null && live.idle_seconds_remaining > 0) {
+    _syncIdlePauseTimer();
+    return;
+  }
+
+  // Clamp the local clock before the network round trip so idle time is never
+  // presented as focused effort. Re-read instead of blindly pausing: another
+  // browser tab may have sent a newer prompt and extended the server lease.
+  _stopTicker();
+  _renderLive();
+  _setBusy(true);
+  _showError('');
+  try {
+    const state = await _request('/state', {}, workspaceId);
+    if (_applyState(state, { syncForm: false, sessionId: workspaceId })) {
+      _announce(state.timer_running
+        ? 'Focus timer refreshed from newer Study prompt activity.'
+        : 'Focus timer paused after 10 minutes without a Study prompt.');
+    }
+  } catch (error) {
+    if (error?.name !== 'AbortError') {
+      console.error('Study Mode could not confirm the inactivity pause:', error);
+      _showError('The focus clock reached its 10-minute inactivity limit. Restia will confirm the pause when the workspace syncs.');
+    }
+  } finally {
+    _setBusy(false);
+  }
+}
+
+function _syncIdlePauseTimer() {
+  _stopIdlePauseTimer();
+  if (!_active || !_state.timer_running || !_sessionId(_activeSessionId)) return;
+  const delay = _idlePauseDelayMs();
+  if (delay == null) return;
+  const generation = _idlePauseGeneration;
+  const workspaceId = _sessionId(_activeSessionId);
+  _idlePauseTimeout = setTimeout(() => {
+    _idlePauseTimeout = null;
+    void _refreshExpiredPromptLease(workspaceId, generation);
+  }, Math.min(delay, 2147483647));
+  // Node-based DOM tests should not be kept alive by a real ten-minute lease.
+  _idlePauseTimeout?.unref?.();
 }
 
 async function _request(path, options = {}, sessionId = _activeSessionId) {
@@ -631,7 +751,7 @@ async function _initializeWorkspace({ prompt = '', sessionId = _activeSessionId,
   if (_initializingPrompt.has(requestKey)) return _initializingPrompt.get(requestKey);
 
   const operation = (async () => {
-    _busyMessage = cleanPrompt ? 'Saving your learning goal…' : 'Starting your focus timer…';
+    _busyMessage = cleanPrompt ? 'Saving your learning setup…' : 'Loading Study workspace…';
     _setBusy(true);
     _showError('');
     try {
@@ -733,7 +853,6 @@ async function _timerAction(action) {
   try {
     const state = await _queueMutation(() => _request(`/timer/${action}`, { method: 'POST' }, workspaceId));
     if (!_applyState(state, { syncForm: false, sessionId: workspaceId })) return;
-    if (action === 'start') _announce('Focus timer started.');
     if (action === 'pause') _announce('Focus timer paused.');
     if (action === 'finish') {
       const added = Math.max(0, _seconds(state.total_seconds) - _seconds(before.total_seconds));
@@ -1297,7 +1416,6 @@ function _onSessionSelected(event) {
 function _wireEvents() {
   _elements['study-panel-collapse']?.addEventListener('click', () => _setCollapsed(!_collapsed));
   _elements['study-panel-close']?.addEventListener('click', () => void close({ manual: true }));
-  _elements['study-timer-start']?.addEventListener('click', () => void _timerAction('start'));
   _elements['study-timer-pause']?.addEventListener('click', () => void _timerAction('pause'));
   _elements['study-timer-finish']?.addEventListener('click', () => void _timerAction('finish'));
   _elements['study-workspace-switcher']?.addEventListener('change', event => void _switchWorkspace(event));
@@ -1329,6 +1447,7 @@ function _wireEvents() {
   });
   window.addEventListener('restia:session-selected', _onSessionSelected);
   window.addEventListener('focus', _refreshAuthoritativeState);
+  window.addEventListener('online', _refreshAuthoritativeState);
   window.addEventListener('resize', _syncDrawerClearance);
   document.addEventListener('visibilitychange', _refreshAuthoritativeState);
   document.addEventListener('keydown', _handleControlsKeydown);
@@ -1482,6 +1601,7 @@ async function _close(options = {}) {
   _lifecycleGeneration += 1;
   _invalidatePendingWorkspaceTransition();
   _closing = true;
+  _stopIdlePauseTimer();
   const closingSessionId = _sessionId(_activeSessionId);
   if (_stateController) {
     _stateController.abort();
@@ -1558,7 +1678,7 @@ export function focus() {
   return Boolean(target);
 }
 
-/** Save the first substantive prompt before the chat request builds tutor context. */
+/** Save first-prompt setup before chat builds tutor context or calls a model. */
 export async function prepareFirstPrompt(prompt, { sessionId = null } = {}) {
   const workspaceId = _sessionId(sessionId || _currentSessionId() || _activeSessionId);
   const isStudyWorkspace = _studySessions().some(session => String(session.id) === workspaceId);
@@ -1586,6 +1706,23 @@ export async function applyServerInitialization(payload, sessionId = null) {
   return true;
 }
 
+/** Reconcile one captured Study workspace after a chat transport failure. */
+export async function refreshState({ sessionId = null } = {}) {
+  const workspaceId = _sessionId(sessionId || _currentSessionId() || _activeSessionId);
+  if (!workspaceId) return false;
+  try {
+    const state = await _request('/state', {}, workspaceId);
+    if (workspaceId === _sessionId(_activeSessionId)) {
+      _applyState(state, { syncForm: !_goalDirty, sessionId: workspaceId });
+      _lastResyncMs = _monotonicNow();
+    }
+    return true;
+  } catch (error) {
+    console.error('Could not reconcile Study timer state:', error);
+    return false;
+  }
+}
+
 const studyModule = {
   init,
   enter,
@@ -1594,6 +1731,7 @@ const studyModule = {
   beforeSessionSwitch,
   prepareFirstPrompt,
   applyServerInitialization,
+  refreshState,
   isActive,
   focus,
 };

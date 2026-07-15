@@ -865,10 +865,10 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
       }
     }
 
-    // A Study workspace derives its durable goal/title from the first real
-    // prompt. Persist that before the chat request builds tutor context. The
-    // streaming endpoint repeats the same idempotent initialization, so a
-    // transient preflight failure never eats the user's message.
+    // This preflight saves first-prompt goal/title setup before chat builds tutor
+    // context. The chat endpoint records the accepted prompt's focus activity
+    // and streams the authoritative timer state before any model output, so a
+    // transient setup failure never eats the user's message.
     const preparingSessionId = sessionModule.getCurrentSessionId();
     if (window.studyModule?.prepareFirstPrompt) {
       try {
@@ -911,6 +911,19 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
     const streamSessionId = sessionModule.getCurrentSessionId();
     _streamSessionId = streamSessionId;
     const streamQuery = msg;
+    const streamWasStudyMode = window.__restiaStudyModeActive === true;
+    let studyChatRequestAttempted = false;
+    const _refreshStudyAfterAcceptedFailure = () => {
+      if (!streamWasStudyMode || !studyChatRequestAttempted) return;
+      try {
+        const refresh = window.studyModule?.refreshState?.({ sessionId: streamSessionId });
+        if (refresh?.catch) refresh.catch(error => {
+          console.error('Could not reconcile Study timer after chat failure:', error);
+        });
+      } catch (error) {
+        console.error('Could not request Study timer reconciliation:', error);
+      }
+    };
     _lastReaderActivity = Date.now();
 
     // Acquire Web Lock to hint browser not to discard this tab while streaming
@@ -1388,6 +1401,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
         catch { return ''; }
       })();
       _sendPerf.mark('chat_stream_post_begin');
+      studyChatRequestAttempted = true;
       const res = await fetch(`${API_BASE}/api/chat_stream`, {
         method: 'POST',
         body: fd,
@@ -1398,6 +1412,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
       _sendPerf.report('headers_received');
       
       if (!res.ok) {
+        _refreshStudyAfterAcceptedFailure();
         clearResponseTimeout();
         if (res.status === 404) {
           // Session was deleted (e.g. by AI) — reload and go to welcome
@@ -3237,6 +3252,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
       } // end if (!_isBgFinal)
 
     } catch (err) {
+      _refreshStudyAfterAcceptedFailure();
       _renderStream();
       // Clean up any active spinner (e.g. "Generating response" during tool calls)
       if (spinner && spinner.element) spinner.destroy();

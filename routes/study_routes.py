@@ -60,7 +60,8 @@ class StudyReviewRequest(BaseModel):
 class StudyInitializeRequest(BaseModel):
     # Empty means "activate this workspace now". The first substantive prompt
     # may arrive here or through either chat endpoint; both share one atomic
-    # initializer and therefore cannot overwrite a goal twice.
+    # initializer and therefore cannot overwrite a goal twice. This route is
+    # setup/preflight only; accepted chat endpoints record focus activity.
     prompt: str = Field(default="", max_length=10_000)
 
 
@@ -136,7 +137,12 @@ def setup_study_routes() -> APIRouter:
     ):
         owner, _workspace = workspace_for(request, session_id)
         try:
-            return initialize_study_workspace(owner, session_id, payload.prompt)
+            return initialize_study_workspace(
+                owner,
+                session_id,
+                payload.prompt,
+                record_prompt_activity=False,
+            )
         except StudyWorkspaceNotFoundError as exc:
             # The session may have been deleted between authorization and the
             # initialization transaction. Preserve the non-enumerating 404.

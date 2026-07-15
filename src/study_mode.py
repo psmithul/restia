@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import unicodedata
 from datetime import datetime, timedelta
@@ -24,6 +25,7 @@ DEFAULT_STUDY_GOAL = (
     "retrieval, derivation, and deliberate practice."
 )
 DEFAULT_TARGET_MINUTES = 60
+STUDY_PROMPT_IDLE_SECONDS = 10 * 60
 STUDY_REVIEW_OUTCOMES = ("missed", "hinted", "clean", "transfer")
 # Level zero is an immediate repair loop; subsequent levels expand only when
 # the learner produces stronger evidence.  Transfer advances faster than clean
@@ -47,7 +49,7 @@ class StudyGoalConflictError(ValueError):
 
 
 class StudyGoalRequiredError(ValueError):
-    """Raised when a focus timer is started before a goal exists."""
+    """Raised when a client tries to start focus time without a Study prompt."""
 
 
 class StudyWorkspaceNotFoundError(LookupError):
@@ -198,12 +200,57 @@ def _get_or_create(db, owner: Optional[str], session_id: str) -> StudyState:
     return state
 
 
+def _prompt_idle_deadline(state: StudyState) -> Optional[datetime]:
+    activity_at = getattr(state, "last_prompt_at", None)
+    if activity_at is None:
+        return None
+    return activity_at + timedelta(seconds=STUDY_PROMPT_IDLE_SECONDS)
+
+
 def _timer_seconds(state: StudyState, now: Optional[datetime] = None) -> int:
     elapsed = max(0, int(state.current_session_seconds or 0))
     if state.timer_running and state.timer_started_at:
         current = now or _now()
+        deadline = _prompt_idle_deadline(state)
+        if deadline is None:
+            return elapsed
+        if current > deadline:
+            current = deadline
         elapsed += max(0, int((current - state.timer_started_at).total_seconds()))
     return elapsed
+
+
+def _checkpoint_prompt_idle(state: StudyState, now: datetime) -> bool:
+    """Durably-ready a running timer for commit after its prompt lease expires.
+
+    Legacy running rows have no prompt clock because older releases started
+    focus time on workspace entry. Pause them without adding unverifiable
+    elapsed time; already-checkpointed seconds remain intact.
+    """
+
+    if not state.timer_running:
+        return False
+    deadline = _prompt_idle_deadline(state)
+    if state.timer_started_at is None or deadline is None:
+        state.timer_started_at = None
+        state.timer_running = False
+        return True
+    if now < deadline:
+        return False
+    state.current_session_seconds = _timer_seconds(state, now=deadline)
+    state.timer_started_at = None
+    state.timer_running = False
+    return True
+
+
+def _record_prompt_activity(state: StudyState, now: datetime) -> None:
+    """Start/resume focus time and renew its lease for one accepted Study turn."""
+
+    _checkpoint_prompt_idle(state, now)
+    state.last_prompt_at = now
+    if not state.timer_running:
+        state.timer_started_at = now
+        state.timer_running = True
 
 
 def _pause_other_timers(
@@ -219,6 +266,9 @@ def _pause_other_timers(
         StudyState.timer_running.is_(True),
     )
     for other in _owner_filter(query, owner).all():
+        _checkpoint_prompt_idle(other, now)
+        if not other.timer_running:
+            continue
         other.current_session_seconds = _timer_seconds(other, now=now)
         other.timer_started_at = None
         other.timer_running = False
@@ -469,6 +519,15 @@ def _iso_utc(value: Optional[datetime]) -> Optional[str]:
     return value.isoformat(timespec="seconds") + "Z"
 
 
+def _iso_utc_precise(value: Optional[datetime]) -> Optional[str]:
+    """Keep prompt deadlines exact without adding noise to whole-second clocks."""
+
+    if value is None:
+        return None
+    timespec = "microseconds" if value.microsecond else "seconds"
+    return value.isoformat(timespec=timespec) + "Z"
+
+
 def _serialize_review_state(state: StudyState, now: datetime) -> dict:
     next_review = state.next_review_at
     if next_review is None:
@@ -504,6 +563,9 @@ def serialize_study_state(state: Optional[StudyState], now: Optional[datetime] =
             "target_date": None,
             "timer_running": False,
             "timer_seconds": 0,
+            "last_prompt_at": None,
+            "idle_pause_at": None,
+            "idle_seconds_remaining": None,
             "total_seconds": 0,
             "studied_seconds": 0,
             "remaining_seconds": 0,
@@ -522,6 +584,18 @@ def serialize_study_state(state: Optional[StudyState], now: Optional[datetime] =
 
     current = now or _now()
     timer_seconds = _timer_seconds(state, now=current)
+    deadline = _prompt_idle_deadline(state)
+    timer_running = bool(
+        state.timer_running
+        and state.timer_started_at
+        and deadline is not None
+        and current < deadline
+    )
+    idle_seconds_remaining = (
+        max(1, math.ceil((deadline - current).total_seconds()))
+        if timer_running and deadline is not None
+        else None
+    )
     total_seconds = max(0, int(state.total_seconds or 0))
     studied_seconds = total_seconds + timer_seconds
     target_seconds = max(0, int(state.target_minutes or 0)) * 60
@@ -537,8 +611,11 @@ def serialize_study_state(state: Optional[StudyState], now: Optional[datetime] =
         "setup_initialized": bool(getattr(state, "setup_initialized", False)),
         "target_minutes": max(0, int(state.target_minutes or 0)),
         "target_date": state.target_date or None,
-        "timer_running": bool(state.timer_running),
+        "timer_running": timer_running,
         "timer_seconds": timer_seconds,
+        "last_prompt_at": _iso_utc_precise(getattr(state, "last_prompt_at", None)),
+        "idle_pause_at": _iso_utc_precise(deadline) if timer_running else None,
+        "idle_seconds_remaining": idle_seconds_remaining,
         "total_seconds": total_seconds,
         "studied_seconds": studied_seconds,
         "remaining_seconds": remaining_seconds,
@@ -591,6 +668,9 @@ def build_study_tracker(state: dict, workspace_name: str) -> dict:
             "running": bool(state.get("timer_running")),
             "elapsed_seconds": max(0, int(state.get("timer_seconds") or 0)),
             "completed_seconds": max(0, int(state.get("total_seconds") or 0)),
+            "last_prompt_at": state.get("last_prompt_at"),
+            "idle_pause_at": state.get("idle_pause_at"),
+            "idle_seconds_remaining": state.get("idle_seconds_remaining"),
         },
         "learning_goal": {
             "text": state.get("goal_text") or "",
@@ -633,13 +713,18 @@ def initialize_study_workspace(
     prompt: Any = "",
     *,
     promote_to_study: bool = False,
+    record_prompt_activity: bool = False,
 ) -> dict:
     """Activate one exact workspace and derive its first real goal once.
 
     This is shared by the explicit initialize API and both chat paths. It
     updates the StudyState and chat-session title in one database transaction,
     pauses any other owned Study timer, and never replaces an established goal
-    or intentional title.
+    or intentional title. Opening/preflighting a workspace never starts focus
+    time. The accepted chat paths opt into ``record_prompt_activity`` so every
+    validated user turn, including attachment-only sends, renews the persisted
+    ten-minute lease atomically before provider work begins. Goal derivation
+    remains text-only.
     """
 
     session_key = _clean_session_id(session_id)
@@ -676,10 +761,10 @@ def initialize_study_workspace(
             title_initialized = True
 
         now = _now()
+        _checkpoint_prompt_idle(state, now)
         _pause_other_timers(db, owner, session_key, now)
-        if not state.timer_running:
-            state.timer_started_at = now
-            state.timer_running = True
+        if record_prompt_activity:
+            _record_prompt_activity(state, now)
 
         db.commit()
         db.refresh(state)
@@ -714,9 +799,11 @@ def get_study_state(owner: Optional[str], session_id: str) -> dict:
     db = SessionLocal()
     try:
         state = _get_or_create(db, owner, session_id)
+        now = _now()
+        _checkpoint_prompt_idle(state, now)
         db.commit()
         db.refresh(state)
-        return serialize_study_state(state)
+        return serialize_study_state(state, now=now)
     except Exception:
         db.rollback()
         raise
@@ -736,6 +823,8 @@ def save_study_goal(
     db = SessionLocal()
     try:
         state = _get_or_create(db, owner, session_id)
+        now = _now()
+        _checkpoint_prompt_idle(state, now)
         cleaned_goal = goal_text.strip()
         goal_changed = (state.goal_text or "").strip() != cleaned_goal
         has_progress = bool(
@@ -752,6 +841,7 @@ def save_study_goal(
             state.current_session_seconds = 0
             state.timer_started_at = None
             state.timer_running = False
+            state.last_prompt_at = None
             _reset_review_state(state)
         state.goal_text = cleaned_goal
         state.target_minutes = int(target_minutes)
@@ -759,7 +849,7 @@ def save_study_goal(
         state.setup_initialized = True
         db.commit()
         db.refresh(state)
-        return serialize_study_state(state)
+        return serialize_study_state(state, now=now)
     except Exception:
         db.rollback()
         raise
@@ -780,6 +870,7 @@ def record_study_review(owner: Optional[str], session_id: str, outcome: str) -> 
     try:
         state = _get_or_create(db, owner, session_id)
         now = _now()
+        _checkpoint_prompt_idle(state, now)
         level = _review_level_after(state.review_level, outcome)
         state.review_level = level
         state.review_count = max(0, int(state.review_count or 0)) + 1
@@ -798,26 +889,11 @@ def record_study_review(owner: Optional[str], session_id: str, outcome: str) -> 
 
 @_serialized_state_access
 def start_study_timer(owner: Optional[str], session_id: str) -> dict:
-    """Start or resume the focus timer; repeated starts are idempotent."""
+    """Reject manual starts so navigation/UI controls cannot fake study time."""
 
-    db = SessionLocal()
-    try:
-        state = _get_or_create(db, owner, session_id)
-        if state is None or not (state.goal_text or "").strip() or int(state.target_minutes or 0) <= 0:
-            raise StudyGoalRequiredError("Set a study goal before starting the focus timer.")
-        now = _now()
-        _pause_other_timers(db, owner, state.id, now)
-        if not state.timer_running:
-            state.timer_started_at = now
-            state.timer_running = True
-        db.commit()
-        db.refresh(state)
-        return serialize_study_state(state, now=now)
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
+    raise StudyGoalRequiredError(
+        "Send a Study prompt to start or resume focus time."
+    )
 
 
 @_serialized_state_access
@@ -828,6 +904,7 @@ def pause_study_timer(owner: Optional[str], session_id: str) -> dict:
     try:
         state = _get_or_create(db, owner, session_id)
         now = _now()
+        _checkpoint_prompt_idle(state, now)
         if state.timer_running:
             state.current_session_seconds = _timer_seconds(state, now=now)
             state.timer_started_at = None
@@ -850,6 +927,7 @@ def finish_study_timer(owner: Optional[str], session_id: str) -> dict:
     try:
         state = _get_or_create(db, owner, session_id)
         now = _now()
+        _checkpoint_prompt_idle(state, now)
         completed = _timer_seconds(state, now=now)
         if completed:
             state.total_seconds = max(0, int(state.total_seconds or 0)) + completed

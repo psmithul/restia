@@ -122,12 +122,21 @@ def _initialize_study_turn(
         initialize_study_workspace,
     )
 
+    # Session ownership has already been verified by the chat route. Use the
+    # persisted workspace owner for StudyState lookups instead of re-resolving
+    # the request owner: in AUTH_ENABLED=false mode a chat session can be
+    # intentionally unowned even when a single configured profile exists.
+    # Mixing those two identities makes the accepted prompt look like a
+    # missing Study workspace and prevents its timer lease from starting.
+    study_owner = _persisted_study_workspace_owner(session_id, owner)
+
     try:
         initialized = initialize_study_workspace(
-            owner,
+            study_owner,
             session_id,
             message,
             promote_to_study=True,
+            record_prompt_activity=True,
         )
     except StudyWorkspaceNotFoundError as exc:
         raise HTTPException(404, str(exc)) from exc
@@ -150,6 +159,47 @@ def _initialize_study_turn(
         cached.name = initialized["workspace_name"]
         cached.mode = "study"
     return initialized
+
+
+def _persisted_study_workspace_owner(
+    session_id: str,
+    request_owner: Optional[str],
+) -> Optional[str]:
+    """Return the exact owner stored on an already-authorized workspace."""
+
+    db = SessionLocal()
+    try:
+        row = db.query(DBSession.owner).filter(DBSession.id == session_id).first()
+    finally:
+        db.close()
+    if row is None:
+        return request_owner
+    return str(row.owner or "").strip() or None
+
+
+def _refresh_study_turn_for_stream(
+    owner: Optional[str],
+    session_id: str,
+    initialized: dict,
+) -> dict:
+    """Refresh the accepted prompt lease immediately before its SSE event.
+
+    Context preprocessing can take meaningful time. Re-serializing here keeps
+    the browser's countdown anchored to the original accepted prompt instead
+    of accidentally granting a fresh ten minutes when the first event arrives.
+    """
+
+    from src.study_mode import get_study_state, study_state_with_tracker
+
+    workspace_name = str(initialized.get("workspace_name") or "Study workspace")
+    study_owner = _persisted_study_workspace_owner(session_id, owner)
+    refreshed = study_state_with_tracker(
+        get_study_state(study_owner, session_id),
+        workspace_name,
+    )
+    refreshed["goal_initialized"] = bool(initialized.get("goal_initialized"))
+    refreshed["title_initialized"] = bool(initialized.get("title_initialized"))
+    return refreshed
 
 
 _WEB_FOLLOWUP_RE = re.compile(
@@ -1110,7 +1160,12 @@ def setup_chat_routes(
                 # The UI can update the tracker/title before the first tutor
                 # token. API clients still get the same persistence because
                 # initialization happened before build_chat_context above.
-                yield f"data: {json.dumps({'type': 'study_initialized', 'data': _study_setup})}\n\n"
+                # Refresh the serialization now so slow preprocessing cannot
+                # shift the prompt inactivity deadline later in the browser.
+                _study_event = _refresh_study_turn_for_stream(
+                    owner, session, _study_setup
+                )
+                yield f"data: {json.dumps({'type': 'study_initialized', 'data': _study_event})}\n\n"
 
             if ctx.preprocessed.attachment_meta:
                 yield f"data: {json.dumps({'type': 'attachments', 'data': ctx.preprocessed.attachment_meta})}\n\n"

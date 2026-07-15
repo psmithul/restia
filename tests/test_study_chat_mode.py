@@ -330,6 +330,25 @@ def test_study_initialization_precedes_tutor_context_on_both_chat_paths():
         assert ast.unparse(guard.test) == "study_mode"
 
 
+def test_shared_chat_initializer_records_prompt_activity_only_after_acceptance():
+    source = _CHAT_ROUTES.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(_CHAT_ROUTES))
+    helper = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_initialize_study_turn"
+    )
+    call = next(
+        node
+        for node in ast.walk(helper)
+        if isinstance(node, ast.Call)
+        and _call_name(node) == "initialize_study_workspace"
+    )
+    keywords = {keyword.arg: ast.unparse(keyword.value) for keyword in call.keywords}
+
+    assert keywords["record_prompt_activity"] == "True"
+
+
 def test_stream_announces_initialized_tracker_before_any_tutor_tokens():
     _, function = _chat_stream_tree()
     stream_with_save = next(
@@ -343,6 +362,12 @@ def test_stream_announces_initialized_tracker_before_any_tutor_tokens():
         if isinstance(node, (ast.Yield, ast.YieldFrom))
         and "study_initialized" in ast.unparse(node)
     )
+    refresh_call = next(
+        node
+        for node in ast.walk(stream_with_save)
+        if isinstance(node, ast.Call)
+        and _call_name(node) == "_refresh_study_turn_for_stream"
+    )
     generation_calls = [
         node
         for node in ast.walk(stream_with_save)
@@ -354,6 +379,7 @@ def test_stream_announces_initialized_tracker_before_any_tutor_tokens():
         "stream_llm_with_fallback",
         "stream_agent_loop",
     }
+    assert refresh_call.lineno < initialized_event.lineno
     assert all(initialized_event.lineno < call.lineno for call in generation_calls)
 
     parents = _parents(stream_with_save)

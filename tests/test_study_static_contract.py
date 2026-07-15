@@ -135,7 +135,6 @@ def test_study_rail_tracker_and_chat_control_dialog_dom_contract_is_complete():
         "study-panel-close",
         "study-timer",
         "study-timer-status",
-        "study-timer-start",
         "study-timer-pause",
         "study-timer-finish",
         "study-session-total",
@@ -215,7 +214,6 @@ def test_right_study_panel_is_read_only_and_mutations_live_in_chat_dialog():
         "study-workspace-switcher",
         "study-new-workspace",
         "study-rename-workspace",
-        "study-timer-start",
         "study-timer-pause",
         "study-timer-finish",
         "study-goal-form",
@@ -282,6 +280,7 @@ def test_app_imports_initializes_and_routes_the_study_module():
         "beforeSessionSwitch",
         "prepareFirstPrompt",
         "applyServerInitialization",
+        "refreshState",
         "isActive",
         "focus",
     ):
@@ -297,6 +296,9 @@ def test_app_imports_initializes_and_routes_the_study_module():
     assert "setAttribute('aria-expanded', 'true')" in module
     assert "setAttribute('aria-expanded', 'false')" in module
     assert "REQUEST_TIMEOUT_MS" in module and "new AbortController()" in module
+    assert "study-timer-start" not in module
+    assert "/timer/start" not in module
+    assert "Math.abs(deadlineDelay - relativeDelay) <= 5000" in module
 
 
 def test_chat_formdata_marks_study_and_disables_conflicting_modes():
@@ -359,6 +361,24 @@ def test_first_study_prompt_is_saved_before_chat_and_stream_refreshes_tracker():
     apply_event = module[module.index("export async function applyServerInitialization") :]
     assert "_applyState(payload" in apply_event[:1200]
     assert "reloadSessions" in apply_event[:1200]
+
+
+def test_failed_study_chat_reconciles_prompt_started_timer_state():
+    source = CHAT_JS.read_text(encoding="utf-8")
+    helper = source.index("const _refreshStudyAfterAcceptedFailure")
+    post = source.index("/api/chat_stream", helper)
+    non_ok = source.index("if (!res.ok)", post)
+    catch = source.index("} catch (err) {", non_ok)
+    assert "streamWasStudyMode" in source[helper : helper + 500]
+    assert "!streamWasStudyMode || !studyChatRequestAttempted" in source[
+        helper : helper + 500
+    ]
+    assert "window.studyModule?.refreshState?.({ sessionId: streamSessionId })" in source[
+        helper : helper + 700
+    ]
+    assert "_refreshStudyAfterAcceptedFailure();" in source[non_ok : non_ok + 200]
+    assert "_refreshStudyAfterAcceptedFailure();" in source[catch : catch + 200]
+    assert source.index("studyChatRequestAttempted = true", helper) < post
 
 
 def test_study_sessions_have_an_icon_and_restore_event():

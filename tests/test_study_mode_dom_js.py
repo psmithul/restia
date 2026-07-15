@@ -91,7 +91,7 @@ DOM_HARNESS = r"""
   const ids = [
     'study-panel', 'study-panel-body', 'study-panel-title',
     'study-panel-collapse', 'study-panel-close', 'study-timer',
-    'study-timer-status', 'study-timer-start', 'study-timer-pause',
+    'study-timer-status', 'study-timer-pause',
     'study-timer-finish', 'study-session-total', 'study-goal-form',
     'study-goal-text', 'study-target-hours', 'study-target-date',
     'study-goal-save', 'study-progress-bar', 'study-progress-value',
@@ -127,8 +127,8 @@ DOM_HARNESS = r"""
   const focusable = [
     elements.get('study-controls-close'), elements.get('study-workspace-switcher'),
     elements.get('study-rename-workspace'), elements.get('study-new-workspace'),
-    elements.get('study-timer-start'), elements.get('study-timer-pause'),
-    elements.get('study-timer-finish'), elements.get('study-goal-text'),
+    elements.get('study-timer-pause'), elements.get('study-timer-finish'),
+    elements.get('study-goal-text'),
     elements.get('study-target-hours'), elements.get('study-target-date'),
     elements.get('study-goal-save'), recallButton, cleanButton,
   ];
@@ -218,24 +218,24 @@ def _run_node(body: str) -> dict:
     result = subprocess.run(
         ["node", "--input-type=module", "-e", DOM_HARNESS + body],
         cwd=ROOT,
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
         timeout=20,
     )
+    assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
 
 
-def test_auto_start_race_goal_guard_dialog_and_drawer_clearance():
+def test_prompt_only_timer_controls_dialog_and_drawer_clearance():
     values = _run_node(
         r"""
           const events = [];
-          let releaseStart;
-          const startGate = new Promise(resolve => { releaseStart = resolve; });
           const server = {
             session_id: 'study-a', workspace_name: 'Dynamics', goal_initialized: true,
             goal_text: 'Build deep mastery', target_minutes: 60, target_date: null,
             timer_running: false, timer_seconds: 0, total_seconds: 0,
+            last_prompt_at: null, idle_pause_at: null, idle_seconds_remaining: null,
             review: { level: 0, count: 0, due: false, due_in_seconds: null, status: 'not_scheduled' },
           };
           const snapshot = () => ({
@@ -255,18 +255,12 @@ def test_auto_start_race_goal_guard_dialog_and_drawer_clearance():
           globalThis.fetch = async (url, options = {}) => {
             const path = new URL(url).pathname;
             if (path.endsWith('/initialize')) {
-              events.push('initialize');
-              server.timer_running = true;
+              const prompt = JSON.parse(options.body || '{}').prompt || '';
+              events.push(`initialize:${prompt}`);
               return response(snapshot());
             }
             if (path.endsWith('/state')) {
               events.push('state');
-              return response(snapshot());
-            }
-            if (path.endsWith('/timer/start')) {
-              events.push('start');
-              await startGate;
-              server.timer_running = true;
               return response(snapshot());
             }
             if (path.endsWith('/timer/pause')) {
@@ -289,17 +283,15 @@ def test_auto_start_race_goal_guard_dialog_and_drawer_clearance():
           });
           await study.open({ focus: false });
 
-          const start = elements.get('study-timer-start');
           const pause = elements.get('study-timer-pause');
           const goal = elements.get('study-goal-text');
-          const autoStarted = server.timer_running;
-          const startDisabledWhileRunning = start.disabled;
+          const stayedPausedOnEntry = !server.timer_running;
+          const promptOnlyStatus = elements.get('study-timer-status').textContent;
           const launcherVisible = !elements.get('study-chat-launcher').hidden;
           const drawerBottom = elements.get('study-panel').style.getPropertyValue('--study-drawer-bottom');
 
           goal.value = 'Unsaved replacement goal';
           goal.dispatchEvent(new Event('input'));
-          const dirtyDisablesStart = start.disabled;
           goal.value = server.goal_text;
           goal.dispatchEvent(new Event('input'));
 
@@ -307,16 +299,23 @@ def test_auto_start_race_goal_guard_dialog_and_drawer_clearance():
           await waitFor(() => server.review.count === 1, 'review mutation');
           const reviewStatus = elements.get('study-review-status').textContent;
 
+          const prepared = await study.prepareFirstPrompt('Continue control theory', { sessionId: 'study-a' });
+          const preflightStayedPaused = !server.timer_running;
+          const acceptedPrompt = snapshot();
+          acceptedPrompt.timer_running = true;
+          acceptedPrompt.last_prompt_at = '2026-07-15T10:00:00';
+          acceptedPrompt.idle_pause_at = '2026-07-15T10:10:00';
+          acceptedPrompt.idle_seconds_remaining = 600;
+          server.timer_running = true;
+          Object.assign(server, acceptedPrompt);
+          await study.applyServerInitialization(acceptedPrompt, 'study-a');
+          const startedAfterAcceptedPrompt = server.timer_running && !pause.disabled;
+
           pause.click();
           await waitFor(() => !server.timer_running, 'manual pause');
-          start.click();
-          await flush();
-          const closePromise = study.close({ manual: false, startFresh: false });
-          releaseStart();
-          const closed = await closePromise;
-          const stoppedAfterRace = !server.timer_running;
+          const closed = await study.close({ manual: false, startFresh: false });
           const reopened = await study.open({ focus: false });
-          const restartedOnReopen = server.timer_running;
+          const stayedPausedOnReopen = !server.timer_running;
 
           const trigger = elements.get('study-controls-open');
           trigger.focus();
@@ -338,24 +337,26 @@ def test_auto_start_race_goal_guard_dialog_and_drawer_clearance():
 
           await study.close({ manual: false, startFresh: false });
           console.log(JSON.stringify({
-            autoStarted, startDisabledWhileRunning, launcherVisible, dirtyDisablesStart,
-            drawerBottom, reviewStatus, events, closed, stoppedAfterRace, reopened,
-            restartedOnReopen, modalOpened, tabWrapped, escapeClosed, triggerRestored,
+            stayedPausedOnEntry, promptOnlyStatus, launcherVisible, prepared,
+            preflightStayedPaused, startedAfterAcceptedPrompt, drawerBottom,
+            reviewStatus, events, closed, reopened, stayedPausedOnReopen,
+            modalOpened, tabWrapped, escapeClosed, triggerRestored,
             backgroundInertWhileOpen, backgroundRestored,
           }));
         """
     )
 
-    assert values["autoStarted"] is True
-    assert values["startDisabledWhileRunning"] is True
+    assert values["stayedPausedOnEntry"] is True
+    assert values["promptOnlyStatus"] == "Send a Study prompt to start"
     assert values["launcherVisible"] is True
-    assert values["dirtyDisablesStart"] is True
+    assert values["prepared"] is True
+    assert values["preflightStayedPaused"] is True
+    assert values["startedAfterAcceptedPrompt"] is True
     assert values["drawerBottom"] == "112px"
     assert values["reviewStatus"] == "Level 1 · 1 evidence check"
     assert values["closed"] is True
-    assert values["stoppedAfterRace"] is True
     assert values["reopened"] is True
-    assert values["restartedOnReopen"] is True
+    assert values["stayedPausedOnReopen"] is True
     assert values["modalOpened"] is True
     assert values["tabWrapped"] is True
     assert values["escapeClosed"] is True
@@ -363,14 +364,120 @@ def test_auto_start_race_goal_guard_dialog_and_drawer_clearance():
     assert values["backgroundInertWhileOpen"] is True
     assert values["backgroundRestored"] is True
     assert values["events"] == [
-        "initialize",
+        "initialize:",
         "review:clean",
+        "initialize:Continue control theory",
         "pause",
-        "start",
         "pause",
-        "initialize",
+        "initialize:",
         "pause",
     ]
+
+
+def test_inactivity_deadline_clamps_and_reconciles_without_blind_pause():
+    values = _run_node(
+        r"""
+          let stateReads = 0;
+          let pauseCalls = 0;
+          const server = {
+            running: true,
+            seconds: 40,
+            lastPromptAt: '2026-07-15T10:00:00',
+            idlePauseAt: new Date(Date.now() + 250).toISOString(),
+            idleRemaining: 5,
+          };
+          const review = { level: 0, count: 0, due: false, due_in_seconds: null, status: 'not_scheduled' };
+          const snapshot = () => ({
+            session_id: 'study-a', workspace_name: 'Dynamics', goal_initialized: true,
+            goal_text: 'Build deep mastery', target_minutes: 60, target_date: null,
+            timer_running: server.running, timer_seconds: server.seconds, total_seconds: 0,
+            last_prompt_at: server.lastPromptAt, idle_pause_at: server.idlePauseAt,
+            idle_seconds_remaining: server.running ? server.idleRemaining : null,
+            studied_seconds: server.seconds, remaining_seconds: Math.max(0, 3600 - server.seconds),
+            progress_percent: server.seconds / 36, review,
+            tracker: {
+              active_workspace: { session_id: 'study-a', title: 'Dynamics', mode: 'study' },
+              focus_block: { running: server.running, elapsed_seconds: server.seconds, completed_seconds: 0 },
+              learning_goal: { text: 'Build deep mastery', target_minutes: 60, target_date: null, source: 'prompt' },
+              effort: { studied_seconds: server.seconds, target_seconds: 3600, remaining_seconds: 3600 - server.seconds, progress_percent: server.seconds / 36 },
+              mastery: { status: 'building', next_evidence: 'Complete one hint-free recall check.', review_level: 0, review_count: 0 },
+              review_due: review,
+            },
+          });
+          globalThis.fetch = async (url, options = {}) => {
+            const path = new URL(url).pathname;
+            if (path.endsWith('/initialize')) return response(snapshot());
+            if (path.endsWith('/state')) {
+              stateReads += 1;
+              if (stateReads === 1) {
+                // Another tab accepted a newer prompt just before this tab's
+                // stale local deadline fired. A blind pause would erase it.
+                server.running = true;
+                server.lastPromptAt = '2026-07-15T10:09:59';
+                server.idlePauseAt = new Date(Date.now() + 600000).toISOString();
+                server.idleRemaining = 600;
+              } else {
+                server.running = false;
+                server.seconds = 640;
+                server.idlePauseAt = null;
+                server.idleRemaining = null;
+              }
+              return response(snapshot());
+            }
+            if (path.endsWith('/timer/pause')) {
+              pauseCalls += 1;
+              server.running = false;
+              server.idleRemaining = null;
+              return response(snapshot());
+            }
+            throw new Error(`Unexpected Study request: ${options.method || 'GET'} ${path}`);
+          };
+
+          const study = await import('./static/js/study.js');
+          study.init('http://study.test', {
+            getCurrentSessionId: () => 'study-a',
+            getSessions: () => [{ id: 'study-a', name: 'Dynamics', mode: 'study' }],
+          });
+          await study.open({ focus: false });
+          await new Promise(resolve => setTimeout(resolve, 300));
+          await waitFor(() => stateReads === 1, 'cross-tab lease refresh');
+          const newerPromptPreserved = server.running
+            && elements.get('study-timer-status').textContent.includes('Focus timer running');
+
+          const clamped = study.deriveLiveProgress({
+            ...snapshot(), timer_seconds: 40, idle_seconds_remaining: 600,
+          }, 700);
+          server.idleRemaining = 5;
+          server.idlePauseAt = new Date(Date.now() + 100).toISOString();
+          await study.applyServerInitialization(snapshot(), 'study-a');
+          await new Promise(resolve => setTimeout(resolve, 150));
+          await waitFor(() => stateReads === 2, 'authoritative idle pause');
+          const pausedAtDeadline = !server.running
+            && elements.get('study-timer-status').textContent.includes('send a Study prompt to resume');
+          const pauseCallsBeforeClose = pauseCalls;
+          await study.close({ manual: false, startFresh: false });
+
+          console.log(JSON.stringify({
+            newerPromptPreserved,
+            clampedRunning: clamped.timer_running,
+            clampedSeconds: clamped.timer_seconds,
+            clampedIdleRemaining: clamped.idle_seconds_remaining,
+            pausedAtDeadline,
+            stateReads,
+            pauseCallsBeforeClose,
+          }));
+        """
+    )
+
+    assert values == {
+        "newerPromptPreserved": True,
+        "clampedRunning": False,
+        "clampedSeconds": 640,
+        "clampedIdleRemaining": 0,
+        "pausedAtDeadline": True,
+        "stateReads": 2,
+        "pauseCallsBeforeClose": 0,
+    }
 
 
 def test_workspace_switch_create_first_prompt_and_stream_refresh():
@@ -386,7 +493,7 @@ def test_workspace_switch_create_first_prompt_and_stream_refresh():
           ];
           const records = new Map(sessions.map(session => [session.id, {
             title: session.name, goal: 'Choose a substantive Study prompt', goalInitialized: false,
-            running: false, seconds: 0, total: 0,
+            running: false, seconds: 0, total: 0, lastPromptAt: null,
           }]));
           const snapshot = id => {
             const record = records.get(id);
@@ -395,6 +502,9 @@ def test_workspace_switch_create_first_prompt_and_stream_refresh():
               goal_initialized: record.goalInitialized,
               goal_text: record.goal, target_minutes: 180, target_date: null,
               timer_running: record.running, timer_seconds: record.seconds,
+              last_prompt_at: record.lastPromptAt,
+              idle_pause_at: record.running ? '2026-07-15T10:10:00' : null,
+              idle_seconds_remaining: record.running ? 600 : null,
               total_seconds: record.total, studied_seconds: record.total + record.seconds,
               remaining_seconds: 10800, progress_percent: 0,
               review: { level: 0, count: 0, due: false, due_in_seconds: null, status: 'not_scheduled' },
@@ -417,7 +527,6 @@ def test_workspace_switch_create_first_prompt_and_stream_refresh():
               const prompt = JSON.parse(options.body || '{}').prompt || '';
               events.push(`initialize:${id}:${prompt}`);
               for (const [otherId, other] of records) if (otherId !== id) other.running = false;
-              record.running = true;
               if (prompt.trim() && !record.goalInitialized) {
                 record.goalInitialized = true;
                 record.title = 'PID Control Mastery';
@@ -453,33 +562,41 @@ def test_workspace_switch_create_first_prompt_and_stream_refresh():
             createStudySession: async name => {
               const id = 'study-c';
               sessions.push({ id, name, mode: 'study' });
-              records.set(id, { title: name, goal: 'Choose a substantive Study prompt', goalInitialized: false, running: false, seconds: 0, total: 0 });
+              records.set(id, { title: name, goal: 'Choose a substantive Study prompt', goalInitialized: false, running: false, seconds: 0, total: 0, lastPromptAt: null });
               return { id, name, mode: 'study' };
             },
             reloadSessions: async () => { reloadCount += 1; },
           });
 
           await study.enter({ focus: false });
-          const enteredA = records.get('study-a').running;
+          const enteredAPaused = !records.get('study-a').running;
           const trainingMovesDisabledBeforeGoal = recallButton.disabled && cleanButton.disabled;
           elements.get('study-workspace-switcher').value = 'study-b';
           elements.get('study-workspace-switcher').dispatchEvent(new Event('change'));
           await waitFor(() => events.some(item => item === 'initialize:study-b:'), 'workspace switch initialization');
           const switched = currentId === 'study-b';
-          const enteredB = records.get('study-b').running && !records.get('study-a').running;
+          const enteredBPaused = !records.get('study-b').running && !records.get('study-a').running;
 
           elements.get('study-controls-open').click();
           elements.get('study-new-workspace').click();
           await waitFor(() => events.some(item => item === 'initialize:study-c:'), 'new workspace initialization');
-          const createdAndStarted = currentId === 'study-c'
-            && records.get('study-c').running
+          const createdAndPaused = currentId === 'study-c'
+            && !records.get('study-c').running
             && !records.get('study-b').running;
 
           const prepared = await study.prepareFirstPrompt('Master PID control from scratch', { sessionId: 'study-c' });
           const promptSaved = records.get('study-c').goalInitialized;
+          const preflightStayedPaused = !records.get('study-c').running;
           const trainingMovesEnabledAfterGoal = !recallButton.disabled && !cleanButton.disabled;
           const derivedTitle = elements.get('study-tracker-workspace-name').textContent;
           const derivedGoal = elements.get('study-goal-summary').textContent;
+
+          records.get('study-c').running = true;
+          records.get('study-c').lastPromptAt = '2026-07-15T10:00:00';
+          const accepted = snapshot('study-c');
+          await study.applyServerInitialization(accepted, 'study-c');
+          const startedAfterAcceptedPrompt = records.get('study-c').running
+            && elements.get('study-timer-status').textContent.includes('Focus timer running');
 
           const streamed = snapshot('study-c');
           streamed.workspace_name = 'PID Control — Transfer';
@@ -497,7 +614,8 @@ def test_workspace_switch_create_first_prompt_and_stream_refresh():
 
           await study.close({ manual: false, startFresh: false });
           console.log(JSON.stringify({
-            enteredA, switched, enteredB, createdAndStarted, prepared, promptSaved,
+            enteredAPaused, switched, enteredBPaused, createdAndPaused, prepared,
+            promptSaved, preflightStayedPaused, startedAfterAcceptedPrompt,
             trainingMovesDisabledBeforeGoal, trainingMovesEnabledAfterGoal,
             derivedTitle, derivedGoal, streamApplied, streamedTitle, masteryDistance,
             quickPrompt, quickClosedDialog, quickFocusedComposer, reloadCount, events,
@@ -505,12 +623,14 @@ def test_workspace_switch_create_first_prompt_and_stream_refresh():
         """
     )
 
-    assert values["enteredA"] is True
+    assert values["enteredAPaused"] is True
     assert values["switched"] is True
-    assert values["enteredB"] is True
-    assert values["createdAndStarted"] is True
+    assert values["enteredBPaused"] is True
+    assert values["createdAndPaused"] is True
     assert values["prepared"] is True
     assert values["promptSaved"] is True
+    assert values["preflightStayedPaused"] is True
+    assert values["startedAfterAcceptedPrompt"] is True
     assert values["trainingMovesDisabledBeforeGoal"] is True
     assert values["trainingMovesEnabledAfterGoal"] is True
     assert values["derivedTitle"] == "PID Control Mastery"
@@ -555,7 +675,7 @@ def test_workspace_creation_failure_is_visible_and_retryable():
           });
           globalThis.fetch = async (url, options = {}) => {
             const path = new URL(url).pathname;
-            if (path.endsWith('/initialize')) { record.running = true; return response(snapshot()); }
+            if (path.endsWith('/initialize')) { return response(snapshot()); }
             if (path.endsWith('/timer/pause')) { record.running = false; return response(snapshot()); }
             throw new Error(`Unexpected request ${options.method || 'GET'} ${path}`);
           };
@@ -583,8 +703,8 @@ def test_workspace_creation_failure_is_visible_and_retryable():
           const retryEnabled = !elements.get('study-new-workspace').disabled;
 
           elements.get('study-new-workspace').click();
-          await waitFor(() => record.running, 'retry workspace auto-start');
-          const recovered = study.isActive() && currentId === 'study-retry';
+          await waitFor(() => study.isActive() && currentId === 'study-retry', 'retry workspace activation');
+          const recovered = study.isActive() && currentId === 'study-retry' && !record.running;
           const errorCleared = elements.get('study-error').hidden && elements.get('study-tracker-alert').hidden;
           await study.close({ manual: false, startFresh: false });
 
@@ -640,7 +760,6 @@ def test_closing_during_workspace_creation_never_reopens_study():
             const parsed = new URL(url);
             const id = parsed.searchParams.get('session_id');
             if (parsed.pathname.endsWith('/initialize')) {
-              records.get(id).running = true;
               return response(snapshot(id));
             }
             if (parsed.pathname.endsWith('/timer/pause')) {

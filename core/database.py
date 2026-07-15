@@ -294,6 +294,10 @@ class StudyState(TimestampMixin, Base):
     current_session_seconds = Column(Integer, nullable=False, default=0)
     timer_started_at = Column(DateTime, nullable=True)
     timer_running = Column(Boolean, nullable=False, default=False)
+    # The focus timer is leased by real Study prompts, never by opening the
+    # workspace.  Persisting the most recent prompt lets the server cap and
+    # pause stale timers correctly after a closed tab or process restart.
+    last_prompt_at = Column(DateTime, nullable=True)
     # Durable one-time setup marker. Goal text cannot serve as this sentinel:
     # a learner may intentionally save wording identical to the starter goal.
     # False means the generated starter is still eligible for replacement by
@@ -1572,6 +1576,37 @@ def _migrate_add_study_setup_initialized_column():
                 pass
 
 
+def _migrate_add_study_last_prompt_at_column():
+    """Add the persisted Study prompt-activity clock to existing databases."""
+
+    if not DATABASE_URL.startswith("sqlite:///"):
+        return
+    db_path = DATABASE_URL.replace("sqlite:///", "", 1)
+    if db_path == ":memory:" or not os.path.exists(db_path):
+        return
+
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(study_states)").fetchall()
+        }
+        if columns and "last_prompt_at" not in columns:
+            conn.execute(
+                "ALTER TABLE study_states ADD COLUMN last_prompt_at DATETIME"
+            )
+            conn.commit()
+            logger.info("Migrated: added last_prompt_at to study_states")
+    except Exception as exc:
+        logger.warning("study_states prompt activity migration failed: %s", exc)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def _migrate_add_mode_column():
     """Add mode column to sessions table if it doesn't exist."""
     import sqlite3
@@ -2356,6 +2391,7 @@ def init_db():
     harden_database_permissions()
     _migrate_add_study_review_columns()
     _migrate_add_study_setup_initialized_column()
+    _migrate_add_study_last_prompt_at_column()
     _migrate_add_hidden_models_column()
     _migrate_add_cached_models_column()
     _migrate_add_pinned_models_column()
