@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EMBERLINE — Ashes of the Ninth Sun</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='34' fill='%23e58a3a'/><circle cx='50' cy='50' r='18' fill='%23f5d78e'/></svg>">
+<link rel="stylesheet" href="css/game.css">
+</head>
+<body>
+<canvas id="skyfield" aria-hidden="true"></canvas>
+<div id="app">
+
+  <!-- Title -->
+  <section id="screen-title" class="screen">
+    <div class="embers" aria-hidden="true"></div>
+    <div class="title-card">
+      <div class="title-glyph">燼</div>
+      <h1 class="title-logo">EMBERLINE</h1>
+      <div class="title-sub">Ashes of the Ninth Sun</div>
+      <p class="title-blurb">Nine suns were shot from the sky, and the world grew cold around their buried embers.
+      Cultivators refine what light remains — racing their own lifespans to kindle a Tenth Dawn.
+      When you fall, your heir rises: the Hearthline endures.</p>
+      <div class="title-actions">
+        <button class="btn btn-primary" id="btn-new">Found a new Hearthline</button>
+      </div>
+      <div id="title-saves" class="title-saves"></div>
+      <div class="title-foot">a full-stack cultivation life · saves live on your own server</div>
+    </div>
+  </section>
+
+  <!-- Character creation -->
+  <section id="screen-create" class="screen hidden">
+    <div class="create-card">
+      <h2>The First of the Line</h2>
+      <label class="field"><span>Name</span>
+        <input id="create-name" maxlength="24" placeholder="e.g. Wei Ashdown" autocomplete="off">
+      </label>
+      <h3>Ash Lineage <small>— how the old fire runs in your blood</small></h3>
+      <div id="create-lineages" class="card-row"></div>
+      <h3>Origin <small>— the life before the path</small></h3>
+      <div id="create-origins" class="card-row"></div>
+      <div class="create-actions">
+        <button class="btn btn-ghost" id="btn-create-back">Back</button>
+        <button class="btn btn-primary" id="btn-create-go">Light the first spark</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Main game -->
+  <section id="screen-game" class="screen hidden">
+    <header id="topbar">
+      <span class="top-logo">燼 EMBERLINE</span>
+      <span id="date-label"></span>
+      <span id="ap-pips" title="Actions left this season"></span>
+      <span class="top-spacer"></span>
+      <span id="save-dot" title="save status">●</span>
+      <button class="btn btn-small" id="btn-endseason">End Season ▸</button>
+      <button class="btn btn-small btn-ghost" id="btn-settings" title="Settings — sound, quiet minigames, still sky">⚙</button>
+      <button class="btn btn-small btn-ghost" id="btn-menu">Menu</button>
+    </header>
+    <div id="game-cols">
+      <aside id="char-panel" aria-label="Character"></aside>
+      <main id="main-panel">
+        <div id="region-bar"></div>
+        <div id="region-desc"></div>
+        <div id="action-grid"></div>
+        <div id="log" aria-live="polite"></div>
+      </main>
+      <aside id="side-panel" aria-label="Possessions and records">
+        <nav id="side-tabs"></nav>
+        <div id="side-content"></div>
+      </aside>
+    </div>
+  </section>
+
+</div>
+<div id="modal-root"></div>
+<div id="toast-root" aria-live="polite"></div>
+<script type="module" src="js/main.js"></script>
+</body>
+</html>

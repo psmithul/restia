@@ -1,0 +1,15 @@
+{
+  "_readme": "Content packs: any .json file in this folder is merged at boot. Events use the same schema as EVENTS in data.js (id, regions, w, once, minRealm, text, choices[{label, req, out}]). Outcome keys: stones, items, cult, hp, hpPct, qiPct, karma, insight, tech, flag, contrib, log, roll{stat,dc,win,lose}, fight.",
+  "events": [
+    {
+      "id": "pack_tea_house",
+      "regions": ["cinder_market", "riverport"],
+      "w": 2,
+      "text": "A tiny teahouse with four seats and a proprietor who pours without asking. The cup she gives you is older than the Market. \"On the house,\" she says. \"You look like the arguing type. My customers will enjoy you.\"",
+      "choices": [
+        { "label": "Stay and argue cultivation theory", "out": { "cult": 12, "log": "Three hours of magnificent disagreement with strangers. You leave with two new enemies, one new friend, and a better grip on your own foundations." } },
+        { "label": "Drink quietly and listen", "out": { "karma": 1, "log": "You learn more in an hour of other people's arguments than in a week of your own. The proprietor refills your cup exactly once, which is her highest honor." } }
+      ]
+    }
+  ]
+}

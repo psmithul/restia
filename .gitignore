@@ -108,3 +108,7 @@ docker_logs.txt
 test_mem.db*
 scratchpad_test_*.py
 graphify-out/
+
+# Backups
+backups/
+
