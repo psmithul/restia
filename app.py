@@ -72,6 +72,10 @@ from core.constants import (
 )
 from core.database import SessionLocal, ApiToken
 from core.middleware import SecurityHeadersMiddleware, is_cors_preflight
+from core.project_upload_limit import (
+    ProjectAttachmentBodyLimitMiddleware,
+    is_project_attachment_upload,
+)
 from core.auth import AuthManager, normalize_known_username
 from core.exceptions import (
     SessionNotFoundError, InvalidFileUploadError,
@@ -127,6 +131,11 @@ app = FastAPI(
     description="Comprehensive AI chat with memory, research, and multi-modal capabilities",
     version="1.0.0",
 )
+
+# Bound project multipart bodies before Starlette creates upload temp files.
+# Register this before CORS/security middleware so their response headers still
+# wrap an early 413 generated here.
+app.add_middleware(ProjectAttachmentBodyLimitMiddleware)
 
 # ========= CORS =========
 CORS_ALLOW_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"]
@@ -191,7 +200,14 @@ _TIMEOUT_EXEMPT_PREFIXES = (
 class _RequestTimeoutMiddleware(_BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         path = request.url.path or ""
-        if any(path.startswith(p) for p in _TIMEOUT_EXEMPT_PREFIXES):
+        if (
+            any(path.startswith(p) for p in _TIMEOUT_EXEMPT_PREFIXES)
+            or is_project_attachment_upload(request.method, path)
+        ):
+            # The upload middleware already bounds body size and concurrency.
+            # Let durable file+metadata completion define the response rather
+            # than returning a 504 while a BaseHTTPMiddleware child task can
+            # still commit the attachment in the background.
             return await call_next(request)
         try:
             return await _asyncio.wait_for(call_next(request), timeout=REQUEST_HARD_TIMEOUT)
@@ -845,6 +861,10 @@ set_task_scheduler(task_scheduler)
 from routes.task_routes import setup_task_routes
 app.include_router(setup_task_routes(task_scheduler))
 
+# Multi-project workflow boards, durable deliverables, and task activity.
+from routes.project_routes import setup_project_routes
+app.include_router(setup_project_routes())
+
 from routes.assistant_routes import setup_assistant_routes
 app.include_router(setup_assistant_routes(task_scheduler))
 
@@ -981,6 +1001,10 @@ async def serve_calendar(request: Request):
 
 @app.get("/study")
 async def serve_study(request: Request):
+    return await serve_index(request)
+
+@app.get("/projects")
+async def serve_projects(request: Request):
     return await serve_index(request)
 
 # Per-tool deep-link routes — all serve the same SPA, the JS auto-opens

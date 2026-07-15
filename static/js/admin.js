@@ -2781,7 +2781,7 @@ function initBackup() {
       URL.revokeObjectURL(a.href);
       msg.textContent = 'Export downloaded.'; msg.className = 'admin-success';
     } catch (e) { msg.textContent = 'Export failed: ' + e.message; msg.className = 'admin-error'; }
-    btn.disabled = false; btn.textContent = 'Export Data';
+    btn.disabled = false; btn.textContent = 'Export Profile';
   });
 
   const fileInput = el('adm-importFile');
@@ -2815,7 +2815,7 @@ function initBackup() {
         msg.textContent = result.message || result.detail || 'Import failed'; msg.className = 'admin-error';
       }
     } catch (e) { msg.textContent = 'Import failed: ' + e.message; msg.className = 'admin-error'; }
-    btn.disabled = false; btn.textContent = 'Import Data';
+    btn.disabled = false; btn.textContent = 'Import Profile';
   });
 }
 
@@ -2825,7 +2825,7 @@ function initDangerZone() {
   // via data-wipe-kind; one delegated handler handles double-confirm,
   // POSTs to /api/admin/wipe/{kind}, and writes the result.
   const _LABELS = {
-    chats: 'chats', study: 'study goals and timer progress', memory: 'memory entries', skills: 'skills',
+    chats: 'chats', study: 'study goals and timer progress', projects: 'projects and deliverables', memory: 'memory entries', skills: 'skills',
     notes: 'notes', tasks: 'tasks', documents: 'documents',
     gallery: 'gallery images', calendar: 'calendar items',
   };

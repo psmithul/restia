@@ -476,6 +476,22 @@ Key settings:
 | `ODYSSEUS_MEMORY_IMPORT_MAX_BYTES` | `10485760` | Memory import file cap in bytes (10 MB). |
 | `ODYSSEUS_PERSONAL_UPLOAD_MAX_BYTES` | `26214400` | Personal document upload cap in bytes (25 MB). |
 | `ODYSSEUS_EMAIL_COMPOSE_UPLOAD_MAX_BYTES` | `26214400` | Email compose attachment cap in bytes (25 MB). |
+| `ODYSSEUS_PROJECT_ATTACHMENT_MAX_BYTES` | `52428800` | Project reference, draft, and deliverable upload cap in bytes (50 MB). |
+| `RESTIA_PROJECT_UPLOAD_CONCURRENCY` | `2` | Simultaneous project upload request lifecycles (1-16); bounds parser, memory, and disk pressure. |
+| `RESTIA_PROJECT_UPLOAD_BODY_IDLE_TIMEOUT_SECONDS` | `30` | Maximum pause between incoming upload-body chunks before a retryable 408 response. |
+| `RESTIA_PROJECT_UPLOAD_BODY_TOTAL_TIMEOUT_SECONDS` | `900` | Maximum time to receive a complete Project upload body; durable file/metadata completion is not cut off. |
+| `RESTIA_PROJECT_STORAGE_MAX_BYTES` | `5368709120` | Total durable attachment storage allowed per Project (5 GB). |
+| `RESTIA_PROJECT_OWNER_STORAGE_MAX_BYTES` | `53687091200` | Total Project attachment storage owned by one profile (50 GB). |
+| `RESTIA_PROJECT_GLOBAL_STORAGE_MAX_BYTES` | `214748364800` | Total Project attachment storage across this Restia install (200 GB). |
+| `RESTIA_PROJECT_MAX_PROJECTS_PER_OWNER` | `200` | Retained Projects one profile may own. |
+| `RESTIA_PROJECT_MAX_STAGES_PER_PROJECT` | `50` | Workflow stages retained in one Project. |
+| `RESTIA_PROJECT_MAX_ACTIVITY_PER_PROJECT` | `20000` | Newest audit events retained per Project; older events roll off automatically. |
+| `RESTIA_PROJECT_MAX_ACTIVE_ITEMS` | `2000` | Active cards allowed on one board. |
+| `RESTIA_PROJECT_MAX_ITEMS` | `10000` | Active and archived work items retained per Project. |
+| `RESTIA_PROJECT_MAX_CHECKLIST_ITEMS_PER_ITEM` | `500` | Checklist rows retained on one work item. |
+| `RESTIA_PROJECT_MAX_COMMENTS_PER_ITEM` | `1000` | Comments retained on one work item; detail responses show the latest 200. |
+| `RESTIA_PROJECT_MAX_ATTACHMENTS_PER_ITEM` | `200` | Maximum attachments retained on one work item. |
+| `RESTIA_PROJECT_MAX_ATTACHMENTS_PER_PROJECT` | `5000` | Maximum attachments retained across one Project. |
 | `ODYSSEUS_STT_MAX_AUDIO_BYTES` | `26214400` | Speech-to-text audio cap in bytes (25 MB). |
 | `ODYSSEUS_ICS_MAX_BYTES` | `10485760` | Calendar `.ics` import cap in bytes (10 MB). |
 
@@ -505,8 +521,9 @@ docs/      landing page (index.html) + preview clips
 ```
 
 ## Data
-All profile data lives in `data/` (gitignored): `app.db` (sessions, messages, documents),
-`memory.json`, `presets.json`, `uploads/`, `personal_docs/`, `chroma/`, `settings.json`.
+All profile data lives in `data/` (gitignored): `app.db` (sessions, messages, documents,
+Projects), `memory.json`, `presets.json`, `uploads/`, `project_files/`, `personal_docs/`,
+`chroma/`, `settings.json`.
 
 To back up or restore everything in `data/`, see the
 [Backup & Restore guide](backup-restore.md).

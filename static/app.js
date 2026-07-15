@@ -29,6 +29,7 @@ import galleryModule from './js/gallery.js';
 import tasksModule from './js/tasks.js?v=20260630tasksactivity';
 import calendarModule from './js/calendar.js';
 import notesModule from './js/notes.js';
+import projectsModule from './js/projects.js';
 import studyModule from './js/study.js';
 import notificationCenterModule from './js/notificationCenter.js';
 import adminModule from './js/admin.js';
@@ -58,6 +59,7 @@ window.sessionModule = sessionModule;
 window.uiModule = uiModule;
 window.adminModule = adminModule;
 window.cookbookModule = cookbookModule;
+window.projectsModule = projectsModule;
 window.studyModule = studyModule;
 
 function _isMobileChatInput() {
@@ -177,6 +179,7 @@ function initRailHoverLabels() {
     'rail-archive': 'Library',
     'rail-memory': 'Brain',
     'rail-notes': 'Notes',
+    'rail-projects': 'Projects',
     'rail-study': 'Study',
     'rail-todos': 'To Do',
     'rail-tasks': 'Tasks',
@@ -1127,6 +1130,20 @@ function initializeEventListeners() {
     });
   }
 
+  // Projects is a full workspace rather than a floating modal. Keep the
+  // compact icon rail available while giving the board the rest of the screen.
+  const toolProjectsBtn = el('tool-projects-btn');
+  if (toolProjectsBtn) {
+    toolProjectsBtn.addEventListener('click', () => {
+      if (!projectsModule) return;
+      if (projectsModule.isOpen()) projectsModule.close();
+      else {
+        _collapseSidebarToRail();
+        void projectsModule.open();
+      }
+    });
+  }
+
   // Study workspaces are durable Study chat sessions. Enter reopens the current
   // workspace (or creates the first one); the panel's + New control creates
   // additional subjects without sacrificing their separate chat or progress.
@@ -1225,6 +1242,11 @@ function initializeEventListeners() {
   }
   const _routeOpen = {
     '/study':    () => document.getElementById('tool-study-btn')?.click(),
+    '/projects': () => {
+      if (!projectsModule) return;
+      _collapseSidebarToRail();
+      void projectsModule.open();
+    },
     '/notes':    () => {
       if (!notesModule) return;
       _collapseSidebarToRail();
@@ -1373,6 +1395,9 @@ function initializeEventListeners() {
     .then(r => r.json())
     .then(d => {
       window._isAdmin = !!d.is_admin;
+      // Feature workspaces use this only to hide actions the current profile
+      // cannot perform. Every API route still enforces identity server-side.
+      window._currentUsername = String(d.username || '').trim().toLowerCase();
       if (d.is_admin && userBarAdmin) userBarAdmin.style.display = '';
       const userBarName = el('user-bar-name');
       const userBarAvatar = el('user-bar-avatar');
@@ -2681,6 +2706,7 @@ function initializeEventListeners() {
     'tool-library':        '#tool-library-btn',
     'tool-memory':         '#tool-memory-btn',
     'tool-notes':          '#tool-notes-btn',
+    'tool-projects':       '#tool-projects-btn, #rail-projects',
     'tool-study':          '#tool-study-btn, #rail-study',
     'tool-todos':          '#tool-todos-btn',
     'tool-tasks':          '#tool-tasks-btn',
@@ -3698,6 +3724,14 @@ function startRestiaApp() {
     reloadSessions: sessionModule.loadSessions,
     styledPrompt: uiModule.styledPrompt,
   });
+  projectsModule.init(API_BASE, {
+    uiModule,
+    showToast: uiModule.showToast,
+    styledConfirm: uiModule.styledConfirm,
+    styledPrompt: uiModule.styledPrompt,
+    currentUsername: () => window._currentUsername || '',
+    restoreSidebar: () => window._restoreSidebarIfRouteCollapsed?.(),
+  });
   groupModule.init(API_BASE);
   // Initialize compare module
   if (compareModule) {
@@ -3716,6 +3750,26 @@ function startRestiaApp() {
   // Initialize search chat module
   if (searchChatModule) {
     searchChatModule.init(API_BASE);
+  }
+
+  // The icon rail is the workspace switcher while Projects is open. If a task
+  // has unsaved edits, let Projects finish its close confirmation before the
+  // destination tool runs; cancelling keeps the user safely on the board.
+  const projectsRail = el('icon-rail');
+  let replayingProjectsRailClick = false;
+  if (projectsRail) {
+    projectsRail.addEventListener('click', async (event) => {
+      if (replayingProjectsRailClick || !projectsModule?.isOpen()) return;
+      const destination = event.target.closest?.('.icon-rail-btn');
+      if (!destination || destination.id === 'rail-projects') return;
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation?.();
+      const closed = await projectsModule.close();
+      if (!closed || !destination.isConnected) return;
+      replayingProjectsRailClick = true;
+      try { destination.click(); } finally { replayingProjectsRailClick = false; }
+    }, true);
   }
 
   // Search buttons — icon rail + sidebar
@@ -3737,6 +3791,7 @@ function startRestiaApp() {
     'rail-messages':  'tool-messages-btn',
     'rail-calendar':  'tool-calendar-btn',
     'rail-notes':     'tool-notes-btn',
+    'rail-projects':  'tool-projects-btn',
     'rail-study':     'tool-study-btn',
     'rail-todos':     'tool-todos-btn',
     'rail-memory':    'tool-memory-btn',

@@ -80,9 +80,13 @@ TOKEN_TTL = 60 * 60 * 24 * 7  # 7 days
 # `_SYNTHETIC_OWNERS` in routes/assistant_routes.py and the matching guards in
 # src/task_scheduler.py / routes/research_routes.py) — a real account with one
 # of those names would be denied an assistant and inconsistently owner-scoped.
-# Refuse to create or rename into any of them so the sentinels can't be
+# ``owner@localhost`` is the pre-profile Projects owner and must likewise
+# never become a real account that inherits sentinel-owned work. Refuse to
+# create or rename into any of them so the sentinels can't be
 # impersonated. (Keep this in sync with that synthetic-owner set.)
-RESERVED_USERNAMES = frozenset({INTERNAL_TOOL_USER, "api", "demo", "system"})
+RESERVED_USERNAMES = frozenset(
+    {INTERNAL_TOOL_USER, "api", "demo", "system", "owner@localhost"}
+)
 _SESSION_KEY_PREFIX = "sha256:"
 _BACKUP_KEY_PREFIX = "sha256:"
 
@@ -155,6 +159,11 @@ class AuthManager:
         # concurrent create/delete/rename/privilege operations don't interleave
         # and corrupt the user database.
         self._config_lock = threading.Lock()
+        # Usernames are ownership keys across stores outside auth.json. Auth
+        # routes reserve both sides of a rename here while those references are
+        # migrated; owner-scoped writers consult it under _config_lock and
+        # reject writes until the migration commits or rolls back.
+        self._identity_migrations: set[str] = set()
         # Guards the first-run setup check-and-write so concurrent requests
         # cannot both observe is_configured==False and both create admin accounts.
         self._setup_lock = threading.Lock()

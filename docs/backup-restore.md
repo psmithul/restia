@@ -2,7 +2,8 @@
 
 Restia keeps all of your state in the `data/` directory — the SQLite database
 (`app.db`), the Fernet encryption key (`data/.app_key`), the vault, memory, RAG
-indexes, personal documents, and uploads. The `scripts/odysseus-backup` tool
+indexes, personal documents, Project workspaces and deliverables, and uploads.
+The `scripts/odysseus-backup` tool
 snapshots that directory into a single gzip tarball and restores it later.
 
 Snapshots are safe to take while the app is running: SQLite databases are copied
@@ -51,8 +52,8 @@ Writes a `tar.gz` of `data/` to `backups/<timestamp>.tar.gz`.
 | `--include-attachments` | Include `data/mail-attachments/` (skipped by default — cached IMAP extractions, re-derivable). |
 
 By default the snapshot includes everything under `data/` **except**
-`deep_research/` and `mail-attachments/`. Personal uploads and documents are
-included.
+`deep_research/` and `mail-attachments/`. Personal uploads, Project records,
+Project deliverables, and documents are included.
 
 ```bash
 # Snapshot straight to a mounted NAS path

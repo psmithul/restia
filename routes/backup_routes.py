@@ -17,7 +17,12 @@ def setup_backup_routes(memory_manager, preset_manager, skills_manager) -> APIRo
 
     @router.get("/api/export")
     async def export_data(request: Request):
-        """Export all user data as a downloadable JSON file."""
+        """Export portable profile settings as a downloadable JSON file.
+
+        This intentionally excludes binary/application data such as Project
+        deliverables. The full-data snapshot tool covers the entire data/
+        directory without loading large files into the web process.
+        """
         require_admin(request)
         user = get_current_user(request)
 

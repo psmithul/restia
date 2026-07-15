@@ -1,10 +1,26 @@
 import os
 import json
+import hashlib
 import logging
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from sqlalchemy import event, create_engine, Column, String, Text, Boolean, DateTime, Integer, ForeignKey, JSON, Index, func, text
+from sqlalchemy import (
+    event,
+    create_engine,
+    Column,
+    String,
+    Text,
+    Boolean,
+    DateTime,
+    Integer,
+    ForeignKey,
+    JSON,
+    Index,
+    UniqueConstraint,
+    func,
+    text,
+)
 from sqlalchemy.engine import Engine
 from sqlalchemy.types import TypeDecorator
 from sqlalchemy.ext.declarative import declarative_base, declared_attr
@@ -22,6 +38,13 @@ Base = declarative_base()
 def utcnow_naive() -> datetime:
     """Return naive UTC for existing DateTime columns."""
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def project_owner_quota_lock_key(owner: str) -> str:
+    """Return the stable, non-identifying mutex key for an owner quota."""
+
+    normalized = str(owner or "").strip().lower()
+    return f"project-owner:{hashlib.sha256(normalized.encode('utf-8')).hexdigest()}"
 
 
 class TimestampMixin:
@@ -310,6 +333,285 @@ class StudyState(TimestampMixin, Base):
     last_review_result = Column(String, nullable=True)
     last_reviewed_at = Column(DateTime, nullable=True)
     next_review_at = Column(DateTime, nullable=True)
+
+
+class Project(TimestampMixin, Base):
+    """A durable, owner-scoped workflow workspace.
+
+    ``owner`` is always concrete, including auth-disabled installations.  That
+    avoids SQLite's special handling of NULL in unique constraints and keeps a
+    project key (for example REST) unambiguous within one account.
+    """
+
+    __tablename__ = "projects"
+
+    id = Column(String(36), primary_key=True)
+    owner = Column(String, nullable=False, index=True)
+    key = Column(String(12), nullable=False)
+    name = Column(String(160), nullable=False)
+    description = Column(Text, nullable=False, default="")
+    template = Column(String(32), nullable=False, default="general")
+    color = Column(String(16), nullable=False, default="#5b8abf")
+    icon = Column(String(32), nullable=True)
+    archived = Column(Boolean, nullable=False, default=False, index=True)
+    next_item_number = Column(Integer, nullable=False, default=1)
+    version = Column(Integer, nullable=False, default=1)
+
+    members = relationship(
+        "ProjectMember", back_populates="project", cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    stages = relationship(
+        "ProjectStage", back_populates="project", cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    work_items = relationship(
+        "ProjectWorkItem", back_populates="project", cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    activities = relationship(
+        "ProjectActivity", back_populates="project", cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+    __table_args__ = (
+        UniqueConstraint("owner", "key", name="uq_projects_owner_key"),
+        Index("ix_projects_owner_archived_updated", "owner", "archived", "updated_at"),
+    )
+
+
+class ProjectQuotaLock(Base):
+    """Stable row-level mutexes for cross-project quota admission.
+
+    SQLite serializes project writes with ``BEGIN IMMEDIATE``. Databases with
+    row-level locking need a durable row even when an owner does not yet own a
+    project; otherwise two first-project creates can both pass a count check.
+    Project-scoped lock rows cascade with their project so activity retention
+    does not create an unbounded lock registry under create/delete churn.
+    """
+
+    __tablename__ = "project_quota_locks"
+
+    key = Column(String(80), primary_key=True)
+    project_id = Column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=True,
+        index=True,
+    )
+    created_at = Column(DateTime, nullable=False, default=utcnow_naive)
+
+
+class ProjectMember(Base):
+    """One user's role inside a project."""
+
+    __tablename__ = "project_members"
+
+    project_id = Column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), primary_key=True,
+    )
+    username = Column(String, primary_key=True)
+    role = Column(String(16), nullable=False, default="viewer")
+    added_by = Column(String, nullable=True)
+    joined_at = Column(DateTime, nullable=False, default=utcnow_naive)
+
+    project = relationship("Project", back_populates="members")
+
+    __table_args__ = (
+        Index("ix_project_members_username", "username", "project_id"),
+    )
+
+
+class ProjectStage(TimestampMixin, Base):
+    """A user-orderable column in a project's board workflow."""
+
+    __tablename__ = "project_stages"
+
+    id = Column(String(36), primary_key=True)
+    project_id = Column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False,
+        index=True,
+    )
+    name = Column(String(80), nullable=False)
+    category = Column(String(24), nullable=False, default="todo")
+    color = Column(String(16), nullable=False, default="#64748b")
+    position = Column(Integer, nullable=False, default=0)
+    wip_limit = Column(Integer, nullable=True)
+
+    project = relationship("Project", back_populates="stages")
+    work_items = relationship(
+        "ProjectWorkItem", back_populates="stage", passive_deletes=True,
+    )
+
+    __table_args__ = (
+        Index("ix_project_stages_order", "project_id", "position"),
+    )
+
+
+class ProjectWorkItem(TimestampMixin, Base):
+    """A Jira-style issue/card belonging to exactly one project."""
+
+    __tablename__ = "project_work_items"
+
+    id = Column(String(36), primary_key=True)
+    project_id = Column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False,
+        index=True,
+    )
+    stage_id = Column(
+        String(36), ForeignKey("project_stages.id", ondelete="SET NULL"), nullable=True,
+        index=True,
+    )
+    item_number = Column(Integer, nullable=False)
+    item_type = Column(String(16), nullable=False, default="task")
+    title = Column(String(240), nullable=False)
+    description = Column(Text, nullable=False, default="")
+    priority = Column(String(16), nullable=False, default="medium")
+    labels = Column(JSON, nullable=False, default=list)
+    reporter = Column(String, nullable=False)
+    assignee = Column(String, nullable=True, index=True)
+    start_date = Column(String(10), nullable=True)
+    due_date = Column(String(10), nullable=True, index=True)
+    estimate_minutes = Column(Integer, nullable=False, default=0)
+    logged_minutes = Column(Integer, nullable=False, default=0)
+    parent_id = Column(
+        String(36), ForeignKey("project_work_items.id", ondelete="SET NULL"), nullable=True,
+        index=True,
+    )
+    blocked_by_id = Column(
+        String(36), ForeignKey("project_work_items.id", ondelete="SET NULL"), nullable=True,
+        index=True,
+    )
+    position = Column(Integer, nullable=False, default=0)
+    archived = Column(Boolean, nullable=False, default=False, index=True)
+    completed_at = Column(DateTime, nullable=True)
+    version = Column(Integer, nullable=False, default=1)
+
+    project = relationship("Project", back_populates="work_items")
+    stage = relationship("ProjectStage", back_populates="work_items")
+    parent = relationship(
+        "ProjectWorkItem", remote_side=[id], foreign_keys=[parent_id],
+        backref=backref("subtasks"),
+    )
+    blocked_by = relationship(
+        "ProjectWorkItem", remote_side=[id], foreign_keys=[blocked_by_id],
+        backref=backref("blocking"),
+    )
+    checklist = relationship(
+        "ProjectChecklistItem", back_populates="work_item",
+        cascade="all, delete-orphan", passive_deletes=True,
+    )
+    comments = relationship(
+        "ProjectComment", back_populates="work_item",
+        cascade="all, delete-orphan", passive_deletes=True,
+    )
+    attachments = relationship(
+        "ProjectAttachment", back_populates="work_item",
+        cascade="all, delete-orphan", passive_deletes=True,
+    )
+
+    __table_args__ = (
+        UniqueConstraint("project_id", "item_number", name="uq_project_work_item_number"),
+        Index(
+            "ix_project_work_items_board",
+            "project_id", "archived", "stage_id", "position",
+        ),
+    )
+
+
+class ProjectChecklistItem(TimestampMixin, Base):
+    __tablename__ = "project_checklist_items"
+
+    id = Column(String(36), primary_key=True)
+    work_item_id = Column(
+        String(36), ForeignKey("project_work_items.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    text = Column(String(500), nullable=False)
+    is_done = Column(Boolean, nullable=False, default=False)
+    position = Column(Integer, nullable=False, default=0)
+    created_by = Column(String, nullable=False)
+    completed_at = Column(DateTime, nullable=True)
+
+    work_item = relationship("ProjectWorkItem", back_populates="checklist")
+
+    __table_args__ = (
+        Index("ix_project_checklist_order", "work_item_id", "position"),
+    )
+
+
+class ProjectComment(TimestampMixin, Base):
+    __tablename__ = "project_comments"
+
+    id = Column(String(36), primary_key=True)
+    work_item_id = Column(
+        String(36), ForeignKey("project_work_items.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    author = Column(String, nullable=False)
+    body = Column(Text, nullable=False)
+    edited_at = Column(DateTime, nullable=True)
+
+    work_item = relationship("ProjectWorkItem", back_populates="comments")
+
+    __table_args__ = (
+        Index("ix_project_comments_item_created", "work_item_id", "created_at"),
+    )
+
+
+class ProjectAttachment(TimestampMixin, Base):
+    __tablename__ = "project_attachments"
+
+    id = Column(String(36), primary_key=True)
+    work_item_id = Column(
+        String(36), ForeignKey("project_work_items.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    uploader = Column(String, nullable=False)
+    kind = Column(String(16), nullable=False, default="reference")
+    description = Column(String(500), nullable=False, default="")
+    original_name = Column(String(240), nullable=False)
+    storage_key = Column(String(160), nullable=False, unique=True)
+    mime = Column(String(160), nullable=False)
+    size = Column(Integer, nullable=False)
+    sha256 = Column(String(64), nullable=False, index=True)
+    status = Column(String(16), nullable=False, default="ready", index=True)
+    supersedes_id = Column(
+        String(36), ForeignKey("project_attachments.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    work_item = relationship("ProjectWorkItem", back_populates="attachments")
+
+    __table_args__ = (
+        Index("ix_project_attachments_item_created", "work_item_id", "created_at"),
+    )
+
+
+class ProjectActivity(Base):
+    """Append-only project audit/event stream."""
+
+    __tablename__ = "project_activity"
+
+    id = Column(String(36), primary_key=True)
+    project_id = Column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False,
+        index=True,
+    )
+    work_item_id = Column(
+        String(36), ForeignKey("project_work_items.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
+    actor = Column(String, nullable=False)
+    event_type = Column(String(40), nullable=False, index=True)
+    summary = Column(String(500), nullable=False, default="")
+    payload = Column(JSON, nullable=False, default=dict)
+    created_at = Column(DateTime, nullable=False, default=utcnow_naive, index=True)
+
+    project = relationship("Project", back_populates="activities")
+
+    __table_args__ = (
+        Index("ix_project_activity_project_created", "project_id", "created_at"),
+        Index("ix_project_activity_item_created", "work_item_id", "created_at"),
+    )
 
 class Document(TimestampMixin, Base):
     """Living document that the AI can create and edit in-place."""

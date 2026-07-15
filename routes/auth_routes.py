@@ -6,6 +6,8 @@ from typing import Optional
 import asyncio
 import logging
 import os
+import uuid
+from functools import wraps
 
 import json
 import re
@@ -97,6 +99,88 @@ def username_reserved(name: str) -> bool:
 def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
     router = APIRouter(prefix="/api/auth", tags=["auth"])
 
+    def _reserve_identity_migration(*usernames: str) -> bool:
+        """Block owner-scoped writers across an auth rename transaction.
+
+        AuthManager.rename_user intentionally releases its config lock before
+        this route migrates SQL/file ownership. Reserving both identities under
+        that same lock closes the window where a newly renamed session could
+        create owner data that collides with the migration or survives a later
+        auth rollback.
+        """
+
+        names = {str(value or "").strip().lower() for value in usernames}
+        names.discard("")
+        lock = getattr(auth_manager, "_config_lock", None)
+        if lock is not None:
+            lock.acquire()
+        try:
+            active = set(getattr(auth_manager, "_identity_migrations", set()) or set())
+            if active.intersection(names):
+                return False
+            setattr(auth_manager, "_identity_migrations", active | names)
+            return True
+        finally:
+            if lock is not None:
+                lock.release()
+
+    def _release_identity_migration(*usernames: str) -> None:
+        names = {str(value or "").strip().lower() for value in usernames}
+        names.discard("")
+        lock = getattr(auth_manager, "_config_lock", None)
+        if lock is not None:
+            lock.acquire()
+        try:
+            active = set(getattr(auth_manager, "_identity_migrations", set()) or set())
+            active.difference_update(names)
+            setattr(auth_manager, "_identity_migrations", active)
+        finally:
+            if lock is not None:
+                lock.release()
+
+    def _guard_profile_identity_mutation(handler):
+        """Reserve a deletion target through preflight, auth, and cleanup."""
+
+        @wraps(handler)
+        async def guarded(body: DeleteUserRequest, request: Request):
+            target = str(body.username or "").strip().lower()
+            requesting_user = str(_get_current_user(request) or "").strip().lower()
+            identities = {value for value in (target, requesting_user) if value}
+            if identities and not _reserve_identity_migration(*identities):
+                raise HTTPException(409, "A profile identity change is already in progress")
+            try:
+                return await handler(body, request)
+            finally:
+                if identities:
+                    _release_identity_migration(*identities)
+
+        return guarded
+
+    def _guard_profile_rename(handler):
+        """Reserve rename source, destination, and requesting principal."""
+
+        @wraps(handler)
+        async def guarded(
+            username: str,
+            body: RenameUserRequest,
+            request: Request,
+        ):
+            old_username = str(username or "").strip().lower()
+            new_username = str(body.username or "").strip().lower()
+            requesting_user = str(_get_current_user(request) or "").strip().lower()
+            identities = {
+                value for value in (old_username, new_username, requesting_user) if value
+            }
+            if identities and not _reserve_identity_migration(*identities):
+                raise HTTPException(409, "A profile identity change is already in progress")
+            try:
+                return await handler(username, body, request)
+            finally:
+                if identities:
+                    _release_identity_migration(*identities)
+
+        return guarded
+
     _login_limiter = RateLimiter(max_requests=15, window_seconds=60)
     _signup_limiter = RateLimiter(max_requests=3, window_seconds=300)
     _setup_limiter = RateLimiter(max_requests=3, window_seconds=300)
@@ -121,6 +205,39 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
         ok = await asyncio.to_thread(auth_manager.setup, body.username, body.password)
         if not ok:
             raise HTTPException(500, "Setup failed")
+        # Projects created during localhost first-run use an immutable
+        # sentinel owner. Claim them as part of first-admin setup so adding
+        # more profiles before opening Projects cannot strand that data.
+        try:
+            from core.database import Project, SessionLocal, utcnow_naive
+            from routes.project_routes import _activity
+
+            setup_username = body.username.strip().lower()
+            db = SessionLocal()
+            try:
+                rows = db.query(Project).filter(Project.owner == "owner@localhost").order_by(
+                    Project.created_at.asc(), Project.id.asc()
+                ).all()
+                for project in rows:
+                    project.owner = setup_username
+                    project.updated_at = utcnow_naive()
+                    _activity(
+                        db,
+                        project.id,
+                        setup_username,
+                        "first_run_project_claimed",
+                        "Claimed first-run project during profile setup",
+                    )
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+            finally:
+                db.close()
+        except Exception:
+            # Setup itself succeeded. Keep the account usable and leave the
+            # sentinel rows eligible for the Projects route's singleton claim.
+            logger.exception("Failed to claim first-run projects during admin setup")
         return {"ok": True, "message": "Admin account created"}
 
     @router.post("/signup")
@@ -326,6 +443,7 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
 
     @router.put("/profiles/{username}/rename")
     @router.put("/users/{username}/rename", deprecated=True)
+    @_guard_profile_rename
     async def rename_user(username: str, body: RenameUserRequest, request: Request):
         user = _get_current_user(request)
         if not user or not auth_manager.is_admin(user):
@@ -343,6 +461,10 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
         if username_reserved(new_username):
             raise HTTPException(403, "Username is reserved")
 
+        # TODO(project-identity-journal): persist an idempotent pending rename
+        # before auth.json changes and resume it during startup. The in-process
+        # coordinator below closes request races, but process death between the
+        # auth save and SQL owner migration still requires durable recovery.
         # Gate on auth first. Every mutation below is contingent on this
         # succeeding — doing it last meant a rejected rename (e.g. reserved
         # username) left file-backed owner fields already rewritten with no
@@ -378,7 +500,10 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
             from core.database import (
                 Base, DirectMessage, HomeLink, LinkInvite, RemoteBlock,
                 RemoteContactPref, SessionLocal, StatusPost, StatusView,
-                UserKey, UserProfile,
+                UserKey, UserProfile, Project, ProjectMember,
+                ProjectWorkItem, ProjectChecklistItem, ProjectComment,
+                ProjectAttachment, ProjectActivity, ProjectQuotaLock,
+                project_owner_quota_lock_key,
             )
             db = SessionLocal()
             try:
@@ -396,6 +521,15 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
                 # renamed profile's private state or let a later profile with
                 # the old name inherit it.
                 identity_columns = (
+                    (Project, Project.owner),
+                    (ProjectMember, ProjectMember.username),
+                    (ProjectMember, ProjectMember.added_by),
+                    (ProjectWorkItem, ProjectWorkItem.reporter),
+                    (ProjectWorkItem, ProjectWorkItem.assignee),
+                    (ProjectChecklistItem, ProjectChecklistItem.created_by),
+                    (ProjectComment, ProjectComment.author),
+                    (ProjectAttachment, ProjectAttachment.uploader),
+                    (ProjectActivity, ProjectActivity.actor),
                     (DirectMessage, DirectMessage.sender),
                     (DirectMessage, DirectMessage.recipient),
                     (UserKey, UserKey.username),
@@ -413,6 +547,12 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
                         .filter(func.lower(column) == old_username)
                         .update({column.key: new_username}, synchronize_session=False)
                     )
+                # Owner quota mutexes are created lazily. Remove the obsolete
+                # hash so repeated profile renames cannot grow the lock table.
+                db.query(ProjectQuotaLock).filter(
+                    ProjectQuotaLock.key == project_owner_quota_lock_key(old_username),
+                    ProjectQuotaLock.project_id.is_(None),
+                ).delete(synchronize_session=False)
                 # Reaction ownership is encoded as JSON object keys rather
                 # than a column, so it needs an explicit rewrite too.
                 reacted = db.query(DirectMessage).filter(DirectMessage.reactions.isnot(None)).all()
@@ -654,10 +794,37 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
 
     @router.delete("/profiles")
     @router.delete("/users", deprecated=True)
+    @_guard_profile_identity_mutation
     async def admin_delete_user(body: DeleteUserRequest, request: Request):
         user = _get_current_user(request)
         if not user or not auth_manager.is_admin(user):
             raise HTTPException(403, "Admin only")
+
+        target_username = (body.username or "").strip().lower()
+        # A deleted owner cannot be recreated (usernames are retired), so
+        # silently leaving their projects behind would permanently remove the
+        # only principal allowed to manage stages/members/deletion. Require an
+        # explicit project transfer/delete first; the Projects API exposes an
+        # owner-only transfer endpoint for that workflow.
+        try:
+            from sqlalchemy import func
+            from core.database import Project, SessionLocal
+
+            db = SessionLocal()
+            try:
+                owned_projects = db.query(Project.id).filter(
+                    func.lower(Project.owner) == target_username
+                ).count()
+            finally:
+                db.close()
+        except Exception as exc:
+            logger.error("Failed project-ownership preflight for profile deletion: %s", exc)
+            raise HTTPException(503, "Could not verify project ownership; profile was not deleted")
+        if owned_projects:
+            raise HTTPException(
+                409,
+                f"Transfer or delete {owned_projects} owned project(s) before deleting this profile",
+            )
 
         def _invalidate_api_token_cache():
             try:
@@ -677,12 +844,99 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
             raise
         if not ok:
             raise HTTPException(400, "Cannot delete user")
-        # delete_user removes the user's ApiToken rows, but the bearer-auth
-        # middleware serves from an in-memory prefix->token cache that only
-        # rebuilds when flagged dirty. Without this, a deleted user's already
-        # cached token keeps authenticating until some other token op or a
-        # restart clears the cache. Mirror what the token routes do.
+        # Token revocation is already committed. Invalidate the process cache
+        # before any later project cleanup can fail and exit this request.
         _invalidate_api_token_cache()
+        # Membership is access state rather than historical attribution. Once
+        # the auth principal is gone, remove it and unassign open work; keep
+        # reporter/comment/activity names as immutable audit history.
+        try:
+            from sqlalchemy import func
+            from core.database import (
+                Project,
+                ProjectMember,
+                ProjectQuotaLock,
+                ProjectWorkItem,
+                SessionLocal,
+                project_owner_quota_lock_key,
+                utcnow_naive,
+            )
+            from routes.project_routes import _activity
+
+            db = SessionLocal()
+            try:
+                # A target request may have committed a project after the
+                # preflight but before delete_user acquired AuthManager's
+                # identity lock. Project writes now share that lock and reject
+                # retired actors, so this post-delete sweep deterministically
+                # catches the only remaining window and hands ownership to the
+                # deleting admin instead of stranding data.
+                admin_username = str(user).strip().lower()
+                raced_projects = db.query(Project).filter(
+                    func.lower(Project.owner) == target_username
+                ).order_by(Project.created_at.asc(), Project.id.asc()).all()
+                for project in raced_projects:
+                    candidate = project.key
+                    suffix = 2
+                    while db.query(Project.id).filter(
+                        Project.owner == admin_username,
+                        Project.key == candidate,
+                        Project.id != project.id,
+                    ).first():
+                        suffix_text = str(suffix)
+                        candidate = project.key[: 12 - len(suffix_text)] + suffix_text
+                        suffix += 1
+                    project.key = candidate
+                    project.owner = admin_username
+                    project.version = int(project.version or 1) + 1
+                    project.updated_at = utcnow_naive()
+                    db.query(ProjectMember).filter(
+                        ProjectMember.project_id == project.id,
+                        func.lower(ProjectMember.username) == admin_username,
+                    ).delete(synchronize_session=False)
+                    _activity(
+                        db,
+                        project.id,
+                        admin_username,
+                        "project_owner_recovered",
+                        "Recovered ownership during profile deletion",
+                        payload={"deleted_owner": target_username},
+                    )
+                    # SessionLocal disables autoflush. Materialize the newly
+                    # claimed owner/key before selecting the next collision so
+                    # two raced projects cannot both be assigned the same key.
+                    db.flush()
+                db.query(ProjectMember).filter(
+                    func.lower(ProjectMember.username) == target_username
+                ).delete(synchronize_session=False)
+                db.query(ProjectWorkItem).filter(
+                    func.lower(ProjectWorkItem.assignee) == target_username
+                ).update(
+                    {
+                        ProjectWorkItem.assignee: None,
+                        ProjectWorkItem.version: ProjectWorkItem.version + 1,
+                        ProjectWorkItem.updated_at: utcnow_naive(),
+                    },
+                    synchronize_session=False,
+                )
+                db.query(ProjectQuotaLock).filter(
+                    ProjectQuotaLock.key == project_owner_quota_lock_key(target_username),
+                    ProjectQuotaLock.project_id.is_(None),
+                ).delete(synchronize_session=False)
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+            finally:
+                db.close()
+        except Exception:
+            # Authentication deletion already committed and cannot be undone,
+            # but returning success would conceal stranded project ownership.
+            logger.exception("Failed to clean project membership for deleted profile %s", target_username)
+            raise HTTPException(
+                500,
+                "Profile was deleted, but project cleanup failed; administrator action is required",
+            )
         return {"ok": True}
 
     # ---- Feature visibility (admin-managed) ----

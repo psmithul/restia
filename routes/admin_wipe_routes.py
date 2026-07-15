@@ -6,7 +6,7 @@ nuking everything. The catch-all `chats` endpoint mirrors the
 existing /api/sessions/all so the Danger Zone speaks one URL pattern.
 
 URL shape: DELETE /api/admin/wipe/{kind}
-Kinds: chats, study, memory, skills, notes, tasks, documents, gallery, calendar.
+Kinds: chats, study, projects, memory, skills, notes, tasks, documents, gallery, calendar.
 """
 
 import json
@@ -31,8 +31,24 @@ from core.database import (
     CalendarEvent,
     CalendarCal,
     StudyState,
+    Project,
+    ProjectQuotaLock,
+    ProjectMember,
+    ProjectStage,
+    ProjectWorkItem,
+    ProjectChecklistItem,
+    ProjectComment,
+    ProjectAttachment,
+    ProjectActivity,
 )
-from src.constants import DATA_DIR, SKILLS_DIR, SKILLS_FILE, GALLERY_DIR, GALLERY_UPLOADS_DIR
+from src.constants import (
+    DATA_DIR,
+    SKILLS_DIR,
+    SKILLS_FILE,
+    GALLERY_DIR,
+    GALLERY_UPLOADS_DIR,
+    PROJECT_FILES_DIR,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +124,24 @@ def setup_admin_wipe_routes(session_manager):
                 count = db.query(StudyState).count()
                 db.query(StudyState).delete()
                 db.commit()
+                return {"status": "deleted", "kind": kind, "count": count}
+
+            if kind == "projects":
+                # Bulk deletes do not run ORM relationship cascades. Remove
+                # children in dependency order so the wipe is reliable even
+                # on SQLite connections where FK cascades are unavailable.
+                count = db.query(Project).count()
+                db.query(ProjectActivity).delete()
+                db.query(ProjectQuotaLock).delete()
+                db.query(ProjectAttachment).delete()
+                db.query(ProjectChecklistItem).delete()
+                db.query(ProjectComment).delete()
+                db.query(ProjectWorkItem).delete()
+                db.query(ProjectStage).delete()
+                db.query(ProjectMember).delete()
+                db.query(Project).delete()
+                db.commit()
+                _rmtree_quiet(PROJECT_FILES_DIR)
                 return {"status": "deleted", "kind": kind, "count": count}
 
             if kind == "skills":

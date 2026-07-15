@@ -30,7 +30,10 @@ def _fresh_auth_manager(tmp_path):
 
 @pytest.mark.parametrize(
     "name",
-    ["internal-tool", "api", "demo", "system", "INTERNAL-TOOL", " Internal-Tool ", "Api", "SYSTEM"],
+    [
+        "internal-tool", "api", "demo", "system", "owner@localhost",
+        "INTERNAL-TOOL", " Internal-Tool ", "Api", "SYSTEM", " Owner@Localhost ",
+    ],
 )
 def test_create_user_rejects_reserved_usernames(tmp_path, name):
     mgr = _fresh_auth_manager(tmp_path)
