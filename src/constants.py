@@ -4,7 +4,7 @@ import os
 
 from src.runtime_paths import get_app_root, get_default_data_dir
 
-APP_VERSION = "1.0.2"
+APP_VERSION = "2.0.0"
 
 # Git commit SHA baked in at Docker build time (via BUILD_COMMIT build arg).
 # Falls back to reading .git/HEAD at startup for non-Docker installs. Used by

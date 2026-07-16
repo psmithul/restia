@@ -31,6 +31,8 @@ let _phaseTimer = null;
 let _disconnectTimer = null;
 let _homeSignalTimer = null;
 let _homeSignalDown = false;
+let _homeReadyWaiters = new Set();
+let _startPending = false;
 let _transport = 'local';           // local | home
 let _incomingNotification = null;
 let _incomingNotificationTimer = null;
@@ -39,6 +41,7 @@ const RING_TIMEOUT_MS = 45_000;
 const CONNECT_TIMEOUT_MS = 30_000;
 const DISCONNECT_GRACE_MS = 8_000;
 const HOME_SIGNAL_GRACE_MS = 5_000;
+const HOME_PREFLIGHT_TIMEOUT_MS = 8_000;
 const MAX_PENDING_ICE = 64;
 const INCOMING_NOTIFICATION_REPEAT_MS = 12_000;
 
@@ -81,12 +84,21 @@ function _connectEventStream(path, transport) {
       }
     });
   });
-  stream.addEventListener('open', () => {
-    if (transport === 'home') {
+  // For Home Link EventSource's native `open` only means the same-origin
+  // proxy responded. The separate call-transport event below is emitted after
+  // that proxy has authenticated and subscribed to the remote hub.
+  if (transport === 'home') {
+    stream.addEventListener('call-transport', (e) => {
+      let status;
+      try { status = JSON.parse(e.data).status; } catch (_) { return; }
+      if (status !== 'ready') return;
       _homeSignalDown = false;
       _clearHomeSignalTimer();
-    }
-  });
+      const waiters = _homeReadyWaiters;
+      _homeReadyWaiters = new Set();
+      for (const resolve of waiters) resolve();
+    });
+  }
   stream.onerror = () => {
     // EventSource reconnects automatically. An active Home Link call may wait
     // through a brief network flap, but must not continue indefinitely without
@@ -131,6 +143,46 @@ function _turnHint() {
     : '';
 }
 
+function _homeSignalError() {
+  const err = new Error(
+    'Home Link signaling cannot reach the linked Restia. Check that the Home server is online and reachable, then reconnect Home Link in Messages if its address changed. TURN is not involved in this failure.',
+  );
+  err.code = 'home-signaling-unavailable';
+  err.userMessage = err.message;
+  return err;
+}
+
+async function _waitForHomeSignaling() {
+  if (!_homeEs) throw _homeSignalError();
+  if (!_homeSignalDown) return;
+  await new Promise((resolve, reject) => {
+    let settled = false;
+    const ready = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      _homeReadyWaiters.delete(ready);
+      reject(_homeSignalError());
+    }, HOME_PREFLIGHT_TIMEOUT_MS);
+    _homeReadyWaiters.add(ready);
+    // Close the tiny race where readiness arrived between the first check and
+    // registering this waiter.
+    if (!_homeSignalDown) ready();
+  });
+}
+
+function _signalingFailureMessage(err, action = 'continue') {
+  if (_transport === 'home') {
+    return `Could not ${action} the call: ${_homeSignalError().message}`;
+  }
+  return `Call signaling failed: ${_errorText(err, 'request failed')}.`;
+}
+
 function _reportDetachedSendFailure(err, action) {
   console.warn(`call ${action} signal failed`, err);
   uiModule.showToast && uiModule.showToast(`Could not send the ${action} signal`);
@@ -140,7 +192,9 @@ function _handleActiveSendFailure(err, callId, action = 'signaling') {
   console.error(`call ${action} failed`, err);
   if (callId !== _callId || _state === 'idle') return;
   uiModule.showError && uiModule.showError(
-    `Call ${action} failed: ${_errorText(err, 'request failed')}.${_turnHint()}`);
+    _transport === 'home'
+      ? _signalingFailureMessage(err)
+      : `Call ${action} failed: ${_errorText(err, 'request failed')}.`);
   _cleanup();
 }
 
@@ -400,7 +454,10 @@ function _armHomeSignalTimeout() {
   _homeSignalTimer = setTimeout(() => {
     _homeSignalTimer = null;
     if (_transport !== 'home' || _state === 'idle' || _callId !== callId) return;
-    _failConnection('Home Link signaling was lost.');
+    _failConnection(
+      'Home Link signaling was lost. Check that the Home server is online, then retry. TURN is not involved in this failure.',
+      false,
+    );
   }, HOME_SIGNAL_GRACE_MS);
 }
 
@@ -442,7 +499,7 @@ function _armDisconnectTimeout() {
   }, DISCONNECT_GRACE_MS);
 }
 
-function _failConnection(message) {
+function _failConnection(message, includeTurnHint = true) {
   if (_state === 'idle') return;
   const callId = _callId;
   const peer = _peer;
@@ -450,7 +507,8 @@ function _failConnection(message) {
     _send(peer, 'hangup', {}, callId)
       .catch((err) => console.warn('call failure hangup signal failed', err));
   }
-  uiModule.showError && uiModule.showError(`${message}${_turnHint()}`);
+  uiModule.showError && uiModule.showError(
+    `${message}${includeTurnHint ? _turnHint() : ''}`);
   _cleanup();
 }
 
@@ -472,8 +530,23 @@ export async function startCall(peer, video = true, options = {}) {
     uiModule.showError && uiModule.showError('Only this hub\'s configured owner can call linked users.');
     return;
   }
-  if (_state !== 'idle') { uiModule.showToast && uiModule.showToast('Already in a call'); return; }
+  if (_state !== 'idle' || _startPending) {
+    uiModule.showToast && uiModule.showToast('Already in a call');
+    return;
+  }
+  _startPending = true;
+  let phase = requestedTransport === 'home' ? 'home-preflight' : 'media';
   try {
+    // Do not open the microphone/camera or create an offer until the browser
+    // knows that the remote, authenticated Home signaling queue is live. A
+    // reconnect that succeeds inside this bounded window recovers
+    // automatically; a persistent outage fails before requesting media.
+    if (requestedTransport === 'home' && !_homeEs) _connectSignaling();
+    if (requestedTransport === 'home' && (!_homeEs || _homeSignalDown)) {
+      uiModule.showToast && uiModule.showToast('Checking Home Link signaling…');
+      await _waitForHomeSignaling();
+    }
+    phase = 'media';
     _requireMediaContext();
     const callId = _newCallId();
     _callId = callId;
@@ -503,6 +576,7 @@ export async function startCall(peer, video = true, options = {}) {
     await pc.setLocalDescription(offer);
     if (callId !== _callId || pc !== _pc || _state !== 'calling') return;
     const localOffer = pc.localDescription || offer;
+    phase = 'signaling';
     await _send(_peer, 'offer', { sdp: localOffer.sdp, video: !!video }, callId);
     if (callId !== _callId || _state !== 'calling') return;
     _outboundSignalReady = true;
@@ -513,9 +587,13 @@ export async function startCall(peer, video = true, options = {}) {
     const message = err && (err.code === 'insecure-context' || err.code === 'media-unavailable' ||
       err.name === 'NotAllowedError' || err.name === 'NotFoundError')
       ? _mediaFailureMessage(err, video)
-      : `Could not start the call: ${_errorText(err)}.${_turnHint()}`;
+      : phase === 'home-preflight' || (phase === 'signaling' && requestedTransport === 'home')
+        ? `Could not start the call: ${_homeSignalError().message}`
+        : `Could not start the call: ${_errorText(err)}.`;
     uiModule.showError && uiModule.showError(message);
     _cleanup();
+  } finally {
+    _startPending = false;
   }
 }
 
@@ -524,6 +602,7 @@ export async function acceptCall() {
   const incoming = _incoming;
   const callId = _callId;
   const peer = _peer;
+  let phase = 'media';
   _clearPhaseTimer();
   _closeIncomingNotification();
   try {
@@ -552,6 +631,7 @@ export async function acceptCall() {
     _renderConnecting();
     _attachLocalPreview();
     _armConnectTimeout();
+    phase = 'signaling';
     await _send(peer, 'answer', { sdp: localAnswer.sdp }, callId);
     if (callId !== _callId || peer !== _peer || _state === 'idle') return;
     _outboundSignalReady = true;
@@ -562,7 +642,9 @@ export async function acceptCall() {
     const message = err && (err.code === 'insecure-context' || err.code === 'media-unavailable' ||
       err.name === 'NotAllowedError' || err.name === 'NotFoundError')
       ? _mediaFailureMessage(err, incoming.video)
-      : `Could not accept the call: ${_errorText(err)}.${_turnHint()}`;
+      : phase === 'signaling' && _transport === 'home'
+        ? `Could not accept the call: ${_homeSignalError().message}`
+        : `Could not accept the call: ${_errorText(err)}.`;
     uiModule.showError && uiModule.showError(message);
     _cleanup();
   }
@@ -725,7 +807,7 @@ export function canCall(meta) {
   if (meta.remote) return !!_config.can_remote_call;
   return true;
 }
-export function isBusy() { return _state !== 'idle'; }
+export function isBusy() { return _state !== 'idle' || _startPending; }
 
 const callModule = {
   init, refreshConfig, startCall, acceptCall, declineCall, hangup,

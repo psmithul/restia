@@ -133,9 +133,81 @@ def test_sidebar_uses_one_inclusive_mobile_breakpoint_and_migrates_legacy_state(
     assert "window.innerWidth <= MOBILE_BREAKPOINT" in layout
     assert not re.search(r"window\.innerWidth\s*(?:<|>=|<=|>)\s*(?:700|768)", layout)
     assert "_temporaryMobileRightSide" in layout
+    assert "e.target.closest('#v2-mobile-nav')" in layout
     assert "Storage.get(Storage.KEYS.SIDEBAR_SIDE) === 'right'" in layout
+    assert "sidebar.toggleAttribute('inert', sidebarHidden)" in layout
+    assert "sidebar.setAttribute('aria-hidden', 'true')" in layout
+    assert "_sidebarWasVisible && sidebarHidden && activeWasInside" in layout
+    assert "document.querySelector('[data-mobile-nav=\"more\"]') || hamburgerBtn" in layout
     assert "Storage.getJSON('section-collapsed', null)" in init
     assert "Storage.setJSON(KEY, saved)" in init
+
+
+def test_mobile_backdrop_click_is_an_isolated_sidebar_dismissal():
+    values = _node_eval(
+        r"""
+        import { readFileSync } from 'node:fs';
+
+        const source = readFileSync('./static/js/sidebar-layout.js', 'utf8');
+        const match = source.match(
+          /mobileBackdrop\.addEventListener\('click', \(e\) => \{([\s\S]*?)\n  \}\);\n\n  document\.addEventListener\('keydown'/,
+        );
+        if (!match) throw new Error('mobile backdrop click handler not found');
+
+        const names = new Set(['visible']);
+        const sidebar = {
+          classList: {
+            contains(name) { return names.has(name); },
+            add(name) { names.add(name); },
+          },
+        };
+        const backdropNames = new Set(['visible']);
+        const mobileBackdrop = {
+          classList: { remove(name) { backdropNames.delete(name); } },
+        };
+        const document = {
+          getElementById(id) { return id === 'sidebar' ? sidebar : null; },
+          querySelector() { return null; },
+        };
+        const window = { _suppressSidebarClose: false };
+        let syncCalls = 0;
+        const syncRailSide = () => { syncCalls += 1; };
+        const event = {
+          defaultPrevented: false,
+          propagationStopped: false,
+          preventDefault() { this.defaultPrevented = true; },
+          stopPropagation() { this.propagationStopped = true; },
+        };
+        let missionControlOpen = true;
+        let tasksOpened = false;
+
+        const handler = new Function(
+          'e', 'window', 'document', 'mobileBackdrop', 'syncRailSide',
+          match[1],
+        );
+        handler(event, window, document, mobileBackdrop, syncRailSide);
+
+        console.log(JSON.stringify({
+          sidebarHidden: names.has('hidden'),
+          backdropVisible: backdropNames.has('visible'),
+          defaultPrevented: event.defaultPrevented,
+          propagationStopped: event.propagationStopped,
+          syncCalls,
+          missionControlOpen,
+          tasksOpened,
+        }));
+        """
+    )
+
+    assert values == {
+        "sidebarHidden": True,
+        "backdropVisible": False,
+        "defaultPrevented": True,
+        "propagationStopped": True,
+        "syncCalls": 1,
+        "missionControlOpen": True,
+        "tasksOpened": False,
+    }
 
 
 def test_chats_collapse_control_stays_visible_beside_header_actions():
@@ -155,6 +227,8 @@ def test_chats_collapse_control_stays_visible_beside_header_actions():
     assert "#sessions-section .section-collapse-btn:focus-visible" in css
     # Any shell release that changes a full workspace/sidebar CSS must advance both cache
     # layers; otherwise an installed app can combine new markup with old rules.
-    assert "/static/style.css?v=20260715instances" in html
-    assert "/static/projects.css?v=20260715instances" in html
-    assert "const CACHE_NAME = 'restia-v357'" in service_worker
+    assert "/static/style.css?v=20260715v2" in html
+    assert "/static/projects.css?v=20260715v2" in html
+    assert "/static/v2-shell.css?v=20260715v2" in html
+    assert "/static/mission-control.css?v=20260715v2" in html
+    assert "const CACHE_NAME = 'restia-v358'" in service_worker

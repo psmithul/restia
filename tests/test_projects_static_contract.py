@@ -39,6 +39,7 @@ def _parsed_html() -> _ElementParser:
 
 def test_projects_deep_link_serves_spa_and_registers_api_router():
     source = APP_PY.read_text(encoding="utf-8")
+    bootstrap = (ROOT / "src" / "v2" / "bootstrap.py").read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(APP_PY))
     route = next(
         node
@@ -54,8 +55,9 @@ def test_projects_deep_link_serves_spa_and_registers_api_router():
         and decorator.args[0].value == "/projects"
         for decorator in route.decorator_list
     )
-    assert "from routes.project_routes import setup_project_routes" in source
-    assert "app.include_router(setup_project_routes())" in source
+    assert "v2_feature_registry.install(app)" in source
+    assert "from routes.project_routes import setup_project_routes" in bootstrap
+    assert 'registry.register(FeatureSpec("projects"' in bootstrap
 
 
 def test_projects_launchers_and_customization_controls_are_semantic_and_unique():
@@ -70,7 +72,7 @@ def test_projects_launchers_and_customization_controls_are_semantic_and_unique()
     assert 'data-ui-key="tool-projects"' in html
     assert "'/projects': 'Projects — Restia'" in html
     assert "'/projects':" in html
-    assert '/static/projects.css?v=20260715instances' in html
+    assert '/static/projects.css?v=20260715v2' in html
 
 
 def test_projects_module_is_wired_as_a_full_workspace():
@@ -81,7 +83,9 @@ def test_projects_module_is_wired_as_a_full_workspace():
     assert "projectsModule.init(API_BASE" in app_js
     assert "currentUsername: () => window._currentUsername || ''" in app_js
     assert "window._currentUsername = String(d.username || '').trim().toLowerCase()" in app_js
-    assert "'rail-projects':  'tool-projects-btn'" in app_js
+    navigation = (ROOT / "static" / "js" / "navigation-registry.js").read_text(encoding="utf-8")
+    assert "NAVIGATION_ITEMS.flatMap" in app_js
+    assert "legacyIds: { rail: ['rail-projects'], sidebar: ['tool-projects-btn'] }" in navigation
     assert "'tool-projects':       '#tool-projects-btn, #rail-projects'" in app_js
     assert "'/projects': () =>" in app_js
 

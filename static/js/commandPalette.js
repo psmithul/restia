@@ -11,6 +11,7 @@
 import uiModule from './ui.js';
 import { topPortalZ } from './toolWindowZOrder.js';
 import messagingModule from './messaging.js';
+import { getNavigationItems } from './navigation-registry.js';
 
 const RECENTS_KEY = 'restia.palette.recents';
 const MAX_RECENTS = 6;
@@ -31,30 +32,24 @@ let _dynamic = [];        // content commands (conversations…), fetched async
 // (visible when expanded) are BOTH listed; run() clicks whichever is currently
 // visible, so the palette works at any width.
 function _spec() {
-  return [
-    // Tools
-    { id: 'messages', icon: '💬', title: 'Messages', hint: 'Open chats', btns: ['tool-messages-btn', 'rail-messages'], keys: 'dm chat talk' },
-    { id: 'notes', icon: '📝', title: 'Notes', hint: 'Open notes', btns: ['tool-notes-btn', 'rail-notes'], keys: 'note memo' },
-    { id: 'tasks', icon: '✅', title: 'Tasks', hint: 'Open tasks', btns: ['tool-tasks-btn', 'rail-tasks'], keys: 'task agent scheduled' },
-    { id: 'todos', icon: '☑️', title: 'Reminders & Todos', hint: 'Open todos', btns: ['tool-todos-btn', 'rail-todos'], keys: 'todo reminder' },
-    { id: 'calendar', icon: '📅', title: 'Calendar', hint: 'Open calendar', btns: ['tool-calendar-btn', 'rail-calendar'], keys: 'events schedule caldav' },
-    { id: 'documents', icon: '📄', title: 'Documents', hint: 'Open library', btns: ['tool-library-btn', 'rail-documents'], keys: 'docs editor writing' },
-    { id: 'gallery', icon: '🖼️', title: 'Gallery', hint: 'Open gallery', btns: ['tool-gallery-btn', 'rail-gallery'], keys: 'images photos pictures' },
-    { id: 'research', icon: '🔬', title: 'Deep Research', hint: 'Open research', btns: ['tool-research-btn', 'rail-research'], keys: 'research web report' },
-    { id: 'compare', icon: '⚖️', title: 'Compare Models', hint: 'Open compare', btns: ['tool-compare-btn', 'rail-compare'], keys: 'compare models test' },
-    { id: 'cookbook', icon: '📓', title: 'Cookbook', hint: 'Models & serving', btns: ['tool-cookbook-btn', 'rail-cookbook'], keys: 'cookbook models download serve' },
-    { id: 'memory', icon: '🧠', title: 'Memory', hint: 'Open memory', btns: ['tool-memory-btn', 'rail-memory'], keys: 'memory facts recall' },
-    { id: 'email', icon: '✉️', title: 'Email', hint: 'Open inbox', btns: ['rail-email', 'email-section-title'], keys: 'mail inbox imap' },
-    { id: 'settings', icon: '⚙️', title: 'Settings', hint: 'Open settings', btns: ['rail-settings', 'user-bar-settings'], keys: 'settings preferences config' },
-    { id: 'search', icon: '🔎', title: 'Search Chats', hint: 'Search your chats', btns: ['rail-search-btn'], keys: 'find search history' },
-    // Actions
-    { id: 'quick-note', icon: '⚡', title: 'Quick Note', hint: 'Jot something instantly', run: () => _openCapture('note'), keys: 'quick note capture jot memo write' },
-    { id: 'quick-todo', icon: '⚡', title: 'Quick Todo', hint: 'Capture a checklist', run: () => _openCapture('todo'), keys: 'quick todo task checklist capture' },
-    { id: 'new-chat', icon: '✨', title: 'New Chat', hint: 'Start a fresh session', btns: ['rail-new-session'], keys: 'new session conversation' },
-    { id: 'new-message', icon: '📨', title: 'New Message', hint: 'Message someone', btns: ['tool-messages-btn', 'rail-messages'], after: 'msg-newchat-btn', keys: 'dm new message compose' },
-    { id: 'share-moment', icon: '📸', title: 'Share a Moment', hint: 'Post a status photo', btns: ['tool-messages-btn', 'rail-messages'], after: 'msg-moment-add', keys: 'moment status photo bereal' },
-    { id: 'theme', icon: '🌗', title: 'Toggle Theme', hint: 'Light / dark', btns: ['tool-theme-btn', 'rail-theme'], keys: 'theme dark light appearance' },
-  ];
+  return getNavigationItems({ surface: 'command-palette', includeHidden: true })
+    .filter((item) => item.command)
+    .map((item) => {
+      const command = item.command;
+      let run = null;
+      if (command.handler === 'quick-capture:note') run = () => _openCapture('note');
+      else if (command.handler === 'quick-capture:todo') run = () => _openCapture('todo');
+      return {
+        id: command.id,
+        icon: command.icon,
+        title: command.title,
+        hint: command.hint,
+        btns: command.triggerIds || [],
+        after: command.afterTriggerId || null,
+        keys: (command.keywords || []).join(' '),
+        run,
+      };
+    });
 }
 
 function _isClickable(el) {

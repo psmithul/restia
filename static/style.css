@@ -1766,11 +1766,34 @@ body.bg-pattern-sparkles {
       font-family: inherit;
       text-align: left;
     }
+    .tool-library-main {
+      all: unset;
+      box-sizing: border-box;
+      display: flex;
+      flex: 1;
+      align-self: stretch;
+      min-width: 0;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+    }
+    .tool-library-main:focus-visible,
+    #email-section-title:focus-visible {
+      outline: 2px solid var(--accent, var(--red));
+      outline-offset: 2px;
+      border-radius: 4px;
+    }
     .list-item button {
       margin: 0;
       height: 24px;
       padding: 0 8px;
       font-size: 9px;
+    }
+    .list-item > .tool-library-main {
+      height: auto;
+      min-height: 0;
+      margin: 0;
+      padding: 0;
     }
     /* Inline "+" action on a tool/section row (Library → new document,
        Email → compose). Sizing forced + min-* zeroed so the mobile
@@ -5279,7 +5302,9 @@ body.bg-pattern-sparkles {
       }
     }
     #mobile-backdrop, #mobile-menu-btn { display:none !important; }
-    #sidebar-backdrop { display:none !important; }
+    @media (min-width: 769px) {
+      #sidebar-backdrop { display:none !important; }
+    }
     /* ----- Loading spinner ----- */
     @keyframes spin {
       to { transform: rotate(360deg); }
@@ -32911,6 +32936,11 @@ body.doc-find-active mark.doc-find-mark.current {
   opacity: 1 !important;
   background: none !important;
 }
+#email-section-title {
+  background: transparent;
+  height: auto;
+  min-height: 0;
+}
 #email-compose-btn svg {
   width: 11px;
   height: 11px;
@@ -32931,7 +32961,8 @@ body.doc-find-active mark.doc-find-mark.current {
   opacity: 0;
   transition: opacity 0.15s ease;
 }
-#tool-library-btn:hover #library-new-doc-btn {
+#tool-library-row:hover #library-new-doc-btn,
+#tool-library-row:focus-within #library-new-doc-btn {
   opacity: 0.7;
 }
 #library-new-doc-btn:hover {

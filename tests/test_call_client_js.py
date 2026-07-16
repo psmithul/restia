@@ -29,6 +29,7 @@ const FIXED_CALL_ID = '8e288d0b-f6a8-4ec3-a12f-a30f33d76993';
 let loadSequence = 0;
 
 async function loadCall({ secure = true, failKinds = [], deferMedia = false,
+  homeUnreachable = false,
   notificationPermission = 'granted', fullscreen = false,
   config = { enabled: true, turn: false, ice_servers: [{ urls: 'stun:test' }],
     can_home_call: false, can_remote_call: false } } = {}) {
@@ -157,6 +158,9 @@ async function loadCall({ secure = true, failKinds = [], deferMedia = false,
     const body = JSON.parse(opts.body || '{}');
     requests.push(body);
     requestUrls.push(String(url));
+    if (homeUnreachable && String(url).endsWith('/api/homelink/calls/signal')) {
+      return response(false, 502, { detail: 'Home server unreachable (ConnectError)' });
+    }
     if (failKinds.includes(body.kind)) return response(false, 503, { detail: `${body.kind} unavailable` });
     return response(true, 200, { ok: true });
   }
@@ -320,6 +324,8 @@ async function loadCall({ secure = true, failKinds = [], deferMedia = false,
   await h.ns.startCall('alice', true);
   assert.equal(h.ns.isBusy(), false);
   assert.match(h.errors.at(-1), /offer unavailable/);
+  assert.doesNotMatch(h.errors.at(-1), /STUN only|TURN relay/,
+    'same-origin signaling failures are unrelated to ICE relay availability');
 }
 
 {
@@ -359,8 +365,15 @@ async function loadCall({ secure = true, failKinds = [], deferMedia = false,
   await h.ns.refreshConfig();
   assert.equal(oldHomeStream.closed, true, 're-pairing must close the old bearer-backed stream');
   assert.equal(h.eventSources.at(-1).url, '/api/homelink/calls/stream');
+  // The local proxy opening is not enough: media must wait until the proxy
+  // confirms its authenticated upstream subscription.
   h.eventSources.at(-1).emit('open', {});
-  await h.ns.startCall('hub.example', false, { home: true });
+  const starting = h.ns.startCall('hub.example', false, { home: true });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.mediaCalls(), 0);
+  assert.equal(h.ns.isBusy(), true, 'Home preflight reserves the call slot');
+  h.eventSources.at(-1).emit('call-transport', { status: 'ready' });
+  await starting;
   assert.ok(h.requestUrls.every(url => url.endsWith('/api/homelink/calls/signal')));
   assert.equal('to' in h.requests[0], false, 'federated envelope must omit profile routing fields');
   h.eventSources.at(-1).onerror();
@@ -368,6 +381,60 @@ async function loadCall({ secure = true, failKinds = [], deferMedia = false,
   assert.equal(h.ns.isBusy(), false,
     'an active Home Link call must end if its authenticated signal stream stays down');
   assert.match(h.errors.at(-1), /signaling was lost/);
+  assert.doesNotMatch(h.errors.at(-1), /STUN only|TURN relay/);
+}
+
+{
+  const h = await loadCall({ config: {
+    enabled: true, turn: false, ice_servers: [{ urls: 'stun:test' }],
+    can_home_call: true, can_remote_call: false,
+  } });
+  // startCall must also establish its own signaling streams if module init has
+  // not completed yet; callers should not be able to bypass the preflight.
+  const starting = h.ns.startCall('hub.example', false, { home: true });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(h.eventSources.map(e => e.url),
+    ['/api/calls/stream', '/api/homelink/calls/stream']);
+  h.eventSources.at(-1).emit('open', {});
+  await h.runTimer(8_000);
+  await starting;
+  assert.equal(h.mediaCalls(), 0, 'an unreachable Home server must fail before media access');
+  assert.equal(h.requests.length, 0, 'preflight failure must not emit an offer');
+  assert.equal(h.ns.isBusy(), false);
+  assert.match(h.errors.at(-1), /Home Link signaling cannot reach/);
+  assert.match(h.errors.at(-1), /reconnect Home Link in Messages/);
+  assert.match(h.errors.at(-1), /TURN is not involved/);
+  assert.doesNotMatch(h.errors.at(-1), /STUN only|configure a TURN relay/);
+}
+
+{
+  const h = await loadCall({ homeUnreachable: true, config: {
+    enabled: true, turn: false, ice_servers: [{ urls: 'stun:test' }],
+    can_home_call: true, can_remote_call: false,
+  } });
+  await h.ns.init();
+  h.eventSources.at(-1).emit('call-transport', { status: 'ready' });
+  await h.ns.startCall('hub.example', false, { home: true });
+  assert.equal(h.ns.isBusy(), false);
+  assert.match(h.errors.at(-1), /Home Link signaling cannot reach/);
+  assert.match(h.errors.at(-1), /TURN is not involved/);
+  assert.doesNotMatch(h.errors.at(-1), /STUN only|configure a TURN relay|ConnectError/);
+}
+
+{
+  const h = await loadCall({ homeUnreachable: true, config: {
+    enabled: true, turn: false, ice_servers: [{ urls: 'stun:test' }],
+    can_home_call: true, can_remote_call: false,
+  } });
+  await h.ns.init();
+  h.eventSources.at(-1).emit('call-transport', { status: 'ready' });
+  await h.emit({ from: 'hub.example', call_id: FIXED_CALL_ID, kind: 'offer',
+    data: { sdp: 'v=0\r\no=hub\r\n', video: false } });
+  await h.ns.acceptCall();
+  assert.equal(h.ns.isBusy(), false);
+  assert.match(h.errors.at(-1), /Home Link signaling cannot reach/);
+  assert.match(h.errors.at(-1), /TURN is not involved/);
+  assert.doesNotMatch(h.errors.at(-1), /STUN only|configure a TURN relay|ConnectError/);
 }
 
 console.log('ok');

@@ -56,7 +56,7 @@ from urllib.parse import quote, unquote, urlparse
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictStr
 from sqlalchemy import and_, func, or_, text
 from sqlalchemy.orm import load_only
@@ -119,7 +119,16 @@ MAX_CALL_SSE_BUFFER_BYTES = 48 * 1024
 HOME_LINK_TERMINAL_GRACE_S = 3.0
 HOME_CALL_WATCH_IDLE_S = 5.0
 HOME_CALL_WATCH_MAX_BACKOFF_S = 20.0
-_HOME_CALL_UPSTREAM_READY = ": upstream-connected\n\n"
+# This marker is deliberately a browser-visible SSE event rather than a
+# comment.  The local Home Link proxy can accept its browser connection before
+# it has reached (and authenticated to) the remote hub; EventSource's native
+# ``open`` event therefore is not proof that call signaling is usable.  Emit a
+# credential-free readiness event only after the upstream bearer-scoped queue
+# is subscribed.
+_HOME_CALL_UPSTREAM_READY = (
+    'event: call-transport\n'
+    'data: {"status":"ready"}\n\n'
+)
 _home_call_watch_config_warned = False
 MAX_CALL_TARGET_LEN = 96
 MAX_CALL_KIND_LEN = 16
@@ -129,6 +138,13 @@ PROJECT_MUTATION_INDETERMINATE_DETAIL = (
     "Home server did not confirm this project change. It may have succeeded; "
     "reload linked projects before retrying."
 )
+PROJECT_UPLOAD_UPSTREAM_ERROR_DETAILS = {
+    408: "Project attachment upload timed out",
+    413: "Project attachment is too large",
+    415: "Project attachment upload must be multipart/form-data",
+    422: "Invalid project attachment upload request",
+    507: "Home server could not store the project attachment",
+}
 
 # Home Link's browser-facing Projects proxy is deliberately a closed protocol,
 # not a general-purpose forwarder. Each path segment is bounded and the allowed
@@ -146,7 +162,7 @@ _PROJECT_PROXY_RULES = tuple(
         (rf"invitations/{_PROJECT_PROXY_SEGMENT}/respond", ("POST",)),
         (rf"attachments/{_PROJECT_PROXY_SEGMENT}/download", ("GET",)),
         (rf"{_PROJECT_PROXY_SEGMENT}", ("GET", "PATCH")),
-        (rf"{_PROJECT_PROXY_SEGMENT}/(?:overview|board|stages|items|activity)", ("GET",)),
+        (rf"{_PROJECT_PROXY_SEGMENT}/(?:overview|context|board|stages|items|activity)", ("GET",)),
         (rf"{_PROJECT_PROXY_SEGMENT}/stages", ("POST",)),
         (rf"{_PROJECT_PROXY_SEGMENT}/stages/order", ("PUT",)),
         (rf"{_PROJECT_PROXY_SEGMENT}/stages/{_PROJECT_PROXY_SEGMENT}", ("PATCH", "DELETE")),
@@ -1943,6 +1959,7 @@ def _raise_hub_response_error(
     content: bytes,
     *,
     allow_not_found: bool = False,
+    safe_status_details: Optional[dict[int, str]] = None,
 ) -> None:
     """Map a bounded upstream error without exposing its URL or credential."""
     try:
@@ -1963,6 +1980,15 @@ def _raise_hub_response_error(
             detail
             if isinstance(detail, str) and len(detail) <= 300
             else "Home server refused the request",
+        )
+    safe_status_details = safe_status_details or {}
+    if status_code in safe_status_details:
+        fallback = str(safe_status_details[status_code])[:300]
+        raise HTTPException(
+            status_code,
+            detail
+            if isinstance(detail, str) and len(detail) <= 300
+            else fallback,
         )
     if status_code in (400, 409, 429) or (allow_not_found and status_code == 404):
         raise HTTPException(
@@ -2257,7 +2283,7 @@ async def _proxy_home_project_upload(
     staged_upload: tuple[BinaryIO, str, int],
     remote_path: str,
     snapshot: dict[str, Any],
-) -> dict:
+) -> JSONResponse:
     """Stream one staged, bounded multipart request to the pinned hub."""
     staged, content_type, content_length = staged_upload
     headers = {
@@ -2293,7 +2319,12 @@ async def _proxy_home_project_upload(
             PROJECT_MUTATION_INDETERMINATE_DETAIL,
         ) from exc
     if status_code >= 400:
-        _raise_hub_response_error(status_code, content, allow_not_found=True)
+        _raise_hub_response_error(
+            status_code,
+            content,
+            allow_not_found=True,
+            safe_status_details=PROJECT_UPLOAD_UPSTREAM_ERROR_DETAILS,
+        )
     try:
         value = json.loads(content)
     except Exception as exc:
@@ -2304,7 +2335,14 @@ async def _proxy_home_project_upload(
     if not isinstance(value, dict):
         raise HTTPException(502, PROJECT_MUTATION_INDETERMINATE_DETAIL)
     _assert_home_project_link_current(snapshot, mutation=True)
-    return value
+    # Preserve the authoritative endpoint's creation status for API semantics
+    # and observability. Restia's browser accepts every 2xx response, while
+    # external consumers may still distinguish creation (201) from update.
+    return JSONResponse(
+        status_code=status_code,
+        content=value,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 def _safe_project_download_headers(response: httpx.Response) -> dict[str, str]:

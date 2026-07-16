@@ -58,10 +58,11 @@ from datetime import datetime, timezone
 from typing import Dict
 
 from contextlib import asynccontextmanager
-from fastapi import Depends, FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from src.constants import APP_VERSION
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 
@@ -127,9 +128,9 @@ logger = logging.getLogger(__name__)
 # and passed to FastAPI so we can use the modern context-manager lifecycle
 # instead of the deprecated @app.on_event("startup"/"shutdown") decorators.
 app = FastAPI(
-    title="AI Chat Application",
-    description="Comprehensive AI chat with memory, research, and multi-modal capabilities",
-    version="1.0.0",
+    title="Restia",
+    description="Local-first personal AI workspace for planning, projects, knowledge, and communication",
+    version=APP_VERSION,
 )
 
 # Bound project multipart bodies before Starlette creates upload temp files.
@@ -836,6 +837,24 @@ app.include_router(setup_link_hub_routes())
 app.include_router(setup_link_project_invitation_routes())
 app.include_router(setup_home_link_routes())
 
+# Restia V2 feature boundary. Mission Control, Projects (local + linked), and
+# Calendar now share one deterministic registration order and one lifecycle
+# owner. New V2 model work receives only the LLMProvider capability exposed by
+# this registry; legacy callers continue through src.llm_core unchanged.
+from src.v2.bootstrap import build_v2_feature_registry
+from src.v2.llm_provider import RestiaLLMProvider
+
+llm_provider = RestiaLLMProvider()
+app.state.llm_provider = llm_provider
+v2_feature_registry = build_v2_feature_registry(
+    rag_manager=rag_manager,
+    memory_vector=memory_vector,
+    require_link_project_remote=require_link_project_remote,
+    llm_provider=llm_provider,
+)
+v2_feature_registry.install(app)
+calendar_router = v2_feature_registry.router_for("calendar")
+
 # End-to-end encryption key store (identity keys for encrypted DMs)
 from routes.e2ee_routes import setup_e2ee_routes
 app.include_router(setup_e2ee_routes())
@@ -868,22 +887,8 @@ set_task_scheduler(task_scheduler)
 from routes.task_routes import setup_task_routes
 app.include_router(setup_task_routes(task_scheduler))
 
-# Multi-project workflow boards, durable deliverables, and task activity.
-from routes.project_routes import setup_project_routes
-app.include_router(setup_project_routes())
-app.include_router(setup_project_routes(
-    prefix="/api/link/projects",
-    remote_only=True,
-    dependencies=[Depends(require_link_project_remote)],
-))
-
 from routes.assistant_routes import setup_assistant_routes
 app.include_router(setup_assistant_routes(task_scheduler))
-
-# Calendar (CalDAV)
-from routes.calendar_routes import setup_calendar_routes
-calendar_router = setup_calendar_routes()
-app.include_router(calendar_router)
 
 # Shell (user-facing command execution)
 from routes.shell_routes import setup_shell_routes
@@ -1017,6 +1022,14 @@ async def serve_study(request: Request):
 
 @app.get("/projects")
 async def serve_projects(request: Request):
+    return await serve_index(request)
+
+@app.get("/today")
+async def serve_today(request: Request):
+    return await serve_index(request)
+
+@app.get("/activity")
+async def serve_activity(request: Request):
     return await serve_index(request)
 
 # Per-tool deep-link routes — all serve the same SPA, the JS auto-opens
@@ -1181,16 +1194,24 @@ async def runtime_info() -> Dict[str, object]:
         "ollama_base_url": ollama_url,
     }
 
+# All imported routers and app-local route decorators now exist. Recheck only
+# the signatures owned by V2 so a later legacy include cannot silently shadow
+# one of its routes; unrelated historical duplicates remain outside this gate.
+v2_feature_registry.validate_final_routes(app)
+
 # ========= LIFECYCLE =========
 
 @asynccontextmanager
 async def _lifespan(app):
     """Modern lifespan context manager replacing deprecated @app.on_event."""
-    # ── STARTUP ──
-    await _startup_event()
-    yield
-    # ── SHUTDOWN ──
-    await _shutdown_event()
+    try:
+        # ── STARTUP ──
+        await _startup_event()
+        yield
+    finally:
+        # Run cleanup after a partial startup failure as well as a normal
+        # shutdown. Feature hooks are state-guarded, so they still run once.
+        await _shutdown_event()
 
 app.router.lifespan_context = _lifespan
 
@@ -1439,10 +1460,23 @@ async def _startup_event():
     from src.cookbook_serve_lifecycle import cookbook_serve_lifecycle_loop
     _startup_tasks.append(asyncio.create_task(cookbook_serve_lifecycle_loop()))
 
+    # V2 hooks start last so every declared legacy dependency is ready first.
+    # A hook failure is explicit and its already-started V2 predecessors are
+    # rolled back by the registry before the lifespan unwinds.
+    await v2_feature_registry.startup(app)
+
     logger.info("Application startup complete")
 
 async def _shutdown_event():
     logger.info("Application shutting down...")
+    v2_shutdown_error = None
+    if v2_feature_registry.state == v2_feature_registry.STARTED:
+        try:
+            # V2 started last, so its owned resources stop first.
+            await v2_feature_registry.shutdown(app)
+        except Exception as exc:
+            v2_shutdown_error = exc
+            logger.error("V2 feature shutdown failed", exc_info=True)
     if upload_cleanup_task:
         upload_cleanup_task.cancel()
         try:
@@ -1479,6 +1513,8 @@ async def _shutdown_event():
     except Exception:
         logger.warning("Incoming call notification shutdown failed")
     logger.info("Application shutdown complete")
+    if v2_shutdown_error is not None:
+        raise v2_shutdown_error
 
 
 if __name__ == "__main__":

@@ -74,12 +74,16 @@ function _bringToFront(modal) {
   modal.style.setProperty('z-index', String(z), 'important');
 }
 
-function _emitModalOpened(id, modal) {
+function _emitModalState(eventName, id, modal) {
   try {
-    window.dispatchEvent(new CustomEvent('odysseus:modal-opened', {
+    window.dispatchEvent(new CustomEvent(eventName, {
       detail: { id, modal },
     }));
   } catch (_) {}
+}
+
+function _emitModalOpened(id, modal) {
+  _emitModalState('odysseus:modal-opened', id, modal);
 }
 
 function _captureRestoreHeight(modal, state) {
@@ -1203,6 +1207,7 @@ export function register(id, { restoreFn, closeFn, railBtnId, sidebarBtnId, labe
 
 export function unregister(id) {
   const s = _state.get(id);
+  const modal = document.getElementById(id);
   if (s) _setBadge(s.btnIds, false);
   _state.delete(id);
   _chipPositions.delete(id);
@@ -1217,6 +1222,7 @@ export function unregister(id) {
   if (idx >= 0) _dockOrder.splice(idx, 1);
   _saveDockState();
   _renderDock();
+  if (s) _emitModalState('odysseus:modal-closed', id, modal);
 }
 
 export function isRegistered(id)  { return _state.has(id); }
@@ -1256,6 +1262,7 @@ export function minimize(id) {
   _setBadge(s.btnIds, true);
   _ensureDock();
   _renderDock();
+  _emitModalState('odysseus:modal-minimized', id, modal);
   return true;
 }
 
@@ -1317,6 +1324,7 @@ export function close(id) {
   if (shouldRememberDock) _rememberDock(id, suspendedDockSide);
   else _forgetDock(id);
   try { s.closeFn(); } catch (e) { console.error('closeFn:', e); }
+  const registeredAfterCloseFn = _state.has(id);
   // Some tools (cookbook) animate their close over ~250ms before adding
   // .hidden. If the user re-opens the tool before that finishes, open()
   // sees the modal as "still visible" and takes its no-op early-return
@@ -1347,6 +1355,8 @@ export function close(id) {
   _chipPositions.delete(id);
   _saveDockState();
   _renderDock();
+  // closeFn implementations that call unregister() already emitted this state.
+  if (registeredAfterCloseFn) _emitModalState('odysseus:modal-closed', id, modal || modalBeforeClose);
 }
 
 /** Inject a minimize (`_`) button next to the close button in a modal.
@@ -1535,6 +1545,7 @@ window.addEventListener('modal-dismissed', (e) => {
   }
   _ensureDock();
   _renderDock();
+  _emitModalState('odysseus:modal-minimized', id, modal);
   // Stop legacy listeners that reset internal `_open` state
   e.stopImmediatePropagation();
 });

@@ -265,7 +265,9 @@ def test_app_imports_initializes_and_routes_the_study_module():
         r"['\"]/study['\"]\s*:\s*\(\)\s*=>\s*document\.getElementById\(['\"]tool-study-btn['\"]\)",
         source,
     )
-    assert re.search(r"['\"]rail-study['\"]\s*:\s*['\"]tool-study-btn['\"]", source)
+    registry = (ROOT / "static" / "js" / "navigation-registry.js").read_text(encoding="utf-8")
+    assert "const _railToolMap = Object.fromEntries(NAVIGATION_ITEMS.flatMap" in source
+    assert "legacyIds: { rail: ['rail-study'], sidebar: ['tool-study-btn'] }" in registry
     assert re.search(r"toolStudyBtn\.addEventListener\(['\"]click['\"]", source)
     assert "await studyModule.enter()" in source
     assert "await studyModule.close({ startFresh: false })" in source

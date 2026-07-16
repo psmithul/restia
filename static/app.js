@@ -52,6 +52,8 @@ import spinnerModule from './js/spinner.js';
 import { initKeyboardShortcuts } from './js/keyboard-shortcuts.js';
 import { initSidebarLayout, syncRailSide } from './js/sidebar-layout.js';
 import { initSectionCollapse, initSectionDrag } from './js/section-management.js';
+import { activateNavigationItem, initV2NavigationShell } from './js/v2NavigationShell.js';
+import { NAVIGATION_ITEMS, findNavigationItemByLegacyId } from './js/navigation-registry.js';
 
 const API_BASE = window.location.origin;
 window.themeModule = themeModule;
@@ -164,31 +166,11 @@ function initForegroundActivityHeartbeat() {
 initForegroundActivityHeartbeat();
 
 function initRailHoverLabels() {
-  const labels = {
-    'rail-search-btn': 'Search',
-    'rail-new-session': 'New',
-    'rail-delete-session': 'Delete',
-    'rail-chats': 'Chat',
-    'rail-documents': 'Docs',
-    'rail-calendar': 'Calendar',
-    'rail-compare': 'Compare',
-    'rail-cookbook': 'Cookbook',
-    'rail-research': 'Research',
-    'rail-email': 'Email',
-    'rail-gallery': 'Gallery',
-    'rail-archive': 'Library',
-    'rail-memory': 'Brain',
-    'rail-notes': 'Notes',
-    'rail-projects': 'Projects',
-    'rail-study': 'Study',
-    'rail-todos': 'To Do',
-    'rail-tasks': 'Tasks',
-    'rail-theme': 'Theme',
-    'rail-settings': 'Settings',
-  };
   document.querySelectorAll('#icon-rail .icon-rail-btn').forEach(btn => {
     if (btn.querySelector('.rail-hover-label')) return;
-    const label = labels[btn.id] || btn.getAttribute('aria-label') || btn.getAttribute('title') || '';
+    const navigationItem = findNavigationItemByLegacyId(btn.id);
+    const label = navigationItem?.shortLabel || navigationItem?.label
+      || btn.getAttribute('aria-label') || btn.getAttribute('title') || '';
     if (!label) return;
     const span = document.createElement('span');
     span.className = 'rail-hover-label';
@@ -1136,7 +1118,10 @@ function initializeEventListeners() {
   if (toolProjectsBtn) {
     toolProjectsBtn.addEventListener('click', () => {
       if (!projectsModule) return;
-      if (projectsModule.isOpen()) projectsModule.close();
+      // Projects is a destination, not a toggle. Re-selecting it from the
+      // sidebar, rail, command palette, or mobile nav keeps the workspace open
+      // and restores focus; the workspace's explicit Close action owns exit.
+      if (projectsModule.isOpen()) projectsModule.focus();
       else {
         _collapseSidebarToRail();
         void projectsModule.open();
@@ -1151,6 +1136,11 @@ function initializeEventListeners() {
   if (toolStudyBtn) {
     toolStudyBtn.addEventListener('click', async () => {
       if (!studyModule) return;
+      if (projectsModule?.isOpen?.()) {
+        const closed = await projectsModule.close();
+        if (!closed) return;
+      }
+      window.missionControlModule?.close?.();
       if (studyModule.isActive()) {
         studyModule.focus();
         return;
@@ -1241,6 +1231,8 @@ function initializeEventListeners() {
     }
   }
   const _routeOpen = {
+    '/today':    () => activateNavigationItem('home'),
+    '/activity': () => activateNavigationItem('activity'),
     '/study':    () => document.getElementById('tool-study-btn')?.click(),
     '/projects': () => {
       if (!projectsModule) return;
@@ -3680,6 +3672,7 @@ function startRestiaApp() {
   _bumpChatPriority(10000);
   // Set CSS variables
   document.documentElement.style.setProperty('--line-height', '20px');
+  initV2NavigationShell();
   initRailHoverLabels();
 
   // Smooth keyboard open/close on mobile — keep chat scrolled to bottom
@@ -3781,23 +3774,11 @@ function startRestiaApp() {
   }
 
   // Rail tool buttons — delegate to sidebar tool buttons
-  const _railToolMap = {
-    'rail-compare':   'tool-compare-btn',
-    'rail-research':  'tool-research-btn',
-    'rail-cookbook':   'tool-cookbook-btn',
-    'rail-archive':   'tool-library-btn',
-    'rail-gallery':   'tool-gallery-btn',
-    'rail-tasks':     'tool-tasks-btn',
-    'rail-messages':  'tool-messages-btn',
-    'rail-calendar':  'tool-calendar-btn',
-    'rail-notes':     'tool-notes-btn',
-    'rail-projects':  'tool-projects-btn',
-    'rail-study':     'tool-study-btn',
-    'rail-todos':     'tool-todos-btn',
-    'rail-memory':    'tool-memory-btn',
-    'rail-theme':     'tool-theme-btn',
-    'rail-email':     'email-section-title',
-  };
+  const _railToolMap = Object.fromEntries(NAVIGATION_ITEMS.flatMap((item) => {
+    const sidebarId = item.legacyIds.sidebar.find((id) =>
+      id.startsWith('tool-') || id === 'email-section-title');
+    return sidebarId ? item.legacyIds.rail.map((railId) => [railId, sidebarId]) : [];
+  }));
   Object.entries(_railToolMap).forEach(([railId, toolId]) => {
     const railBtn = el(railId);
     if (railBtn) {
@@ -4529,7 +4510,7 @@ function startRestiaApp() {
 
   // Restore saved order on load
   const savedOrder = Storage.get(Storage.KEYS.SECTION_ORDER);
-  if (savedOrder) {
+  if (savedOrder && document.getElementById('sidebar')?.dataset.navigationVersion !== '2') {
     try {
       const order = JSON.parse(savedOrder);
       const innerContainer = sidebarInner || document.getElementById('sidebar');

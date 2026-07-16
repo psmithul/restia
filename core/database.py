@@ -354,6 +354,10 @@ class Project(TimestampMixin, Base):
     color = Column(String(16), nullable=False, default="#5b8abf")
     icon = Column(String(32), nullable=True)
     archived = Column(Boolean, nullable=False, default=False, index=True)
+    # Completion is a first-class lifecycle state, distinct from archival.
+    # Completed projects remain visible as durable outcomes and can be
+    # reopened; archival is reserved for removing a project from active use.
+    completed_at = Column(DateTime, nullable=True, index=True)
     next_item_number = Column(Integer, nullable=False, default=1)
     version = Column(Integer, nullable=False, default=1)
 
@@ -2196,6 +2200,43 @@ def _migrate_add_api_token_scopes_column():
         except Exception:
             pass
 
+
+def _migrate_add_project_completion_column():
+    """Add the reversible project completion marker to existing installs."""
+    import sqlite3
+
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(projects)").fetchall()]
+        if columns and "completed_at" not in columns:
+            conn.execute("ALTER TABLE projects ADD COLUMN completed_at DATETIME")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_projects_completed_at ON projects (completed_at)"
+            )
+            conn.commit()
+            logging.getLogger(__name__).info("Migrated: added completed_at column to projects")
+    except Exception as e:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        logging.getLogger(__name__).exception(
+            "Required projects.completed_at migration failed"
+        )
+        raise RuntimeError(
+            "Required projects.completed_at migration failed; database schema is unusable"
+        ) from e
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
 def _migrate_assign_legacy_owner():
     """Assign all null-owner data to the first (admin) user.
 
@@ -2846,6 +2887,7 @@ def init_db():
     _migrate_add_multiuser_owner_columns()
     _migrate_add_gallery_caption_column()
     _migrate_add_api_token_scopes_column()
+    _migrate_add_project_completion_column()
     _migrate_backfill_document_owner_from_session()
     _migrate_assign_legacy_owner()
     _migrate_add_tidy_verdict()

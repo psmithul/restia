@@ -45,6 +45,24 @@ export function initSidebarLayout(Storage, opts) {
   const sidebar = document.getElementById('sidebar');
   let _temporaryMobileRightSide = false;
   let _wasMobileViewport = _isMobileViewport();
+  let _sidebarWasVisible = Boolean(sidebar && !sidebar.classList.contains('hidden'));
+
+  function _syncSidebarAccessibility(sidebarHidden) {
+    if (!sidebar) return;
+    const activeWasInside = sidebar.contains(document.activeElement);
+    sidebar.toggleAttribute('inert', sidebarHidden);
+    if (sidebarHidden) sidebar.setAttribute('aria-hidden', 'true');
+    else sidebar.removeAttribute('aria-hidden');
+
+    // Every mobile dismissal path (toggle, backdrop, swipe, outside click,
+    // tool launch, or Escape) converges here. Never leave keyboard focus in an
+    // off-canvas inert drawer.
+    if (_isMobileViewport() && _sidebarWasVisible && sidebarHidden && activeWasInside) {
+      const returnTarget = document.querySelector('[data-mobile-nav="more"]') || hamburgerBtn;
+      try { returnTarget?.focus({ preventScroll: true }); } catch (_) { try { returnTarget?.focus(); } catch (_) {} }
+    }
+    _sidebarWasVisible = !sidebarHidden;
+  }
 
   function _setSidebarRightSide(wantRight, { persist = false, syncDocument = true } = {}) {
     if (!sidebar) return false;
@@ -63,6 +81,7 @@ export function initSidebarLayout(Storage, opts) {
     if (!iconRail || !sidebar) return;
     const isRight = sidebar.classList.contains('right-side');
     const sidebarHidden = sidebar.classList.contains('hidden');
+    _syncSidebarAccessibility(sidebarHidden);
     const railHidden = iconRail.classList.contains('rail-hidden');
     const isMobileMini = iconRail.classList.contains('mobile-mini');
     iconRail.classList.toggle('right-side', isRight);
@@ -92,6 +111,8 @@ export function initSidebarLayout(Storage, opts) {
       btn.setAttribute('aria-label', sidebarHidden ? 'Show sidebar' : 'Collapse sidebar');
       btn.title = sidebarHidden ? 'Show sidebar' : 'Collapse sidebar';
     });
+    const mobileMore = document.querySelector('[data-mobile-nav="more"]');
+    mobileMore?.setAttribute('aria-expanded', String(!sidebarHidden));
     // Keep incognito button clear of hamburger
     const incogBtn = document.getElementById('incognito-btn');
     if (incogBtn) {
@@ -310,6 +331,10 @@ export function initSidebarLayout(Storage, opts) {
   // Suppress sidebar close briefly after dropdown actions
   window._suppressSidebarClose = false;
   mobileBackdrop.addEventListener('click', (e) => {
+    // The scrim owns this gesture. Keep it from reaching document-level
+    // navigation/modal handlers after the drawer state changes underneath it.
+    e.preventDefault();
+    e.stopPropagation();
     if (window._suppressSidebarClose) return;
     // Don't close while a session is being renamed inline — the rename input
     // lives inside the sidebar, and a backdrop tap (e.g. to dismiss the
@@ -327,6 +352,17 @@ export function initSidebarLayout(Storage, opts) {
     if (sb && !sb.classList.contains('hidden')) {
       sb.classList.add('hidden');
     }
+    mobileBackdrop.classList.remove('visible');
+    syncRailSide();
+  });
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape' || !_isMobileViewport()) return;
+    const sb = document.getElementById('sidebar');
+    if (!sb || sb.classList.contains('hidden')) return;
+    e.preventDefault();
+    e.stopPropagation();
+    sb.classList.add('hidden');
     mobileBackdrop.classList.remove('visible');
     syncRailSide();
   });
@@ -370,7 +406,7 @@ export function initSidebarLayout(Storage, opts) {
     // Ignore clicks on elements removed from DOM (e.g. session list re-render during folder toggle)
     if (!e.target.isConnected) return;
     // Ignore clicks on the sidebar, icon rail, or hamburger button itself
-    if (e.target.closest('#sidebar') || e.target.closest('#icon-rail') || e.target.closest('#hamburger-btn') || e.target.closest('#sidebar-toggle-btn')) return;
+    if (e.target.closest('#sidebar') || e.target.closest('#icon-rail') || e.target.closest('#v2-mobile-nav') || e.target.closest('#hamburger-btn') || e.target.closest('#sidebar-toggle-btn')) return;
     // Ignore clicks inside modals or the chat input area
     if (e.target.closest('.modal') || e.target.closest('.input-bar') || e.target.closest('#message')) return;
     // Ignore clicks on session/folder dropdowns and the styled prompt

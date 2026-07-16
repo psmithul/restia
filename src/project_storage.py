@@ -430,15 +430,22 @@ class ProjectFileStore:
         self,
         referenced_storage_keys: Iterable[str],
         *,
+        delete_durable_orphans: bool = False,
         grace_seconds: float = PROJECT_RECONCILE_GRACE_SECONDS,
         max_entries: int = PROJECT_RECONCILE_MAX_ENTRIES,
         time_budget_seconds: float = PROJECT_RECONCILE_TIME_BUDGET_SECONDS,
     ) -> dict[str, int | bool]:
-        """Remove old orphan/temp files while preserving every DB reference.
+        """Remove stale private temp files and optionally durable orphans.
 
         Filesystem traversal is entry- and time-bounded, never follows
         symlinks, and recognizes only this store's three-segment attachment
         paths or its private atomic-temp prefix. Unknown files are left alone.
+
+        Durable attachment files are preserved by default. A caller may be
+        connected to a different or incomplete database while sharing this
+        storage root, so absence from one reference scan is not proof that a
+        durable file is safe to delete. Explicit maintenance may opt in only
+        after establishing that the reference set is authoritative.
         """
 
         if grace_seconds < 0:
@@ -566,6 +573,8 @@ class ProjectFileStore:
                         except HTTPException:
                             continue
                         if expected != resolved:
+                            continue
+                        if not delete_durable_orphans:
                             continue
                     try:
                         modified_at = entry.stat(follow_symlinks=False).st_mtime

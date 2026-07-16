@@ -354,3 +354,38 @@ def test_expand_daily_rrule_large_window_is_capped_and_marked_truncated():
     assert len(results) == cal._RRULE_EXPANSION_LIMIT
     assert results[-1]["uid"] == "evt-daily-cap::2022-09-26T09:00"
     assert all(r["truncated"] is True for r in results)
+
+
+@pytest.mark.parametrize(
+    ("work_limit", "output_limit", "expected"),
+    ((2, 100, 2), (100, 3, 3)),
+)
+def test_shared_recurrence_budget_caps_request_work_and_output(
+    work_limit,
+    output_limit,
+    expected,
+):
+    cal = import_calendar_routes()
+    ev = _make_event(
+        uid="evt-request-budget",
+        dtstart=datetime(2026, 6, 1, 9, 0),
+        dtend=datetime(2026, 6, 1, 9, 30),
+        rrule="FREQ=HOURLY",
+    )
+    budget = cal._RecurrenceBudget(
+        work_limit=work_limit,
+        output_limit=output_limit,
+    )
+
+    results = cal._expand_rrule(
+        ev,
+        datetime(2026, 6, 1),
+        datetime(2026, 6, 3),
+        limit=100,
+        work_limit=100,
+        budget=budget,
+    )
+
+    assert len(results) == expected
+    assert results.truncated is True
+    assert budget.exhausted is True

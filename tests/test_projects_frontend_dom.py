@@ -272,6 +272,11 @@ def test_activity_scope_rejects_stale_local_to_home_error_race():
     )[0]
     assert "state.activityGate.invalidate();" in select_source
     assert "state.activityController?.abort();" in select_source
+    assert "state.project = selected;" in select_source
+    assert "state.stages = [];" in select_source
+    assert "state.items = [];" in select_source
+    assert "state.members = [];" in select_source
+    assert "state.mobileStageId = null;" in select_source
     activity_source = source.split("async function loadActivity", 1)[1].split(
         "export async function moveTask", 1
     )[0]
@@ -363,8 +368,11 @@ def test_linked_projects_members_and_invitations_are_transport_scoped():
         """
         const local = __test.normalizeProject({id:'same',name:'Local',source:'local'});
         const linked = __test.normalizeProject({id:'same',name:'Linked',source:'home',role:'editor'});
+        const completed = __test.normalizeProject({
+          id:'done',name:'Completed',source:'local',completed_at:'2026-07-15T12:00:00Z'
+        });
         const archived = __test.normalizeProject({id:'old',name:'Old',source:'home',archived:true});
-        const groups = __test.projectGroups([local,linked,archived]);
+        const groups = __test.projectGroups([local,linked,completed,archived]);
         const profile = __test.normalizeMember({username:'mits',kind:'profile',role:'editor'});
         const activeInstance = __test.normalizeMember({
           id:'grant-1',handle:'lab',kind:'instance',role:'editor',status:'accepted',version:4
@@ -389,7 +397,11 @@ def test_linked_projects_members_and_invitations_are_transport_scoped():
             __test.projectPath('same','/board','local'),
             __test.projectPath('same','/board','home'),
           ],
-          groups:{local:groups.local.map(x=>x.name),home:groups.home.map(x=>x.name)},
+          groups:{
+            local:groups.local.map(x=>x.name),
+            home:groups.home.map(x=>x.name),
+            completed:groups.completed.map(x=>x.name),
+          },
           members:{
             profile:{kind:profile.kind,status:profile.status,assignable:__test.isAssignableMember(profile)},
             active:{kind:activeInstance.kind,status:activeInstance.status,grant:activeInstance.grant_id,
@@ -413,7 +425,7 @@ def test_linked_projects_members_and_invitations_are_transport_scoped():
         "keys": ["local::same", "home::same"],
         "parsed": {"source": "home", "id": "same"},
         "paths": ["/api/projects/same/board", "/api/homelink/projects/same/board"],
-        "groups": {"local": ["Local"], "home": ["Linked"]},
+        "groups": {"local": ["Local"], "home": ["Linked"], "completed": ["Completed"]},
         "members": {
             "profile": {"kind": "profile", "status": "active", "assignable": True},
             "active": {
@@ -440,6 +452,97 @@ def test_linked_projects_members_and_invitations_are_transport_scoped():
         },
         "board": {"source": "home", "actor": "grant-1"},
     }
+
+
+def test_linked_attachment_upload_contract_is_executable_and_status_aware():
+    result = run_node(
+        """
+        class FakeFormData {
+          constructor() { this.rows = []; }
+          append(name, value, filename) { this.rows.push([name, value, filename]); }
+        }
+        const context = {
+          projectId:'11111111-1111-1111-1111-111111111111',
+          itemId:'22222222-2222-2222-2222-222222222222',
+          source:'home',
+        };
+        const file = {name:'evidence.txt'};
+        const form = __test.buildAttachmentFormData({
+          file, kind:'deliverable', description:'Remote result',
+        }, {
+          submissionNote:'Ready for review',
+          transitionStageId:'33333333-3333-3333-3333-333333333333',
+          version:4,
+        }, FakeFormData);
+        const rows = form.rows.map(([name, value, filename]) => [
+          name,
+          name === 'file' ? value.name : value,
+          filename || null,
+        ]);
+        const errors = {};
+        for (const [status, detail] of [
+          [403, 'Project role does not allow this action'],
+          [413, 'Attachment exceeds 50 MB limit'],
+        ]) {
+          try { __test.resolveUploadResponse(status, {detail}); }
+          catch (error) {
+            errors[status] = {status:error.status, message:error.message, detail:error.payload.detail};
+          }
+        }
+        console.log(JSON.stringify({
+          path:__test.attachmentUploadPath(context),
+          rows,
+          ok200:__test.resolveUploadResponse(200, {attachment:{id:'a'}}),
+          ok201:__test.resolveUploadResponse(201, {attachment:{id:'b'}}),
+          errors,
+        }));
+        """
+    )
+    assert result == {
+        "path": (
+            "/api/homelink/projects/11111111-1111-1111-1111-111111111111/"
+            "items/22222222-2222-2222-2222-222222222222/attachments"
+        ),
+        "rows": [
+            ["file", "evidence.txt", "evidence.txt"],
+            ["kind", "deliverable", None],
+            ["description", "Remote result", None],
+            ["submission_note", "Ready for review", None],
+            [
+                "transition_stage_id",
+                "33333333-3333-3333-3333-333333333333",
+                None,
+            ],
+            ["version", "4", None],
+        ],
+        "ok200": {"attachment": {"id": "a"}},
+        "ok201": {"attachment": {"id": "b"}},
+        "errors": {
+            "403": {
+                "status": 403,
+                "message": "Project role does not allow this action",
+                "detail": "Project role does not allow this action",
+            },
+            "413": {
+                "status": 413,
+                "message": "Attachment exceeds 50 MB limit",
+                "detail": "Attachment exceeds 50 MB limit",
+            },
+        },
+    }
+
+
+def test_project_completion_counts_only_active_incomplete_checklist_steps():
+    result = run_node(
+        """
+        console.log(JSON.stringify({remaining: __test.countIncompleteChecklistSteps([
+          {checklist_count: 4, checklist_done: 1, archived: false},
+          {checklist_count: 2, checklist_done: 2, archived: false},
+          {checklist_count: 5, checklist_done: 0, archived: true},
+        ])}));
+        """
+    )
+    assert result == {"remaining": 3}
 
 
 def test_item_response_merge_applies_backend_aliases_and_preserves_loaded_detail():

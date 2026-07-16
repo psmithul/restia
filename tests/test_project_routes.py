@@ -128,7 +128,20 @@ async def test_project_templates_members_and_owner_scoping(project_env):
         templates = await client.get("/api/projects/templates", headers=_headers("alice"))
         assert templates.status_code == 200
         template_ids = {row["id"] for row in templates.json()["templates"]}
-        assert {"general", "software", "research", "content", "personal", "coursework", "gtm"} <= template_ids
+        assert {
+            "general",
+            "software",
+            "research",
+            "content",
+            "personal",
+            "coursework",
+            "gtm",
+            "applications",
+            "engineering_labbook",
+            "opportunity_radar",
+            "gtm_pipeline",
+            "weekly_review",
+        } <= template_ids
 
         created = await _create_project(client)
         project = created["project"]
@@ -242,6 +255,284 @@ async def test_project_templates_members_and_owner_scoping(project_env):
         assert handed_off.json()["item"]["assignee"] is None
         assert handed_off.json()["item"]["version"] == 2
         assert (await client.get(f"/api/projects/{project_id}", headers=_headers("alice"))).status_code == 404
+
+
+@pytest.mark.parametrize(
+    ("template_id", "expected_name", "expected_stages"),
+    [
+        (
+            "applications",
+            "Applications Cockpit",
+            [
+                ("Researching", "backlog", "#64748b"),
+                ("Shortlisted", "todo", "#3b82f6"),
+                ("Preparing", "in_progress", "#f59e0b"),
+                ("Submitted", "review", "#8b5cf6"),
+                ("Decision", "done", "#22c55e"),
+            ],
+        ),
+        (
+            "engineering_labbook",
+            "Engineering Labbook",
+            [
+                ("Ideas & Questions", "backlog", "#64748b"),
+                ("Planned", "todo", "#3b82f6"),
+                ("Setup & Calibration", "todo", "#06b6d4"),
+                ("Experiment Running", "in_progress", "#f59e0b"),
+                ("Analysis", "review", "#8b5cf6"),
+                ("Findings", "done", "#22c55e"),
+            ],
+        ),
+        (
+            "opportunity_radar",
+            "Opportunity Radar",
+            [
+                ("Discovered", "backlog", "#64748b"),
+                ("Evaluating", "todo", "#3b82f6"),
+                ("Qualified", "todo", "#06b6d4"),
+                ("Pursuing", "in_progress", "#f59e0b"),
+                ("Waiting", "review", "#8b5cf6"),
+                ("Closed", "done", "#22c55e"),
+            ],
+        ),
+        (
+            "gtm_pipeline",
+            "GTM Pipeline",
+            [
+                ("Accounts", "backlog", "#64748b"),
+                ("Qualified", "todo", "#3b82f6"),
+                ("Outreach", "in_progress", "#f59e0b"),
+                ("Conversation", "in_progress", "#06b6d4"),
+                ("Pilot / Proposal", "review", "#8b5cf6"),
+                ("Closed", "done", "#22c55e"),
+            ],
+        ),
+        (
+            "weekly_review",
+            "Weekly Review",
+            [
+                ("Capture", "backlog", "#64748b"),
+                ("Review", "todo", "#3b82f6"),
+                ("Decide", "in_progress", "#f59e0b"),
+                ("Scheduled", "review", "#8b5cf6"),
+                ("Closed", "done", "#22c55e"),
+            ],
+        ),
+    ],
+)
+async def test_v2_project_templates_list_create_and_detail(
+    project_env,
+    template_id,
+    expected_name,
+    expected_stages,
+):
+    app, _, _ = project_env
+    async with _client(app) as client:
+        listed = await client.get("/api/projects/templates", headers=_headers("alice"))
+        assert listed.status_code == 200
+        listed_template = next(
+            row for row in listed.json()["templates"] if row["id"] == template_id
+        )
+        assert listed_template == {
+            "id": template_id,
+            "name": expected_name,
+            "stages": [
+                {"name": name, "category": category, "color": color}
+                for name, category, color in expected_stages
+            ],
+        }
+
+        created_response = await client.post(
+            "/api/projects",
+            headers=_headers("alice"),
+            json={
+                "name": expected_name,
+                "key": {
+                    "applications": "APPS",
+                    "engineering_labbook": "LAB",
+                    "opportunity_radar": "RADAR",
+                    "gtm_pipeline": "GTM",
+                    "weekly_review": "WEEK",
+                }[template_id],
+                "template": template_id,
+            },
+        )
+        assert created_response.status_code == 201, created_response.text
+        created = created_response.json()
+        assert created["project"]["template"] == template_id
+        assert [
+            (stage["name"], stage["category"], stage["color"])
+            for stage in created["stages"]
+        ] == expected_stages
+        assert [stage["position"] for stage in created["stages"]] == list(
+            range(len(expected_stages))
+        )
+
+        detail_response = await client.get(
+            f"/api/projects/{created['project']['id']}",
+            headers=_headers("alice"),
+        )
+        assert detail_response.status_code == 200
+        detail = detail_response.json()
+        assert detail["project"]["template"] == template_id
+        assert detail["stages"] == created["stages"]
+
+
+@pytest.mark.parametrize("template", ["not-a-template", "   ", ""])
+async def test_project_creation_rejects_invalid_template_loudly(
+    project_env,
+    template,
+):
+    app, factory, _ = project_env
+    async with _client(app) as client:
+        rejected = await client.post(
+            "/api/projects",
+            headers=_headers("alice"),
+            json={"name": "Invalid template", "key": "BAD", "template": template},
+        )
+    assert rejected.status_code == 400
+    assert "template" in rejected.json()["detail"].lower()
+    db = factory()
+    assert db.query(cdb.Project).count() == 0
+    db.close()
+
+
+async def test_project_completion_is_explicit_guarded_and_reversible(project_env):
+    app, _, _ = project_env
+    async with _client(app) as client:
+        created = await _create_project(client, key="SHIP")
+        project = created["project"]
+        project_id = project["id"]
+        first_stage = created["stages"][0]
+        done_stage = next(stage for stage in created["stages"] if stage["category"] == "done")
+
+        assert project["status"] == "active"
+        assert project["completed_at"] is None
+
+        item_response = await client.post(
+            f"/api/projects/{project_id}/items",
+            headers=_headers("alice"),
+            json={"title": "Ship the outcome", "stage_id": first_stage["id"]},
+        )
+        assert item_response.status_code == 201, item_response.text
+        item = item_response.json()["item"]
+
+        blocked = await client.post(
+            f"/api/projects/{project_id}/complete",
+            headers=_headers("alice"),
+            json={"version": project["version"]},
+        )
+        assert blocked.status_code == 409
+        assert "remaining 1 active work item" in blocked.json()["detail"]
+
+        moved = await client.post(
+            f"/api/projects/{project_id}/items/{item['id']}/move",
+            headers=_headers("alice"),
+            json={
+                "stage_id": done_stage["id"],
+                "version": item["version"],
+            },
+        )
+        assert moved.status_code == 200, moved.text
+        assert moved.json()["item"]["completed_at"] is not None
+
+        completed = await client.post(
+            f"/api/projects/{project_id}/complete",
+            headers=_headers("alice"),
+            json={"version": project["version"]},
+        )
+        assert completed.status_code == 200, completed.text
+        completed_project = completed.json()["project"]
+        assert completed_project["status"] == "completed"
+        assert completed_project["completed_at"] is not None
+
+        read_only = await client.patch(
+            f"/api/projects/{project_id}",
+            headers=_headers("alice"),
+            json={"description": "Should not change", "version": completed_project["version"]},
+        )
+        assert read_only.status_code == 409
+        assert "Reopen" in read_only.json()["detail"]
+
+        reopened = await client.post(
+            f"/api/projects/{project_id}/reopen",
+            headers=_headers("alice"),
+            json={"version": completed_project["version"]},
+        )
+        assert reopened.status_code == 200, reopened.text
+        reopened_project = reopened.json()["project"]
+        assert reopened_project["status"] == "active"
+        assert reopened_project["completed_at"] is None
+
+        editable_again = await client.patch(
+            f"/api/projects/{project_id}",
+            headers=_headers("alice"),
+            json={"description": "Outcome recorded", "version": reopened_project["version"]},
+        )
+        assert editable_again.status_code == 200, editable_again.text
+
+
+async def test_project_context_brief_prioritizes_risk_and_surfaces_evidence(project_env):
+    app, _, _ = project_env
+    async with _client(app) as client:
+        created = await _create_project(client, key="LAB", template="engineering_labbook")
+        project_id = created["project"]["id"]
+        first_stage = created["stages"][0]["id"]
+
+        overdue = await client.post(
+            f"/api/projects/{project_id}/items",
+            headers=_headers("alice"),
+            json={
+                "title": "Calibrate the load cell",
+                "description": "Sensitive raw setup notes stay out of the brief.",
+                "stage_id": first_stage,
+                "priority": "high",
+                "due_date": "2000-01-01",
+            },
+        )
+        assert overdue.status_code == 201, overdue.text
+        overdue_item = overdue.json()["item"]
+        for index in range(6):
+            added = await client.post(
+                f"/api/projects/{project_id}/items",
+                headers=_headers("alice"),
+                json={
+                    "title": f"Experiment follow-up {index}",
+                    "stage_id": first_stage,
+                    "priority": "medium",
+                },
+            )
+            assert added.status_code == 201
+
+        pdf = b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n"
+        uploaded = await client.post(
+            f"/api/projects/{project_id}/items/{overdue_item['id']}/attachments",
+            headers=_headers("alice"),
+            files={"file": ("calibration.pdf", pdf, "application/pdf")},
+            data={"kind": "deliverable", "description": "Calibration evidence"},
+        )
+        assert uploaded.status_code == 201, uploaded.text
+
+        response = await client.get(
+            f"/api/projects/{project_id}/context", headers=_headers("alice")
+        )
+        assert response.status_code == 200, response.text
+        context = response.json()
+        assert context["project"]["template"] == "engineering_labbook"
+        assert "hypothesis" in context["guidance"].lower()
+        assert "7 open items" in context["brief"]
+        assert context["next_actions"][0]["id"] == overdue_item["id"]
+        assert context["next_actions"][0]["reason"].startswith("Overdue since")
+        assert len(context["next_actions"]) == context["limits"]["next_actions"] == 5
+        assert "description" not in context["next_actions"][0]
+        assert context["evidence"][0]["name"] == "calibration.pdf"
+        assert context["evidence"][0]["description"] == "Calibration evidence"
+        assert len(context["recent_activity"]) <= context["limits"]["recent_activity"]
+
+        hidden = await client.get(
+            f"/api/projects/{project_id}/context", headers=_headers("bob")
+        )
+        assert hidden.status_code == 404
 
 
 async def test_remote_grant_lifecycle_authorization_and_safe_serialization(project_env):

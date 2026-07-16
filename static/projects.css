@@ -161,6 +161,17 @@ body.hamburger-right .projects-workspace {
   background: color-mix(in srgb, var(--red) 86%, white 14%);
 }
 
+.projects-btn--complete {
+  border-color: color-mix(in srgb, #22c55e 58%, var(--border));
+  color: color-mix(in srgb, #22c55e 74%, var(--fg));
+  background: color-mix(in srgb, #22c55e 12%, var(--panel));
+}
+
+.projects-btn--complete:hover:not(:disabled) {
+  border-color: color-mix(in srgb, #22c55e 78%, var(--border));
+  background: color-mix(in srgb, #22c55e 20%, var(--panel));
+}
+
 .projects-btn--quiet { background: transparent; }
 .projects-btn--danger {
   color: var(--color-error, #ef6b73);
@@ -354,6 +365,7 @@ body.hamburger-right .projects-workspace {
 .projects-project-row__title strong { min-width: 0; flex: 1; }
 .projects-source-badge,
 .projects-instance-badge,
+.projects-complete-badge,
 .projects-member-status {
   display: inline-flex;
   width: fit-content;
@@ -375,6 +387,85 @@ body.hamburger-right .projects-workspace {
   color: color-mix(in srgb, var(--red) 72%, var(--fg));
   border-color: color-mix(in srgb, var(--red) 34%, var(--border));
   background: color-mix(in srgb, var(--red) 8%, transparent);
+}
+
+.projects-complete-badge {
+  color: color-mix(in srgb, #22c55e 72%, var(--fg));
+  border-color: color-mix(in srgb, #22c55e 34%, var(--border));
+  background: color-mix(in srgb, #22c55e 9%, transparent);
+}
+
+.projects-project-brief {
+  display: grid;
+  gap: 14px;
+  padding: 16px;
+}
+.projects-brief-loading,
+.projects-brief-error,
+.projects-brief-empty { margin: 0; padding: 18px 8px; color: var(--fg-muted, #888); font-size: 11px; text-align: center; }
+.projects-brief-error { color: var(--danger, #ef6b73); }
+.projects-brief-summary { display: grid; gap: 10px; }
+.projects-brief-summary > p { margin: 0; font-size: 13px; font-weight: 650; line-height: 1.5; }
+.projects-brief-summary > aside {
+  padding: 10px 12px;
+  border-left: 3px solid var(--red);
+  border-radius: 6px;
+  color: color-mix(in srgb, var(--fg) 70%, transparent);
+  background: color-mix(in srgb, var(--red) 7%, transparent);
+  font-size: 10px;
+  line-height: 1.5;
+}
+.projects-brief-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 7px; }
+.projects-brief-metrics > div {
+  display: flex;
+  min-height: 56px;
+  padding: 8px;
+  flex-direction: column;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--fg) 3%, transparent);
+}
+.projects-brief-metrics strong { font-size: 16px; }
+.projects-brief-metrics span { color: var(--fg-muted, #888); font-size: 8px; text-transform: uppercase; }
+.projects-brief-section { display: grid; gap: 7px; }
+.projects-brief-section h3 { margin: 0; font-size: 10px; letter-spacing: .05em; text-transform: uppercase; }
+.projects-brief-list { display: grid; gap: 5px; }
+.projects-brief-row {
+  width: 100%;
+  min-height: 48px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 3px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--fg);
+  background: transparent;
+  text-align: left;
+}
+.projects-brief-row > span { color: var(--fg-muted, #888); font-size: 9px; }
+.projects-brief-evidence,
+.projects-brief-activity {
+  min-height: 44px;
+  padding: 8px 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 68%, transparent);
+}
+.projects-brief-evidence > div { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
+.projects-brief-evidence strong { overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.projects-brief-evidence span,
+.projects-brief-activity small { color: var(--fg-muted, #888); font-size: 8px; }
+.projects-brief-evidence a { color: var(--red); font-size: 9px; }
+.projects-brief-activity span { min-width: 0; overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+
+@media (max-width: 520px) {
+  .projects-brief-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 .projects-project-row__copy strong,

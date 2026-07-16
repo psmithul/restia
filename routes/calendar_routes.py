@@ -560,6 +560,191 @@ def _event_to_dict(ev: CalendarEvent) -> dict:
 # ── Recurrence expansion ──
 
 _RRULE_EXPANSION_LIMIT = 1000
+_RRULE_EXPANSION_WORK_LIMIT = 10000
+_RRULE_TEXT_LIMIT = 4096
+_CALENDAR_LIST_CANDIDATE_LIMIT = 2500
+_CALENDAR_LIST_RECURRENCE_WORK_LIMIT = 100000
+_CALENDAR_LIST_OUTPUT_LIMIT = 2000
+
+_RRULE_FIXED_FREQUENCY_SECONDS = {
+    "SECONDLY": 1,
+    "MINUTELY": 60,
+    "HOURLY": 60 * 60,
+    "DAILY": 24 * 60 * 60,
+    "WEEKLY": 7 * 24 * 60 * 60,
+}
+
+_RRULE_EXPANDING_PARTS = {
+    "YEARLY": (
+        "BYMONTH", "BYYEARDAY", "BYWEEKNO", "BYMONTHDAY", "BYDAY",
+        "BYHOUR", "BYMINUTE", "BYSECOND",
+    ),
+    "MONTHLY": ("BYMONTHDAY", "BYDAY", "BYHOUR", "BYMINUTE", "BYSECOND"),
+    "WEEKLY": ("BYDAY", "BYHOUR", "BYMINUTE", "BYSECOND"),
+    "DAILY": ("BYHOUR", "BYMINUTE", "BYSECOND"),
+    "HOURLY": ("BYMINUTE", "BYSECOND"),
+    "MINUTELY": ("BYSECOND",),
+    "SECONDLY": (),
+}
+
+
+class _ExpandedOccurrences(list):
+    """List-compatible recurrence result with truncation metadata.
+
+    The attribute matters when every examined occurrence was excluded: there
+    are no dictionaries on which to carry the historical ``truncated`` flag.
+    """
+
+    def __init__(self, values=(), *, truncated: bool = False):
+        super().__init__(values)
+        self.truncated = bool(truncated)
+
+
+class _RecurrenceBudget:
+    """One hard work/output budget shared by every series in a request."""
+
+    def __init__(self, *, work_limit: int, output_limit: int):
+        self.remaining_work = max(0, int(work_limit))
+        self.remaining_output = max(0, int(output_limit))
+        self.exhausted = False
+
+    def consume_work(self, amount: int = 1) -> bool:
+        amount = max(0, int(amount))
+        if amount > self.remaining_work:
+            self.remaining_work = 0
+            self.exhausted = True
+            return False
+        self.remaining_work -= amount
+        return True
+
+    def consume_output(self) -> bool:
+        if self.remaining_output < 1:
+            self.exhausted = True
+            return False
+        self.remaining_output -= 1
+        return True
+
+
+def _rrule_parameters(raw: str) -> dict[str, str]:
+    """Parse the single RRULE clause used by CalendarEvent rows."""
+
+    text_value = str(raw or "").strip()
+    if not text_value or len(text_value) > _RRULE_TEXT_LIMIT:
+        return {}
+    lines = [line.strip() for line in text_value.splitlines() if line.strip()]
+    if len(lines) != 1:
+        return {}
+    clause = lines[0]
+    if clause.upper().startswith("RRULE:"):
+        clause = clause.split(":", 1)[1]
+    parameters: dict[str, str] = {}
+    for token in clause.split(";"):
+        key, separator, value = token.partition("=")
+        if separator and key.strip() and value.strip():
+            parameters[key.strip().upper()] = value.strip()
+    return parameters
+
+
+def _positive_rrule_int(value: Optional[str], default: int) -> int:
+    try:
+        parsed = int(str(value or ""))
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _rrule_seek_work_estimate(
+    ev: CalendarEvent,
+    expand_start: datetime,
+    parameters: dict[str, str],
+    *,
+    dtstart: Optional[datetime] = None,
+) -> int:
+    """Conservatively estimate occurrences dateutil would seek past.
+
+    ``rrule.xafter`` advances from DTSTART internally before yielding its first
+    value. This estimate lets callers rebase or reject pathological historical
+    rules before entering that unobservable loop.
+    """
+
+    frequency = parameters.get("FREQ", "").upper()
+    if frequency not in _RRULE_EXPANDING_PARTS:
+        return _RRULE_EXPANSION_WORK_LIMIT + 1
+    rule_start = ev.dtstart if dtstart is None else dtstart
+    try:
+        if rule_start >= expand_start:
+            return 0
+    except TypeError:
+        return _RRULE_EXPANSION_WORK_LIMIT + 1
+
+    interval = _positive_rrule_int(parameters.get("INTERVAL"), 1)
+    if frequency in _RRULE_FIXED_FREQUENCY_SECONDS:
+        try:
+            seconds = max(0.0, (expand_start - rule_start).total_seconds())
+        except (TypeError, OverflowError):
+            return _RRULE_EXPANSION_WORK_LIMIT + 1
+        period_seconds = _RRULE_FIXED_FREQUENCY_SECONDS[frequency] * interval
+        base_periods = int(seconds // period_seconds) + 1
+    elif frequency == "MONTHLY":
+        months = (
+            (expand_start.year - rule_start.year) * 12
+            + expand_start.month
+            - rule_start.month
+        )
+        base_periods = max(1, months // interval + 1)
+    else:  # YEARLY
+        years = max(0, expand_start.year - rule_start.year)
+        base_periods = max(1, years // interval + 1)
+
+    expansion_factor = 1
+    for name in _RRULE_EXPANDING_PARTS[frequency]:
+        raw_values = parameters.get(name)
+        if not raw_values:
+            continue
+        value_count = sum(1 for value in raw_values.split(",") if value.strip())
+        expansion_factor *= max(1, value_count)
+        if expansion_factor > _RRULE_EXPANSION_WORK_LIMIT:
+            expansion_factor = _RRULE_EXPANSION_WORK_LIMIT + 1
+            break
+
+    estimate = base_periods * expansion_factor
+    if "COUNT" in parameters:
+        count = _positive_rrule_int(parameters.get("COUNT"), estimate)
+        estimate = min(estimate, count)
+    return estimate
+
+
+def _rrule_rebased_dtstart(
+    ev: CalendarEvent,
+    expand_start: datetime,
+    parameters: dict[str, str],
+) -> Optional[datetime]:
+    """Fast-forward an infinite fixed-frequency rule without changing phase."""
+
+    if "COUNT" in parameters:
+        # COUNT is relative to the original DTSTART, so rebasing would reset it.
+        return None
+    frequency = parameters.get("FREQ", "").upper()
+    unit_seconds = _RRULE_FIXED_FREQUENCY_SECONDS.get(frequency)
+    if unit_seconds is None:
+        # Month/year arithmetic can clamp dates (Jan 31 -> Feb 28), changing
+        # recurrence semantics. Reject those rare huge seeks instead.
+        return None
+    interval = _positive_rrule_int(parameters.get("INTERVAL"), 1)
+    period_seconds = unit_seconds * interval
+    try:
+        elapsed = (expand_start - ev.dtstart).total_seconds()
+    except (TypeError, OverflowError):
+        return None
+    if elapsed <= period_seconds:
+        return ev.dtstart
+    # Leave one full base period before the expansion window so overlap and
+    # BY* rules retain context while historical iteration stays constant-sized.
+    periods = max(0, int(elapsed // period_seconds) - 1)
+    try:
+        return ev.dtstart + timedelta(seconds=periods * period_seconds)
+    except (OverflowError, ValueError):
+        return None
 
 
 def _recurrence_exdates(ev: CalendarEvent) -> list[str]:
@@ -585,7 +770,13 @@ def _occurrence_exdate_key(uid: str, ev: CalendarEvent) -> str:
 
 
 def _expand_rrule(
-    ev: CalendarEvent, start: datetime, end: datetime
+    ev: CalendarEvent,
+    start: datetime,
+    end: datetime,
+    *,
+    limit: int = _RRULE_EXPANSION_LIMIT,
+    work_limit: Optional[int] = None,
+    budget: Optional[_RecurrenceBudget] = None,
 ) -> List[dict]:
     """Expand a single recurring CalendarEvent into occurrence dicts.
 
@@ -598,6 +789,15 @@ def _expand_rrule(
     list — the caller doesn't need to branch.
     """
     duration = ev.dtend - ev.dtstart
+    expansion_limit = max(1, min(int(limit), _RRULE_EXPANSION_LIMIT))
+    requested_work_limit = (
+        expansion_limit * 10 if work_limit is None else int(work_limit)
+    )
+    occurrence_work_limit = max(
+        expansion_limit,
+        min(requested_work_limit, _RRULE_EXPANSION_WORK_LIMIT),
+    )
+    occurrence_seek_limit = occurrence_work_limit
 
     if not ev.rrule or not ev.rrule.strip():
         # Non-recurring — return the base event as-is. list_events
@@ -607,10 +807,12 @@ def _expand_rrule(
         d["is_recurrence"] = False
         d["series_uid"] = ev.uid
         d["truncated"] = False
-        return [d]
+        return _ExpandedOccurrences([d])
 
     # Parse the rrule, applying it to the base dtstart.
     rrule_str = ev.rrule
+    if len(str(rrule_str or "")) > _RRULE_TEXT_LIMIT:
+        return _ExpandedOccurrences(truncated=True)
     if ev.dtstart is not None and getattr(ev.dtstart, "tzinfo", None) is None:
         # Events are stored with a naive (UTC) dtstart, but standard .ics
         # exporters (Google/Apple/Outlook/Fastmail) write the bound as an
@@ -623,8 +825,29 @@ def _expand_rrule(
         rrule_str = _re.sub(
             r"(UNTIL=\d{8}(?:T\d{6})?)Z", r"\1", rrule_str, flags=_re.IGNORECASE
         )
+    if "\n" in rrule_str or "\r" in rrule_str:
+        return _ExpandedOccurrences(truncated=True)
+    expand_start = start - duration
+    parameters = _rrule_parameters(rrule_str)
+    rule_dtstart = ev.dtstart
+    # A short malformed rule is cheap to parse and retains the historical
+    # base-event fallback below. Valid rules get the bounded seek preflight.
+    if parameters.get("FREQ", "").upper() in _RRULE_EXPANDING_PARTS:
+        seek_estimate = _rrule_seek_work_estimate(ev, expand_start, parameters)
+        if seek_estimate > occurrence_seek_limit:
+            rule_dtstart = _rrule_rebased_dtstart(ev, expand_start, parameters)
+            if rule_dtstart is None:
+                return _ExpandedOccurrences(truncated=True)
+        charged_seek = _rrule_seek_work_estimate(
+            ev,
+            expand_start,
+            parameters,
+            dtstart=rule_dtstart,
+        )
+        if budget is not None and not budget.consume_work(charged_seek):
+            return _ExpandedOccurrences(truncated=True)
     try:
-        rule = rrulestr(rrule_str, dtstart=ev.dtstart)
+        rule = rrulestr(rrule_str, dtstart=rule_dtstart)
     except Exception as ex:
         logger.warning(
             "Failed to parse rrule=%r for event %s: %s", ev.rrule, ev.uid, ex
@@ -637,20 +860,35 @@ def _expand_rrule(
         # with only dtstart < end_dt — the base event may not actually
         # overlap the window. Only return if it does.
         if ev.dtstart < end and ev.dtend > start:
-            return [d]
-        return []
+            if budget is not None and not budget.consume_output():
+                return _ExpandedOccurrences(truncated=True)
+            return _ExpandedOccurrences([d])
+        return _ExpandedOccurrences()
 
     # Expand from start - duration so multi-day / overnight occurrences
     # that start before the window but end inside it are captured
     # (matching non-recurring overlap semantics: dtstart < end AND
     # dtend > start).
-    expand_start = start - duration
-    results = []
+    results = _ExpandedOccurrences()
     truncated = False
+    examined = 0
     base = _event_to_dict(ev)
     exdates = set(_recurrence_exdates(ev))
 
-    for occ_start in rule.xafter(expand_start, inc=True):
+    occurrence_iterator = iter(rule.xafter(expand_start, inc=True))
+    while True:
+        if examined >= occurrence_work_limit:
+            truncated = True
+            break
+        if budget is not None and not budget.consume_work():
+            truncated = True
+            break
+        try:
+            occ_start = next(occurrence_iterator)
+        except StopIteration:
+            break
+        examined += 1
+
         if occ_start >= end:
             break
 
@@ -662,7 +900,7 @@ def _expand_rrule(
         if occ_end <= start:
             continue
 
-        if len(results) >= _RRULE_EXPANSION_LIMIT:
+        if len(results) >= expansion_limit:
             truncated = True
             break
 
@@ -676,6 +914,10 @@ def _expand_rrule(
 
         if exdate_key in exdates:
             continue
+
+        if budget is not None and not budget.consume_output():
+            truncated = True
+            break
 
         d = dict(base)
         d["uid"] = occ_uid
@@ -697,6 +939,7 @@ def _expand_rrule(
     if truncated:
         for d in results:
             d["truncated"] = True
+    results.truncated = truncated
 
     return results
 
@@ -1146,40 +1389,100 @@ def setup_calendar_routes() -> APIRouter:
             # are fetched so their actual occurrences can be expanded
             # server-side and appear in every year they repeat, not just the
             # DTSTART year.
-            q = db.query(CalendarEvent).join(CalendarCal).filter(
-                CalendarEvent.status != "cancelled",
-                CalendarCal.owner == owner,
-                or_(
-                    # Non-recurring: event times must overlap the query window
-                    and_(
-                        or_(CalendarEvent.rrule == "", CalendarEvent.rrule.is_(None)),
-                        CalendarEvent.dtstart < end_dt,
-                        CalendarEvent.dtend > start_dt,
-                    ),
-                    # Recurring: dtstart before window end — RRULE expansion
-                    # generates the actual occurrences within the window
-                    and_(
-                        CalendarEvent.rrule.isnot(None),
-                        CalendarEvent.rrule != "",
-                        CalendarEvent.dtstart < end_dt,
-                    ),
+            def scoped_events():
+                query = db.query(CalendarEvent).join(CalendarCal).filter(
+                    CalendarEvent.status != "cancelled",
+                    CalendarCal.owner == owner,
+                )
+                if calendar:
+                    query = query.filter(
+                        (CalendarEvent.calendar_id == calendar)
+                        | (CalendarCal.name == calendar)
+                    )
+                return query
+
+            # Bound direct and recurring candidates independently. Otherwise
+            # thousands of old series can consume one combined DTSTART-ordered
+            # cap and hide an overlapping one-off event that is happening now.
+            direct_events = (
+                scoped_events()
+                .filter(
+                    or_(CalendarEvent.rrule == "", CalendarEvent.rrule.is_(None)),
+                    CalendarEvent.dtstart < end_dt,
+                    CalendarEvent.dtend > start_dt,
+                )
+                .order_by(CalendarEvent.dtstart.asc(), CalendarEvent.uid.asc())
+                .limit(_CALENDAR_LIST_OUTPUT_LIMIT + 1)
+                .all()
+            )
+            direct_overflow = len(direct_events) > _CALENDAR_LIST_OUTPUT_LIMIT
+            direct_events = [
+                event
+                for event in direct_events[:_CALENDAR_LIST_OUTPUT_LIMIT]
+                if not (event.rrule and event.rrule.strip())
+            ]
+
+            recurring_events = (
+                scoped_events()
+                .filter(
+                    CalendarEvent.rrule.isnot(None),
+                    CalendarEvent.rrule != "",
+                    CalendarEvent.dtstart < end_dt,
+                )
+                .order_by(CalendarEvent.dtstart.desc(), CalendarEvent.uid.asc())
+                .limit(_CALENDAR_LIST_CANDIDATE_LIMIT + 1)
+                .all()
+            )
+            recurring_overflow = (
+                len(recurring_events) > _CALENDAR_LIST_CANDIDATE_LIMIT
+            )
+            recurring_events = [
+                event
+                for event in recurring_events[:_CALENDAR_LIST_CANDIDATE_LIMIT]
+                if event.rrule and event.rrule.strip()
+            ]
+
+            expanded = []
+            for event in direct_events:
+                expanded.extend(_expand_rrule(event, start_dt, end_dt))
+
+            truncated = direct_overflow or recurring_overflow
+            budget = _RecurrenceBudget(
+                work_limit=_CALENDAR_LIST_RECURRENCE_WORK_LIMIT,
+                output_limit=max(
+                    0,
+                    _CALENDAR_LIST_OUTPUT_LIMIT - len(direct_events),
                 ),
             )
-            if calendar:
-                q = q.filter(
-                    (CalendarEvent.calendar_id == calendar) |
-                    (CalendarCal.name == calendar)
+            for event in recurring_events:
+                if budget.remaining_work < 1 or budget.remaining_output < 1:
+                    truncated = True
+                    break
+                occurrences = _expand_rrule(
+                    event,
+                    start_dt,
+                    end_dt,
+                    limit=max(1, min(_RRULE_EXPANSION_LIMIT, budget.remaining_output)),
+                    work_limit=max(
+                        1,
+                        min(_RRULE_EXPANSION_WORK_LIMIT, budget.remaining_work),
+                    ),
+                    budget=budget,
                 )
-            events = q.order_by(CalendarEvent.dtstart).all()
-
-            # Expand recurring events into individual occurrences.
-            expanded = []
-            for e in events:
-                expanded.extend(_expand_rrule(e, start_dt, end_dt))
+                truncated = truncated or bool(
+                    getattr(occurrences, "truncated", False)
+                )
+                expanded.extend(occurrences)
+                if budget.exhausted:
+                    truncated = True
+                    break
 
             # Sort by occurrence start time for consistent frontend ordering.
-            truncated = any(e.get("truncated") for e in expanded)
+            truncated = truncated or any(e.get("truncated") for e in expanded)
             expanded.sort(key=lambda d: d["dtstart"])
+            if len(expanded) > _CALENDAR_LIST_OUTPUT_LIMIT:
+                truncated = True
+                expanded = expanded[:_CALENDAR_LIST_OUTPUT_LIMIT]
             response: dict = {"events": expanded}
             if truncated:
                 response["truncated"] = True

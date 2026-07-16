@@ -8,7 +8,25 @@ const PROJECT_VIEWS = new Set(['board', 'list', 'activity']);
 const ATTACHMENT_KINDS = new Set(['reference', 'draft', 'deliverable']);
 const ITEM_TYPES = Object.freeze(['task', 'story', 'bug', 'epic', 'subtask']);
 const PRIORITIES = Object.freeze(['lowest', 'low', 'medium', 'high', 'highest', 'critical']);
-const PROJECT_TEMPLATES = Object.freeze(['general', 'personal', 'research', 'software', 'content', 'coursework', 'gtm']);
+const PROJECT_TEMPLATES = Object.freeze([
+  'general', 'personal', 'research', 'software', 'content', 'coursework', 'gtm',
+  'applications', 'engineering_labbook', 'opportunity_radar', 'gtm_pipeline',
+  'weekly_review',
+]);
+const PROJECT_TEMPLATE_LABELS = Object.freeze({
+  general: 'General',
+  personal: 'Personal',
+  research: 'Research',
+  software: 'Software',
+  content: 'Content',
+  coursework: 'Coursework',
+  gtm: 'GTM',
+  applications: 'Applications Cockpit',
+  engineering_labbook: 'Engineering Labbook',
+  opportunity_radar: 'Opportunity Radar',
+  gtm_pipeline: 'GTM Pipeline',
+  weekly_review: 'Weekly Review',
+});
 const STAGE_CATEGORIES = Object.freeze(['backlog', 'todo', 'in_progress', 'review', 'done']);
 const PROJECT_SOURCES = Object.freeze({ LOCAL: 'local', HOME: 'home' });
 const REMOTE_MEMBER_STATUSES = new Set(['pending', 'active', 'declined', 'revoked']);
@@ -366,6 +384,8 @@ function normalizeProject(raw = {}) {
     color: safeHexColor(raw.color, '#e06c75'),
     icon: String(raw.icon || ''),
     archived: Boolean(raw.archived || raw.is_archived || raw.archived_at),
+    completed_at: raw.completed_at || null,
+    completed: Boolean(raw.completed_at || raw.status === 'completed'),
     role: String(raw.role || (source === PROJECT_SOURCES.HOME ? 'viewer' : 'owner')).toLowerCase(),
     owner: String(raw.owner_username || raw.owner || ''),
     instance_name: String(raw.instance_name || raw.restia_name || raw.contact || raw.home || ''),
@@ -682,13 +702,14 @@ function remoteProjectAccessState(
 
 function canEditProject() {
   const accessState = remoteProjectAccessState();
-  return !state.project?.archived && accessState !== 'unavailable' && accessState !== 'removed' &&
+  return !state.project?.archived && !state.project?.completed &&
+    accessState !== 'unavailable' && accessState !== 'removed' &&
     (projectRole() === 'owner' || projectRole() === 'editor');
 }
 
 function canManageProject() {
   return state.activeProjectSource === PROJECT_SOURCES.LOCAL &&
-    !state.project?.archived && projectRole() === 'owner';
+    !state.project?.archived && !state.project?.completed && projectRole() === 'owner';
 }
 
 function canManageSpecificProject(project) {
@@ -897,6 +918,15 @@ function projectPath(projectId, suffix = '', source = null, projects = state.pro
   const transport = projectSourceForId(projectId, source, projects);
   const root = transport === PROJECT_SOURCES.HOME ? '/api/homelink/projects' : '/api/projects';
   return `${root}/${encodeURIComponent(asId(projectId))}${suffix}`;
+}
+
+function attachmentUploadPath(context) {
+  if (!context?.projectId || !context?.itemId) return '';
+  return projectPath(
+    context.projectId,
+    `/items/${encodeURIComponent(asId(context.itemId))}/attachments`,
+    context.source,
+  );
 }
 
 function projectQueueKey(projectId = state.activeProjectId, source = state.activeProjectSource) {
@@ -1174,10 +1204,13 @@ function renderTopSummary() {
   const { total, done } = computeProjectHealth(state.items, state.stages);
   const open = Math.max(0, total - done);
   const progress = total ? Math.round((done / total) * 100) : 0;
+  const completionLabel = state.project.completed
+    ? `Completed${state.project.completed_at ? ` · ${formatDate(state.project.completed_at)}` : ''}`
+    : `${progress}% complete · ${open} open task${open === 1 ? '' : 's'}`;
   refs.activeSummary.append(
     make('strong', { text: `${state.project.key} · ${state.project.name}` }),
     make('span', {
-      text: `${state.activeProjectSource === PROJECT_SOURCES.HOME ? 'Linked project · ' : ''}${progress}% complete · ${open} open task${open === 1 ? '' : 's'}`,
+      text: `${state.activeProjectSource === PROJECT_SOURCES.HOME ? 'Linked project · ' : ''}${completionLabel}`,
     }),
   );
 }
@@ -1217,10 +1250,12 @@ function projectHealth(project) {
 }
 
 function projectGroups(projects = state.projects) {
-  const active = asArray(projects).filter((project) => !project.archived);
+  const active = asArray(projects).filter((project) => !project.archived && !project.completed);
+  const completed = asArray(projects).filter((project) => !project.archived && project.completed);
   return {
     local: active.filter((project) => normalizeProjectSource(project.source) === PROJECT_SOURCES.LOCAL),
     home: active.filter((project) => normalizeProjectSource(project.source) === PROJECT_SOURCES.HOME),
+    completed,
   };
 }
 
@@ -1345,6 +1380,15 @@ function renderNavigator() {
       empty: 'No projects have been shared with this Restia.', error: state.remoteProjectsError,
     }),
   );
+  const completed = groups.completed;
+  if (completed.length) {
+    const details = make('details', { className: 'projects-archived-projects projects-completed-projects' });
+    details.appendChild(make('summary', { text: `Completed (${completed.length})` }));
+    const completedList = make('div', { className: 'projects-project-list', attrs: { role: 'list' } });
+    completed.forEach((project) => completedList.appendChild(renderProjectRow(project)));
+    details.appendChild(completedList);
+    refs.navigator.appendChild(details);
+  }
   const archived = state.projects.filter((project) => project.archived);
   if (archived.length) {
     const details = make('details', { className: 'projects-archived-projects' });
@@ -1373,6 +1417,9 @@ function renderProjectRow(project) {
   const copy = make('span', { className: 'projects-project-row__copy' }, [
     make('span', { className: 'projects-project-row__title' }, [
       make('strong', { text: project.name }),
+      ...(project.completed
+        ? [make('span', { className: 'projects-complete-badge', text: 'Completed' })]
+        : []),
       ...(project.source === PROJECT_SOURCES.HOME
         ? [make('span', { className: 'projects-source-badge', text: 'Linked' })]
         : []),
@@ -1385,6 +1432,15 @@ function renderProjectRow(project) {
     row.appendChild(actionButton('Restore', 'restore-project', {
       className: 'projects-row-action', dataset: { projectId: project.id, projectSource: project.source },
     }));
+  } else if (project.completed && canManageSpecificProject(project)) {
+    row.append(
+      actionButton('Reopen', 'reopen-project', {
+        className: 'projects-row-action', dataset: { projectId: project.id, projectSource: project.source },
+      }),
+      actionButton('Archive', 'archive-project', {
+        className: 'projects-row-action', dataset: { projectId: project.id, projectSource: project.source },
+      }),
+    );
   } else if (!project.archived && canManageSpecificProject(project)) {
     row.append(
       actionButton('Edit', 'edit-project', {
@@ -1408,29 +1464,36 @@ function renderMobileControls() {
     dataset: { action: 'mobile-project' },
   });
   const groups = projectGroups();
-  [['On this Restia', groups.local], ['Linked projects', groups.home]].forEach(([label, projects]) => {
+  [['On this Restia', groups.local], ['Linked projects', groups.home], ['Completed', groups.completed]].forEach(([label, projects]) => {
     if (!projects.length) return;
     const group = make('optgroup', { attrs: { label } });
     projects.forEach((project) => {
       const option = make('option', {
-        value: projectNavigatorKey(project), text: `${project.key} · ${project.name}`,
+        value: projectNavigatorKey(project),
+        text: `${project.key} · ${project.name}${label === 'Completed' && project.source === PROJECT_SOURCES.HOME ? ' · Linked' : ''}`,
       });
       option.selected = activeProjectMatches(project.id, project.source);
       group.appendChild(option);
     });
     projectSelect.appendChild(group);
   });
-  const activeIsListed = [...groups.local, ...groups.home].some((project) => (
+  const activeIsListed = [...groups.local, ...groups.home, ...groups.completed].some((project) => (
     activeProjectMatches(project.id, project.source)
   ));
-  if (!activeIsListed && state.project && state.activeProjectSource === PROJECT_SOURCES.HOME) {
+  if (!activeIsListed && state.project) {
     const accessState = remoteProjectAccessState();
-    const suffix = accessState === 'archived'
+    const suffix = state.project.completed
+      ? 'completed'
+      : state.project.archived
+        ? 'archived'
+      : accessState === 'archived'
       ? 'archived'
       : accessState === 'viewer'
         ? 'view only'
         : 'access unavailable';
-    const current = make('optgroup', { attrs: { label: 'Current linked project' } });
+    const current = make('optgroup', {
+      attrs: { label: state.activeProjectSource === PROJECT_SOURCES.HOME ? 'Current linked project' : 'Current project' },
+    });
     const option = make('option', {
       value: projectNavigatorKey(state.activeProjectId, state.activeProjectSource),
       text: `${state.project.key} · ${state.project.name} (${suffix})`,
@@ -1499,17 +1562,32 @@ function renderToolbar() {
     tabs.appendChild(tab);
   });
   const archivedCount = state.items.filter((item) => item.archived).length;
-  const actions = make('div', { className: 'projects-toolbar__actions' }, [
+  const lifecycleAction = state.project && canManageSpecificProject(state.project)
+    ? actionButton(state.project.completed ? 'Reopen project' : 'Complete project', state.project.completed ? 'reopen-project' : 'complete-project', {
+      className: 'projects-btn projects-btn--quiet',
+      disabled: state.loadingBoard || Boolean(state.project.archived),
+      dataset: { projectId: state.project.id, projectSource: state.activeProjectSource },
+      title: state.project.completed ? 'Return this project to active work' : 'Finish the project once every active task is done',
+    })
+    : null;
+  const actionItems = [
+    actionButton('Project brief', 'open-project-brief', {
+      className: 'projects-btn projects-btn--quiet',
+      disabled: !state.project || state.loadingBoard,
+      title: 'See risks, next actions, evidence, and recent decisions in one view',
+    }),
+    ...(lifecycleAction ? [lifecycleAction] : []),
     actionButton(`Archived (${archivedCount})`, 'show-archived-tasks', {
       className: 'projects-btn projects-btn--quiet', disabled: !state.project || archivedCount === 0,
     }),
-    actionButton('Members', 'manage-members', { className: 'projects-btn projects-btn--quiet', disabled: !state.project || !canManageProject() }),
-    actionButton('Stages', 'manage-stages', { className: 'projects-btn projects-btn--quiet', disabled: !state.project || !canManageProject() }),
+    actionButton('Members', 'manage-members', { className: 'projects-btn projects-btn--quiet', disabled: !state.project || state.loadingBoard || !canManageProject() }),
+    actionButton('Stages', 'manage-stages', { className: 'projects-btn projects-btn--quiet', disabled: !state.project || state.loadingBoard || !canManageProject() }),
     actionButton('New task', 'new-task', {
       className: 'projects-btn projects-btn--primary',
       disabled: !state.project || !state.stages.length || !canEditProject(),
     }),
-  ]);
+  ];
+  const actions = make('div', { className: 'projects-toolbar__actions' }, actionItems);
   refs.toolbar.append(title, tabs, actions);
 }
 
@@ -1629,7 +1707,7 @@ function renderFirstProjectState() {
   return make('div', { className: 'projects-empty-state' }, [
     make('p', { className: 'projects-eyebrow', text: 'Build momentum with a visible workflow' }),
     make('h2', { text: 'Create your first project' }),
-    make('p', { text: 'Start from General, Personal, Research, Software, Content, Coursework, or GTM.' }),
+    make('p', { text: 'Start from a focused workflow, including Applications Cockpit and Engineering Labbook.' }),
     actionButton('Create project', 'new-project', { className: 'projects-btn projects-btn--primary' }),
   ]);
 }
@@ -2113,6 +2191,12 @@ async function selectProject(projectId, { force = false, source = null } = {}) {
   const saved = restoreProjectUiState(id, projectSource);
   state.loadingBoard = true;
   state.loadError = '';
+  state.project = selected;
+  state.stages = [];
+  state.items = [];
+  state.members = [];
+  state.overview = null;
+  state.mobileStageId = null;
   state.selectedItem = null;
   state.actor = null;
   state.drawerDirty = false;
@@ -2286,6 +2370,7 @@ function renderTaskDrawer() {
   const item = state.selectedItem;
   const editable = canEditProject() && !item.archived;
   const submitting = state.submittingTasks.has(taskScopeKey(state.activeProjectId, item.id, state.activeProjectSource));
+  const moving = state.movingTasks.has(item.id);
   const reporterLabel = memberDisplayName(item.reporter_name || item.reporter);
   const header = make('header', { className: 'projects-drawer__header' }, [
     make('div', {}, [
@@ -2326,6 +2411,12 @@ function renderTaskDrawer() {
       type: 'submit', disabled: submitting, className: 'projects-btn projects-btn--primary',
       attrs: { form: 'projects-task-details-form' },
       text: submitting ? 'Submission in progress…' : 'Save changes',
+    }));
+    const done = state.stages.some((stage) => stage.id === item.stage_id && stage.category === 'done');
+    footer.appendChild(actionButton(done ? 'Reopen task' : 'Mark complete', done ? 'reopen-task' : 'complete-task', {
+      className: done ? 'projects-btn projects-btn--quiet' : 'projects-btn projects-btn--complete',
+      disabled: submitting || moving,
+      title: done ? 'Move this task back into active work' : 'Move this task to the completed stage',
     }));
   }
   if (item.archived && canEditProject()) {
@@ -2868,7 +2959,7 @@ function openProjectEditor(project = null) {
   description.value = project?.description || '';
   const template = make('select', { name: 'template', disabled: editing }, [
     ...PROJECT_TEMPLATES
-      .map((value) => selectOption(value, value[0].toUpperCase() + value.slice(1), project?.template || 'general')),
+      .map((value) => selectOption(value, PROJECT_TEMPLATE_LABELS[value] || value, project?.template || 'general')),
   ]);
   const color = make('input', { type: 'color', name: 'color', value: /^#[0-9a-f]{6}$/i.test(project?.color || '') ? project.color : '#e06c75' });
   form.append(
@@ -2963,6 +3054,83 @@ async function restoreProject(projectId, source = PROJECT_SOURCES.LOCAL) {
   }
 }
 
+function applyProjectLifecycleUpdate(rawProject) {
+  const updated = normalizeProject(rawProject);
+  state.projects = state.projects.map((candidate) => (
+    candidate.id === updated.id && candidate.source === updated.source
+      ? { ...candidate, ...updated }
+      : candidate
+  ));
+  if (activeProjectMatches(updated.id, updated.source) && state.project) {
+    state.project = { ...state.project, ...updated };
+  }
+  renderAll();
+  return updated;
+}
+
+function countIncompleteChecklistSteps(items = state.items) {
+  return asArray(items).reduce((total, item) => (
+    item.archived
+      ? total
+      : total + Math.max(0, asNumber(item.checklist_count) - asNumber(item.checklist_done))
+  ), 0);
+}
+
+async function completeProject(projectId, source = PROJECT_SOURCES.LOCAL) {
+  const project = state.projects.find((candidate) => (
+    candidate.id === asId(projectId) && candidate.source === normalizeProjectSource(source)
+  )) || (activeProjectMatches(projectId, source) ? state.project : null);
+  if (!project || !canManageSpecificProject(project) || project.archived || project.completed) return;
+  const health = activeProjectMatches(project.id, project.source)
+    ? computeProjectHealth(state.items, state.stages)
+    : projectHealth(project);
+  const open = Math.max(0, health.total - health.done);
+  if (open) {
+    showToast(`Complete the remaining ${open} task${open === 1 ? '' : 's'} first.`, 'error');
+    announce('Project completion blocked by unfinished tasks.', 'assertive');
+    return;
+  }
+  if (activeProjectMatches(project.id, project.source)) {
+    const incompleteChecklistSteps = countIncompleteChecklistSteps();
+    if (incompleteChecklistSteps) {
+      showToast(`Complete the remaining ${incompleteChecklistSteps} checklist step${incompleteChecklistSteps === 1 ? '' : 's'} first.`, 'error');
+      announce('Project completion blocked by unfinished checklist steps.', 'assertive');
+      return;
+    }
+  }
+  const accepted = await confirmAction(`Mark “${project.name}” complete? It will become read-only until reopened.`, {
+    confirmText: 'Complete project',
+  });
+  if (!accepted) return;
+  try {
+    const result = await request(projectPath(project.id, '/complete', project.source), {
+      method: 'POST', body: { version: project.version },
+    });
+    applyProjectLifecycleUpdate({ ...result.project, source: project.source });
+    showToast('Project completed');
+    announce(`${project.name} completed`);
+  } catch (error) {
+    showToast(`Could not complete project: ${error.message}`, 'error');
+  }
+}
+
+async function reopenProject(projectId, source = PROJECT_SOURCES.LOCAL) {
+  const project = state.projects.find((candidate) => (
+    candidate.id === asId(projectId) && candidate.source === normalizeProjectSource(source)
+  )) || (activeProjectMatches(projectId, source) ? state.project : null);
+  if (!project || !canManageSpecificProject(project) || project.archived || !project.completed) return;
+  try {
+    const result = await request(projectPath(project.id, '/reopen', project.source), {
+      method: 'POST', body: { version: project.version },
+    });
+    applyProjectLifecycleUpdate({ ...result.project, source: project.source });
+    showToast('Project reopened');
+    announce(`${project.name} reopened`);
+  } catch (error) {
+    showToast(`Could not reopen project: ${error.message}`, 'error');
+  }
+}
+
 function openArchivedTasksDialog() {
   if (!state.project) return;
   const archived = state.items
@@ -2995,6 +3163,100 @@ function openArchivedTasksDialog() {
     actionButton('Close', 'close-dialog', { className: 'projects-btn projects-btn--quiet' }),
   ]));
   openDialog(`Archived tasks (${archived.length})`, content);
+}
+
+function projectBriefSection(title, body) {
+  return make('section', { className: 'projects-brief-section' }, [
+    make('h3', { text: title }),
+    body,
+  ]);
+}
+
+async function openProjectBrief() {
+  if (!state.project) return;
+  const projectId = state.project.id;
+  const source = state.activeProjectSource;
+  const content = make('div', { className: 'projects-project-brief' }, [
+    make('p', { className: 'projects-brief-loading', text: 'Building a current project brief…', attrs: { role: 'status' } }),
+  ]);
+  const opened = openDialog('Project brief', content);
+  try {
+    const payload = await request(projectPath(projectId, '/context', source));
+    if (!opened.dialog.isConnected || !activeProjectMatches(projectId, source)) return;
+    const overview = payload.overview || {};
+    const metrics = make('div', { className: 'projects-brief-metrics' }, [
+      make('div', {}, [make('strong', { text: `${asNumber(overview.completion_percent)}%` }), make('span', { text: 'complete' })]),
+      make('div', {}, [make('strong', { text: asNumber(overview.open_items) }), make('span', { text: 'open' })]),
+      make('div', {}, [make('strong', { text: asNumber(overview.overdue_items) }), make('span', { text: 'overdue' })]),
+      make('div', {}, [make('strong', { text: asNumber(overview.blocked_items) }), make('span', { text: 'blocked' })]),
+    ]);
+    const summary = make('div', { className: 'projects-brief-summary' }, [
+      make('p', { text: String(payload.brief || 'No project summary is available yet.') }),
+      ...(payload.guidance ? [make('aside', { text: String(payload.guidance) })] : []),
+      metrics,
+    ]);
+
+    const next = make('div', { className: 'projects-brief-list' });
+    asArray(payload.next_actions).forEach((item) => next.appendChild(actionButton(
+      String(item.title || item.key || 'Untitled task'),
+      'open-brief-item',
+      {
+        className: 'projects-brief-row',
+        dataset: { taskId: item.id },
+        title: `Open ${String(item.key || item.title || 'task')}`,
+      },
+    )));
+    if (!next.children.length) next.appendChild(make('p', {
+      className: 'projects-brief-empty',
+      text: 'No open next actions. Review the definition of done and checklists before completing the project.',
+    }));
+    asArray(payload.next_actions).forEach((item, index) => {
+      const row = next.children[index];
+      if (!row?.classList?.contains('projects-brief-row')) return;
+      row.append(
+        make('span', { text: [item.key, item.reason, item.stage].filter(Boolean).join(' · ') }),
+      );
+    });
+
+    const evidence = make('div', { className: 'projects-brief-list' });
+    asArray(payload.evidence).forEach((attachment) => {
+      const row = make('div', { className: 'projects-brief-evidence' }, [
+        make('div', {}, [
+          make('strong', { text: String(attachment.name || 'Attachment') }),
+          make('span', { text: `${attachmentKindLabel(attachment.kind)} · ${formatBytes(attachment.size)}` }),
+        ]),
+        make('a', {
+          text: 'Download',
+          attrs: {
+            href: source === PROJECT_SOURCES.HOME
+              ? `/api/homelink/projects/attachments/${encodeURIComponent(attachment.id)}/download`
+              : (attachment.download_url || `/api/projects/attachments/${encodeURIComponent(attachment.id)}/download`),
+            download: attachment.name || 'attachment',
+            rel: 'noopener',
+          },
+        }),
+      ]);
+      evidence.appendChild(row);
+    });
+    if (!evidence.children.length) evidence.appendChild(make('p', { className: 'projects-brief-empty', text: 'No evidence attached yet.' }));
+
+    const activity = make('div', { className: 'projects-brief-list' });
+    asArray(payload.recent_activity).forEach((entry) => activity.appendChild(make('div', { className: 'projects-brief-activity' }, [
+      make('span', { text: String(entry.summary || entry.event_type || 'Project update') }),
+      make('small', { text: formatDate(entry.created_at) }),
+    ])));
+    if (!activity.children.length) activity.appendChild(make('p', { className: 'projects-brief-empty', text: 'No activity recorded yet.' }));
+
+    content.replaceChildren(
+      summary,
+      projectBriefSection('Next actions', next),
+      projectBriefSection('Evidence ledger', evidence),
+      projectBriefSection('Recent decisions & activity', activity),
+    );
+  } catch (error) {
+    if (!opened.dialog.isConnected) return;
+    content.replaceChildren(make('p', { className: 'projects-brief-error', text: `Could not build project brief: ${error.message}`, attrs: { role: 'alert' } }));
+  }
 }
 
 async function restoreArchivedTask(taskId, control = null) {
@@ -4468,6 +4730,50 @@ async function setTaskArchived(archived) {
   } catch (error) { showToast(`Could not ${archived ? 'archive' : 'restore'} task: ${error.message}`, 'error'); }
 }
 
+async function setTaskCompletion(completed) {
+  const item = state.selectedItem;
+  if (!item || !canEditProject() || item.archived) return;
+
+  if (completed) {
+    const checklist = asArray(item.checklist);
+    const incompleteChecklist = checklist.some((entry) => !entry.done)
+      || asNumber(item.checklist_done) < asNumber(item.checklist_count);
+    if (incompleteChecklist) {
+      showToast('Complete this task’s checklist before marking it complete.', 'error');
+      announce('Task completion blocked by an incomplete checklist.', 'assertive');
+      return;
+    }
+    if (item.blocked_by_id) {
+      const blocker = state.items.find((candidate) => candidate.id === item.blocked_by_id);
+      const blockerDone = blocker && state.stages.some(
+        (stage) => stage.id === blocker.stage_id && stage.category === 'done',
+      );
+      if (blocker && !blockerDone) {
+        showToast(`Finish blocker ${blocker.key || blocker.title} first.`, 'error');
+        announce('Task completion blocked by unfinished work.', 'assertive');
+        return;
+      }
+    }
+  }
+
+  const categoryPreference = completed
+    ? ['done']
+    : ['in_progress', 'todo', 'backlog', 'review'];
+  let target = null;
+  for (const category of categoryPreference) {
+    target = state.stages.find((stage) => stage.category === category);
+    if (target) break;
+  }
+  if (!target) {
+    showToast(completed
+      ? 'Add a Done stage before completing tasks.'
+      : 'Add an active stage before reopening tasks.', 'error');
+    return;
+  }
+  const moved = await moveTask(item.id, target.id, null, { source: 'completion' });
+  if (moved) showToast(completed ? 'Task completed' : 'Task reopened');
+}
+
 function queueId() {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
   return `queue-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -4537,13 +4843,36 @@ function uploadWithXhr(url, formData, entry) {
     xhr.addEventListener('load', () => {
       entry.xhr = null;
       const payload = xhr.response || (() => { try { return JSON.parse(xhr.responseText); } catch (_) { return {}; } })();
-      if (xhr.status >= 200 && xhr.status < 300) resolve(payload || {});
-      else reject(new Error(payload?.detail || payload?.error || `HTTP ${xhr.status}`));
+      try { resolve(resolveUploadResponse(xhr.status, payload)); }
+      catch (error) { reject(error); }
     });
     xhr.addEventListener('error', () => { entry.xhr = null; reject(new Error('Network error')); });
     xhr.addEventListener('abort', () => { entry.xhr = null; reject(Object.assign(new Error('Upload cancelled'), { name: 'AbortError' })); });
     xhr.send(formData);
   });
+}
+
+function resolveUploadResponse(status, payload) {
+  const normalizedStatus = Number(status) || 0;
+  if (normalizedStatus >= 200 && normalizedStatus < 300) return payload || {};
+  const error = new Error(payload?.detail || payload?.error || `HTTP ${normalizedStatus}`);
+  error.status = normalizedStatus;
+  error.payload = payload || null;
+  throw error;
+}
+
+function buildAttachmentFormData(entry, {
+  submissionNote = '', transitionStageId = '', version = 0,
+} = {}, FormDataType = globalThis.FormData) {
+  if (typeof FormDataType !== 'function') throw new Error('FormData is unavailable');
+  const formData = new FormDataType();
+  formData.append('file', entry.file, entry.file.name || 'attachment');
+  formData.append('kind', ATTACHMENT_KINDS.has(entry.kind) ? entry.kind : 'reference');
+  if (entry.description) formData.append('description', entry.description);
+  if (submissionNote) formData.append('submission_note', submissionNote);
+  if (transitionStageId) formData.append('transition_stage_id', transitionStageId);
+  formData.append('version', String(version));
+  return formData;
 }
 
 function updateQueueProgress(entry) {
@@ -4566,16 +4895,12 @@ async function uploadQueueEntry(entry, {
   const expectedVersion = version ?? scopedItem?.version ?? 0;
   entry.status = 'uploading'; entry.error = ''; entry.progress = 0;
   if (taskContextMatches(context)) renderTaskDrawer();
-  const formData = new FormData();
-  formData.append('file', entry.file, entry.file.name || 'attachment');
-  formData.append('kind', ATTACHMENT_KINDS.has(entry.kind) ? entry.kind : 'reference');
-  if (entry.description) formData.append('description', entry.description);
-  if (submissionNote) formData.append('submission_note', submissionNote);
-  if (transitionStageId) formData.append('transition_stage_id', transitionStageId);
-  formData.append('version', String(expectedVersion));
-  const url = `${API_BASE}${projectPath(
-    context.projectId, `/items/${encodeURIComponent(context.itemId)}/attachments`, context.source,
-  )}`;
+  const formData = buildAttachmentFormData(entry, {
+    submissionNote,
+    transitionStageId,
+    version: expectedVersion,
+  });
+  const url = `${API_BASE}${attachmentUploadPath(context)}`;
   try {
     const result = await uploadWithXhr(url, formData, entry);
     const attachment = normalizeAttachment(result.attachment || { name: entry.file.name, size: entry.file.size, kind: entry.kind, description: entry.description });
@@ -4689,6 +5014,8 @@ async function onWorkspaceClick(event) {
     }
     case 'archive-project': await archiveProject(control.dataset.projectId, control.dataset.projectSource); break;
     case 'restore-project': await restoreProject(control.dataset.projectId, control.dataset.projectSource); break;
+    case 'complete-project': await completeProject(control.dataset.projectId, control.dataset.projectSource); break;
+    case 'reopen-project': await reopenProject(control.dataset.projectId, control.dataset.projectSource); break;
     case 'retry-remote-invitations':
     case 'retry-linked-projects':
       await Promise.all([
@@ -4734,6 +5061,13 @@ async function onWorkspaceClick(event) {
       break;
     case 'manage-stages': openStageManager(); break;
     case 'show-archived-tasks': openArchivedTasksDialog(); break;
+    case 'open-project-brief': await openProjectBrief(); break;
+    case 'open-brief-item': {
+      const taskId = control.dataset.taskId;
+      closeDialog();
+      await openTaskDetail(taskId, control);
+      break;
+    }
     case 'open-archived-task': {
       const taskId = control.dataset.taskId;
       closeDialog();
@@ -4761,6 +5095,8 @@ async function onWorkspaceClick(event) {
     case 'drawer-close': await closeTaskDetail(); break;
     case 'archive-task': await setTaskArchived(true); break;
     case 'restore-task': await setTaskArchived(false); break;
+    case 'complete-task': await setTaskCompletion(true); break;
+    case 'reopen-task': await setTaskCompletion(false); break;
     case 'delete-checklist': await deleteChecklistItem(control.dataset.checklistId); break;
     case 'delete-comment': await deleteComment(control.dataset.commentId); break;
     case 'load-earlier-comments': await loadEarlierComments(control); break;
@@ -5023,6 +5359,14 @@ export function init(apiBase = '', deps = {}) {
 
 export async function open() {
   if (state.open) { focus(); return true; }
+  // Projects is a primary workspace. Leave Study cleanly (including pausing
+  // its focus timer) and close Mission Control before mounting the board so
+  // mobile and desktop never stack competing full-screen surfaces.
+  if (typeof window !== 'undefined' && window.studyModule?.isActive?.()) {
+    const closed = await window.studyModule.close({ startFresh: false });
+    if (!closed && window.studyModule?.isActive?.()) return false;
+  }
+  if (typeof window !== 'undefined') window.missionControlModule?.close?.();
   if (!state.initialized) init();
   state.previousFocus = typeof document !== 'undefined' ? document.activeElement : null;
   state.open = true;
@@ -5065,6 +5409,7 @@ export async function close({ force = false } = {}) {
   lifecycleCleanups.splice(0).forEach((cleanup) => { try { cleanup(); } catch (_) {} });
   refs.root?.remove();
   document.body.classList.remove('projects-view');
+  document.dispatchEvent(new CustomEvent('restia:projects-closed'));
   const previous = state.previousFocus;
   state.selectedItem = null;
   state.actor = null;
@@ -5136,8 +5481,12 @@ export const __test = Object.freeze({
   runMoveTransaction,
   visibleStagesForViewport,
   computeProjectHealth,
+  countIncompleteChecklistSteps,
   isAcceptedAttachment,
   attachmentKindLabel,
+  attachmentUploadPath,
+  buildAttachmentFormData,
+  resolveUploadResponse,
 });
 
 const projectsModule = { init, open, close, toggle, isOpen, focus, moveTask, __test };

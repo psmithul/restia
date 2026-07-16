@@ -75,7 +75,7 @@ def test_cancelled_thread_write_settles_then_deletes_final_file(tmp_path):
     assert not list(store.root.rglob(".project-file-*"))
 
 
-def test_reconcile_deletes_only_old_confined_orphans_and_temps(
+def test_default_reconcile_preserves_durable_orphans_and_deletes_old_private_temps(
     tmp_path,
     caplog,
 ):
@@ -111,18 +111,47 @@ def test_reconcile_deletes_only_old_confined_orphans_and_temps(
 
     assert valid_path.exists()
     assert recent_path.exists()
-    assert not orphan_path.exists()
+    assert orphan_path.read_bytes() == b"%PDF-orphan"
     assert not temporary.exists()
     assert outside.read_bytes() == b"outside"
     if symlink is not None:
         assert symlink.is_symlink()
     assert stats["referenced"] == 2
     assert stats["missing"] == 1
-    assert stats["deleted_orphans"] == 1
+    assert stats["deleted_orphans"] == 0
     assert stats["deleted_temps"] == 1
-    assert stats["skipped_recent"] == 1
+    assert stats["skipped_recent"] == 0
     assert stats["truncated"] is False
     assert "missing file" in caplog.text
+
+
+def test_explicit_maintenance_can_delete_old_confined_durable_orphans(tmp_path):
+    store = ProjectFileStore(tmp_path / "project-files")
+    valid_key = store.storage_key("project-1", "item-1", "valid-1", ".pdf")
+    orphan_key = store.storage_key("project-1", "item-1", "orphan-1", ".pdf")
+    recent_key = store.storage_key("project-1", "item-1", "recent-1", ".pdf")
+
+    valid_path = store.write(valid_key, b"%PDF-valid")
+    orphan_path = store.write(orphan_key, b"%PDF-orphan")
+    recent_path = store.write(recent_key, b"%PDF-recent")
+    _make_old(valid_path)
+    _make_old(orphan_path)
+
+    stats = store.reconcile(
+        [valid_key],
+        delete_durable_orphans=True,
+        grace_seconds=3_600,
+        max_entries=100,
+        time_budget_seconds=5,
+    )
+
+    assert valid_path.exists()
+    assert not orphan_path.exists()
+    assert recent_path.exists()
+    assert stats["deleted_orphans"] == 1
+    assert stats["deleted_temps"] == 0
+    assert stats["skipped_recent"] == 1
+    assert stats["truncated"] is False
 
 
 def test_incomplete_reference_scan_aborts_deletion(tmp_path):
@@ -141,6 +170,7 @@ def test_incomplete_reference_scan_aborts_deletion(tmp_path):
 
     stats = store.reconcile(
         slow_references(),
+        delete_durable_orphans=True,
         grace_seconds=0,
         max_entries=100,
         time_budget_seconds=0.005,
@@ -151,6 +181,36 @@ def test_incomplete_reference_scan_aborts_deletion(tmp_path):
     assert stats["deleted_orphans"] == 0
     assert first_path.exists()
     assert late_path.exists()
+
+
+def test_project_router_startup_with_mismatched_empty_db_preserves_durable_file(
+    monkeypatch,
+    tmp_path,
+):
+    class Query:
+        def yield_per(self, _size):
+            return iter(())
+
+    class Session:
+        def query(self, _column):
+            return Query()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(project_routes, "SessionLocal", Session)
+    store = ProjectFileStore(tmp_path / "project-files")
+    durable_key = store.storage_key("project-1", "item-1", "durable-1", ".pdf")
+    durable_path = store.write(durable_key, b"%PDF-durable")
+    temporary = durable_path.parent / ".project-file-crashed-writer"
+    temporary.write_bytes(b"partial")
+    _make_old(durable_path)
+    _make_old(temporary)
+
+    project_routes.setup_project_routes(store)
+
+    assert durable_path.read_bytes() == b"%PDF-durable"
+    assert not temporary.exists()
 
 
 def test_project_router_setup_invokes_one_reconciliation_pass(monkeypatch, tmp_path):
@@ -175,10 +235,15 @@ def test_project_router_setup_invokes_one_reconciliation_pass(monkeypatch, tmp_p
     monkeypatch.setattr(
         store,
         "reconcile",
-        lambda keys: calls.append(list(keys)) or {"truncated": False},
+        lambda keys, **kwargs: calls.append((list(keys), kwargs)) or {"truncated": False},
     )
 
     project_routes.setup_project_routes(store)
 
-    assert calls == [["project-1/item-1/file-1.pdf"]]
+    assert calls == [
+        (
+            ["project-1/item-1/file-1.pdf"],
+            {"delete_durable_orphans": False},
+        )
+    ]
     assert session.closed is True

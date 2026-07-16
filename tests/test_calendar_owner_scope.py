@@ -13,6 +13,7 @@ dropped (the original cross-tenant behavior).
 """
 import ast
 import asyncio
+import importlib.util
 import sys
 import types
 from pathlib import Path
@@ -73,6 +74,12 @@ class _Column:
     def isnot(self, value):
         return _Expr("isnot", self.field, value)
 
+    def asc(self):
+        return self
+
+    def desc(self):
+        return self
+
 
 def _expr_contains(expr, field, value):
     if isinstance(expr, _Expr):
@@ -103,6 +110,7 @@ class _FakeQuery:
         self.filter_calls = []
         self.owner_filter = None
         self.all_called = False
+        self.limit_value = None
 
     def join(self, *_args, **_kwargs):
         return self
@@ -117,23 +125,32 @@ class _FakeQuery:
     def order_by(self, *_args, **_kwargs):
         return self
 
+    def limit(self, value):
+        self.limit_value = int(value)
+        return self
+
     def first(self):
         return self.rows[0] if self.rows else None
 
     def all(self):
         self.all_called = True
         if self.owner_filter is None:
-            return list(self.rows)
-        return [
-            row for row in self.rows
-            if getattr(getattr(row, "calendar", None), "owner", None) == self.owner_filter
-        ]
+            rows = list(self.rows)
+        else:
+            rows = [
+                row for row in self.rows
+                if getattr(getattr(row, "calendar", None), "owner", None)
+                == self.owner_filter
+            ]
+        return rows[:self.limit_value] if self.limit_value is not None else rows
 
 
 class _FakeSession:
     def __init__(self, *, calendars=(), events=()):
         self.calendar_query = _FakeQuery(list(calendars))
-        self.event_query = _FakeQuery(list(events))
+        self.event_rows = list(events)
+        self.event_query = _FakeQuery(self.event_rows)
+        self.event_queries = []
         self.add = MagicMock()
         self.commit = MagicMock()
         self.rollback = MagicMock()
@@ -143,6 +160,8 @@ class _FakeSession:
         if model is _CalendarCal:
             return self.calendar_query
         if model is _CalendarEvent:
+            self.event_query = _FakeQuery(self.event_rows)
+            self.event_queries.append(self.event_query)
             return self.event_query
         raise AssertionError(f"unexpected query model: {model!r}")
 
@@ -181,8 +200,19 @@ def _install_multipart_stub(monkeypatch):
 def _import_calendar_routes(monkeypatch):
     _install_calendar_db_stub(monkeypatch)
     _install_multipart_stub(monkeypatch)
-    monkeypatch.delitem(sys.modules, "routes.calendar_routes", raising=False)
-    mod = __import__("routes.calendar_routes", fromlist=["setup_calendar_routes"])
+    # Load an isolated copy instead of deleting the canonical module from
+    # sys.modules. Deleting and re-importing left ``routes.calendar_routes``
+    # pointing at a different module object after MonkeyPatch restored
+    # sys.modules, so later tests patched one copy and executed another.
+    module_name = f"routes._calendar_routes_owner_scope_{id(monkeypatch)}"
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        Path("routes/calendar_routes.py").resolve(),
+    )
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, module_name, mod)
+    spec.loader.exec_module(mod)
     monkeypatch.setattr(mod, "or_", lambda *args: _Expr("or", children=args))
     monkeypatch.setattr(mod, "and_", lambda *args: _Expr("and", children=args))
     return mod
@@ -297,6 +327,66 @@ def test_list_events_filters_by_calendar_owner_before_output(monkeypatch):
     assert expanded == ["alice-event"]
     assert session.event_query.owner_filter == "alice"
     session.close.assert_called_once()
+
+
+def test_list_events_bounds_candidates_and_combined_output(monkeypatch):
+    calendar_routes = _import_calendar_routes(monkeypatch)
+    monkeypatch.setattr(calendar_routes, "_CALENDAR_LIST_CANDIDATE_LIMIT", 5)
+    monkeypatch.setattr(calendar_routes, "_CALENDAR_LIST_OUTPUT_LIMIT", 3)
+    events = [_event("alice", f"event-{index}") for index in range(10)]
+    for event in events[2:]:
+        event.rrule = "FREQ=DAILY"
+    session = _FakeSession(events=events)
+    monkeypatch.setattr(calendar_routes, "SessionLocal", lambda: session)
+
+    def fake_expand(event, _start, _end, **kwargs):
+        budget = kwargs.get("budget")
+        if budget is not None:
+            assert budget.remaining_output == 1
+            assert budget.consume_output() is True
+        return [{"uid": event.uid, "dtstart": f"2026-06-02T{event.uid[-1]}0:00:00"}]
+
+    monkeypatch.setattr(calendar_routes, "_expand_rrule", fake_expand)
+    list_events = _route_endpoint(calendar_routes, "/events", "GET")
+
+    out = asyncio.run(list_events(
+        _request(),
+        start="2026-06-01T00:00:00",
+        end="2026-06-03T00:00:00",
+    ))
+
+    assert len(out["events"]) == 3
+    assert out["truncated"] is True
+    assert [query.limit_value for query in session.event_queries] == [4, 6]
+    session.close.assert_called_once()
+
+
+def test_old_recurring_candidates_cannot_starve_current_direct_event(monkeypatch):
+    calendar_routes = _import_calendar_routes(monkeypatch)
+    monkeypatch.setattr(calendar_routes, "_CALENDAR_LIST_CANDIDATE_LIMIT", 2)
+    monkeypatch.setattr(calendar_routes, "_CALENDAR_LIST_OUTPUT_LIMIT", 5)
+    old_series = [_event("alice", f"old-series-{index}") for index in range(3)]
+    for event in old_series:
+        event.rrule = "FREQ=YEARLY"
+    current = _event("alice", "current-direct")
+    session = _FakeSession(events=[*old_series, current])
+    monkeypatch.setattr(calendar_routes, "SessionLocal", lambda: session)
+
+    def fake_expand(event, _start, _end, **_kwargs):
+        return [{"uid": event.uid, "dtstart": f"2026-06-02T10:00:{event.uid[-1]}0"}]
+
+    monkeypatch.setattr(calendar_routes, "_expand_rrule", fake_expand)
+    list_events = _route_endpoint(calendar_routes, "/events", "GET")
+
+    out = asyncio.run(list_events(
+        _request(),
+        start="2026-06-01T00:00:00",
+        end="2026-06-03T00:00:00",
+    ))
+
+    assert "current-direct" in {event["uid"] for event in out["events"]}
+    assert out["truncated"] is True
+    assert [query.limit_value for query in session.event_queries] == [6, 3]
 
 
 def test_export_ics_rejects_null_owner_calendar_at_route_boundary(monkeypatch):

@@ -9,14 +9,109 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
+import core.database as cdb
+from core.project_upload_limit import ProjectAttachmentBodyLimitMiddleware
 from routes import link_routes
+from routes import project_routes
+from src.project_storage import ProjectFileStore
 
 PROJECT_ID = "11111111-1111-1111-1111-111111111111"
 ITEM_ID = "22222222-2222-2222-2222-222222222222"
 ATTACHMENT_ID = "33333333-3333-3333-3333-333333333333"
+
+
+def _remote_upload_env(monkeypatch, tmp_path):
+    """Mount the real remote Projects router behind the local Home Link proxy."""
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+
+    @event.listens_for(engine, "connect")
+    def _foreign_keys(dbapi_connection, _connection_record):
+        dbapi_connection.execute("PRAGMA foreign_keys=ON")
+
+    cdb.Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    monkeypatch.setattr(link_routes, "SessionLocal", factory)
+    monkeypatch.setattr(project_routes, "SessionLocal", factory)
+    monkeypatch.setattr(
+        link_routes,
+        "_project_remote_limiter",
+        link_routes.RateLimiter(max_requests=10_000, window_seconds=60),
+    )
+    monkeypatch.setattr(
+        link_routes,
+        "_project_remote_invalid_limiter",
+        link_routes.RateLimiter(max_requests=10_000, window_seconds=60),
+    )
+    monkeypatch.setenv("LINK_HUB_ENABLED", "true")
+
+    db = factory()
+    try:
+        guest = cdb.LinkGuest(
+            handle="remote-editor",
+            token_hash=link_routes._hash_token("server-only-bearer"),
+            status="approved",
+        )
+        project = cdb.Project(
+            id=PROJECT_ID,
+            owner="owner",
+            key="LINK",
+            name="Linked project",
+        )
+        stage = cdb.ProjectStage(
+            id="44444444-4444-4444-4444-444444444444",
+            project_id=PROJECT_ID,
+            name="Doing",
+            category="active",
+            position=0,
+        )
+        item = cdb.ProjectWorkItem(
+            id=ITEM_ID,
+            project_id=PROJECT_ID,
+            stage_id=stage.id,
+            item_number=1,
+            title="Remote deliverable",
+            reporter="owner",
+        )
+        db.add_all([guest, project, stage, item])
+        db.flush()
+        grant = cdb.ProjectRemoteGrant(
+            id="55555555-5555-5555-5555-555555555555",
+            project_id=PROJECT_ID,
+            guest_id=guest.id,
+            handle_snapshot=guest.handle,
+            role="editor",
+            status="active",
+            invited_by="owner",
+        )
+        db.add(grant)
+        db.commit()
+        guest_id = int(guest.id)
+        grant_id = str(grant.id)
+    finally:
+        db.close()
+
+    store = ProjectFileStore(tmp_path / "project-files")
+    hub = FastAPI()
+    hub.add_middleware(ProjectAttachmentBodyLimitMiddleware)
+    hub.include_router(
+        project_routes.setup_project_routes(
+            store,
+            prefix="/api/link/projects",
+            remote_only=True,
+            dependencies=[Depends(link_routes.require_link_project_remote)],
+        )
+    )
+    return hub, factory, store, engine, guest_id, grant_id
 
 
 def _proxy_app(monkeypatch, *, assert_current=None):
@@ -354,6 +449,7 @@ def test_project_proxy_transport_classification_is_exact():
         "GET", f"attachments/{ATTACHMENT_ID}/download"
     ) == "download"
     assert link_routes._project_proxy_kind("GET", f"{PROJECT_ID}/board") == "json"
+    assert link_routes._project_proxy_kind("GET", f"{PROJECT_ID}/context") == "json"
     with pytest.raises(HTTPException) as exc:
         link_routes._project_proxy_kind(
             "POST", f"attachments/{ATTACHMENT_ID}/download"
@@ -552,12 +648,127 @@ def test_project_upload_proxy_replays_the_staged_multipart_bytes(monkeypatch):
         f"{PROJECT_ID}/items/{ITEM_ID}/attachments",
         {"token": "server-only-bearer", "base_url": "https://pinned.example"},
     ))
-    assert result == {"ok": True}
+    assert result.status_code == 200
+    assert json.loads(result.body) == {"ok": True}
+    assert result.headers["cache-control"] == "no-store"
     assert seen == {
         "body": payload,
         "content_length": str(len(payload)),
         "content_type": "multipart/form-data; boundary=restia-test",
     }
+
+
+@pytest.mark.parametrize(
+    ("status_code", "upstream_detail", "expected_detail"),
+    [
+        (408, "Project attachment upload body timed out", "Project attachment upload body timed out"),
+        (413, "Attachment exceeds 50 MB limit", "Attachment exceeds 50 MB limit"),
+        (415, "Project attachment upload must be multipart/form-data", "Project attachment upload must be multipart/form-data"),
+        (422, [{"loc": ["body", "file"], "msg": "Field required"}], "Invalid project attachment upload request"),
+        (507, "Unable to store attachment; check project storage space and permissions", "Unable to store attachment; check project storage space and permissions"),
+    ],
+)
+def test_project_upload_proxy_preserves_bounded_actionable_upstream_errors(
+    monkeypatch,
+    status_code,
+    upstream_detail,
+    expected_detail,
+):
+    payload = b"--restia-test\r\nbody\r\n--restia-test--\r\n"
+    real_client = httpx.AsyncClient
+
+    async def upstream(_request):
+        return httpx.Response(status_code, json={"detail": upstream_detail})
+
+    def client_factory(**kwargs):
+        return real_client(transport=httpx.MockTransport(upstream), **kwargs)
+
+    monkeypatch.setattr(link_routes.httpx, "AsyncClient", client_factory)
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(link_routes._proxy_home_project_upload(
+            (
+                io.BytesIO(payload),
+                "multipart/form-data; boundary=restia-test",
+                len(payload),
+            ),
+            f"{PROJECT_ID}/items/{ITEM_ID}/attachments",
+            {"token": "server-only-bearer", "base_url": "https://pinned.example"},
+        ))
+    assert exc.value.status_code == status_code
+    assert exc.value.detail == expected_detail
+    assert "server-only-bearer" not in str(exc.value.detail)
+
+
+def test_remote_editor_upload_reaches_authoritative_project_router(
+    monkeypatch,
+    tmp_path,
+):
+    """Exercise browser multipart -> local proxy -> bearer-gated hub upload."""
+    hub, factory, store, engine, _guest_id, grant_id = _remote_upload_env(
+        monkeypatch,
+        tmp_path,
+    )
+    local, snapshot = _proxy_app(monkeypatch)
+    local.add_middleware(ProjectAttachmentBodyLimitMiddleware)
+    real_async_client = httpx.AsyncClient
+
+    def client_factory(**kwargs):
+        return real_async_client(
+            transport=httpx.ASGITransport(
+                app=hub,
+                client=("203.0.113.43", 4321),
+            ),
+            **kwargs,
+        )
+
+    monkeypatch.setattr(link_routes.httpx, "AsyncClient", client_factory)
+    payload = b"linked editor evidence\n"
+    try:
+        response = TestClient(local).post(
+            f"/api/homelink/projects/{PROJECT_ID}/items/{ITEM_ID}/attachments",
+            headers={"Authorization": "Bearer browser-controlled-token"},
+            files={"file": ("evidence.txt", payload, "text/plain")},
+            data={"kind": "deliverable", "description": "Remote result"},
+        )
+        assert response.status_code == 201, response.text
+        body = response.json()
+        assert body["attachment"]["name"] == "evidence.txt"
+        assert body["attachment"]["size"] == len(payload)
+        assert body["attachment"]["download_url"].startswith(
+            "/api/link/projects/attachments/"
+        )
+        assert snapshot["token"] not in response.text
+
+        db = factory()
+        try:
+            attachment = db.query(cdb.ProjectAttachment).one()
+            assert attachment.uploader == project_routes.remote_grant_principal(grant_id)
+            stored_path = store.resolve(attachment.storage_key)
+        finally:
+            db.close()
+        assert stored_path.read_bytes() == payload
+
+        db = factory()
+        try:
+            grant = db.query(cdb.ProjectRemoteGrant).filter_by(id=grant_id).one()
+            grant.role = "viewer"
+            db.commit()
+        finally:
+            db.close()
+        denied = TestClient(local).post(
+            f"/api/homelink/projects/{PROJECT_ID}/items/{ITEM_ID}/attachments",
+            files={"file": ("forbidden.txt", b"not stored\n", "text/plain")},
+        )
+        assert denied.status_code == 403
+        assert denied.json()["detail"] == "Project role does not allow this action"
+        assert snapshot["token"] not in denied.text
+        db = factory()
+        try:
+            assert db.query(cdb.ProjectAttachment).count() == 1
+        finally:
+            db.close()
+    finally:
+        engine.dispose()
 
 
 def test_project_spool_io_finishes_worker_before_propagating_cancellation():

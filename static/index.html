@@ -111,6 +111,13 @@
       // Shapes are line-stroke SVGs (no emoji glyphs). Each entry returns
       // the inner SVG markup rendered against currentColor=`ac`.
       var SHAPES = {
+        '/today':
+          "<path d='M5 15 L16 5 L27 15' fill='none' stroke='" + ac + "' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/>" +
+          "<path d='M8 13 V27 H24 V13' fill='none' stroke='" + ac + "' stroke-width='2.5' stroke-linejoin='round'/>" +
+          "<path d='M13 27 V20 H19 V27' fill='none' stroke='" + ac + "' stroke-width='2.2' stroke-linejoin='round'/>",
+        '/activity':
+          "<path d='M5 27 V16 M12 27 V9 M19 27 V13 M26 27 V5' fill='none' stroke='" + ac + "' stroke-width='2.5' stroke-linecap='round'/>" +
+          "<path d='M3 27 H29' fill='none' stroke='" + ac + "' stroke-width='2.5' stroke-linecap='round'/>",
         '/calendar':
           "<rect x='4' y='6' width='24' height='22' rx='2' fill='none' stroke='" + ac + "' stroke-width='2.5'/>" +
           "<line x1='4' y1='12' x2='28' y2='12' stroke='" + ac + "' stroke-width='2.5'/>" +
@@ -167,6 +174,8 @@
       apple.href = href;
       // Also customize the page title so the bookmark inherits a useful name.
       var titles = {
+        '/today': 'Today — Restia',
+        '/activity': 'Activity — Restia',
         '/calendar': 'Calendar — Restia',
         '/notes': 'Notes — Restia',
         '/study': 'Study Mode — Restia',
@@ -226,9 +235,11 @@
       if (k) k.addEventListener('load', function(){ k.media = 'all'; }, { once: true });
     })();
   </script>
-  <link rel="stylesheet" href="/static/style.css?v=20260715instances">
-  <link id="projects-workspace-css" rel="stylesheet" href="/static/projects.css?v=20260715instances">
-  <link rel="modulepreload" href="/static/app.js?v=20260715instances">
+  <link rel="stylesheet" href="/static/style.css?v=20260715v2">
+  <link id="projects-workspace-css" rel="stylesheet" href="/static/projects.css?v=20260715v2">
+  <link id="v2-shell-css" rel="stylesheet" href="/static/v2-shell.css?v=20260715v2">
+  <link id="mission-control-css" rel="stylesheet" href="/static/mission-control.css?v=20260715v2">
+  <link rel="modulepreload" href="/static/app.js?v=20260715v2">
   <link rel="modulepreload" href="/static/js/chat.js">
   <link rel="modulepreload" href="/static/js/ui.js">
   <link rel="modulepreload" href="/static/js/sessions.js">
@@ -801,7 +812,7 @@
 
       <div class="section" id="email-section">
         <div class="section-header-flex">
-          <span class="section-title" id="email-section-title" style="cursor:pointer;" title="Open email inbox"><svg class="section-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/></svg><span>Email</span></span>
+          <button type="button" class="section-title" id="email-section-title" title="Open email inbox"><svg class="section-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/></svg><span>Email</span></button>
           <button type="button" class="section-header-btn list-item-plus-btn" id="email-compose-btn" title="Compose email">
             <svg class="list-item-plus-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
             <span class="list-item-plus-label">new</span>
@@ -906,11 +917,13 @@
           </svg>
           <span class="grow">Gallery</span>
         </div>
-        <div class="list-item" id="tool-library-btn">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;opacity:0.5;">
-            <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/><path d="M9 7h6M9 11h4"/>
-          </svg>
-          <span class="grow">Library</span>
+        <div class="list-item tool-library-row" id="tool-library-row">
+          <button type="button" class="tool-library-main" id="tool-library-btn" aria-haspopup="dialog">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;opacity:0.5;">
+              <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/><path d="M9 7h6M9 11h4"/>
+            </svg>
+            <span class="grow">Library</span>
+          </button>
           <button type="button" class="list-item-plus-btn" id="library-new-doc-btn" title="New document">
             <svg class="list-item-plus-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="width:11px;height:11px;"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
             <span class="list-item-plus-label">document</span>
@@ -2777,7 +2790,7 @@
 <script type="module" src="/static/js/settings.js"></script>
 <script type="module" src="/static/js/admin.js"></script>
 <script type="module" src="/static/js/assistant.js"></script>
-<script type="module" src="/static/app.js?v=20260715instances"></script>  <!-- app.js must be LAST -->
+<script type="module" src="/static/app.js?v=20260715v2"></script>  <!-- app.js must be LAST -->
 <script type="module" src="/static/js/init.js"></script>
 <script type="module" src="/static/js/a11y.js"></script>
 <script type="module" src="/static/js/updateChecker.js"></script>

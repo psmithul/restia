@@ -184,6 +184,75 @@ PROJECT_TEMPLATES: dict[str, list[tuple[str, str, str]]] = {
         ("Waiting / Review", "review", "#8b5cf6"),
         ("Shipped", "done", "#22c55e"),
     ],
+    "applications": [
+        ("Researching", "backlog", "#64748b"),
+        ("Shortlisted", "todo", "#3b82f6"),
+        ("Preparing", "in_progress", "#f59e0b"),
+        ("Submitted", "review", "#8b5cf6"),
+        ("Decision", "done", "#22c55e"),
+    ],
+    "engineering_labbook": [
+        ("Ideas & Questions", "backlog", "#64748b"),
+        ("Planned", "todo", "#3b82f6"),
+        ("Setup & Calibration", "todo", "#06b6d4"),
+        ("Experiment Running", "in_progress", "#f59e0b"),
+        ("Analysis", "review", "#8b5cf6"),
+        ("Findings", "done", "#22c55e"),
+    ],
+    "opportunity_radar": [
+        ("Discovered", "backlog", "#64748b"),
+        ("Evaluating", "todo", "#3b82f6"),
+        ("Qualified", "todo", "#06b6d4"),
+        ("Pursuing", "in_progress", "#f59e0b"),
+        ("Waiting", "review", "#8b5cf6"),
+        ("Closed", "done", "#22c55e"),
+    ],
+    "gtm_pipeline": [
+        ("Accounts", "backlog", "#64748b"),
+        ("Qualified", "todo", "#3b82f6"),
+        ("Outreach", "in_progress", "#f59e0b"),
+        ("Conversation", "in_progress", "#06b6d4"),
+        ("Pilot / Proposal", "review", "#8b5cf6"),
+        ("Closed", "done", "#22c55e"),
+    ],
+    "weekly_review": [
+        ("Capture", "backlog", "#64748b"),
+        ("Review", "todo", "#3b82f6"),
+        ("Decide", "in_progress", "#f59e0b"),
+        ("Scheduled", "review", "#8b5cf6"),
+        ("Closed", "done", "#22c55e"),
+    ],
+}
+
+PROJECT_TEMPLATE_NAMES = {
+    "applications": "Applications Cockpit",
+    "engineering_labbook": "Engineering Labbook",
+    "opportunity_radar": "Opportunity Radar",
+    "gtm_pipeline": "GTM Pipeline",
+    "weekly_review": "Weekly Review",
+}
+
+PROJECT_TEMPLATE_GUIDANCE = {
+    "applications": (
+        "Use one work item per program or role. Put the institution, fit, deadline, "
+        "and evidence gaps in labels/checklists; attach the final submitted artifact."
+    ),
+    "engineering_labbook": (
+        "Use one work item per experiment. Record the hypothesis and calibration before "
+        "the run, then attach raw evidence and close only after a reproducible finding."
+    ),
+    "opportunity_radar": (
+        "Capture opportunities quickly, score fit and expected upside, and pursue only "
+        "the qualified few with a dated next action."
+    ),
+    "gtm_pipeline": (
+        "Use one work item per account or motion. Keep the decision maker, signal, next "
+        "touch, and expected outcome visible through the pipeline."
+    ),
+    "weekly_review": (
+        "Capture loose ends, review every active commitment, decide the next action, and "
+        "schedule it before closing the review."
+    ),
 }
 
 
@@ -805,6 +874,8 @@ def _get_project(
         raise HTTPException(403, "Project role does not allow this action")
     if writable and project.archived:
         raise HTTPException(409, "Restore the project before changing it")
+    if writable and project.completed_at:
+        raise HTTPException(409, "Reopen the completed project before changing it")
     return project, role
 
 
@@ -959,6 +1030,8 @@ def _project_dict(project: Project) -> dict[str, Any]:
         "color": project.color,
         "icon": project.icon,
         "archived": bool(project.archived),
+        "completed_at": _iso(project.completed_at),
+        "status": "archived" if project.archived else ("completed" if project.completed_at else "active"),
         "version": int(project.version or 1),
         "created_at": _iso(project.created_at),
         "updated_at": _iso(project.updated_at),
@@ -2008,9 +2081,11 @@ def setup_project_routes(
         dependencies=list(dependencies or []),
     )
     store = file_store or ProjectFileStore()
-    # One bounded startup/setup pass repairs leftovers from a killed process
-    # before normal requests begin. Reconciliation is best-effort: an audit
-    # problem is loud in logs but must not make the entire Restia UI unavailable.
+    # One bounded startup/setup pass removes stale private writer temp files and
+    # audits missing references before normal requests begin. Durable files are
+    # never treated as deletable orphans here: the mounted database and storage
+    # root may belong to different instances. Reconciliation is best-effort; an
+    # audit problem is loud in logs but must not make the UI unavailable.
     if not remote_only:
         reconciliation_db = None
         try:
@@ -2020,7 +2095,7 @@ def setup_project_routes(
                 for row in reconciliation_db.query(ProjectAttachment.storage_key)
                 .yield_per(1_000)
             )
-            store.reconcile(referenced_keys)
+            store.reconcile(referenced_keys, delete_durable_orphans=False)
         except Exception:
             logger.exception("Project attachment startup reconciliation failed")
         finally:
@@ -2034,7 +2109,9 @@ def setup_project_routes(
             "templates": [
                 {
                     "id": template_id,
-                    "name": template_id.replace("_", " ").title(),
+                    "name": PROJECT_TEMPLATE_NAMES.get(
+                        template_id, template_id.replace("_", " ").title()
+                    ),
                     "stages": [
                         {"name": name, "category": category, "color": color}
                         for name, category, color in stages
@@ -2589,9 +2666,11 @@ def setup_project_routes(
         if remote_only or _is_remote_actor(actor):
             raise HTTPException(403, "Remote project access cannot create projects")
         name = _clean_text(body.name, field="Project name", max_length=160, required=True)
-        template = str(body.template or "general").strip().lower()
+        template = str(body.template).strip().lower()
+        if not template:
+            raise HTTPException(400, "Project template is required")
         if template not in PROJECT_TEMPLATES:
-            raise HTTPException(400, "Unknown project template")
+            raise HTTPException(400, f"Unknown project template: {template}")
         template_stages = PROJECT_TEMPLATES[template]
         if len(template_stages) > PROJECT_MAX_STAGES_PER_PROJECT:
             raise HTTPException(
@@ -2645,6 +2724,141 @@ def setup_project_routes(
             project, role = _get_project(db, project_id, actor)
             return _project_payload(db, project, role)
 
+    @router.get("/{project_id}/context")
+    async def get_project_context(project_id: str, request: Request):
+        """Return a bounded, deterministic project brief and next actions.
+
+        This is deliberately computed from project state rather than a model
+        call: it remains private/local, fast, reproducible, and useful when no
+        LLM provider is configured. Linked viewers receive the same
+        identity-sanitized serializers as the rest of the Projects API.
+        """
+
+        actor = _actor(request)
+        with _db_session(write=False) as db:
+            project, role = _get_project(db, project_id, actor)
+            overview = _overview(db, project)
+            stages = (
+                db.query(ProjectStage)
+                .filter(ProjectStage.project_id == project.id)
+                .order_by(ProjectStage.position.asc(), ProjectStage.id.asc())
+                .all()
+            )
+            items = (
+                db.query(ProjectWorkItem)
+                .options(defer(ProjectWorkItem.description))
+                .filter(
+                    ProjectWorkItem.project_id == project.id,
+                    ProjectWorkItem.archived.is_(False),
+                )
+                .order_by(ProjectWorkItem.item_number.asc(), ProjectWorkItem.id.asc())
+                .limit(PROJECT_MAX_ITEMS)
+                .all()
+            )
+            stage_by_id = {stage.id: stage for stage in stages}
+            item_by_id = {item.id: item for item in items}
+            today = date.today().isoformat()
+            priority_rank = {
+                "critical": 0,
+                "highest": 1,
+                "high": 2,
+                "medium": 3,
+                "low": 4,
+                "lowest": 5,
+            }
+
+            def item_context(item: ProjectWorkItem) -> tuple[bool, bool, str]:
+                stage = stage_by_id.get(item.stage_id)
+                is_done = bool(stage and stage.category == "done")
+                blocker = item_by_id.get(item.blocked_by_id) if item.blocked_by_id else None
+                blocker_stage = stage_by_id.get(blocker.stage_id) if blocker else None
+                blocked = bool(blocker and (not blocker_stage or blocker_stage.category != "done"))
+                stage_name = stage.name if stage else "Unknown stage"
+                return is_done, blocked, stage_name
+
+            candidates = []
+            for item in items:
+                is_done, blocked, stage_name = item_context(item)
+                if is_done:
+                    continue
+                overdue = bool(item.due_date and item.due_date < today)
+                due_today = bool(item.due_date == today)
+                urgency_rank = 0 if overdue else 1 if due_today else 2 if blocked else 3
+                candidates.append((
+                    urgency_rank,
+                    priority_rank.get(str(item.priority or "medium").lower(), 3),
+                    item.due_date or "9999-12-31",
+                    int(item.item_number or 0),
+                    item,
+                    blocked,
+                    stage_name,
+                    overdue,
+                    due_today,
+                ))
+            candidates.sort(key=lambda row: row[:4])
+            next_actions = []
+            for _, _, _, _, item, blocked, stage_name, overdue, due_today in candidates[:5]:
+                if overdue:
+                    reason = f"Overdue since {item.due_date}"
+                elif due_today:
+                    reason = "Due today"
+                elif blocked:
+                    blocker = item_by_id.get(item.blocked_by_id)
+                    reason = f"Blocked by {project.key}-{blocker.item_number}" if blocker else "Blocked"
+                elif str(item.priority or "").lower() in {"critical", "highest", "high"}:
+                    reason = f"{str(item.priority).title()} priority"
+                else:
+                    reason = f"Next in {stage_name}"
+                next_actions.append({
+                    **_item_card_dict(item, project.key),
+                    "stage": stage_name,
+                    "blocked": blocked,
+                    "reason": reason,
+                })
+
+            evidence_rows = (
+                db.query(ProjectAttachment)
+                .join(ProjectWorkItem, ProjectWorkItem.id == ProjectAttachment.work_item_id)
+                .filter(
+                    ProjectWorkItem.project_id == project.id,
+                    ProjectAttachment.status == "ready",
+                )
+                .order_by(ProjectAttachment.created_at.desc(), ProjectAttachment.id.desc())
+                .limit(12)
+                .all()
+            )
+            activity_rows = (
+                db.query(ProjectActivity)
+                .filter(ProjectActivity.project_id == project.id)
+                .order_by(ProjectActivity.created_at.desc(), ProjectActivity.id.desc())
+                .limit(10)
+                .all()
+            )
+            risk_parts = []
+            if overview["overdue_items"]:
+                risk_parts.append(f"{overview['overdue_items']} overdue")
+            if overview["blocked_items"]:
+                risk_parts.append(f"{overview['blocked_items']} blocked")
+            if overview["wip_breaches"]:
+                risk_parts.append(f"{overview['wip_breaches']} WIP breach")
+            risk = ", ".join(risk_parts) if risk_parts else "no current delivery risks"
+            brief = (
+                f"{project.name} is {overview['completion_percent']}% complete with "
+                f"{overview['open_items']} open item"
+                f"{'s' if overview['open_items'] != 1 else ''} and {risk}."
+            )
+            return {
+                "generated_at": _iso(utcnow_naive()),
+                "project": {**_project_dict(project), "role": role},
+                "brief": brief,
+                "guidance": PROJECT_TEMPLATE_GUIDANCE.get(project.template, ""),
+                "overview": overview,
+                "next_actions": next_actions,
+                "evidence": [_attachment_dict(row) for row in evidence_rows],
+                "recent_activity": [_activity_dict(row) for row in activity_rows],
+                "limits": {"next_actions": 5, "evidence": 12, "recent_activity": 10},
+            }
+
     @router.patch("/{project_id}")
     async def update_project(project_id: str, request: Request, body: ProjectUpdate):
         actor = _actor(request)
@@ -2694,6 +2908,80 @@ def setup_project_routes(
                 project.archived = True
                 project.updated_at = utcnow_naive()
                 _activity(db, project.id, actor, "project_archived", f"Archived project {project.key}")
+            db.flush()
+            return {"project": {**_project_dict(project), "role": "owner"}}
+
+    @router.post("/{project_id}/complete")
+    async def complete_project(project_id: str, request: Request, body: VersionRequest):
+        """Complete a project only after its active definition of done is met."""
+
+        actor = _actor(request)
+        with _db_session() as db:
+            project, _ = _get_project(
+                db, project_id, actor, minimum="owner", lock=True
+            )
+            _claim_version(db, project, body.version)
+            if project.archived:
+                raise HTTPException(409, "Restore the project before completing it")
+            if not project.completed_at:
+                overview = _overview(db, project)
+                open_items = int(overview["open_items"])
+                if open_items:
+                    raise HTTPException(
+                        409,
+                        f"Complete the remaining {open_items} active work item"
+                        f"{'s' if open_items != 1 else ''} first",
+                    )
+                incomplete_checklist = (
+                    db.query(ProjectChecklistItem.id)
+                    .join(
+                        ProjectWorkItem,
+                        ProjectWorkItem.id == ProjectChecklistItem.work_item_id,
+                    )
+                    .filter(
+                        ProjectWorkItem.project_id == project.id,
+                        ProjectWorkItem.archived.is_(False),
+                        ProjectChecklistItem.is_done.is_(False),
+                    )
+                    .first()
+                )
+                if incomplete_checklist:
+                    raise HTTPException(
+                        409,
+                        "Complete every active work-item checklist before completing the project",
+                    )
+                project.completed_at = utcnow_naive()
+                project.updated_at = project.completed_at
+                _activity(
+                    db,
+                    project.id,
+                    actor,
+                    "project_completed",
+                    f"Completed project {project.key}",
+                )
+            db.flush()
+            return {"project": {**_project_dict(project), "role": "owner"}}
+
+    @router.post("/{project_id}/reopen")
+    async def reopen_project(project_id: str, request: Request, body: VersionRequest):
+        actor = _actor(request)
+        with _db_session() as db:
+            project, _ = _get_project(
+                db, project_id, actor, minimum="owner", lock=True
+            )
+            _claim_version(db, project, body.version)
+            if project.archived:
+                raise HTTPException(409, "Restore the project before reopening it")
+            if project.completed_at:
+                project.completed_at = None
+                project.updated_at = utcnow_naive()
+                _activity(
+                    db,
+                    project.id,
+                    actor,
+                    "project_reopened",
+                    f"Reopened project {project.key}",
+                )
             db.flush()
             return {"project": {**_project_dict(project), "role": "owner"}}
 

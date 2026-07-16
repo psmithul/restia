@@ -171,6 +171,10 @@ export function initSectionCollapse(Storage) {
  */
 export function initSectionDrag(Storage, loadUIVis) {
   const sidebar = document.getElementById('sidebar');
+  // V2 has a registry-owned group order. Allowing the legacy free-form
+  // section sorter to move nested Chat/Email/Models sections across those
+  // groups would corrupt the new information architecture.
+  if (sidebar?.dataset?.navigationVersion === '2') return;
   const sidebarInner = sidebar ? sidebar.querySelector('.sidebar-inner') : null;
   if (!sidebarInner) return;
 

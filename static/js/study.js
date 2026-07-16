@@ -1531,6 +1531,7 @@ export async function open(options = {}) {
   const panel = _elements['study-panel'];
   panel.hidden = false;
   panel.setAttribute('aria-hidden', 'false');
+  document.dispatchEvent(new CustomEvent('restia:study-opened'));
   if (_elements['study-chat-launcher']) _elements['study-chat-launcher'].hidden = false;
   _activateNavigation(true);
   _enterChatShell();
@@ -1654,6 +1655,7 @@ async function _close(options = {}) {
   _restoreChatShell({ manual });
   _leaveStudyRoute();
   if (startFresh) _startFreshNormalChat();
+  document.dispatchEvent(new CustomEvent('restia:study-closed'));
   return true;
 }
 

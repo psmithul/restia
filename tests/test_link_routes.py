@@ -1100,6 +1100,10 @@ def test_background_home_stream_retains_offer_for_telegram_link_replay(monkeypat
 
     frames = _run(consume_background())
     assert frames[0] == lr._HOME_CALL_UPSTREAM_READY
+    assert frames[0] == (
+        'event: call-transport\n'
+        'data: {"status":"ready"}\n\n'
+    )
     assert any('"kind":"offer"' in frame for frame in frames)
     assert cr.incoming_call_notifications.begun[-1]["transport"] == "home"
 
@@ -1115,6 +1119,7 @@ def test_background_home_stream_retains_offer_for_telegram_link_replay(monkeypat
         iterator = response.body_iterator
         assert "connected" in await anext(iterator)
         assert '"kind":"offer"' in await anext(iterator)
+        assert await anext(iterator) == lr._HOME_CALL_UPSTREAM_READY
         await iterator.aclose()
 
     _run(replay())

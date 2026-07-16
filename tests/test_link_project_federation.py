@@ -723,11 +723,13 @@ async def test_personal_block_hides_pending_invitation_and_prevents_accept(
 
 
 def test_app_mounts_exact_bearer_gated_hub_namespace_only():
-    source = (Path(__file__).resolve().parents[1] / "app.py").read_text("utf-8")
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "app.py").read_text("utf-8")
+    bootstrap = (root / "src" / "v2" / "bootstrap.py").read_text("utf-8")
     assert '_re.compile(r"^/api/link/projects(?:/.*)?$")' in source
     assert "setup_link_project_invitation_routes()" in source
-    assert 'prefix="/api/link/projects"' in source
-    assert "dependencies=[Depends(require_link_project_remote)]" in source
+    assert 'prefix="/api/link/projects"' in bootstrap
+    assert 'dependencies=[Depends(ctx.require("require_link_project_remote"))]' in bootstrap
     auth_block = source[source.index("AUTH_EXEMPT_PATTERNS") : source.index(
         "def _is_auth_exempt"
     )]
