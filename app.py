@@ -825,7 +825,7 @@ app.include_router(setup_signature_routes())
 from routes.messaging_routes import setup_messaging_routes
 app.include_router(setup_messaging_routes())
 
-# Home Link (chat with the developer from a self-hosted instance)
+# Home Link (chat and collaboration between Restia installations)
 from routes.link_routes import (
     home_call_alert_watcher,
     require_link_project_remote,
@@ -944,7 +944,7 @@ app.include_router(setup_webhook_routes(webhook_manager, auth_manager, session_m
 
 # Telegram bot bridge
 from routes.telegram_routes import setup_telegram_routes
-app.include_router(setup_telegram_routes(session_manager, webhook_manager))
+app.include_router(setup_telegram_routes(session_manager, webhook_manager, task_scheduler))
 
 # API Tokens
 from routes.api_token_routes import setup_api_token_routes
@@ -1256,13 +1256,17 @@ async def _startup_event():
         try:
             from src.builtin_mcp import register_builtin_servers
             await register_builtin_servers(mcp_manager)
-        except BaseException as e:
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
             logger.warning(f"Built-in MCP registration failed (non-critical): {type(e).__name__}: {e}")
         try:
             await asyncio.wait_for(mcp_manager.connect_all_enabled(), timeout=20)
+        except asyncio.CancelledError:
+            raise
         except asyncio.TimeoutError:
             logger.warning("User MCP startup timed out (non-critical)")
-        except BaseException as e:
+        except Exception as e:
             logger.warning(f"MCP startup failed (non-critical): {type(e).__name__}: {e}")
 
     _startup_tasks.append(asyncio.create_task(_startup_mcp_connections()))
@@ -1401,6 +1405,18 @@ async def _startup_event():
             "In-process task scheduler disabled (RESTIA_INPROCESS_TASKS=0); "
             "drive task firing externally (e.g. cron)."
         )
+    # Telegram defaults to local Bot API long polling, which works behind NAT
+    # without a public URL. Webhook mode is optional and the same worker simply
+    # idles when it is selected. Keep a strong task reference for clean shutdown.
+    _telegram_inprocess = _env_alias(
+        "RESTIA_INPROCESS_TELEGRAM", "ODYSSEUS_INPROCESS_TELEGRAM", "1"
+    ).strip().lower()
+    if _telegram_inprocess not in ("0", "false", "no", "off", ""):
+        from src.telegram_runtime import telegram_polling_service
+
+        _startup_tasks.append(asyncio.create_task(telegram_polling_service.run()))
+    else:
+        logger.info("In-process Telegram polling disabled (RESTIA_INPROCESS_TELEGRAM=0)")
     # Periodic null-owner sweep — re-runs the legacy-owner assignment hourly
     # so any data created while auth was disabled / localhost-bypassed gets
     # claimed by the admin instead of staying world-visible (M19).
@@ -1483,6 +1499,17 @@ async def _shutdown_event():
             await upload_cleanup_task
         except asyncio.CancelledError:
             pass
+    # Stop every strong-referenced startup task before tearing down the
+    # services they can call. In particular, the asynchronous MCP connector
+    # must be fully cancelled before disconnect_all(), or a slow registration
+    # can reconnect a server after shutdown has already disconnected it.
+    startup_tasks = list(getattr(app.state, "_startup_tasks", []))
+    for task in startup_tasks:
+        if not task.done():
+            task.cancel()
+    if startup_tasks:
+        await asyncio.gather(*startup_tasks, return_exceptions=True)
+    app.state._startup_tasks = []
     # Stop task scheduler (no-op if it never started under the gate)
     try:
         await task_scheduler.stop()
@@ -1498,15 +1525,6 @@ async def _shutdown_event():
         await mcp_manager.disconnect_all()
     except Exception as e:
         logger.warning(f"MCP shutdown error: {e}")
-    # Stop every strong-referenced startup loop, including the Home Link call
-    # watcher, before clearing its in-memory alert tasks.
-    startup_tasks = list(getattr(app.state, "_startup_tasks", []))
-    for task in startup_tasks:
-        if not task.done():
-            task.cancel()
-    if startup_tasks:
-        await asyncio.gather(*startup_tasks, return_exceptions=True)
-    app.state._startup_tasks = []
     try:
         from src.call_notifications import incoming_call_notifications
         await incoming_call_notifications.shutdown()

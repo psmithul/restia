@@ -255,6 +255,17 @@ DEFAULT_SETTINGS = {
     "telegram_enabled": False,
     "telegram_bot_token": "",
     "telegram_webhook_secret": "",
+    # New/private instances use Bot API long polling, so no public URL or
+    # router/NAT setup is required. Existing script-configured webhook installs
+    # are inferred as webhook mode until this field is explicitly saved.
+    "telegram_runtime_mode": "polling",  # "polling" | "webhook"
+    # Display-safe identity + ownership proof for webhook conflict checks.
+    # The token itself remains encrypted separately and is never returned by
+    # Telegram routes.
+    "telegram_bot_id": "",
+    "telegram_bot_username": "",
+    "telegram_bot_first_name": "",
+    "telegram_registered_webhook_url": "",
     "telegram_allowed_chat_ids": [],
     "telegram_allow_all_chats": False,
     "telegram_owner": "",

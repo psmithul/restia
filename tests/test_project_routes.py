@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import tempfile
 import zipfile
@@ -116,7 +117,66 @@ def _docx_bytes() -> bytes:
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w") as archive:
         archive.writestr("[Content_Types].xml", "<Types />")
-        archive.writestr("word/document.xml", "<document><p>work</p></document>")
+        archive.writestr(
+            "word/document.xml",
+            """
+            <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+              <w:body><w:p><w:r><w:t>Verified project work</w:t></w:r></w:p></w:body>
+            </w:document>
+            """,
+        )
+    return output.getvalue()
+
+
+def _xlsx_bytes() -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w") as archive:
+        archive.writestr("[Content_Types].xml", "<Types />")
+        archive.writestr(
+            "xl/workbook.xml",
+            """
+            <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+              xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+              <sheets><sheet name="Results" sheetId="1" r:id="rId1"/></sheets>
+            </workbook>
+            """,
+        )
+        archive.writestr(
+            "xl/_rels/workbook.xml.rels",
+            """
+            <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+              <Relationship Id="rId1" Target="worksheets/sheet1.xml"/>
+            </Relationships>
+            """,
+        )
+        archive.writestr(
+            "xl/worksheets/sheet1.xml",
+            """
+            <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+              <sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Force</t></is></c><c r="B1"><v>42</v></c></row></sheetData>
+            </worksheet>
+            """,
+        )
+    return output.getvalue()
+
+
+def _pptx_bytes() -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w") as archive:
+        archive.writestr("[Content_Types].xml", "<Types />")
+        archive.writestr(
+            "ppt/presentation.xml",
+            '<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"/>',
+        )
+        archive.writestr(
+            "ppt/slides/slide1.xml",
+            """
+            <p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+              xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+              <a:p><a:r><a:t>Design review</a:t></a:r></a:p>
+            </p:sld>
+            """,
+        )
     return output.getvalue()
 
 
@@ -1274,6 +1334,171 @@ async def test_durable_submissions_download_security_and_cleanup(project_env):
         db = factory()
         assert db.query(cdb.Project).filter(cdb.Project.id == project_id).count() == 0
         db.close()
+
+
+async def test_attachment_viewer_supports_safe_types_ranges_and_fallbacks(project_env):
+    app, _, _ = project_env
+    async with _client(app) as client:
+        created = await _create_project(client, key="VIEW")
+        project_id = created["project"]["id"]
+        item = (
+            await client.post(
+                f"/api/projects/{project_id}/items",
+                headers=_headers("alice"),
+                json={
+                    "title": "Inspect evidence",
+                    "stage_id": created["stages"][0]["id"],
+                },
+            )
+        ).json()["item"]
+
+        pdf = b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n"
+        uploaded_pdf = await client.post(
+            f"/api/projects/{project_id}/items/{item['id']}/attachments",
+            headers=_headers("alice"),
+            files={"file": ("design review.pdf", pdf, "application/pdf")},
+        )
+        assert uploaded_pdf.status_code == 201, uploaded_pdf.text
+        pdf_attachment = uploaded_pdf.json()["attachment"]
+        pdf_view = f"/api/projects/attachments/{pdf_attachment['id']}/view"
+
+        full = await client.get(pdf_view, headers=_headers("alice"))
+        assert full.status_code == 200
+        assert full.content == pdf
+        assert full.headers["content-type"] == "application/pdf"
+        assert full.headers["content-disposition"].startswith("inline;")
+        assert full.headers["accept-ranges"] == "bytes"
+        assert full.headers["cache-control"] == "private, no-store"
+        assert full.headers["x-content-type-options"] == "nosniff"
+        assert full.headers["cross-origin-resource-policy"] == "same-origin"
+
+        partial = await client.get(
+            pdf_view,
+            headers={**_headers("alice"), "Range": "bytes=5-13"},
+        )
+        assert partial.status_code == 206
+        assert partial.content == pdf[5:14]
+        assert partial.headers["content-range"] == f"bytes 5-13/{len(pdf)}"
+        assert partial.headers["content-length"] == "9"
+
+        suffix = await client.get(
+            pdf_view,
+            headers={**_headers("alice"), "Range": "bytes=-5"},
+        )
+        assert suffix.status_code == 206
+        assert suffix.content == pdf[-5:]
+        assert suffix.headers["content-range"] == (
+            f"bytes {len(pdf) - 5}-{len(pdf) - 1}/{len(pdf)}"
+        )
+
+        invalid = await client.get(
+            pdf_view,
+            headers={**_headers("alice"), "Range": "bytes=0-1,4-5"},
+        )
+        assert invalid.status_code == 416
+        assert invalid.headers["content-range"] == f"bytes */{len(pdf)}"
+        assert invalid.headers["accept-ranges"] == "bytes"
+        assert (await client.get(pdf_view, headers=_headers("bob"))).status_code == 404
+
+        text_bytes = "first line\nsecond line\n".encode()
+        uploaded_text = await client.post(
+            f"/api/projects/{project_id}/items/{item['id']}/attachments",
+            headers=_headers("alice"),
+            files={"file": ("notes.txt", text_bytes, "text/plain")},
+        )
+        text_view = (
+            f"/api/projects/attachments/{uploaded_text.json()['attachment']['id']}/view"
+        )
+        text_preview = await client.get(
+            text_view,
+            headers={**_headers("alice"), "Range": "bytes=0-9"},
+        )
+        assert text_preview.status_code == 206
+        assert text_preview.content == text_bytes[:10]
+        assert text_preview.headers["content-type"].startswith("text/plain")
+
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        )
+        uploaded_image = await client.post(
+            f"/api/projects/{project_id}/items/{item['id']}/attachments",
+            headers=_headers("alice"),
+            files={"file": ("evidence.png", png, "image/png")},
+        )
+        assert uploaded_image.status_code == 201, uploaded_image.text
+        image_view = (
+            f"/api/projects/attachments/{uploaded_image.json()['attachment']['id']}/view"
+        )
+        image_preview = await client.get(image_view, headers=_headers("alice"))
+        assert image_preview.status_code == 200
+        assert image_preview.content == png
+        assert image_preview.headers["content-type"] == "image/png"
+
+        uploaded_docx = await client.post(
+            f"/api/projects/{project_id}/items/{item['id']}/attachments",
+            headers=_headers("alice"),
+            files={"file": ("calculation.docx", _docx_bytes(), "application/octet-stream")},
+        )
+        docx_view = (
+            f"/api/projects/attachments/{uploaded_docx.json()['attachment']['id']}/view"
+        )
+        fallback = await client.get(docx_view, headers=_headers("alice"))
+        assert fallback.status_code == 415
+        assert "Download it to open it locally" in fallback.json()["detail"]
+        docx_preview_url = (
+            f"/api/projects/attachments/{uploaded_docx.json()['attachment']['id']}/preview"
+        )
+        docx_preview = await client.get(docx_preview_url, headers=_headers("alice"))
+        assert docx_preview.status_code == 200, docx_preview.text
+        assert docx_preview.json()["sections"][0]["text"] == "Verified project work"
+        assert docx_preview.headers["cache-control"] == "private, no-store"
+        assert docx_preview.headers["x-content-type-options"] == "nosniff"
+        assert (await client.get(docx_preview_url, headers=_headers("bob"))).status_code == 404
+
+        uploaded_xlsx = await client.post(
+            f"/api/projects/{project_id}/items/{item['id']}/attachments",
+            headers=_headers("alice"),
+            files={"file": ("results.xlsx", _xlsx_bytes(), "application/octet-stream")},
+        )
+        assert uploaded_xlsx.status_code == 201, uploaded_xlsx.text
+        xlsx_preview = await client.get(
+            f"/api/projects/attachments/{uploaded_xlsx.json()['attachment']['id']}/preview",
+            headers=_headers("alice"),
+        )
+        assert xlsx_preview.status_code == 200, xlsx_preview.text
+        assert xlsx_preview.json()["sections"][0]["rows"] == [["Force", "42"]]
+
+        uploaded_pptx = await client.post(
+            f"/api/projects/{project_id}/items/{item['id']}/attachments",
+            headers=_headers("alice"),
+            files={"file": ("review.pptx", _pptx_bytes(), "application/octet-stream")},
+        )
+        assert uploaded_pptx.status_code == 201, uploaded_pptx.text
+        pptx_preview = await client.get(
+            f"/api/projects/attachments/{uploaded_pptx.json()['attachment']['id']}/preview",
+            headers=_headers("alice"),
+        )
+        assert pptx_preview.status_code == 200, pptx_preview.text
+        assert pptx_preview.json()["sections"] == [
+            {"kind": "text", "title": "Slide 1", "text": "Design review"}
+        ]
+
+        corrupt_docx_bytes = io.BytesIO()
+        with zipfile.ZipFile(corrupt_docx_bytes, "w") as archive:
+            archive.writestr("[Content_Types].xml", "<Types />")
+            archive.writestr("word/document.xml", "<w:document>")
+        corrupt_docx = await client.post(
+            f"/api/projects/{project_id}/items/{item['id']}/attachments",
+            headers=_headers("alice"),
+            files={"file": ("corrupt.docx", corrupt_docx_bytes.getvalue(), "application/octet-stream")},
+        )
+        assert corrupt_docx.status_code == 201, corrupt_docx.text
+        corrupt_preview = await client.get(
+            f"/api/projects/attachments/{corrupt_docx.json()['attachment']['id']}/preview",
+            headers=_headers("alice"),
+        )
+        assert corrupt_preview.status_code == 422
+        assert "Download it" in corrupt_preview.json()["detail"]
 
 
 @pytest.mark.parametrize("download_source", ["local", "linked"])

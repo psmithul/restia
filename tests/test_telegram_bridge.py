@@ -337,7 +337,13 @@ async def test_telegram_webhook_ignores_unauthorized_chat_without_background_tas
 
 
 @pytest.mark.asyncio
-async def test_telegram_webhook_schedules_authorized_message(monkeypatch):
+async def test_telegram_webhook_processes_authorized_message_before_ack(monkeypatch):
+    processed = []
+
+    async def process(*args):
+        processed.append(args[-1].chat_id)
+
+    monkeypatch.setattr("routes.telegram_routes._process_message", process)
     endpoint = _webhook_endpoint(monkeypatch, _config())
     tasks = BackgroundTasks()
 
@@ -347,11 +353,18 @@ async def test_telegram_webhook_schedules_authorized_message(monkeypatch):
     )
 
     assert response == {"ok": True}
-    assert len(tasks.tasks) == 1
+    assert tasks.tasks == []
+    assert processed == ["111"]
 
 
 @pytest.mark.asyncio
 async def test_telegram_webhook_allows_link_command_from_unlisted_chat(monkeypatch):
+    processed = []
+
+    async def process(*args):
+        processed.append(args[-1].chat_id)
+
+    monkeypatch.setattr("routes.telegram_routes._process_message", process)
     endpoint = _webhook_endpoint(monkeypatch, _config())
     tasks = BackgroundTasks()
 
@@ -361,7 +374,8 @@ async def test_telegram_webhook_allows_link_command_from_unlisted_chat(monkeypat
     )
 
     assert response == {"ok": True}
-    assert len(tasks.tasks) == 1
+    assert tasks.tasks == []
+    assert processed == ["222"]
 
 
 class _ExternalSession:

@@ -12,7 +12,15 @@ from pydantic import BaseModel
 
 from core.database import SessionLocal, ScheduledTask, TaskRun
 from core.constants import internal_api_base
-from src.auth_helpers import get_current_user
+from src.auth_helpers import (
+    DEFAULT_LOCAL_OWNER,
+    allows_legacy_null_owner,
+    get_current_user,
+    legacy_owner_storage_key,
+    owner_storage_key,
+    require_user,
+    resolved_request_owner,
+)
 from src.constants import DATA_DIR, EMAIL_URGENCY_CACHE_DIR
 from src.task_action_policy import (
     ADMIN_ONLY_TASK_ACTIONS,
@@ -301,6 +309,28 @@ def setup_task_routes(task_scheduler) -> APIRouter:
     def _owner(request: Request):
         return get_current_user(request)
 
+    def _notification_owners(request: Request) -> list[str]:
+        """Return profile plus legacy outbox scopes for an admitted request.
+
+        Scheduled tasks created by older/auth-disabled installs normalize a
+        missing owner to ``DEFAULT_LOCAL_OWNER``. New note reminders use the
+        configured single profile. Explicit single-user mode may consume both;
+        authenticated profiles remain strictly isolated to one owner.
+        """
+
+        admitted = require_user(request)
+        profile_owner = resolved_request_owner(
+            request,
+            admitted_user=admitted,
+        )
+        owners = [profile_owner]
+        if (
+            allows_legacy_null_owner(request, admitted_user=admitted)
+            and DEFAULT_LOCAL_OWNER not in owners
+        ):
+            owners.append(DEFAULT_LOCAL_OWNER)
+        return owners
+
     async def _generate_task_name(prompt: str, owner: Optional[str] = None) -> str:
         """Use LLM to generate a short task name from the prompt."""
         try:
@@ -560,14 +590,56 @@ def setup_task_routes(task_scheduler) -> APIRouter:
 
     @router.get("/notifications")
     async def get_notifications(request: Request):
-        """Return and clear pending task-run notifications for the
-        current user. Anonymous callers get nothing (prevents
-        cross-tenant drain — see review CRIT-B)."""
-        user = _owner(request)
-        if not user:
-            return {"notifications": []}
-        notes = task_scheduler.pop_notifications(owner=user)
-        return {"notifications": notes}
+        """Read pending notifications without draining the durable outbox."""
+        merged: list[dict] = []
+        seen: set[str] = set()
+        for owner in _notification_owners(request):
+            for note in task_scheduler.pending_notifications(owner=owner):
+                note_id = str((note or {}).get("id") or "")
+                if note_id and note_id in seen:
+                    continue
+                if note_id:
+                    seen.add(note_id)
+                merged.append(note)
+        merged.sort(key=lambda note: str((note or {}).get("timestamp") or ""))
+        return {"notifications": merged}
+
+    @router.post("/notifications/ack")
+    async def acknowledge_notifications(request: Request):
+        """Acknowledge notifications only after this client displayed them."""
+        owners = _notification_owners(request)
+        body = await request.json()
+        ids = body.get("ids") if isinstance(body, dict) else None
+        if not isinstance(ids, list) or not all(isinstance(value, str) for value in ids):
+            raise HTTPException(400, "ids must be a list of notification IDs")
+        if len(ids) > 1000:
+            raise HTTPException(400, "at most 1000 notifications can be acknowledged")
+        acknowledged = 0
+        reminder_acknowledged = 0
+        for owner in owners:
+            if hasattr(task_scheduler, "acknowledge_notifications_detailed"):
+                detail = task_scheduler.acknowledge_notifications_detailed(
+                    owner=owner,
+                    ids=ids,
+                )
+                acknowledged += int(detail.get("acknowledged") or 0)
+                reminder_acknowledged += int(
+                    detail.get("reminder_acknowledged") or 0
+                )
+            else:
+                acknowledged += int(
+                    task_scheduler.acknowledge_notifications(owner=owner, ids=ids)
+                    or 0
+                )
+        return {
+            "ok": True,
+            # Local-mode compatibility may inspect both the concrete profile
+            # and legacy fallback outboxes. Count submitted notification IDs,
+            # not owner-scope matches, so one logical id is never reported
+            # twice when it exists in both scopes.
+            "acknowledged": min(len(ids), acknowledged),
+            "reminder_acknowledged": min(len(ids), reminder_acknowledged),
+        }
 
     @router.post("/{task_id}/clear-cache")
     async def clear_task_cache(request: Request, task_id: str):
@@ -638,8 +710,25 @@ def setup_task_routes(task_scheduler) -> APIRouter:
                         removed_files += 1
                     except Exception:
                         pass
-            owner_slug = "".join(c if (c.isalnum() or c in "-_.@") else "_" for c in (user or "default"))
-            for state_path in [Path(DATA_DIR) / f"email_urgency_state_{owner_slug}.json"]:
+            state_path = Path(DATA_DIR) / f"email_urgency_state_{owner_storage_key(user)}.json"
+            candidate_paths = [state_path]
+            legacy_path = Path(DATA_DIR) / f"email_urgency_state_{legacy_owner_storage_key(user)}.json"
+            if legacy_path != state_path:
+                candidate_paths.append(legacy_path)
+            state_paths = []
+            for candidate_path in candidate_paths:
+                if not candidate_path.exists():
+                    continue
+                try:
+                    candidate_state = json.loads(candidate_path.read_text(encoding="utf-8"))
+                except Exception:
+                    candidate_state = None
+                # A primary safe-looking path can itself be another profile's
+                # old lossy path. Require exact payload attribution before
+                # deleting either current or legacy state.
+                if isinstance(candidate_state, dict) and candidate_state.get("owner") == (user or ""):
+                    state_paths.append(candidate_path)
+            for state_path in state_paths:
                 try:
                     if state_path.exists():
                         state_path.unlink()

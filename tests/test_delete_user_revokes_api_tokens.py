@@ -132,3 +132,35 @@ def test_delete_user_fails_closed_when_api_token_purge_fails(manager, monkeypatc
     assert manager.delete_user("bob", "admin") is False
     assert "bob" in manager.users
     assert manager.validate_token(token) is True
+
+
+def test_delete_user_refuses_active_restia_chat_connection(manager, monkeypatch):
+    class _FakeOutboundChatLink:
+        id = object()
+        owner = _OwnerColumn()
+
+    class _ActiveLinkQuery:
+        def filter(self, *conds):
+            assert ("owner ==", "bob") in conds
+            return self
+
+        def first(self):
+            return object()
+
+    class _ActiveLinkSession:
+        def query(self, model):
+            assert model is _FakeOutboundChatLink.id
+            return _ActiveLinkQuery()
+
+    @contextlib.contextmanager
+    def _active_link_db_session():
+        yield _ActiveLinkSession()
+
+    db_stub = types.ModuleType("core.database")
+    db_stub.get_db_session = _active_link_db_session
+    db_stub.ApiToken = _FakeApiToken
+    db_stub.OutboundChatLink = _FakeOutboundChatLink
+    monkeypatch.setitem(sys.modules, "core.database", db_stub)
+
+    assert manager.delete_user("bob", "admin") is False
+    assert "bob" in manager.users

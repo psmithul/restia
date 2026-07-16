@@ -12,10 +12,12 @@
 // out of DOM fullscreen.
 
 import uiModule from '../ui.js';
+import { notesFromPayload } from './reminderPayload.js';
 
 const API_BASE = window.location.origin;
 
 let _notifFired = new Set(JSON.parse(localStorage.getItem('cal-notif-fired') || '[]'));
+const _notifRetryAt = new Map();
 
 // Compute a fresh, system-clock-accurate notification body. Tries the
 // note's `event_dtstart` first (set by _createEventReminder); falls back
@@ -50,50 +52,80 @@ function _formatReminderBody(note) {
   return body;
 }
 
-// Only fire a reminder if `due` was within this many minutes BEFORE now.
-// Stops a fresh browser (empty `cal-notif-fired` localStorage) from spamming
-// every 2-week-old reminder on first poll. Anything older is silently
-// marked fired so it doesn't keep getting picked up.
-const _REMINDER_STALENESS_MIN = 5;
+// Failed external delivery is retried, not acknowledged. The server owns the
+// durable late-reminder catch-up path; this browser poller uses a short backoff
+// only to avoid retry storms while the selected channel is unavailable.
+const _REMINDER_RETRY_MS = 5 * 60 * 1000;
 
 async function _pollReminders() {
   try {
     const res = await fetch(`${API_BASE}/api/notes?label=calendar`, { credentials: 'same-origin' });
     if (!res.ok) return;
-    const notes = await res.json();
+    const payload = await res.json();
+    const notes = notesFromPayload(payload);
     const now = new Date();
-    const stalenessMs = _REMINDER_STALENESS_MIN * 60 * 1000;
     for (const note of notes) {
       if (!note.due_date || _notifFired.has(note.id)) continue;
+      if ((_notifRetryAt.get(note.id) || 0) > Date.now()) continue;
       const due = new Date(note.due_date);
       if (isNaN(due)) continue;
       if (due > now) continue; // not yet due
-      const ageMs = now - due;
-      if (ageMs > stalenessMs) {
-        // Too old to fire — mark as seen so we don't recheck every minute.
-        _notifFired.add(note.id);
-        continue;
-      }
-      _notifFired.add(note.id);
       const body = _formatReminderBody(note);
-      fetch(`${API_BASE}/api/notes/fire-reminder`, {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          note_id: note.id,
-          title: note.title || 'Calendar Reminder',
-          body,
-        }),
-      }).catch(() => {});
-      if ('Notification' in window && Notification.permission === 'granted') {
-        new Notification(note.title || 'Calendar Reminder', {
-          body,
-          icon: '/static/favicon.png',
-          tag: `cal-remind-${note.id}`,
+      let acknowledged = false;
+      let showLocal = false;
+      let result = null;
+      try {
+        const delivery = await fetch(`${API_BASE}/api/notes/fire-reminder`, {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            note_id: note.id,
+            title: note.title || 'Calendar Reminder',
+            body,
+          }),
         });
+        if (!delivery.ok) throw new Error(`reminder dispatch failed (${delivery.status})`);
+        result = await delivery.json();
+        acknowledged = !!(result && (result.acknowledged || result.delivered || result.skipped || result.suppressed));
+        // Suppressed and deferred responses are intentional profile choices,
+        // not a reason to surface a local Notification/toast. A previously
+        // delivered occurrence (`skipped`) is also silent.
+        showLocal = !!(result && result.browser_sent && result.show_browser
+          && !result.suppressed && !result.skipped);
+      } catch (_) {
+        // Without a structured response we do not know the profile's channel;
+        // retain the browser fallback but leave the occurrence retryable.
+        showLocal = true;
       }
-      if (uiModule.showToast) uiModule.showToast((note.title || 'Calendar Reminder') + (body ? ' — ' + body : ''));
+      if (showLocal) {
+        if ('Notification' in window && Notification.permission === 'granted') {
+          new Notification(note.title || 'Calendar Reminder', {
+            body,
+            icon: '/static/favicon.png',
+            tag: `cal-remind-${note.id}`,
+          });
+        }
+        if (uiModule.showToast) uiModule.showToast((note.title || 'Calendar Reminder') + (body ? ' — ' + body : ''));
+        if (result && result.browser_notification_id) {
+          try {
+            const ackRes = await fetch(`${API_BASE}/api/tasks/notifications/ack`, {
+              method: 'POST',
+              credentials: 'same-origin',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ ids: [result.browser_notification_id] }),
+            });
+            const ack = ackRes.ok ? await ackRes.json() : null;
+            if (ack && ack.reminder_acknowledged > 0) acknowledged = true;
+          } catch (_) {}
+        }
+      }
+      if (acknowledged) {
+        _notifFired.add(note.id);
+        _notifRetryAt.delete(note.id);
+      } else {
+        _notifRetryAt.set(note.id, Date.now() + _REMINDER_RETRY_MS);
+      }
     }
     // Persist fired set (keep last 200)
     const arr = [..._notifFired].slice(-200);

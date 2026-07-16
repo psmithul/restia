@@ -45,11 +45,26 @@ def test_planner_docx_writer_creates_valid_package(tmp_path):
     assert "First task" in document
 
 
-def test_planner_creates_todo_note_without_due_date():
+def test_planner_preserves_task_due_dates_and_creates_planning_items():
     src = (REPO / "routes" / "planner_routes.py").read_text(encoding="utf-8")
 
     assert 'note_type="todo"' in src
-    assert "due_date=None" in src
+    assert '"due_in_days": due_in_days' in src
+    assert '"due_date": due_date' in src
+    assert "create_planning_item(" in src
+
+
+def test_planner_artifact_directories_are_owner_isolated(tmp_path):
+    from routes.planner_routes import _artifact_owner_dir
+
+    alice = _artifact_owner_dir(tmp_path, "alice@example.test")
+    bob = _artifact_owner_dir(tmp_path, "bob@example.test")
+
+    assert alice.parent == tmp_path
+    assert bob.parent == tmp_path
+    assert alice != bob
+    assert "example.test" not in alice.name
+    assert "example.test" not in bob.name
 
 
 def test_note_update_accepts_explicit_null_due_date():
@@ -57,7 +72,7 @@ def test_note_update_accepts_explicit_null_due_date():
 
     assert "model_fields_set" in src
     assert 'if "due_date" in fields_set:' in src
-    assert "note.due_date = body.due_date" in src
+    assert "note.due_date = normalize_notification_due_date(user, body.due_date)" in src
 
 
 def test_telegram_digest_seeded_hourly_and_registered():

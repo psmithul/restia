@@ -5,6 +5,7 @@ import gzip
 import io
 import json
 import threading
+import zipfile
 from types import SimpleNamespace
 
 import httpx
@@ -24,6 +25,21 @@ from src.project_storage import ProjectFileStore
 PROJECT_ID = "11111111-1111-1111-1111-111111111111"
 ITEM_ID = "22222222-2222-2222-2222-222222222222"
 ATTACHMENT_ID = "33333333-3333-3333-3333-333333333333"
+
+
+def _docx_preview_bytes(text: str = "Linked Office proof") -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", "<Types />")
+        archive.writestr(
+            "word/document.xml",
+            (
+                '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                f"<w:body><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:body>"
+                "</w:document>"
+            ),
+        )
+    return output.getvalue()
 
 
 def _remote_upload_env(monkeypatch, tmp_path):
@@ -171,6 +187,34 @@ def test_project_proxy_uses_only_pinned_origin_and_server_side_bearer(monkeypatc
         == link_routes.MAX_PROJECT_PROXY_JSON_RESPONSE_BYTES
     )
     assert snapshot["token"] not in response.text
+
+
+def test_office_preview_proxy_uses_small_cap_and_server_side_bearer(monkeypatch):
+    app, snapshot = _proxy_app(monkeypatch)
+    seen = {}
+
+    async def fake_hub_call(method, path, **kwargs):
+        seen.update({"method": method, "path": path, **kwargs})
+        return {
+            "version": 1,
+            "format": "docx",
+            "sections": [{"kind": "text", "title": "Document", "text": "safe"}],
+            "truncated": False,
+        }
+
+    monkeypatch.setattr(link_routes, "_hub_call", fake_hub_call)
+    response = TestClient(app).get(
+        f"/api/homelink/projects/attachments/{ATTACHMENT_ID}/preview",
+        headers={"Authorization": "Bearer browser-controlled-token"},
+    )
+    assert response.status_code == 200, response.text
+    assert seen["method"] == "GET"
+    assert seen["path"] == f"/api/link/projects/attachments/{ATTACHMENT_ID}/preview"
+    assert seen["base_url"] == snapshot["base_url"]
+    assert seen["token"] == snapshot["token"]
+    assert seen["max_response_bytes"] == link_routes.OFFICE_PREVIEW_MAX_RESPONSE_BYTES
+    assert snapshot["token"] not in response.text
+    assert response.headers["cache-control"] == "private, no-store"
 
 
 def test_project_json_response_cap_covers_legal_endpoint_maxima():
@@ -448,6 +492,12 @@ def test_project_proxy_transport_classification_is_exact():
     assert link_routes._project_proxy_kind(
         "GET", f"attachments/{ATTACHMENT_ID}/download"
     ) == "download"
+    assert link_routes._project_proxy_kind(
+        "GET", f"attachments/{ATTACHMENT_ID}/view"
+    ) == "preview"
+    assert link_routes._project_proxy_kind(
+        "GET", f"attachments/{ATTACHMENT_ID}/preview"
+    ) == "office_preview"
     assert link_routes._project_proxy_kind("GET", f"{PROJECT_ID}/board") == "json"
     assert link_routes._project_proxy_kind("GET", f"{PROJECT_ID}/context") == "json"
     with pytest.raises(HTTPException) as exc:
@@ -455,6 +505,16 @@ def test_project_proxy_transport_classification_is_exact():
             "POST", f"attachments/{ATTACHMENT_ID}/download"
         )
     assert exc.value.status_code == 405
+    with pytest.raises(HTTPException) as preview_method:
+        link_routes._project_proxy_kind(
+            "POST", f"attachments/{ATTACHMENT_ID}/view"
+        )
+    assert preview_method.value.status_code == 405
+    with pytest.raises(HTTPException) as office_preview_method:
+        link_routes._project_proxy_kind(
+            "POST", f"attachments/{ATTACHMENT_ID}/preview"
+        )
+    assert office_preview_method.value.status_code == 405
 
 
 def test_stalled_project_json_body_does_not_hold_lifecycle_lock(monkeypatch):
@@ -771,6 +831,65 @@ def test_remote_editor_upload_reaches_authoritative_project_router(
         engine.dispose()
 
 
+def test_linked_office_preview_stays_same_origin_and_viewer_readable(
+    monkeypatch,
+    tmp_path,
+):
+    hub, factory, _store, engine, _guest_id, grant_id = _remote_upload_env(
+        monkeypatch,
+        tmp_path,
+    )
+    local, snapshot = _proxy_app(monkeypatch)
+    local.add_middleware(ProjectAttachmentBodyLimitMiddleware)
+    real_async_client = httpx.AsyncClient
+
+    def client_factory(**kwargs):
+        return real_async_client(
+            transport=httpx.ASGITransport(
+                app=hub,
+                client=("203.0.113.43", 4321),
+            ),
+            **kwargs,
+        )
+
+    monkeypatch.setattr(link_routes.httpx, "AsyncClient", client_factory)
+    try:
+        uploaded = TestClient(local).post(
+            f"/api/homelink/projects/{PROJECT_ID}/items/{ITEM_ID}/attachments",
+            files={
+                "file": (
+                    "linked-proof.docx",
+                    _docx_preview_bytes(),
+                    "application/octet-stream",
+                )
+            },
+            data={"kind": "deliverable"},
+        )
+        assert uploaded.status_code == 201, uploaded.text
+        attachment_id = uploaded.json()["attachment"]["id"]
+
+        db = factory()
+        try:
+            grant = db.query(cdb.ProjectRemoteGrant).filter_by(id=grant_id).one()
+            grant.role = "viewer"
+            db.commit()
+        finally:
+            db.close()
+
+        preview = TestClient(local).get(
+            f"/api/homelink/projects/attachments/{attachment_id}/preview",
+            headers={"Authorization": "Bearer browser-controlled-token"},
+        )
+        assert preview.status_code == 200, preview.text
+        assert preview.json()["format"] == "docx"
+        assert preview.json()["sections"][0]["text"] == "Linked Office proof"
+        assert snapshot["token"] not in preview.text
+        assert preview.headers["content-type"].startswith("application/json")
+        assert preview.headers["cache-control"] == "private, no-store"
+    finally:
+        engine.dispose()
+
+
 def test_project_spool_io_finishes_worker_before_propagating_cancellation():
     started = threading.Event()
     release = threading.Event()
@@ -830,6 +949,127 @@ def test_download_headers_are_bounded_and_unicode_safe():
         link_routes._safe_project_download_headers(missing_size)
     assert exc.value.status_code == 502
     assert exc.value.detail == "Home server omitted attachment size"
+
+
+def test_preview_headers_require_safe_mime_and_consistent_single_range():
+    ranged = httpx.Response(
+        206,
+        headers={
+            "content-type": "text/plain; charset=utf-8",
+            "content-length": "10",
+            "content-range": "bytes 0-9/42",
+            "content-disposition": 'inline; filename="notes.txt"',
+        },
+    )
+    headers = link_routes._safe_project_download_headers(
+        ranged,
+        inline=True,
+        range_requested=True,
+    )
+    assert headers["Content-Disposition"].startswith("inline;")
+    assert headers["Accept-Ranges"] == "bytes"
+    assert headers["Content-Range"] == "bytes 0-9/42"
+    assert headers["Cross-Origin-Resource-Policy"] == "same-origin"
+
+    unsafe = httpx.Response(
+        200,
+        headers={
+            "content-type": "text/html",
+            "content-length": "12",
+            "content-disposition": 'inline; filename="payload.html"',
+        },
+    )
+    with pytest.raises(HTTPException) as unsafe_type:
+        link_routes._safe_project_download_headers(unsafe, inline=True)
+    assert unsafe_type.value.status_code == 502
+
+    inconsistent = httpx.Response(
+        206,
+        headers={
+            "content-type": "application/pdf",
+            "content-length": "9",
+            "content-range": "bytes 0-9/42",
+        },
+    )
+    with pytest.raises(HTTPException) as invalid_range:
+        link_routes._safe_project_download_headers(
+            inconsistent,
+            inline=True,
+            range_requested=True,
+        )
+    assert invalid_range.value.status_code == 502
+
+    assert link_routes._validated_project_preview_range("bytes=0-9") == "bytes=0-9"
+    with pytest.raises(HTTPException) as multipart:
+        link_routes._validated_project_preview_range("bytes=0-1,4-5")
+    assert multipart.value.status_code == 416
+
+
+def test_preview_proxy_forwards_only_validated_range_and_preserves_206(monkeypatch):
+    raw = b"preview-10"
+    upstream = httpx.Response(
+        206,
+        headers={
+            "content-type": "text/plain; charset=utf-8",
+            "content-length": str(len(raw)),
+            "content-range": f"bytes 0-{len(raw) - 1}/100",
+            "content-disposition": 'inline; filename="notes.txt"',
+        },
+        content=raw,
+    )
+    clients = []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            assert kwargs["follow_redirects"] is False
+            assert kwargs["trust_env"] is False
+            self.request = None
+            self.closed = False
+            clients.append(self)
+
+        def build_request(self, method, url, headers):
+            self.request = httpx.Request(method, url, headers=headers)
+            return self.request
+
+        async def send(self, request, *, stream):
+            assert request is self.request
+            assert stream is True
+            return upstream
+
+        async def aclose(self):
+            self.closed = True
+
+    monkeypatch.setattr(link_routes.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(
+        link_routes,
+        "_assert_home_project_link_current",
+        lambda _snapshot, **_kwargs: None,
+    )
+    snapshot = {
+        "token": "server-only-bearer",
+        "base_url": "https://pinned.example",
+    }
+
+    async def collect():
+        response = await link_routes._proxy_home_project_download(
+            f"attachments/{ATTACHMENT_ID}/view",
+            snapshot,
+            inline=True,
+            range_header=f"bytes=0-{len(raw) - 1}",
+        )
+        content = b"".join([chunk async for chunk in response.body_iterator])
+        return response, content
+
+    response, content = asyncio.run(collect())
+    upstream_headers = clients[0].request.headers
+    assert upstream_headers["authorization"] == "Bearer server-only-bearer"
+    assert upstream_headers["range"] == f"bytes=0-{len(raw) - 1}"
+    assert "cookie" not in upstream_headers
+    assert response.status_code == 206
+    assert response.headers["content-range"] == f"bytes 0-{len(raw) - 1}/100"
+    assert response.headers["content-disposition"].startswith("inline;")
+    assert content == raw
+    assert clients[0].closed is True
 
 
 def test_download_proxy_forces_identity_encoding_and_preserves_length(monkeypatch):

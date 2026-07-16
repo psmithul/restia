@@ -18,6 +18,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 PROJECTS_JS = ROOT / "static" / "js" / "projects.js"
+VIEWER_JS = ROOT / "static" / "js" / "projectAttachmentViewer.js"
 PROJECTS_CSS = ROOT / "static" / "projects.css"
 pytestmark = pytest.mark.skipif(not shutil.which("node"), reason="node binary not on PATH")
 
@@ -25,6 +26,19 @@ pytestmark = pytest.mark.skipif(not shutil.which("node"), reason="node binary no
 def run_node(body: str) -> dict:
     module_url = PROJECTS_JS.resolve().as_uri()
     script = f"import {{ __test }} from {json.dumps(module_url)};\n{body}"
+    completed = subprocess.run(
+        ["node", "--input-type=module", "-e", script],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(completed.stdout)
+
+
+def run_viewer_node(body: str) -> dict:
+    module_url = VIEWER_JS.resolve().as_uri()
+    script = f"import * as viewer from {json.dumps(module_url)};\n{body}"
     completed = subprocess.run(
         ["node", "--input-type=module", "-e", script],
         cwd=ROOT,
@@ -821,8 +835,8 @@ def test_task_drawer_mutations_keep_drafts_and_upload_batches_task_scoped():
     assert "payload.next_before || null" in source
     assert "canDeleteComment(comment)" in source
     assert "canDeleteAttachment(attachment)" in source
-    assert "preview-attachment" not in source
-    assert "Preview could not open" not in source
+    assert "preview-attachment" in source
+    assert "openAttachmentViewer(attachment, control.dataset.projectSource)" in source
     assert "renderNavigator();\n  renderCurrentView();" in source
     assert "if (!taskContextMatches(context)) return;" in source
 
@@ -867,12 +881,15 @@ def test_dom_contract_uses_one_move_path_and_safe_user_data_rendering():
 
 def test_attachment_and_backend_payload_contracts_are_scoped():
     source = PROJECTS_JS.read_text(encoding="utf-8")
+    viewer_source = VIEWER_JS.read_text(encoding="utf-8")
     assert "formData.append('file', entry.file" in source
     assert "formData.append('kind'" in source
     assert "formData.append('submission_note'" in source
     assert "formData.append('transition_stage_id'" in source
     assert "/attachments/${encodeURIComponent(attachment.id)}`" in source
-    assert "/api/projects/attachments/${encodeURIComponent(attachment.id)}/download" in source
+    assert "/api/projects/attachments/${id}/download" in viewer_source
+    assert "/api/projects/attachments/${id}/view" in viewer_source
+    assert "/api/homelink/projects/attachments/${id}/view" in viewer_source
     assert "item_type:" in source
     assert "blocked_by_id:" in source
     for clear_flag in (
@@ -889,6 +906,127 @@ def test_attachment_and_backend_payload_contracts_are_scoped():
     assert "body: { username, version: projectVersion }" in source
     assert "if (!state.open || !activeProjectMatches(projectId, PROJECT_SOURCES.LOCAL))" in source
     assert "project.id === projectId && project.source === PROJECT_SOURCES.LOCAL" in source
+
+
+def test_attachment_viewer_classifies_types_builds_scoped_urls_and_caps_text():
+    result = run_viewer_node(
+        """
+        const calls = [];
+        const fetchImpl = async (url, options) => {
+          calls.push({url, options});
+          const values = {
+            'content-type':'text/plain; charset=utf-8',
+            'content-length':'5',
+            'content-range':'bytes 0-4/12',
+          };
+          return {
+            ok:true, status:206,
+            headers:{get:(name) => values[String(name).toLowerCase()] || null},
+            text:async () => 'hello',
+          };
+        };
+        const loaded = await viewer.loadTextAttachmentPreview('/local-view', {fetchImpl, maxBytes:32});
+        const officePayload = {
+          version:1, format:'xlsx', truncated:false,
+          sections:[{kind:'table',title:'Inputs',rows:[['<img onerror=alert(1)>','=HYPERLINK("javascript:alert(1)")']]}],
+        };
+        const officeBytes = new TextEncoder().encode(JSON.stringify(officePayload));
+        const officeCalls = [];
+        const office = await viewer.loadOfficeAttachmentPreview('/office-preview', {
+          fetchImpl:async (url, options) => {
+            officeCalls.push({url, options});
+            return {
+              ok:true, status:200,
+              headers:{get:(name) => ({
+                'content-type':'application/json',
+                'content-length':String(officeBytes.byteLength),
+              })[String(name).toLowerCase()] || null},
+              arrayBuffer:async () => officeBytes.buffer.slice(
+                officeBytes.byteOffset, officeBytes.byteOffset + officeBytes.byteLength
+              ),
+            };
+          },
+        });
+        console.log(JSON.stringify({
+          kinds:{
+            pdf:viewer.attachmentPreviewKind({name:'report.pdf',mime:'application/pdf'}),
+            image:viewer.attachmentPreviewKind({name:'proof.PNG',mime:'image/png'}),
+            text:viewer.attachmentPreviewKind({name:'notes.md',mime:'text/markdown; charset=utf-8'}),
+            mismatch:viewer.attachmentPreviewKind({name:'report.pdf',mime:'text/html'}),
+            office:viewer.attachmentPreviewKind({name:'report.docx',mime:'application/vnd.openxmlformats-officedocument.wordprocessingml.document'}),
+          },
+          local:viewer.attachmentViewPath('local','file/id'),
+          home:viewer.attachmentViewPath('home','file/id'),
+          officeLocal:viewer.attachmentOfficePreviewPath('local','file/id'),
+          officeHome:viewer.attachmentOfficePreviewPath('home','file/id'),
+          download:viewer.attachmentDownloadPath('home',{id:'file/id'}),
+          fallback:viewer.attachmentFallbackCopy({name:'assembly.step'}),
+          loaded, office,
+          request:{
+            credentials:calls[0].options.credentials,
+            cache:calls[0].options.cache,
+            range:calls[0].options.headers.Range,
+          },
+          officeRequest:{
+            credentials:officeCalls[0].options.credentials,
+            cache:officeCalls[0].options.cache,
+            accept:officeCalls[0].options.headers.Accept,
+          },
+        }));
+        """
+    )
+    assert result["kinds"] == {
+        "pdf": "pdf",
+        "image": "image",
+        "text": "text",
+        "mismatch": "fallback",
+        "office": "office",
+    }
+    assert result["local"] == "/api/projects/attachments/file%2Fid/view"
+    assert result["home"] == "/api/homelink/projects/attachments/file%2Fid/view"
+    assert result["officeLocal"] == "/api/projects/attachments/file%2Fid/preview"
+    assert result["officeHome"] == "/api/homelink/projects/attachments/file%2Fid/preview"
+    assert result["download"] == "/api/homelink/projects/attachments/file%2Fid/download"
+    assert "CAD" in result["fallback"]
+    assert result["loaded"] == {
+        "text": "hello",
+        "truncated": True,
+        "totalBytes": 12,
+        "contentType": "text/plain",
+    }
+    assert result["request"] == {
+        "credentials": "same-origin",
+        "cache": "no-store",
+        "range": "bytes=0-1023",
+    }
+    assert result["office"] == {
+        "version": 1,
+        "format": "xlsx",
+        "truncated": False,
+        "sections": [
+            {
+                "kind": "table",
+                "title": "Inputs",
+                "rows": [[
+                    "<img onerror=alert(1)>",
+                    '=HYPERLINK("javascript:alert(1)")',
+                ]],
+            }
+        ],
+    }
+    assert result["officeRequest"] == {
+        "credentials": "same-origin",
+        "cache": "no-store",
+        "accept": "application/json",
+    }
+    source = VIEWER_JS.read_text(encoding="utf-8")
+    assert "innerHTML" not in source
+    assert "docs.google.com" not in source
+    assert "view.officeapps.live.com" not in source
+    projects_source = PROJECTS_JS.read_text(encoding="utf-8")
+    assert "loadOfficeAttachmentPreview(officePreviewUrl" in projects_source
+    assert "make('td', { text: cell })" in projects_source
+    assert "text: section.text" in projects_source
 
 
 def test_workflow_mutations_match_backend_query_and_version_contracts():
@@ -926,6 +1064,7 @@ def test_archived_tasks_and_subtasks_have_complete_recovery_and_creation_paths()
 
 def test_cross_instance_dom_contract_is_accessible_and_never_expands_local_membership():
     source = PROJECTS_JS.read_text(encoding="utf-8")
+    viewer_source = VIEWER_JS.read_text(encoding="utf-8")
     assert "projectPath(projectId, '/linked-instances', PROJECT_SOURCES.LOCAL)" in source
     assert "'/pairing-invitations'" in source
     assert "function reduceInstancePairing" in source
@@ -939,7 +1078,8 @@ def test_cross_instance_dom_contract_is_accessible_and_never_expands_local_membe
     assert "'/api/homelink/projects?include_archived=true'" in source
     assert "'/api/homelink/projects/invitations'" in source
     assert "`/api/homelink/projects/invitations/${encodeURIComponent(id)}/respond`" in source
-    assert "/api/homelink/projects/attachments/${encodeURIComponent(attachment.id)}/download" in source
+    assert "/api/homelink/projects/attachments/${id}/download" in viewer_source
+    assert "/api/homelink/projects/attachments/${id}/view" in viewer_source
     assert "renderNavigatorGroup('On this Restia'" in source
     assert "renderNavigatorGroup('Linked projects'" in source
     assert "renderIncomingInvitations({ idSuffix: '-mobile' })" in source

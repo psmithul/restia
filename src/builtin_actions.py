@@ -8,16 +8,32 @@ scheduler without needing an LLM call.
 import logging
 import os
 import json
+import asyncio
+import threading
 from datetime import datetime
 from typing import Tuple
 
-from src.auth_helpers import owner_filter
+from src.auth_helpers import legacy_owner_storage_key, owner_filter, owner_storage_key
 from core.platform_compat import IS_WINDOWS, find_bash
 from core.constants import internal_api_base
 from src.constants import DATA_DIR, DEEP_RESEARCH_DIR, TIDY_CALENDAR_STATE_FILE, EMAIL_URGENCY_CACHE_DIR, COOKBOOK_STATE_FILE
 from src.interactive_gate import wait_for_interactive_quiet
 
 logger = logging.getLogger(__name__)
+
+_telegram_digest_locks: dict[str, asyncio.Lock] = {}
+_telegram_digest_locks_guard = threading.Lock()
+
+
+def _telegram_digest_lock(owner: str) -> asyncio.Lock:
+    """Return the process-wide lock for one profile's digest state file."""
+    key = str(owner or "local").strip().lower()
+    with _telegram_digest_locks_guard:
+        lock = _telegram_digest_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _telegram_digest_locks[key] = lock
+        return lock
 
 
 def _clean_line(text, fallback: str = "") -> str:
@@ -1478,7 +1494,164 @@ async def action_daily_brief(owner: str, **kwargs) -> Tuple[str, bool]:
         return str(e), False
 
 
-async def action_telegram_hourly_digest(owner: str, **kwargs) -> Tuple[str, bool]:
+def _render_telegram_digest_sections(local_now, digest_topics: set[str], content: dict[str, list[str]]) -> str:
+    """Render only the sections explicitly selected by this profile."""
+    lines = [f"What needs doing - {local_now.strftime('%a %d %b, %H:%M %Z')}", ""]
+    sections = [
+        ("email", "Email", "No unread or unanswered indexed inbox email", 6),
+        ("todos", "To do", "No active todo items", 10),
+        ("reminders", "Notes due", "No notes due in the next 24 hours", 6),
+        ("calendar", "Calendar", "No events in the next 24 hours", 8),
+        ("projects", "Projects", "No active projects", 5),
+        ("tasks", "Automations", "No active automations", 6),
+    ]
+    for topic, heading, empty, limit in sections:
+        if topic not in digest_topics:
+            continue
+        items = content.get(topic) or []
+        lines.append(f"{heading}:")
+        if items:
+            lines.extend(f"- {_clean_line(item)}" for item in items[:limit])
+        else:
+            lines.append(f"- {empty}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def _write_telegram_digest_state(path, state: dict) -> None:
+    from core.atomic_io import atomic_write_json
+
+    atomic_write_json(str(path), state)
+
+
+async def clear_telegram_digest_pending(owner: str) -> bool:
+    """Remove sensitive partial-cycle text after a digest policy change."""
+
+    from pathlib import Path
+
+    async with _telegram_digest_lock(owner):
+        path = Path(DATA_DIR) / f"telegram_digest_{owner_storage_key(owner, fallback='local')}.json"
+        try:
+            state = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        except Exception:
+            state = {}
+        changed = False
+        for key in ("pending", "quiet_deferred_cycle_at"):
+            if key in state:
+                state.pop(key, None)
+                changed = True
+        if changed:
+            _write_telegram_digest_state(path, state)
+        return changed
+
+
+async def _deliver_telegram_digest_cycle(
+    *,
+    state_path,
+    state: dict,
+    chat_ids,
+    text: str,
+    cadence: str,
+    cycle_started_at,
+    bot_token: str,
+    send_message,
+    policy_topics=None,
+) -> Tuple[str, bool]:
+    """Deliver one digest cycle with durable per-chat acknowledgements.
+
+    The pending message and target set are written before the first Telegram
+    call. Each successful chat is then acknowledged atomically, so a later
+    scheduler tick retries only the chats that failed. The cadence anchor is
+    the cycle start, not the eventual retry completion time.
+    """
+
+    from datetime import datetime as _dt, timezone as _timezone
+
+    now_utc = cycle_started_at.astimezone(_timezone.utc)
+    current_targets = {str(chat_id): chat_id for chat_id in chat_ids}
+    pending = state.get("pending") if isinstance(state.get("pending"), dict) else None
+    if pending is None:
+        pending = {
+            "id": now_utc.isoformat(),
+            "started_at": now_utc.isoformat(),
+            "text": str(text or ""),
+            "targets": list(current_targets),
+            "sent": {},
+            "attempts": {},
+            "policy_cadence": cadence,
+            "policy_topics": sorted(str(topic) for topic in (policy_topics or [])),
+        }
+        state["schema_version"] = 2
+        state["cadence"] = cadence
+        state["pending"] = pending
+        _write_telegram_digest_state(state_path, state)
+    else:
+        text = str(pending.get("text") or "")
+
+    if not text:
+        state.pop("pending", None)
+        _write_telegram_digest_state(state_path, state)
+        return "Telegram digest pending state was invalid and was reset", False
+
+    target_keys = [str(value) for value in (pending.get("targets") or [])]
+    # A chat unlinked during a partial cycle is no longer a delivery target.
+    # Newly linked chats join the next cadence cycle rather than receiving an
+    # old message unexpectedly.
+    active_keys = [key for key in target_keys if key in current_targets]
+    if active_keys != target_keys:
+        pending["targets"] = active_keys
+        pending["dropped_targets"] = sorted(set(target_keys) - set(active_keys))
+        _write_telegram_digest_state(state_path, state)
+
+    sent_map = pending.setdefault("sent", {})
+    attempts = pending.setdefault("attempts", {})
+    pending_keys = [key for key in active_keys if key not in sent_map]
+    failures: list[str] = []
+    sent_now = 0
+    for key in pending_keys:
+        try:
+            await send_message(bot_token, current_targets[key], text)
+            sent_at = _dt.now(_timezone.utc).isoformat()
+            sent_map[key] = sent_at
+            state.setdefault("chat_deliveries", {})[key] = {
+                "cycle_id": str(pending.get("id") or pending.get("started_at") or ""),
+                "sent_at": sent_at,
+            }
+            attempts.pop(key, None)
+            sent_now += 1
+        except Exception as exc:
+            logger.warning("telegram digest send failed for chat %s: %s", key, exc)
+            attempts[key] = {
+                "at": _dt.now(_timezone.utc).isoformat(),
+                "error": (str(exc) or exc.__class__.__name__)[:200],
+            }
+            failures.append(key)
+        # Persist after every target so a crash cannot forget acknowledgements
+        # from earlier chats in this same cycle.
+        _write_telegram_digest_state(state_path, state)
+
+    remaining = [key for key in active_keys if key not in sent_map]
+    if remaining:
+        delivered_total = len(active_keys) - len(remaining)
+        return (
+            f"Telegram digest delivered to {delivered_total} chat(s); "
+            f"{len(remaining)} chat(s) pending retry",
+            False,
+        )
+
+    started_at = str(pending.get("started_at") or now_utc.isoformat())
+    state["last_sent_at"] = started_at
+    state["last_completed_at"] = _dt.now(_timezone.utc).isoformat()
+    state["cadence"] = cadence
+    state.pop("pending", None)
+    _write_telegram_digest_state(state_path, state)
+    total = len(active_keys)
+    if sent_now < total:
+        return f"Telegram digest retry completed for {total} chat(s)", True
+    return f"Telegram digest sent to {total} chat(s)", True
+
+
+async def _action_telegram_hourly_digest_locked(owner: str, **kwargs) -> Tuple[str, bool]:
     """Send a compact hourly "what needs doing" digest to Telegram.
 
     Uses local caches/SQLite rows only for email so this task does not block on
@@ -1486,10 +1659,20 @@ async def action_telegram_hourly_digest(owner: str, **kwargs) -> Tuple[str, bool
     """
     try:
         import sqlite3 as _sqlite3
-        from datetime import datetime as _dt, timedelta as _td
+        from datetime import datetime as _dt, timedelta as _td, timezone as _timezone
+        from pathlib import Path as _P
+        from zoneinfo import ZoneInfo
 
-        from core.database import CalendarCal, CalendarEvent, Note, SessionLocal
+        from core.database import (
+            CalendarCal, CalendarEvent, Note, Project, ProjectMember, ProjectWorkItem,
+            ScheduledTask, SessionLocal,
+        )
         from routes.email_helpers import SCHEDULED_DB, _email_cache_owner_clause, _init_scheduled_db
+        from src.notification_preferences import (
+            load_notification_preferences,
+            quiet_hours_active,
+            seconds_until_quiet_hours_end,
+        )
         from src.telegram_bot import load_telegram_config, send_telegram_message, telegram_chat_ids_for_owner
 
         config = load_telegram_config()
@@ -1502,11 +1685,123 @@ async def action_telegram_hourly_digest(owner: str, **kwargs) -> Tuple[str, bool
         if not chat_ids:
             raise TaskNoop("telegram digest skipped: no Telegram chat target configured")
 
+        preferences = load_notification_preferences(owner)
+        cadence = str(preferences.get("digest_cadence") or "off")
+        topics = set(preferences.get("notification_topics") or [])
+        digest_topics = topics & {"email", "todos", "reminders", "calendar", "projects", "tasks"}
+        _state_slug = owner_storage_key(owner, fallback="local")
+        digest_state_path = _P(DATA_DIR) / f"telegram_digest_{_state_slug}.json"
+        # Do not fall back to a lossy legacy slug for escaped identities: a
+        # pending digest contains private text and the old payload has no exact
+        # owner field with which to authenticate a migration.
+        try:
+            digest_state = json.loads(digest_state_path.read_text(encoding="utf-8")) if digest_state_path.exists() else {}
+        except Exception:
+            digest_state = {}
+
+        if cadence == "off" or not digest_topics:
+            changed = False
+            for key in ("pending", "quiet_deferred_cycle_at"):
+                if key in digest_state:
+                    digest_state.pop(key, None)
+                    changed = True
+            if changed:
+                _write_telegram_digest_state(digest_state_path, digest_state)
+            reason = "profile digest is off" if cadence == "off" else "no digest topics selected"
+            raise TaskNoop(f"telegram digest skipped: {reason}")
+
+        pending_policy = digest_state.get("pending") if isinstance(digest_state.get("pending"), dict) else None
+        expected_topics = sorted(digest_topics)
+        if pending_policy is not None and (
+            str(pending_policy.get("policy_cadence") or "") != cadence
+            or list(pending_policy.get("policy_topics") or []) != expected_topics
+        ):
+            # Never retry private text rendered under a superseded topic policy.
+            # Anchor cadence at the canceled cycle so already-reached chats are
+            # not sent a duplicate replacement immediately.
+            started = str(pending_policy.get("started_at") or "")
+            if started:
+                digest_state["last_sent_at"] = started
+            digest_state.pop("pending", None)
+            digest_state.pop("quiet_deferred_cycle_at", None)
+            _write_telegram_digest_state(digest_state_path, digest_state)
+
+        try:
+            zone = ZoneInfo(str(preferences.get("timezone") or "UTC"))
+        except Exception:
+            zone = ZoneInfo("UTC")
+        _now_override = kwargs.get("_now")
+        if isinstance(_now_override, _dt):
+            if _now_override.tzinfo is None:
+                _now_override = _now_override.replace(tzinfo=zone)
+            local_now = _now_override.astimezone(zone)
+        else:
+            local_now = _dt.now(_timezone.utc).astimezone(zone)
+        deferred_cycle = None
+        try:
+            deferred_cycle = _dt.fromisoformat(str(digest_state.get("quiet_deferred_cycle_at") or ""))
+            if deferred_cycle.tzinfo is None:
+                deferred_cycle = deferred_cycle.replace(tzinfo=_timezone.utc)
+        except Exception:
+            deferred_cycle = None
+        if quiet_hours_active(preferences, now=local_now):
+            if deferred_cycle is None:
+                deferred_cycle = local_now.astimezone(_timezone.utc)
+                digest_state["quiet_deferred_cycle_at"] = deferred_cycle.isoformat()
+                digest_state["cadence"] = cadence
+                _write_telegram_digest_state(digest_state_path, digest_state)
+            delay = seconds_until_quiet_hours_end(preferences, now=local_now)
+            raise TaskDeferred(
+                "telegram digest deferred: profile quiet hours are active",
+                delay_seconds=max(60, delay),
+            )
+        if isinstance(digest_state.get("pending"), dict):
+            # A partial cycle bypasses the normal cadence gate: only its
+            # unacknowledged chats are retried, using the exact original text.
+            delivery = await _deliver_telegram_digest_cycle(
+                state_path=digest_state_path,
+                state=digest_state,
+                chat_ids=chat_ids,
+                text=str(digest_state["pending"].get("text") or ""),
+                cadence=cadence,
+                cycle_started_at=local_now,
+                bot_token=config.bot_token,
+                send_message=send_telegram_message,
+                policy_topics=digest_topics,
+            )
+            if not delivery[1] and isinstance(digest_state.get("pending"), dict):
+                raise TaskDeferred(delivery[0], delay_seconds=15 * 60)
+            if delivery[1] and digest_state.pop("quiet_deferred_cycle_at", None) is not None:
+                _write_telegram_digest_state(digest_state_path, digest_state)
+            return delivery
+        last_sent = None
+        try:
+            last_sent = _dt.fromisoformat(str(digest_state.get("last_sent_at") or ""))
+            if last_sent.tzinfo is None:
+                last_sent = last_sent.replace(tzinfo=_timezone.utc)
+        except Exception:
+            last_sent = None
+        elapsed = (local_now.astimezone(_timezone.utc) - last_sent.astimezone(_timezone.utc)).total_seconds() if last_sent else None
+        if deferred_cycle is None and cadence == "hourly" and elapsed is not None and elapsed < 50 * 60:
+            raise TaskNoop("telegram digest skipped: hourly cadence is not due")
+        if deferred_cycle is None and cadence == "every_3_hours" and elapsed is not None and elapsed < 170 * 60:
+            raise TaskNoop("telegram digest skipped: 3-hour cadence is not due")
+        if deferred_cycle is None and cadence == "every_6_hours" and elapsed is not None and elapsed < 350 * 60:
+            raise TaskNoop("telegram digest skipped: 6-hour cadence is not due")
+        if cadence == "daily" and deferred_cycle is None:
+            target = str(preferences.get("digest_time") or "08:00")
+            if local_now.strftime("%H:%M") < target:
+                raise TaskNoop("telegram digest skipped: today's delivery time has not arrived")
+            if last_sent and last_sent.astimezone(zone).date() >= local_now.date():
+                raise TaskNoop("telegram digest skipped: today's digest was already sent")
+
         now = _dt.now()
         next_24h = now + _td(hours=24)
 
         emails: list[str] = []
         try:
+            if "email" not in digest_topics:
+                raise RuntimeError("email topic disabled")
             _init_scheduled_db()
             owner_clause, owner_params = _email_cache_owner_clause(owner)
             conn = _sqlite3.connect(SCHEDULED_DB)
@@ -1541,6 +1836,8 @@ async def action_telegram_hourly_digest(owner: str, **kwargs) -> Tuple[str, bool
         notes_due: list[str] = []
         todos: list[str] = []
         events: list[str] = []
+        projects: list[str] = []
+        tasks: list[str] = []
 
         def _parse_due(value: str | None):
             if not value:
@@ -1559,14 +1856,18 @@ async def action_telegram_hourly_digest(owner: str, **kwargs) -> Tuple[str, bool
 
         db = SessionLocal()
         try:
-            note_q = db.query(Note).filter(Note.archived == False)  # noqa: E712
-            if owner:
-                note_q = owner_filter(note_q, Note, owner, include_shared=False)
-            for note in note_q.order_by(Note.pinned.desc(), Note.updated_at.desc()).limit(80).all():
+            if "reminders" in digest_topics or "todos" in digest_topics:
+                note_q = db.query(Note).filter(Note.archived == False)  # noqa: E712
+                if owner:
+                    note_q = owner_filter(note_q, Note, owner, include_shared=False)
+                note_rows = note_q.order_by(Note.pinned.desc(), Note.updated_at.desc()).limit(80).all()
+            else:
+                note_rows = []
+            for note in note_rows:
                 due = _parse_due(note.due_date)
-                if due and due <= next_24h:
+                if "reminders" in digest_topics and due and due <= next_24h:
                     notes_due.append(note.title or note.content or "Untitled note")
-                if note.note_type in {"todo", "checklist", "goal"} and note.items:
+                if "todos" in digest_topics and note.note_type in {"todo", "checklist", "goal"} and note.items:
                     try:
                         items = json.loads(note.items)
                     except Exception:
@@ -1583,68 +1884,133 @@ async def action_telegram_hourly_digest(owner: str, **kwargs) -> Tuple[str, bool
                 if len(todos) >= 10 and len(notes_due) >= 6:
                     break
 
-            event_q = (
-                db.query(CalendarEvent)
-                .join(CalendarCal, CalendarEvent.calendar_id == CalendarCal.id)
-                .filter(
-                    CalendarEvent.dtstart >= now,
-                    CalendarEvent.dtstart <= next_24h,
-                    CalendarEvent.status != "cancelled",
+            if "calendar" in digest_topics:
+                from routes.calendar_routes import _expand_rrule
+
+                event_q = db.query(CalendarEvent).join(
+                    CalendarCal, CalendarEvent.calendar_id == CalendarCal.id
+                ).filter(CalendarEvent.status != "cancelled")
+                if owner:
+                    event_q = event_q.filter(CalendarCal.owner == owner)
+                utc_start = local_now.astimezone(_timezone.utc).replace(tzinfo=None)
+                utc_end = (local_now + _td(hours=24)).astimezone(_timezone.utc).replace(tzinfo=None)
+                local_start = local_now.replace(tzinfo=None)
+                local_end = (local_now + _td(hours=24)).replace(tzinfo=None)
+                occurrence_rows: list[tuple[_dt, str]] = []
+                for ev in event_q.order_by(CalendarEvent.dtstart.desc()).limit(2500).all():
+                    range_start, range_end = (
+                        (utc_start, utc_end) if bool(getattr(ev, "is_utc", False))
+                        else (local_start, local_end)
+                    )
+                    recurring = bool(ev.rrule and ev.rrule.strip())
+                    if recurring:
+                        if ev.dtstart >= range_end:
+                            continue
+                    elif not (ev.dtstart < range_end and ev.dtend > range_start):
+                        continue
+                    occurrences = _expand_rrule(
+                        ev, range_start, range_end, limit=16, work_limit=1000,
+                    )
+                    for occurrence_row in occurrences:
+                        raw_start = str(occurrence_row.get("dtstart") or "")
+                        if occurrence_row.get("all_day"):
+                            occurrence_local = _dt.fromisoformat(raw_start).replace(tzinfo=zone)
+                            when = "all day"
+                        else:
+                            parsed_start = _dt.fromisoformat(raw_start.replace("Z", "+00:00"))
+                            if parsed_start.tzinfo is None:
+                                occurrence_local = parsed_start.replace(tzinfo=zone)
+                            else:
+                                occurrence_local = parsed_start.astimezone(zone)
+                            when = occurrence_local.strftime("%a %H:%M")
+                        occurrence_rows.append((
+                            occurrence_local,
+                            f"{when} {occurrence_row.get('summary') or ev.summary}",
+                        ))
+                occurrence_rows.sort(key=lambda row: row[0])
+                events.extend(text for _, text in occurrence_rows[:8])
+            if "projects" in digest_topics and owner:
+                from sqlalchemy import func as _func, or_ as _or
+                _actor = str(owner).strip().lower()
+                membership_ids = db.query(ProjectMember.project_id).filter(
+                    _func.lower(ProjectMember.username) == _actor
                 )
-            )
-            if owner:
-                event_q = event_q.filter(CalendarCal.owner == owner)
-            for ev in event_q.order_by(CalendarEvent.dtstart).limit(8).all():
-                when = ev.dtstart.strftime("%H:%M") if not ev.all_day else "all day"
-                events.append(f"{when} {ev.summary}")
+                for project in db.query(Project).filter(
+                    _or(
+                        _func.lower(Project.owner) == _actor,
+                        Project.id.in_(membership_ids),
+                    ),
+                    Project.archived == False,  # noqa: E712
+                    Project.completed_at.is_(None),
+                ).order_by(Project.updated_at.desc()).limit(5).all():
+                    open_count = db.query(ProjectWorkItem).filter(
+                        ProjectWorkItem.project_id == project.id,
+                        ProjectWorkItem.archived == False,  # noqa: E712
+                        ProjectWorkItem.completed_at.is_(None),
+                    ).count()
+                    projects.append(f"{project.key}: {project.name} ({open_count} open)")
+            if "tasks" in digest_topics:
+                from sqlalchemy import or_ as _or
+                task_q = db.query(ScheduledTask).filter(
+                    ScheduledTask.status == "active",
+                    _or(
+                        ScheduledTask.action.is_(None),
+                        ScheduledTask.action != "telegram_hourly_digest",
+                    ),
+                )
+                if owner:
+                    task_q = task_q.filter(ScheduledTask.owner == owner)
+                for task in task_q.order_by(ScheduledTask.next_run.asc()).limit(6).all():
+                    if task.next_run:
+                        next_run_utc = task.next_run
+                        if next_run_utc.tzinfo is None:
+                            next_run_utc = next_run_utc.replace(tzinfo=_timezone.utc)
+                        when = next_run_utc.astimezone(zone).strftime("%d %b %H:%M")
+                    else:
+                        when = "event-triggered"
+                    tasks.append(f"{task.name} ({when})")
         finally:
             db.close()
 
-        lines = [f"What needs doing - {now.strftime('%a %d %b, %H:%M')}", ""]
-        lines.append("Email:")
-        if emails:
-            lines.extend(f"- {item}" for item in emails)
-        else:
-            lines.append("- No unread or unanswered indexed inbox email")
-        lines.append("")
-        lines.append("To do:")
-        if todos:
-            lines.extend(f"- {item}" for item in todos[:10])
-        else:
-            lines.append("- No active todo items")
-        lines.append("")
-        lines.append("Notes due:")
-        if notes_due:
-            lines.extend(f"- {_clean_line(item, 'Untitled note')}" for item in notes_due[:6])
-        else:
-            lines.append("- No notes due in the next 24 hours")
-        lines.append("")
-        lines.append("Calendar:")
-        if events:
-            lines.extend(f"- {item}" for item in events)
-        else:
-            lines.append("- No events in the next 24 hours")
-
-        text = "\n".join(lines)
-        sent = 0
-        failed: list[str] = []
-        for chat_id in chat_ids:
-            try:
-                await send_telegram_message(config.bot_token, chat_id, text)
-                sent += 1
-            except Exception as exc:
-                logger.warning("telegram digest send failed for chat %s: %s", chat_id, exc)
-                failed.append(str(chat_id))
-        if sent == 0 and failed:
-            return "Telegram digest failed for all configured chats. Make sure the allowed chat has sent /start to the bot.", False
-        if failed:
-            return f"Telegram digest sent to {sent} chat(s); failed for {len(failed)} chat(s)", False
-        return f"Telegram digest sent to {sent} chat(s)", True
+        text = _render_telegram_digest_sections(local_now, digest_topics, {
+            "email": emails,
+            "todos": todos,
+            "reminders": notes_due,
+            "calendar": events,
+            "projects": projects,
+            "tasks": tasks,
+        })
+        delivery = await _deliver_telegram_digest_cycle(
+            state_path=digest_state_path,
+            state=digest_state,
+            chat_ids=chat_ids,
+            text=text,
+            cadence=cadence,
+            cycle_started_at=deferred_cycle or local_now,
+            bot_token=config.bot_token,
+            send_message=send_telegram_message,
+            policy_topics=digest_topics,
+        )
+        if not delivery[1] and isinstance(digest_state.get("pending"), dict):
+            raise TaskDeferred(delivery[0], delay_seconds=15 * 60)
+        if delivery[1] and digest_state.pop("quiet_deferred_cycle_at", None) is not None:
+            _write_telegram_digest_state(digest_state_path, digest_state)
+        return delivery
     except TaskNoop:
         raise
     except Exception as e:
         logger.exception("telegram hourly digest action failed")
         return str(e), False
+
+
+async def action_telegram_hourly_digest(owner: str, **kwargs) -> Tuple[str, bool]:
+    """Serialize one profile's digest state machine.
+
+    The locked implementation reads ``email_message_index`` only; it never
+    opens IMAP merely to build a Telegram digest.
+    """
+    async with _telegram_digest_lock(owner):
+        return await _action_telegram_hourly_digest_locked(owner, **kwargs)
 
 
 async def action_test_skills(owner: str, **kwargs) -> Tuple[str, bool]:
@@ -1840,7 +2206,7 @@ async def action_audit_skills(owner: str, **kwargs) -> Tuple[str, bool]:
         return str(e), False
 
 
-def _advance_recurring_due(raw, repeat):
+def _advance_recurring_due(raw, repeat, *, tz_name: str | None = None):
     """Next FUTURE occurrence of a note's due_date for its repeat rule.
 
     Mirrors the frontend `_advanceRecurring` grammar (static/js/notes.js):
@@ -1852,6 +2218,7 @@ def _advance_recurring_due(raw, repeat):
     """
     import calendar
     from datetime import datetime, timedelta, timezone as _tzmod
+    from zoneinfo import ZoneInfo
 
     if not raw or not repeat or str(repeat).strip() == "none":
         return None
@@ -1861,6 +2228,16 @@ def _advance_recurring_due(raw, repeat):
         d0 = datetime.fromisoformat(s.replace("Z", "+00:00"))
     except Exception:
         return None
+    if tz_name:
+        try:
+            recurrence_zone = ZoneInfo(str(tz_name))
+            d0 = (
+                d0.astimezone(recurrence_zone)
+                if d0.tzinfo is not None
+                else d0.replace(tzinfo=recurrence_zone)
+            )
+        except Exception:
+            pass
 
     def js_wd(dt):
         return (dt.weekday() + 1) % 7  # 0=Sun..6=Sat
@@ -1967,9 +2344,9 @@ def _reset_note_items_json(items_json):
 
 
 async def action_ping_notes(owner: str, **kwargs) -> Tuple[str, bool]:
-    """Background note-due scanner. Fires a reminder for any note whose
-    `due_date` falls in the current ±5-minute window and hasn't been pinged
-    within the last 25 minutes. Mirrors `action_ping_events` for calendar.
+    """Background note-due scanner. Fires only at or after ``due_date`` and
+    catches up missed one-offs without sending a future reminder early.
+    Mirrors ``action_ping_events`` for calendar.
 
     Repeating notes (habits) are advanced server-side after firing: due_date
     rolls to the next occurrence and checklist items reset to unchecked, so
@@ -1989,21 +2366,25 @@ async def action_ping_notes(owner: str, **kwargs) -> Tuple[str, bool]:
         # Per-owner state file so cache-pruning doesn't cross-delete other
         # users' entries (review C4). Legacy path kept as fallback so a
         # single-user install (empty owner) doesn't lose its history.
-        _owner_slug = "".join(c if (c.isalnum() or c in "-_.@") else "_" for c in (owner or "default"))
+        _owner_slug = owner_storage_key(owner)
         STATE = _P(DATA_DIR) / f"note_pings_{_owner_slug}.json"
         STATE.parent.mkdir(parents=True, exist_ok=True)
-        # One-time migration: if legacy global file exists and per-owner file
-        # doesn't, seed from global (entries for OTHER owners still get pruned
-        # on their first run — acceptable, prevents silent loss).
+        # Escaped legacy slugs are deliberately not read. This cache has no
+        # exact owner field, so attributing a colliding file would be unsafe.
+        # The old global cache has no embedded owner and cannot be attributed
+        # safely in multi-profile mode. Only the historical empty-owner runtime
+        # may seed from it; concrete profiles start a fresh isolated cache.
         _legacy = _P(DATA_DIR) / "note_pings.json"
-        if _legacy.exists() and not STATE.exists():
+        if not owner and _legacy.exists() and not STATE.exists():
             try:
                 STATE.write_text(_legacy.read_text(encoding="utf-8"), encoding="utf-8")
             except Exception:
                 pass
-        # Scanner ticks every 60s in _note_pings_loop. 90s window guarantees
-        # every note's due time lands inside at least one tick's window.
-        WINDOW_SEC = 90
+        # Scanner ticks every 60s in _note_pings_loop. One-off reminders remain
+        # eligible after any downtime; recurring reminders use a bounded window.
+        # A short retry backoff avoids hammering an unavailable external channel.
+        CATCHUP_SEC = 24 * 60 * 60
+        RETRY_SEC = 5 * 60
         REPING_MIN = 25     # don't re-ping same note more often than this
 
         def _parse_due(s: str):
@@ -2014,10 +2395,16 @@ async def action_ping_notes(owner: str, **kwargs) -> Tuple[str, bool]:
                 # Handle the JS-style 'Z' suffix.
                 if s.endswith("Z"):
                     return _dt.fromisoformat(s[:-1]).replace(tzinfo=_tz.utc)
-                # Naive → assume local server time.
+                # Legacy naive values were entered in the profile's wall clock,
+                # not the container timezone.
                 d = _dt.fromisoformat(s)
                 if d.tzinfo is None:
-                    d = d.astimezone().astimezone(_tz.utc)
+                    try:
+                        from zoneinfo import ZoneInfo as _ZoneInfo
+
+                        d = d.replace(tzinfo=_ZoneInfo(_reminder_timezone))
+                    except Exception:
+                        d = d.replace(tzinfo=_tz.utc)
                 return d.astimezone(_tz.utc)
             except Exception:
                 return None
@@ -2032,50 +2419,164 @@ async def action_ping_notes(owner: str, **kwargs) -> Tuple[str, bool]:
             q = db.query(_N).filter(_N.archived == False)  # noqa: E712
             q = q.filter(_N.due_date.isnot(None), _N.due_date != "")
             if owner:
-                # Match owner OR legacy null-owner notes (single-user installs).
-                q = owner_filter(q, _N, owner)
+                # Multi-profile scheduler runs must never share legacy
+                # null-owner notes: each such row would otherwise be sent once
+                # per profile. Single-user mode passes an empty owner and keeps
+                # the legacy rows through owner_filter's no-op behavior.
+                q = owner_filter(q, _N, owner, include_shared=False)
             notes = q.all()
             if not notes:
                 raise TaskNoop("no notes with due dates")
 
             now = _dt.now(_tz.utc)
-            window = _td(seconds=WINDOW_SEC)
             reping_cutoff = now - _td(minutes=REPING_MIN)
             seen_ids = set()
             sent = []
+            failed = []
+            deferred = []
+            suppressed = []
+            try:
+                from src.notification_preferences import load_notification_preferences
+                _notification_prefs = load_notification_preferences(owner)
+                _required_channel = str(_notification_prefs.get("reminder_channel") or "browser")
+                _reminder_timezone = str(_notification_prefs.get("timezone") or "UTC")
+                _mirror_required = bool(_notification_prefs.get("reminder_telegram_mirror")) and _required_channel != "telegram"
+            except Exception:
+                _required_channel = "browser"
+                _reminder_timezone = "UTC"
+                _mirror_required = False
+
+            def _advance_occurrence_once(note, next_due: str) -> bool:
+                """CAS one recurrence so browser and scanner cannot both rotate it."""
+
+                from src.note_progression import (
+                    recurring_advance_values,
+                    recurring_occurrence_is_due,
+                )
+
+                old_due = note.due_date
+                old_items = note.items
+                old_repeat = note.repeat
+                if note.archived or not recurring_occurrence_is_due(
+                    items_json=old_items,
+                    repeat=old_repeat,
+                    due_date=old_due,
+                    now=now,
+                    tz_name=_reminder_timezone,
+                ):
+                    return False
+                advanced_items, advanced_due = recurring_advance_values(
+                    items_json=old_items,
+                    repeat=old_repeat,
+                    due_date=old_due,
+                    next_due_date=next_due,
+                )
+                updated = (
+                    db.query(_N)
+                    .filter(
+                        _N.id == note.id,
+                        _N.due_date == old_due,
+                        _N.items == old_items,
+                        _N.repeat == old_repeat,
+                        _N.archived.is_(False),
+                    )
+                    .update(
+                        {
+                            _N.items: advanced_items,
+                            _N.due_date: advanced_due,
+                            _N.updated_at: _dt.now(_tz.utc).replace(tzinfo=None),
+                        },
+                        synchronize_session=False,
+                    )
+                )
+                if updated != 1:
+                    db.rollback()
+                    return False
+                db.commit()
+                return True
 
             for n in notes:
                 seen_ids.add(n.id)
                 due = _parse_due(n.due_date)
                 if not due:
                     continue
-                # Inside the ±5min window?
-                if abs((due - now).total_seconds()) > window.total_seconds():
+                seconds_late = (now - due).total_seconds()
+                # Too early, or older than the bounded catch-up window?
+                if seconds_late < 0 or (
+                    seconds_late > CATCHUP_SEC and (n.repeat or "none") != "none"
+                ):
                     # Missed repeating slot (server was down / overdue for a
                     # while): silently roll to the next occurrence so the
                     # habit fires again instead of dying in the past.
                     if due < now and (n.repeat or "none") != "none":
                         try:
-                            _next = _advance_recurring_due(n.due_date, n.repeat)
+                            _next = _advance_recurring_due(
+                                n.due_date,
+                                n.repeat,
+                                tz_name=_reminder_timezone,
+                            )
                             if _next:
-                                n.due_date = _next
-                                _reset = _reset_note_items_json(n.items)
-                                if _reset is not None:
-                                    n.items = _reset
-                                db.commit()
+                                _advance_occurrence_once(n, _next)
                         except Exception as _adv_e:
                             logger.warning(f"ping_notes: silent repeat advance failed for {n.id}: {_adv_e}")
                     continue
-                # Recently pinged? Skip.
+                # Finished structured work must not notify. A completed
+                # recurring cycle advances silently so the next cycle remains
+                # useful; a completed one-off stays terminal.
+                from src.note_progression import completion_items_fully_done
+                if completion_items_fully_done(n.note_type, n.items):
+                    suppressed.append((n.title or "Completed to do").strip() or "Completed to do")
+                    if (n.repeat or "none") != "none":
+                        try:
+                            _next = _advance_recurring_due(
+                                n.due_date,
+                                n.repeat,
+                                tz_name=_reminder_timezone,
+                            )
+                            if _next:
+                                _advance_occurrence_once(n, _next)
+                        except Exception as _adv_e:
+                            logger.warning(
+                                "ping_notes: completed repeat advance failed for %s: %s",
+                                n.id,
+                                _adv_e,
+                            )
+                    continue
+                # Successfully delivered occurrence? Skip permanently for a
+                # one-off, or until a repeating note moves to a new due value.
+                # Failed attempts carry only attempt_at and remain retryable.
                 last = cache.get(n.id)
                 if last:
                     try:
                         if isinstance(last, dict):
-                            last = last.get("at")
+                            delivered_at = last.get("at")
+                            occurrence = str(last.get("occurrence") or "")
+                            cached_channel = str(last.get("channel") or "")
+                            attempt_at = last.get("attempt_at")
+                            mirror_pending = _mirror_required and not bool(last.get("mirror_complete"))
+                            if delivered_at and occurrence and occurrence == str(n.due_date or "") and not mirror_pending:
+                                continue
+                            if (
+                                delivered_at
+                                and not occurrence
+                                and (n.repeat or "none") == "none"
+                                and cached_channel == _required_channel
+                                and not mirror_pending
+                            ):
+                                continue
+                            if attempt_at:
+                                attempt_dt = _dt.fromisoformat(str(attempt_at))
+                                if attempt_dt.tzinfo is None:
+                                    attempt_dt = attempt_dt.replace(tzinfo=_tz.utc)
+                                if attempt_dt >= now - _td(seconds=RETRY_SEC):
+                                    continue
+                            last = delivered_at
+                        if not last:
+                            raise ValueError("no successful delivery timestamp")
                         last_dt = _dt.fromisoformat(str(last))
                         if last_dt.tzinfo is None:
                             last_dt = last_dt.replace(tzinfo=_tz.utc)
-                        if last_dt >= reping_cutoff:
+                        if last_dt >= reping_cutoff and not _mirror_required:
                             continue
                     except Exception:
                         pass
@@ -2100,39 +2601,102 @@ async def action_ping_notes(owner: str, **kwargs) -> Tuple[str, bool]:
                 body = "\n\n".join(p for p in body_parts if p) or title
                 try:
                     from routes.note_routes import dispatch_reminder
-                    await dispatch_reminder(
+                    _note_label = str(getattr(n, "label", None) or "").strip().lower()
+                    _note_type = str(getattr(n, "note_type", None) or "").strip().lower()
+                    _topic = "calendar" if _note_label == "calendar" else (
+                        "todos" if _note_type in {"todo", "checklist", "goal"} else "reminders"
+                    )
+                    dispatch_result = await dispatch_reminder(
                         title=title, note_body=body, note_id=n.id,
                         owner=n.owner or owner or "",
+                        occurrence=str(n.due_date or ""),
+                        topic=_topic,
                     )
-                    cache[n.id] = now.isoformat()
-                    sent.append(title)
+                    acknowledged = bool(
+                        dispatch_result.get("acknowledged")
+                        or dispatch_result.get("delivered")
+                        or dispatch_result.get("skipped")
+                    )
+                    if not acknowledged:
+                        if dispatch_result.get("deferred"):
+                            deferred.append(title)
+                        else:
+                            failed.append(title)
+                        cache[n.id] = {
+                            "attempt_at": now.isoformat(),
+                            "occurrence": str(n.due_date or ""),
+                            "channel": str(dispatch_result.get("channel") or _required_channel),
+                            "last_error": str(
+                                dispatch_result.get("telegram_error")
+                                or dispatch_result.get("email_error")
+                                or dispatch_result.get("ntfy_error")
+                                or dispatch_result.get("webhook_error")
+                                or dispatch_result.get("suppression_reason")
+                                or "delivery_failed"
+                            )[:160],
+                            "mirror_complete": False,
+                        }
+                        continue
+
+                    cache[n.id] = {
+                        "at": now.isoformat(),
+                        "occurrence": str(n.due_date or ""),
+                        "channel": str(dispatch_result.get("channel") or _required_channel),
+                        "mirror_complete": bool(
+                            not _mirror_required or dispatch_result.get("telegram_sent")
+                        ),
+                    }
+                    if dispatch_result.get("delivered") or dispatch_result.get("skipped"):
+                        sent.append(title)
+                    else:
+                        suppressed.append(title)
                     # Habit engine: roll a repeating note to its next
-                    # occurrence and reset its checklist after firing.
+                    # occurrence only after delivery (or explicit topic opt-out).
                     if (n.repeat or "none") != "none":
                         try:
-                            _next = _advance_recurring_due(n.due_date, n.repeat)
+                            _next = _advance_recurring_due(
+                                n.due_date,
+                                n.repeat,
+                                tz_name=_reminder_timezone,
+                            )
                             if _next:
-                                n.due_date = _next
-                                _reset = _reset_note_items_json(n.items)
-                                if _reset is not None:
-                                    n.items = _reset
-                                db.commit()
+                                _advance_occurrence_once(n, _next)
                         except Exception as _adv_e:
                             logger.warning(f"ping_notes: repeat advance failed for {n.id}: {_adv_e}")
                 except Exception as e:
                     logger.warning(f"ping_notes: dispatch failed for {n.id}: {e}")
+                    failed.append(title)
+                    cache[n.id] = {
+                        "attempt_at": now.isoformat(),
+                        "occurrence": str(n.due_date or ""),
+                        "channel": _required_channel,
+                        "last_error": e.__class__.__name__,
+                    }
 
             # Prune cache entries for notes that no longer exist.
             for stale in [k for k in cache if k not in seen_ids]:
                 cache.pop(stale, None)
 
             try:
-                STATE.write_text(_json.dumps(cache), encoding="utf-8")
+                from core.atomic_io import atomic_write_json as _atomic_write_json
+                _atomic_write_json(str(STATE), cache)
             except Exception as e:
                 logger.warning(f"ping_notes: cache write failed: {e}")
 
-            if not sent:
-                raise TaskNoop(f"scanned {len(notes)} note(s), none due in ±{WINDOW_SEC}s")
+            if failed:
+                preview = "; ".join(failed[:3])
+                extra = f" (+{len(failed) - 3} more)" if len(failed) > 3 else ""
+                return f"Reminder delivery failed for {len(failed)} note(s): {preview}{extra}; retry scheduled", False
+            if deferred:
+                preview = "; ".join(deferred[:3])
+                extra = f" (+{len(deferred) - 3} more)" if len(deferred) > 3 else ""
+                raise TaskNoop(
+                    f"Deferred {len(deferred)} reminder(s) during quiet hours: {preview}{extra}"
+                )
+            if not sent and not suppressed:
+                raise TaskNoop(f"scanned {len(notes)} note(s), none currently due")
+            if not sent and suppressed:
+                raise TaskNoop(f"suppressed {len(suppressed)} reminder(s) by completion or profile policy")
             preview = "; ".join(sent[:3])
             extra = f" (+{len(sent) - 3} more)" if len(sent) > 3 else ""
             return f"Pinged {len(sent)} note(s): {preview}{extra}", True
@@ -2177,8 +2741,10 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
         # Per-owner state file so multi-user runs don't clobber each other's
         # notified_uids / urgency counts. Empty owner falls back to a generic
         # filename for single-user installs (matches prior behaviour).
-        _owner_slug = "".join(c if (c.isalnum() or c in "-_.@") else "_" for c in (owner or "default"))
+        _owner_slug = owner_storage_key(owner)
         STATE_PATH = _P(DATA_DIR) / f"email_urgency_state_{_owner_slug}.json"
+        _legacy_owner_slug = legacy_owner_storage_key(owner)
+        LEGACY_STATE_PATH = _P(DATA_DIR) / f"email_urgency_state_{_legacy_owner_slug}.json"
         CACHE_DIR = _P(EMAIL_URGENCY_CACHE_DIR)
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -2692,6 +3258,15 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
             prior = _json.loads(STATE_PATH.read_text(encoding="utf-8")) if STATE_PATH.exists() else {}
         except Exception:
             prior = {}
+        if not prior and LEGACY_STATE_PATH != STATE_PATH and LEGACY_STATE_PATH.exists():
+            try:
+                legacy_prior = _json.loads(LEGACY_STATE_PATH.read_text(encoding="utf-8"))
+                # Lossy legacy filenames are safe to migrate only when the
+                # payload proves which exact identity wrote them.
+                if isinstance(legacy_prior, dict) and legacy_prior.get("owner") == (owner or ""):
+                    prior = legacy_prior
+            except Exception:
+                pass
         notified_uids = set(prior.get("notified_uids", []))
 
         # ── 5. Fire reminder ONLY when a previously-unnotified UID scores urgent.
@@ -2739,6 +3314,7 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
                 dispatch_result = await dispatch_reminder(
                     title=title, note_body=body, note_id="urgent-email",
                     owner=owner or "",
+                    topic="email",
                 )
                 channel = (settings.get("reminder_channel") or "browser").strip().lower()
                 delivered = bool(dispatch_result.get("browser_sent"))

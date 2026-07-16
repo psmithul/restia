@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 import uuid
@@ -10,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, Tuple
 
 from core.auth import RESERVED_USERNAMES
+from src.auth_helpers import DEFAULT_LOCAL_OWNER
 from src.task_action_policy import (
     is_admin_only_task_action,
     owner_has_admin_task_privileges,
@@ -220,6 +222,16 @@ def compute_next_run(schedule: str, scheduled_time: str,
 
 def _resolve_task_timezone(db, task) -> str | None:
     """Look up the IANA timezone name for a task via its linked CrewMember, if any."""
+    # Profile-managed notification jobs do not need a synthetic CrewMember
+    # merely to retain their IANA timezone. Their compact JSON prompt is
+    # scheduler metadata, not an LLM prompt (task_type is "action").
+    try:
+        if getattr(task, "action", None) == "telegram_hourly_digest" and task.prompt:
+            meta = json.loads(task.prompt)
+            if isinstance(meta, dict) and meta.get("notification_timezone"):
+                return str(meta["notification_timezone"])
+    except Exception:
+        pass
     if not getattr(task, "crew_member_id", None):
         return None
     try:
@@ -344,6 +356,10 @@ class TaskScheduler:
         # tasks could be double-dispatched.
         self._executing_lock = asyncio.Lock()
         self._pending_notifications = []  # completed task notifications
+        from pathlib import Path
+        from src.constants import DATA_DIR
+        self._notification_outbox_path = Path(DATA_DIR) / "browser_notification_outbox.sqlite3"
+        self._reminder_claim_path = Path(DATA_DIR) / "reminder_delivery_claims.sqlite3"
         # Non-destructive copy of recent notifications for the notification
         # command center (pop_notifications drains the pending queue for the
         # popup poller, so history must live separately).
@@ -404,20 +420,36 @@ class TaskScheduler:
             logger.debug("Task abort marker failed for %s", task_id, exc_info=True)
             return False
 
-    def add_notification(self, task_name: str, status: str, task_id: str = None, owner: str = None, body: str = None):
+    def add_notification(
+        self, task_name: str, status: str, task_id: str = None,
+        owner: str = None, body: str = None, dedupe_key: str = "",
+        reminder_claim: dict | None = None,
+    ):
         """Store a notification about a completed task run. Tagged with the
         task's owner so `pop_notifications` can return only that user's
         notifications and prevent cross-tenant drain. `body` is the result
         text — populated when output_target='notification' so the client can
         show a rich browser Notification, not just a toast."""
-        self._pending_notifications.append({
+        normalized_owner = str(owner or DEFAULT_LOCAL_OWNER).strip().lower() or DEFAULT_LOCAL_OWNER
+        item = {
+            "id": str(uuid.uuid4()),
             "task_name": task_name,
             "status": status,
             "task_id": task_id,
-            "owner": owner,
+            "owner": normalized_owner,
             "body": (body[:500] + "…") if body and len(body) > 500 else body,
             "timestamp": _utcnow().isoformat() + "Z",
-        })
+        }
+        outbox_path = getattr(self, "_notification_outbox_path", None)
+        if outbox_path is not None:
+            from src.browser_notification_outbox import enqueue_browser_notification
+            item = enqueue_browser_notification(
+                outbox_path, normalized_owner, item, dedupe_key=dedupe_key,
+                reminder_claim=reminder_claim,
+            )
+            if item.get("_outbox_cancelled"):
+                return item
+        self._pending_notifications.append(item)
         # Cap at 50 to avoid unbounded growth
         if len(self._pending_notifications) > 50:
             self._pending_notifications = self._pending_notifications[-50:]
@@ -426,6 +458,53 @@ class TaskScheduler:
         self._notification_history.append(self._pending_notifications[-1])
         if len(self._notification_history) > 50:
             self._notification_history = self._notification_history[-50:]
+        return item
+
+    def pending_notifications(self, owner: str, limit: int = 200) -> list:
+        """Read durable notifications without draining them."""
+        from src.browser_notification_outbox import pending_browser_notifications
+
+        return pending_browser_notifications(self._notification_outbox_path, owner, limit=limit)
+
+    def acknowledge_notifications(self, owner: str, ids: list[str]) -> int:
+        """Explicitly acknowledge displayed notifications for one owner."""
+        return self.acknowledge_notifications_detailed(owner, ids)["acknowledged"]
+
+    def acknowledge_notifications_detailed(self, owner: str, ids: list[str]) -> dict:
+        """Ack linked reminder claims before removing their outbox rows."""
+        from src.browser_notification_outbox import (
+            acknowledge_browser_notifications,
+            browser_notification_ack_candidates,
+        )
+        from src.reminder_delivery_claims import acknowledge_reminder_delivery
+
+        candidates = browser_notification_ack_candidates(
+            self._notification_outbox_path, owner, ids,
+        )
+        safe_ids: list[str] = []
+        reminder_acknowledged = 0
+        for row in candidates:
+            token = str(row.get("claim_token") or "")
+            if token:
+                ok = acknowledge_reminder_delivery(
+                    self._reminder_claim_path,
+                    owner=str(row.get("claim_owner") or owner),
+                    note_id=str(row.get("claim_note_id") or ""),
+                    occurrence=str(row.get("claim_occurrence") or ""),
+                    channel=str(row.get("claim_channel") or "browser"),
+                    token=token,
+                )
+                if not ok:
+                    continue
+                reminder_acknowledged += 1
+            safe_ids.append(str(row["id"]))
+        acknowledged = acknowledge_browser_notifications(
+            self._notification_outbox_path, owner, safe_ids,
+        )
+        return {
+            "acknowledged": acknowledged,
+            "reminder_acknowledged": reminder_acknowledged,
+        }
 
     def recent_notifications(self, owner: str = None) -> list:
         """Recent completed-task notifications, newest first, WITHOUT draining
@@ -694,6 +773,8 @@ class TaskScheduler:
         scanner never ran for that owner.
         """
         from core.database import SessionLocal, ScheduledTask, Note
+        from sqlalchemy import or_
+        from src.auth_helpers import configured_single_user_owner, resolved_runtime_owner
         db = SessionLocal()
         try:
             owners = set()
@@ -705,9 +786,27 @@ class TaskScheduler:
                 Note.due_date != "",
                 Note.archived == False,  # noqa: E712
             ).distinct()
-            for r in note_q.all():
+            note_owners = note_q.all()
+            for r in note_owners:
                 if r[0]:
                     owners.add(r[0])
+            if any(not r[0] for r in note_owners):
+                # Once V2 creates a concrete owner, a separate owner="" scan
+                # would either disappear (legacy notes starve) or scan every
+                # profile (duplicates/leakage). In a uniquely resolvable local
+                # install, migrate legacy rows once to that concrete profile.
+                migration_owner = configured_single_user_owner()
+                if not migration_owner and os.getenv("AUTH_ENABLED", "true").lower() == "false":
+                    migration_owner = resolved_runtime_owner()
+                if migration_owner:
+                    db.query(Note).filter(
+                        or_(Note.owner.is_(None), Note.owner == "")
+                    ).update(
+                        {Note.owner: str(migration_owner).strip().lower()},
+                        synchronize_session=False,
+                    )
+                    db.commit()
+                    owners.add(str(migration_owner).strip().lower())
             return sorted(owners)
         except Exception:
             return []
@@ -2395,6 +2494,11 @@ class TaskScheduler:
             _prefs = {}
         tasks_enabled = bool(_prefs.get("tasks_enabled"))
         tasks_opened = bool(_prefs.get("tasks_opened"))
+        notification_prefs = _prefs.get("notification_preferences")
+        telegram_digest_enabled = bool(
+            isinstance(notification_prefs, dict)
+            and notification_prefs.get("digest_cadence") not in (None, "", "off")
+        )
 
         db = SessionLocal()
         try:
@@ -2528,8 +2632,18 @@ class TaskScheduler:
                 if normalized:
                     renamed.append(task.action)
                 ships_paused = bool(defs.get("ship_paused"))
+                if task.action == "telegram_hourly_digest" and telegram_digest_enabled:
+                    task.status = "active"
+                    task.next_run = compute_next_run(
+                        task.schedule, task.scheduled_time,
+                        task.scheduled_day, task.scheduled_date,
+                        after=_utcnow(), cron_expression=task.cron_expression,
+                        tz_name=_resolve_task_timezone(db, task),
+                    )
                 if not tasks_enabled and not tasks_opened:
-                    if ships_paused and task.status == "active":
+                    if ships_paused and task.status == "active" and not (
+                        task.action == "telegram_hourly_digest" and telegram_digest_enabled
+                    ):
                         task.status = "paused"
                     elif not ships_paused and task.status == "paused":
                         task.status = "active"

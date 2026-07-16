@@ -9,7 +9,7 @@ from fastapi import APIRouter, HTTPException, Query, Request, UploadFile, File, 
 from src.request_models import DirectoryRequest
 from core.constants import BASE_DIR, PERSONAL_DIR, PERSONAL_UPLOADS_DIR
 from src.rag_singleton import get_rag_manager
-from src.auth_helpers import require_privilege, require_user
+from src.auth_helpers import owner_storage_key, require_privilege, require_user
 from core.middleware import require_admin
 from src.upload_handler import secure_filename
 from src.upload_limits import PERSONAL_UPLOAD_MAX_BYTES
@@ -20,8 +20,13 @@ logger = logging.getLogger(__name__)
 
 
 def _personal_upload_dir_for_owner(owner: str | None, *, create: bool = True) -> str:
-    """Return the per-owner upload directory used for direct RAG uploads."""
-    owner_segment = secure_filename((owner or "local").strip())[:80] or "local"
+    """Return the collision-resistant per-owner direct-upload directory.
+
+    Escaped pre-V2 directory names are not used as a fallback because the
+    directory itself carries no exact owner attestation; a lossy-name fallback
+    could expose another profile's documents.
+    """
+    owner_segment = owner_storage_key(owner, fallback="local")
     upload_dir = os.path.abspath(os.path.join(UPLOADS_DIR, owner_segment))
     base_abs = os.path.abspath(UPLOADS_DIR)
     if os.path.commonpath([upload_dir, base_abs]) != base_abs:

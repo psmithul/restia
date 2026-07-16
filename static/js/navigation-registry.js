@@ -205,7 +205,7 @@ export const NAVIGATION_ITEMS = deepFreeze([
       sidebar: ['sidebar-toggle-btn'],
       auxiliary: ['hamburger-btn', 'mobile-menu-btn'],
     },
-    shortcut: { action: 'toggle_sidebar', defaultCombo: 'ctrl+alt+b' },
+    shortcut: { action: 'toggle_sidebar', defaultCombo: 'ctrl+b' },
     slash: {
       command: 'toggle', subcommand: 'sidebar', aliases: ['sidebar'],
       usage: '/toggle sidebar [full|mini|off]', behavior: 'toggle',
@@ -233,8 +233,8 @@ export const NAVIGATION_ITEMS = deepFreeze([
   }),
   navigationItem({
     id: 'tasks',
-    label: 'Tasks',
-    description: 'Manage scheduled tasks, runs, and activity.',
+    label: 'Automations',
+    description: 'Manage scheduled automations, runs, and activity.',
     icon: 'tasks',
     group: 'work',
     order: 20,
@@ -245,8 +245,8 @@ export const NAVIGATION_ITEMS = deepFreeze([
     modal: { ids: ['tasks-modal'], manager: 'auto', kind: 'modal' },
     visibility: { preferences: { sidebar: 'tool-tasks' } },
     command: {
-      id: 'tasks', title: 'Tasks', hint: 'Open tasks', icon: '✅',
-      keywords: ['task', 'agent', 'scheduled'], triggerIds: ['tool-tasks-btn', 'rail-tasks'],
+      id: 'tasks', title: 'Automations', hint: 'Open automations', icon: '✅',
+      keywords: ['automation', 'task', 'agent', 'scheduled'], triggerIds: ['tool-tasks-btn', 'rail-tasks'],
       afterTriggerId: null, handler: null,
     },
     shortcut: { action: 'open_tasks', defaultCombo: '' },

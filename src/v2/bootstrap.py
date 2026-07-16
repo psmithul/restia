@@ -43,6 +43,16 @@ def build_v2_feature_registry(
 
         return setup_project_routes()
 
+    def progression(_ctx: FeatureContext):
+        from routes.progression_routes import setup_progression_routes
+
+        return setup_progression_routes()
+
+    def planning(_ctx: FeatureContext):
+        from routes.planning_routes import setup_planning_routes
+
+        return setup_planning_routes()
+
     def linked_projects(ctx: FeatureContext):
         from routes.project_routes import setup_project_routes
 
@@ -58,6 +68,8 @@ def build_v2_feature_registry(
         return setup_calendar_routes()
 
     registry.register(FeatureSpec("mission-control", 100, router_factory=mission_control))
+    registry.register(FeatureSpec("progression", 105, router_factory=progression))
+    registry.register(FeatureSpec("planning", 107, router_factory=planning))
     registry.register(FeatureSpec("projects", 110, router_factory=projects))
     registry.register(FeatureSpec("linked-projects", 120, router_factory=linked_projects))
     registry.register(FeatureSpec("calendar", 130, router_factory=calendar))

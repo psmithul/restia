@@ -135,6 +135,7 @@ def _fresh(monkeypatch):
         conn.exec_driver_sql("DELETE FROM direct_messages")
         conn.exec_driver_sql("DELETE FROM link_guests")
         conn.exec_driver_sql("DELETE FROM home_link")
+        conn.exec_driver_sql("DELETE FROM outbound_chat_links")
         conn.exec_driver_sql("DELETE FROM link_invites")
         conn.exec_driver_sql("DELETE FROM remote_contact_prefs")
         conn.exec_driver_sql("DELETE FROM remote_blocks")
@@ -1577,3 +1578,212 @@ def test_home_sse_parser_rejects_profile_injection_and_normalizes_origin():
         lr._validated_home_base("http://hub.example")
     with pytest.raises(HTTPException):
         lr._validated_home_base("https://hub.example/redirect")
+
+
+def test_fresh_install_has_no_developer_contact_and_advertises_peer_actions(monkeypatch):
+    monkeypatch.delenv("RESTIA_HOME_SERVER", raising=False)
+    monkeypatch.delenv("LINK_HUB_ENABLED", raising=False)
+    assert lr.DEFAULT_HOME_SERVER == ""
+    assert lr.home_server() == ""
+    assert lr.home_contact_name() == ""
+    assert lr.home_enabled() is False
+    assert lr.hub_enabled() is True
+
+    payload = _run(MSG[("GET", "/api/messages/profiles")](_req("mika")))
+    assert not [row for row in payload["profiles"] if row.get("home")]
+    assert payload["can_connect_restia"] is True
+    assert payload["can_invite_restia"] is True
+
+
+def test_additive_chat_links_keep_multiple_restia_contacts(monkeypatch):
+    monkeypatch.delenv("RESTIA_HOME_SERVER", raising=False)
+    calls = _fake_hub(monkeypatch, {
+        ("POST", "/api/link/register"): {
+            "ok": True,
+            "handle": "my-restia",
+            "status": "pending",
+            "scope": "chat",
+            "token": "chat-token-12345678901234567890",
+        },
+        ("GET", "/api/link/summary"): {
+            "unread": 0,
+            "last_body": None,
+            "last_at": None,
+            "last_mine": False,
+        },
+        ("POST", "/api/link/messages"): {
+            "message": {
+                "id": 1,
+                "body": "hello",
+                "mine": True,
+                "created_at": None,
+                "read": False,
+            }
+        },
+    })
+    connect_chat = HL[("POST", "/api/homelink/chat/connect")]
+    first = _run(connect_chat(
+        lr.ConnectRequest(handle="my-restia", home_url="https://one.example"),
+        _req("mika"),
+    ))
+    # Return a distinct remote credential for the second origin.
+    async def second_hub(method, path, *, token=None, json_body=None, params=None,
+                         base_url=None, max_response_bytes=lr.MAX_HUB_RESPONSE_BYTES):
+        calls.append({"method": method, "path": path, "token": token,
+                      "json": json_body, "params": params,
+                      "base_url": base_url, "max_response_bytes": max_response_bytes})
+        if method == "POST" and path == "/api/link/register":
+            return {"handle": "my-restia-2", "status": "pending", "scope": "chat",
+                    "token": "second-chat-token-123456789012345"}
+        if method == "POST" and path == "/api/link/messages":
+            return {"message": {"id": 2, "body": "hello", "mine": True,
+                                "created_at": None, "read": False}}
+        return {"unread": 0, "last_body": None, "last_at": None, "last_mine": False}
+    monkeypatch.setattr(lr, "_hub_call", second_hub)
+    second = _run(connect_chat(
+        lr.ConnectRequest(handle="my-restia-2", home_url="https://two.example"),
+        _req("mika"),
+    ))
+
+    assert first["contact"].startswith(lr.OUTBOUND_CHAT_PREFIX)
+    assert second["contact"].startswith(lr.OUTBOUND_CHAT_PREFIX)
+    assert first["contact"] != second["contact"]
+    db = _TS()
+    try:
+        assert db.query(cdb.OutboundChatLink).count() == 2
+        assert db.query(cdb.HomeLink).count() == 0
+    finally:
+        db.close()
+
+    _run(lr.home_send_message("mika", "hello", contact=first["contact"]))
+    _run(lr.home_send_message("mika", "hello", contact=second["contact"]))
+    sends = [call for call in calls if call["path"] == "/api/link/messages"]
+    assert sends[-2]["base_url"] == "https://one.example"
+    assert sends[-2]["token"] == "chat-token-12345678901234567890"
+    assert sends[-1]["base_url"] == "https://two.example"
+    assert sends[-1]["token"] == "second-chat-token-123456789012345"
+
+    picker = _run(MSG[("GET", "/api/messages/profiles")](_req("mika")))
+    peers = [row for row in picker["profiles"] if row.get("chat_only")]
+    assert {row["display"] for row in peers} == {"one.example", "two.example"}
+    assert all(row["can_call"] is False for row in peers)
+
+
+def test_chat_invitation_redeem_uses_explicit_origin_and_chat_scope(monkeypatch):
+    monkeypatch.delenv("RESTIA_HOME_SERVER", raising=False)
+    calls = _fake_hub(monkeypatch, {
+        ("POST", "/api/link/redeem"): {
+            "ok": True,
+            "handle": "accepted-restia",
+            "status": "approved",
+            "scope": "chat",
+            "token": "accepted-chat-token-123456789012345",
+        },
+    })
+    out = _run(HL[("POST", "/api/homelink/chat/redeem")](
+        lr.RedeemHomeRequest(
+            handle="accepted-restia",
+            code="one-time-code",
+            home_url="https://inviter.example",
+        ),
+        _req("mika"),
+    ))
+    assert out["status"] == "approved"
+    assert out["display"] == "inviter.example"
+    assert calls == [{
+        "method": "POST",
+        "path": "/api/link/redeem",
+        "token": None,
+        "json": {
+            "handle": "accepted-restia",
+            "code": "one-time-code",
+            "scope": "chat",
+        },
+        "params": None,
+        "base_url": "https://inviter.example",
+        "max_response_bytes": lr.MAX_HUB_RESPONSE_BYTES,
+    }]
+    db = _TS()
+    try:
+        row = db.query(cdb.OutboundChatLink).one()
+        assert row.home_url == "https://inviter.example"
+        assert row.token == "accepted-chat-token-123456789012345"
+        assert db.query(cdb.HomeLink).count() == 0
+    finally:
+        db.close()
+
+
+def test_primary_home_link_rejects_messages_only_invitation(monkeypatch):
+    calls = _fake_hub(monkeypatch, {
+        ("POST", "/api/link/redeem"): {
+            "ok": True,
+            "handle": "wrong-scope",
+            "status": "approved",
+            "scope": "chat",
+            "token": "wrong-scope-token-123456789012345",
+        },
+        ("POST", "/api/link/revoke"): {"ok": True},
+    })
+    with pytest.raises(HTTPException) as exc:
+        _run(HL[("POST", "/api/homelink/redeem")](
+            lr.RedeemHomeRequest(
+                handle="wrong-scope",
+                code="messages-code",
+                home_url="https://inviter.example",
+            ),
+            _req("mika"),
+        ))
+    assert (exc.value.status_code, exc.value.detail) == (
+        400,
+        "This invitation is for Messages; accept it from New message instead",
+    )
+    assert calls[0]["json"] == {
+        "handle": "wrong-scope",
+        "code": "messages-code",
+        "scope": "project",
+    }
+    assert calls[-1]["path"] == "/api/link/revoke"
+    db = _TS()
+    try:
+        assert db.query(cdb.HomeLink).count() == 0
+    finally:
+        db.close()
+
+
+def test_chat_connect_revokes_remote_credential_if_owner_identity_changes(monkeypatch):
+    calls = _fake_hub(monkeypatch, {
+        ("POST", "/api/link/register"): {
+            "ok": True,
+            "handle": "racing-owner",
+            "status": "pending",
+            "scope": "chat",
+            "token": "racing-owner-token-123456789012345",
+        },
+        ("POST", "/api/link/revoke"): {"ok": True},
+    })
+    request = _req("mika")
+    request.app.state.auth_manager._identity_migrations = {"mika"}
+    with pytest.raises(HTTPException) as exc:
+        _run(HL[("POST", "/api/homelink/chat/connect")](
+            lr.ConnectRequest(handle="racing-owner", home_url="https://race.example"),
+            request,
+        ))
+    assert (exc.value.status_code, exc.value.detail) == (
+        409,
+        "Profile identity changed; retry",
+    )
+    assert calls[0]["json"] == {"handle": "racing-owner", "scope": "chat"}
+    assert calls[-1]["path"] == "/api/link/revoke"
+    db = _TS()
+    try:
+        assert db.query(cdb.OutboundChatLink).count() == 0
+    finally:
+        db.close()
+
+
+def test_non_admin_link_owner_falls_back_to_admin(monkeypatch):
+    monkeypatch.setenv("LINK_OWNER", "alice")
+    request = _req("mika")
+    assert lr._owner_username(request) == "mika"
+    assert lr.is_hub_owner(request, "mika") is True
+    assert lr.is_hub_owner(request, "alice") is False

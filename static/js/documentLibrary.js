@@ -12,6 +12,7 @@ import markdownModule from './markdown.js';
 import { makeWindowDraggable } from './windowDrag.js';
 import { langIcon } from './langIcons.js';
 import { registerMenuDismiss, dismissOrRemove } from './escMenuStack.js';
+import { closeSidebar, SIDEBAR_STATES } from './sidebar-layout.js';
 
 // ── Injected references from documentModule ──
 let API_BASE = '';
@@ -2013,11 +2014,7 @@ let _libraryArchivedView = false;   // Documents tab showing archived docs?
           // sidebar itself on mobile. Skip on desktop where the user
           // expects the sidebar to stay where they left it.
           if (window.innerWidth <= 768) {
-            const sb = document.getElementById('sidebar');
-            if (sb) {
-              sb.classList.add('hidden');
-              try { window.syncRailSide && window.syncRailSide(); } catch (_) {}
-            }
+            closeSidebar({ state: SIDEBAR_STATES.OFF, persist: false });
           }
         });
         const archiveBtn = preview.querySelector('.doclib-chat-archive-btn');

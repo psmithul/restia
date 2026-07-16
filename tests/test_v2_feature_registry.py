@@ -206,6 +206,8 @@ def test_product_registry_declares_the_v2_feature_areas_in_one_order():
 
     assert registry.feature_names == (
         "mission-control",
+        "progression",
+        "planning",
         "projects",
         "linked-projects",
         "calendar",
@@ -229,6 +231,9 @@ def test_product_registry_installs_each_actual_v2_route_once():
     signatures = _route_signatures(app.router)
     assert len(signatures) == len(set(signatures))
     assert ("GET", "/api/mission-control/today") in signatures
+    assert ("GET", "/api/mission-control/activity") in signatures
+    assert ("GET", "/api/progression") in signatures
+    assert ("GET", "/api/planning") in signatures
     assert ("GET", "/api/projects") in signatures
     assert ("GET", "/api/link/projects") in signatures
     assert ("GET", "/api/calendar/events") in signatures

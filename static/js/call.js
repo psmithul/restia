@@ -803,6 +803,7 @@ export async function refreshConfig() {
 export function isEnabled() { return !!(_config && _config.enabled); }
 export function canCall(meta) {
   if (!isEnabled() || !meta) return false;
+  if (meta.can_call === false || meta.chat_only) return false;
   if (meta.home) return !!_config.can_home_call;
   if (meta.remote) return !!_config.can_remote_call;
   return true;

@@ -303,13 +303,40 @@ def test_review_scheduler_uses_evidence_levels_and_due_clock(study_db, monkeypat
 
     hinted = study.record_study_review("alice", "controls", "hinted")["review"]
     assert (hinted["level"], hinted["count"], hinted["due_in_seconds"]) == (1, 2, 43_200)
+    clock.advance(43_200)
     clean = study.record_study_review("alice", "controls", "clean")["review"]
     assert (clean["level"], clean["count"], clean["due_in_seconds"]) == (2, 3, 86_400)
+    clock.advance(86_400)
     transfer = study.record_study_review("alice", "controls", "transfer")["review"]
     assert (transfer["level"], transfer["count"], transfer["due_in_seconds"]) == (4, 4, 604_800)
 
     with pytest.raises(ValueError, match="exactly one of"):
         study.record_study_review("alice", "controls", "Clean")
+
+
+def test_review_cannot_be_reposted_to_farm_progression_xp(study_db, monkeypatch):
+    clock = _Clock(datetime(2026, 7, 14, 9, 0, 0))
+    monkeypatch.setattr(study, "_now", clock)
+
+    first = study.record_study_review("alice", "controls", "clean")
+    with pytest.raises(study.StudyReviewNotDueError, match="not due yet"):
+        study.record_study_review("alice", "controls", "transfer")
+
+    db = study_db()
+    try:
+        state = db.query(StudyState).one()
+        events = db.query(cdb.ProgressionEvent).all()
+        assert state.review_count == 1
+        assert state.last_review_result == "clean"
+        assert len(events) == 1
+        assert events[0].source_type == "study_review_passed"
+        assert events[0].xp == 35
+    finally:
+        db.close()
+
+    clock.advance(first["review"]["due_in_seconds"])
+    second = study.record_study_review("alice", "controls", "transfer")
+    assert second["review"]["count"] == 2
 
 
 def test_review_evidence_is_session_isolated_and_goal_reset_clears_it(
@@ -391,6 +418,11 @@ async def test_review_api_validates_outcome_and_owner_scope(study_db, monkeypatc
             headers={"x-test-user": "alice"},
             json={"outcome": "clean"},
         )
+        too_soon = await client.post(
+            _study_url("/api/study/review", "alice-study"),
+            headers={"x-test-user": "alice"},
+            json={"outcome": "transfer"},
+        )
         invalid = await client.post(
             _study_url("/api/study/review", "alice-study"),
             headers={"x-test-user": "alice"},
@@ -420,6 +452,8 @@ async def test_review_api_validates_outcome_and_owner_scope(study_db, monkeypatc
     assert saved.status_code == 200
     assert saved.json()["review"]["last_result"] == "clean"
     assert saved.json()["review"]["next_review_at"] == "2026-07-15T09:00:00Z"
+    assert too_soon.status_code == 400
+    assert "not due yet" in too_soon.text
     assert invalid.status_code == 422
     assert "missed" in invalid.text and "transfer" in invalid.text
     assert missing.status_code == 422

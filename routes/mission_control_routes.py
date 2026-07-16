@@ -9,9 +9,11 @@ one unavailable subsystem is visible without hiding the rest of the snapshot.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
+import time as monotonic_time
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -24,7 +26,9 @@ from core.database import (
     CalendarCal,
     CalendarEvent,
     Note,
+    PlanningItem,
     Project,
+    ProjectActivity,
     ProjectMember,
     ProjectStage,
     ProjectWorkItem,
@@ -33,15 +37,24 @@ from core.database import (
     SessionLocal,
     StudyState,
     TaskRun,
+    ProgressionEvent,
 )
 from routes.calendar_routes import (
     FALLBACK_OWNER as CALENDAR_FALLBACK_OWNER,
     _expand_rrule,
 )
 from routes.project_routes import EXPLICIT_PROJECT_FALLBACK_OWNER, FALLBACK_PROJECT_OWNER
-from src.auth_helpers import effective_owner, require_user
+from src.auth_helpers import (
+    DEFAULT_LOCAL_OWNER,
+    effective_owner,
+    legacy_owner_storage_key,
+    owner_storage_key,
+    require_user,
+)
 from src.constants import DATA_DIR
 from src.study_mode import build_study_tracker, serialize_study_state
+from src.planning import normalize_planning_owner, serialize_planning_item
+from src.progression import build_progression_summary, normalize_progression_owner
 
 
 logger = logging.getLogger(__name__)
@@ -53,8 +66,10 @@ TASK_ITEM_LIMIT = 20
 STUDY_REVIEW_ITEM_LIMIT = 10
 IMPORTANT_MAIL_ITEM_LIMIT = 10
 NOTES_TODAY_ITEM_LIMIT = 10
+PLANNING_ITEM_LIMIT = 20
 DAILY_BRIEF_ITEM_LIMIT = 1
 NEXT_ACTION_LIMIT = 3
+ACTIVITY_ITEM_LIMIT = 50
 
 _CALENDAR_RECURRING_SCAN_LIMIT = 500
 _CALENDAR_OCCURRENCE_WORK_LIMIT = 210
@@ -65,6 +80,9 @@ _NOTES_TODAY_ITEMS_BYTES = 32 * 1024
 _NOTES_TODAY_STEP_LIMIT = 100
 _DAILY_BRIEF_CONTENT_LIMIT = 4000
 _HEALTH_SERVICE_LIMIT = 20
+_HEALTH_TIMEOUT_SECONDS = 3.0
+_HEALTH_CACHE_TTL_SECONDS = 30.0
+_ACTIVITY_SOURCE_SCAN_LIMIT = 100
 _HIGH_PRIORITIES = ("high", "highest", "critical")
 _HEALTH_STATUSES = {"ok", "degraded", "down", "disabled"}
 
@@ -396,6 +414,56 @@ def _load_project_work(
         db.close()
 
 
+def _planning_owner(scope: _OwnerScope) -> str:
+    return normalize_planning_owner(
+        scope.owner or scope.calendar_owner or scope.project_actor or DEFAULT_LOCAL_OWNER
+    )
+
+
+def _load_planning(
+    session_factory: Callable[[], Any],
+    scope: _OwnerScope,
+    *,
+    today: date,
+) -> dict[str, Any]:
+    """Return a small mix of open commitments and recently completed work."""
+
+    db = session_factory()
+    try:
+        owner = _planning_owner(scope)
+        status_rank = case((PlanningItem.status == "open", 0), else_=1)
+        due_rank = case((PlanningItem.due_date.is_(None), 1), else_=0)
+        rows = (
+            db.query(PlanningItem)
+            .filter(PlanningItem.owner == owner)
+            .order_by(
+                status_rank.asc(),
+                due_rank.asc(),
+                PlanningItem.due_date.asc(),
+                PlanningItem.updated_at.desc(),
+                PlanningItem.id.asc(),
+            )
+            .limit(PLANNING_ITEM_LIMIT + 1)
+            .all()
+        )
+        today_text = today.isoformat()
+        payload: list[dict[str, Any]] = []
+        for item in rows[:PLANNING_ITEM_LIMIT]:
+            serialized = serialize_planning_item(item)
+            serialized["overdue"] = bool(
+                item.status == "open" and item.due_date and item.due_date < today_text
+            )
+            serialized["due_today"] = bool(
+                item.status == "open" and item.due_date == today_text
+            )
+            payload.append(serialized)
+        source = _items_source(payload, truncated=len(rows) > PLANNING_ITEM_LIMIT)
+        source["open_count"] = sum(1 for row in payload if row.get("status") == "open")
+        return source
+    finally:
+        db.close()
+
+
 def _study_owner_filters(scope: _OwnerScope) -> tuple[Any, Any]:
     if scope.owner is None:
         return StudyState.owner.is_(None), ChatSession.owner.is_(None)
@@ -637,13 +705,6 @@ def _load_study_reviews(
         db.close()
 
 
-def _owner_slug(owner: Optional[str]) -> str:
-    return "".join(
-        char if (char.isalnum() or char in "-_.@") else "_"
-        for char in (owner or "default")
-    )
-
-
 def _important_mail_paths(
     data_dir: Path, scope: _OwnerScope
 ) -> list[tuple[Path, str]]:
@@ -656,7 +717,13 @@ def _important_mail_paths(
         owners.append(None)
     paths: list[tuple[Path, str]] = []
     for owner in owners:
-        path = data_dir / f"email_urgency_state_{_owner_slug(owner)}.json"
+        path = data_dir / f"email_urgency_state_{owner_storage_key(owner)}.json"
+        # A lossy pre-V2 path is considered only when no collision-resistant
+        # state exists. `_load_important_mail` then requires its embedded exact
+        # owner before exposing any private header metadata.
+        legacy_path = data_dir / f"email_urgency_state_{legacy_owner_storage_key(owner)}.json"
+        if not path.exists() and legacy_path != path and legacy_path.exists():
+            path = legacy_path
         candidate = (path, owner or "")
         if candidate not in paths:
             paths.append(candidate)
@@ -736,13 +803,13 @@ def _load_notes_today(
     session_factory: Callable[[], Any],
     scope: _OwnerScope,
 ) -> dict[str, Any]:
-    """Return one next unchecked step per active goal note, never note bodies."""
+    """Return one unchecked step per active to-do or goal, never note bodies."""
 
     db = session_factory()
     try:
         note_filters = (
             Note.archived.is_(False),
-            Note.note_type == "goal",
+            Note.note_type.in_(("todo", "checklist", "goal")),
             Note.items.isnot(None),
             Note.items != "",
         )
@@ -759,6 +826,7 @@ def _load_notes_today(
         query = db.query(
             Note.id.label("id"),
             func.substr(Note.title, 1, 160).label("title"),
+            Note.note_type.label("note_type"),
             Note.items.label("items"),
             func.substr(Note.due_date, 1, 80).label("due_date"),
             Note.pinned.label("pinned"),
@@ -812,6 +880,7 @@ def _load_notes_today(
             items.append({
                 "id": note.id,
                 "title": (note.title or "Untitled goal")[:160],
+                "kind": "goal" if note.note_type == "goal" else "todo",
                 "next_step": next_text or "Continue this goal",
                 "next_step_index": next_index,
                 "completed_steps": completed,
@@ -873,6 +942,30 @@ def _load_daily_brief(
         }], truncated=content_truncated)
     finally:
         db.close()
+
+
+def _load_progression(
+    session_factory: Callable[[], Any],
+    scope: _OwnerScope,
+    *,
+    utc_offset_minutes: int,
+    now_utc: datetime,
+) -> dict[str, Any]:
+    summary = build_progression_summary(
+        owner=scope.owner or _planning_owner(scope),
+        session_factory=session_factory,
+        utc_offset_minutes=utc_offset_minutes,
+        now=now_utc,
+    )
+    recent = summary.get("recent_events")
+    items = recent if isinstance(recent, list) else []
+    return {
+        "status": "ok",
+        "items": items,
+        "count": len(items),
+        "truncated": False,
+        **summary,
+    }
 
 
 def _source_items(source: dict[str, Any]) -> list[dict[str, Any]]:
@@ -961,6 +1054,21 @@ def _build_next_actions(sources: dict[str, dict[str, Any]]) -> list[dict[str, An
             tie=row.get("due_at"),
         )
 
+    for row in _source_items(sources.get("planning", {})):
+        if row.get("status") != "open":
+            continue
+        if row.get("overdue") or row.get("due_today"):
+            add(
+                4 if row.get("overdue") else 5,
+                row.get("id"),
+                kind="planning_item",
+                title=row.get("title"),
+                detail="Overdue planning item" if row.get("overdue") else "Due today",
+                target="home",
+                urgency="critical" if row.get("overdue") else "attention",
+                tie=row.get("due_date"),
+            )
+
     for row in project_rows:
         if row.get("due_today") and not row.get("overdue"):
             add(
@@ -981,7 +1089,7 @@ def _build_next_actions(sources: dict[str, dict[str, Any]]) -> list[dict[str, An
             kind="goal_step",
             title=row.get("next_step"),
             detail=f"Next step for {row.get('title') or 'goal'}.",
-            target="notes",
+            target="todos" if row.get("kind") == "todo" else "notes",
             urgency="normal",
             tie=row.get("due_date") or row.get("title"),
         )
@@ -1042,7 +1150,13 @@ async def _load_health(
     rag_manager: Any,
     memory_vector: Any,
 ) -> dict[str, Any]:
-    result = collector(rag_manager, memory_vector)
+    if inspect.iscoroutinefunction(collector):
+        result = collector(rag_manager, memory_vector)
+    else:
+        # A custom/synchronous probe must not monopolize the event loop used by
+        # Today and Activity. Production's collector is async, but this keeps
+        # the injectable seam bounded as well.
+        result = await asyncio.to_thread(collector, rag_manager, memory_vector)
     if inspect.isawaitable(result):
         result = await result
     if not isinstance(result, dict):
@@ -1071,6 +1185,45 @@ async def _load_health(
     }
 
 
+class _HealthSnapshotCache:
+    """Small stale-if-error cache so health probes never stall work views."""
+
+    def __init__(self, ttl_seconds: float, timeout_seconds: float):
+        self.ttl_seconds = max(0.0, float(ttl_seconds))
+        self.timeout_seconds = max(0.05, float(timeout_seconds))
+        self.value: dict[str, Any] | None = None
+        self.expires_at = 0.0
+        self.lock: asyncio.Lock | None = None
+
+    async def get(
+        self,
+        collector: Callable[..., Any],
+        rag_manager: Any,
+        memory_vector: Any,
+    ) -> dict[str, Any]:
+        now = monotonic_time.monotonic()
+        if self.value is not None and now < self.expires_at:
+            return dict(self.value)
+        if self.lock is None:
+            self.lock = asyncio.Lock()
+        async with self.lock:
+            now = monotonic_time.monotonic()
+            if self.value is not None and now < self.expires_at:
+                return dict(self.value)
+            try:
+                value = await asyncio.wait_for(
+                    _load_health(collector, rag_manager, memory_vector),
+                    timeout=self.timeout_seconds,
+                )
+            except Exception:
+                if self.value is not None:
+                    return {**self.value, "stale": True}
+                raise
+            self.value = dict(value)
+            self.expires_at = monotonic_time.monotonic() + self.ttl_seconds
+            return dict(value)
+
+
 def _safe_load(source: str, loader: Callable[[], dict[str, Any]]) -> dict[str, Any]:
     try:
         return loader()
@@ -1083,6 +1236,202 @@ def _safe_load(source: str, loader: Callable[[], dict[str, Any]]) -> dict[str, A
         return _source_problem(source)
 
 
+def _activity_target(source_type: str, details: Any = None) -> str:
+    if (
+        source_type == "todo_item_completed"
+        and isinstance(details, dict)
+        and details.get("planning_item_id")
+    ):
+        return "home"
+    if source_type.startswith("project_"):
+        return "projects"
+    if source_type == "todo_item_completed":
+        return "todos"
+    if source_type == "calendar_event_completed":
+        return "calendar"
+    if source_type == "study_review_passed":
+        return "study"
+    return "home"
+
+
+def _load_activity_feed(
+    session_factory: Callable[[], Any],
+    scope: _OwnerScope,
+    *,
+    limit: int,
+    before: datetime | None,
+    before_id: str | None = None,
+) -> dict[str, Any]:
+    """Merge three bounded owner-scoped audit sources into one stable feed."""
+
+    bounded_limit = max(1, min(ACTIVITY_ITEM_LIMIT, int(limit)))
+    scan_limit = min(_ACTIVITY_SOURCE_SCAN_LIMIT, bounded_limit * 2)
+    candidates: list[tuple[datetime, str, dict[str, Any]]] = []
+    source_overflow = False
+
+    cursor_id = str(before_id or "").strip()
+    cursor_prefix, cursor_source_id = (
+        cursor_id.split(":", 1) if ":" in cursor_id else ("", "")
+    )
+
+    def apply_cursor(query: Any, occurred_column: Any, id_column: Any, prefix: str):
+        """Apply the global ``(occurred_at, stable_id)`` activity cursor.
+
+        Timestamp-only cursors retain the original strict-before contract.
+        Composite cursors include tied timestamps and compare the source prefix
+        plus row id, so a full page ending in a tie cannot skip the remaining
+        events on the next page.
+        """
+
+        if before is None:
+            return query
+        if not cursor_prefix or not cursor_source_id:
+            return query.filter(occurred_column < before)
+        if prefix < cursor_prefix:
+            return query.filter(occurred_column <= before)
+        if prefix > cursor_prefix:
+            return query.filter(occurred_column < before)
+        return query.filter(
+            or_(
+                occurred_column < before,
+                and_(occurred_column == before, id_column < cursor_source_id),
+            )
+        )
+
+    db = session_factory()
+    try:
+        run_occurred = func.coalesce(TaskRun.finished_at, TaskRun.started_at)
+        run_query = (
+            db.query(TaskRun, ScheduledTask)
+            .join(ScheduledTask, ScheduledTask.id == TaskRun.task_id)
+        )
+        run_query = _owned_task_query(run_query, scope)
+        run_query = apply_cursor(
+            run_query, run_occurred, TaskRun.id, "automation"
+        )
+        run_rows = (
+            run_query.order_by(run_occurred.desc(), TaskRun.id.desc())
+            .limit(scan_limit + 1)
+            .all()
+        )
+        source_overflow = source_overflow or len(run_rows) > scan_limit
+        for run, task in run_rows[:scan_limit]:
+            occurred = run.finished_at or run.started_at
+            if occurred is None:
+                continue
+            status = str(run.status or "unknown")
+            candidates.append((occurred, f"automation:{run.id}", {
+                "id": f"automation:{run.id}",
+                "source": "automation",
+                "title": (task.name or "Automation")[:240],
+                "detail": f"Automation {status}",
+                "status": status,
+                "occurred_at": _iso_utc(occurred),
+                "target": "tasks",
+                "xp": 0,
+            }))
+
+        actor = scope.project_actor
+        membership_ids = db.query(ProjectMember.project_id).filter(
+            func.lower(ProjectMember.username) == actor
+        )
+        project_query = (
+            db.query(ProjectActivity, Project)
+            .join(Project, Project.id == ProjectActivity.project_id)
+            .filter(
+                or_(func.lower(Project.owner) == actor, Project.id.in_(membership_ids))
+            )
+        )
+        project_query = apply_cursor(
+            project_query,
+            ProjectActivity.created_at,
+            ProjectActivity.id,
+            "project",
+        )
+        project_rows = (
+            project_query.order_by(
+                ProjectActivity.created_at.desc(), ProjectActivity.id.desc()
+            )
+            .limit(scan_limit + 1)
+            .all()
+        )
+        source_overflow = source_overflow or len(project_rows) > scan_limit
+        for activity, project in project_rows[:scan_limit]:
+            occurred = activity.created_at
+            if occurred is None:
+                continue
+            candidates.append((occurred, f"project:{activity.id}", {
+                "id": f"project:{activity.id}",
+                "source": "project",
+                "title": (activity.summary or project.name or "Project updated")[:240],
+                "detail": f"{project.name} · {str(activity.event_type or 'updated').replace('_', ' ')}"[:300],
+                "status": str(activity.event_type or "updated"),
+                "occurred_at": _iso_utc(occurred),
+                "target": "projects",
+                "xp": 0,
+            }))
+
+        progression_owner = normalize_progression_owner(
+            scope.owner or _planning_owner(scope)
+        )
+        progression_query = db.query(ProgressionEvent).filter(
+            ProgressionEvent.owner == progression_owner
+        )
+        progression_query = apply_cursor(
+            progression_query,
+            ProgressionEvent.occurred_at,
+            ProgressionEvent.id,
+            "progression",
+        )
+        progression_rows = (
+            progression_query.order_by(
+                ProgressionEvent.occurred_at.desc(), ProgressionEvent.id.desc()
+            )
+            .limit(scan_limit + 1)
+            .all()
+        )
+        source_overflow = source_overflow or len(progression_rows) > scan_limit
+        for event in progression_rows[:scan_limit]:
+            occurred = event.occurred_at
+            if occurred is None:
+                continue
+            candidates.append((occurred, f"progression:{event.id}", {
+                "id": f"progression:{event.id}",
+                "source": "progression",
+                "title": (event.title or "Objective cleared")[:240],
+                "detail": f"Objective cleared · +{int(event.xp or 0)} XP",
+                "status": event.source_type,
+                "occurred_at": _iso_utc(occurred),
+                "target": _activity_target(
+                    str(event.source_type or ""), event.details
+                ),
+                "xp": int(event.xp or 0),
+            }))
+
+        candidates.sort(key=lambda row: (row[0], row[1]), reverse=True)
+        if before is not None and cursor_id:
+            candidates = [
+                row for row in candidates
+                if (row[0], row[1]) < (before, cursor_id)
+            ]
+        items = [payload for _, _, payload in candidates[:bounded_limit]]
+        counts: dict[str, int] = {}
+        for item in items:
+            source_name = str(item.get("source") or "unknown")
+            counts[source_name] = counts.get(source_name, 0) + 1
+        return {
+            "status": "ok",
+            "items": items,
+            "count": len(items),
+            "truncated": source_overflow or len(candidates) > bounded_limit,
+            "source_counts": counts,
+            "next_before": items[-1].get("occurred_at") if len(items) == bounded_limit else None,
+            "next_before_id": items[-1].get("id") if len(items) == bounded_limit else None,
+        }
+    finally:
+        db.close()
+
+
 def setup_mission_control_routes(
     rag_manager: Any = None,
     memory_vector: Any = None,
@@ -1091,6 +1440,8 @@ def setup_mission_control_routes(
     health_collector: Optional[Callable[..., Any]] = None,
     now_factory: Callable[[], datetime] = _utc_now,
     data_dir: Path | str = DATA_DIR,
+    health_timeout_seconds: float = _HEALTH_TIMEOUT_SECONDS,
+    health_cache_ttl_seconds: float = _HEALTH_CACHE_TTL_SECONDS,
 ) -> APIRouter:
     """Build the read-only Mission Control router.
 
@@ -1101,6 +1452,10 @@ def setup_mission_control_routes(
 
     router = APIRouter(prefix="/api/mission-control", tags=["mission-control"])
     mission_data_dir = Path(data_dir)
+    health_cache = _HealthSnapshotCache(
+        ttl_seconds=health_cache_ttl_seconds,
+        timeout_seconds=health_timeout_seconds,
+    )
 
     @router.get("/today")
     async def today_snapshot(
@@ -1143,6 +1498,10 @@ def setup_mission_control_routes(
                 "project_work",
                 lambda: _load_project_work(session_factory, scope, today=local_date),
             )
+            planning = _safe_load(
+                "planning",
+                lambda: _load_planning(session_factory, scope, today=local_date),
+            )
             goals = _safe_load(
                 "goals",
                 lambda: _load_goals(session_factory, scope, now_naive=now_naive),
@@ -1172,6 +1531,15 @@ def setup_mission_control_routes(
                 "daily_brief",
                 lambda: _load_daily_brief(session_factory, scope),
             )
+            progression = _safe_load(
+                "progression",
+                lambda: _load_progression(
+                    session_factory,
+                    scope,
+                    utc_offset_minutes=utc_offset_minutes,
+                    now_utc=now_utc,
+                ),
+            )
         else:
             owner_problem = {
                 "status": "unavailable",
@@ -1180,12 +1548,14 @@ def setup_mission_control_routes(
             }
             calendar = _source_problem("calendar", **owner_problem)
             project_work = _source_problem("project_work", **owner_problem)
+            planning = _source_problem("planning", **owner_problem)
             goals = _source_problem("goals", **owner_problem)
             tasks = _source_problem("tasks", **owner_problem)
             study_reviews = _source_problem("study_reviews", **owner_problem)
             important_mail = _source_problem("important_mail", **owner_problem)
             notes_today = _source_problem("notes_today", **owner_problem)
             daily_brief = _source_problem("daily_brief", **owner_problem)
+            progression = _source_problem("progression", **owner_problem)
 
         collector = health_collector
         if collector is None:
@@ -1193,7 +1563,7 @@ def setup_mission_control_routes(
 
             collector = collect_service_health
         try:
-            health = await _load_health(collector, rag_manager, memory_vector)
+            health = await health_cache.get(collector, rag_manager, memory_vector)
         except Exception as exc:
             logger.error(
                 "Mission Control health source failed (%s)", type(exc).__name__
@@ -1212,12 +1582,14 @@ def setup_mission_control_routes(
         sources = {
             "calendar": calendar,
             "project_work": project_work,
+            "planning": planning,
             "goals": goals,
             "tasks": tasks,
             "study_reviews": study_reviews,
             "important_mail": important_mail,
             "notes_today": notes_today,
             "daily_brief": daily_brief,
+            "progression": progression,
             "health": health,
         }
         next_actions = _build_next_actions(sources)
@@ -1228,17 +1600,87 @@ def setup_mission_control_routes(
             "summary": {
                 "calendar": calendar["count"],
                 "project_work": project_work["count"],
+                "planning": int(planning.get("open_count", planning["count"])),
                 "goals": goals["count"],
                 "tasks": tasks["count"],
                 "study_reviews": study_reviews["count"],
                 "important_mail": important_mail["count"],
                 "notes_today": notes_today["count"],
                 "daily_brief": daily_brief["count"],
+                "progression": int(
+                    (progression.get("profile") or {}).get("total_xp", 0)
+                    if isinstance(progression.get("profile"), dict)
+                    else 0
+                ),
                 "next_actions": len(next_actions),
                 "health": health["overall"],
             },
             "next_actions": next_actions,
             "sources": sources,
+        }
+
+    @router.get("/activity")
+    async def activity_snapshot(
+        request: Request,
+        limit: int = Query(default=30, ge=1, le=ACTIVITY_ITEM_LIMIT),
+        before: datetime | None = Query(
+            default=None,
+            description="Return activity strictly before this ISO-8601 timestamp.",
+        ),
+        before_id: str | None = Query(
+            default=None,
+            max_length=300,
+            description="Stable id paired with before so equal timestamps are not skipped.",
+        ),
+    ) -> dict[str, Any]:
+        scope = _resolve_owner_scope(request)
+        before_naive = _as_utc(before).replace(tzinfo=None) if before else None
+        if scope.available:
+            feed = _safe_load(
+                "activity",
+                lambda: _load_activity_feed(
+                    session_factory,
+                    scope,
+                    limit=limit,
+                    before=before_naive,
+                    before_id=before_id,
+                ),
+            )
+        else:
+            feed = _source_problem(
+                "activity",
+                status="unavailable",
+                code="owner_unavailable",
+                message="Owner scope could not be resolved for this request.",
+            )
+
+        collector = health_collector
+        if collector is None:
+            from src.service_health import collect_service_health
+
+            collector = collect_service_health
+        try:
+            health = await health_cache.get(collector, rag_manager, memory_vector)
+        except Exception as exc:
+            logger.error(
+                "Mission Control activity health failed (%s)", type(exc).__name__
+            )
+            health = {
+                "status": "error",
+                "overall": "unknown",
+                "services": [],
+                "truncated": False,
+                "cached": False,
+                "stale": False,
+                "error": {
+                    "code": "health_unavailable",
+                    "message": "Could not load service health.",
+                },
+            }
+        return {
+            "as_of": _iso_utc(_as_utc(now_factory())),
+            "feed": feed,
+            "health": health,
         }
 
     return router

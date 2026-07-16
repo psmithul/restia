@@ -809,12 +809,15 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
         # owner-only transfer endpoint for that workflow.
         try:
             from sqlalchemy import func
-            from core.database import Project, SessionLocal
+            from core.database import OutboundChatLink, Project, SessionLocal
 
             db = SessionLocal()
             try:
                 owned_projects = db.query(Project.id).filter(
                     func.lower(Project.owner) == target_username
+                ).count()
+                owned_chat_links = db.query(OutboundChatLink.id).filter(
+                    func.lower(OutboundChatLink.owner) == target_username
                 ).count()
             finally:
                 db.close()
@@ -825,6 +828,11 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
             raise HTTPException(
                 409,
                 f"Transfer or delete {owned_projects} owned project(s) before deleting this profile",
+            )
+        if owned_chat_links:
+            raise HTTPException(
+                409,
+                f"Disconnect {owned_chat_links} connected Restia chat(s) before deleting this profile",
             )
 
         def _invalidate_api_token_cache():

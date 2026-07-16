@@ -36,6 +36,7 @@ from email.mime.multipart import MIMEMultipart
 
 from fastapi import APIRouter, Query, UploadFile, File, BackgroundTasks, HTTPException, Depends, Request
 from fastapi.responses import FileResponse, StreamingResponse
+from src.auth_helpers import legacy_owner_storage_key, owner_storage_key
 from src.constants import DATA_DIR
 
 from src.llm_core import llm_call_async
@@ -4921,13 +4922,23 @@ def setup_email_routes():
     async def get_email_urgency_state(owner: str = Depends(require_user)):
         from pathlib import Path as _P
         import json as _json
-        _slug = "".join(c if (c.isalnum() or c in "-_.@") else "_" for c in (owner or "default"))
+        _slug = owner_storage_key(owner)
         path = _P(DATA_DIR) / f"email_urgency_state_{_slug}.json"
+        legacy_path = _P(DATA_DIR) / f"email_urgency_state_{legacy_owner_storage_key(owner)}.json"
+        if not path.exists() and legacy_path != path and legacy_path.exists():
+            path = legacy_path
         if not path.exists():
             return {"total_unread": 0, "total_urgent": 0, "max_score": 0, "per_uid": {}}
         try:
             data = _json.loads(path.read_text(encoding="utf-8"))
         except Exception:
+            return {"total_unread": 0, "total_urgent": 0, "max_score": 0, "per_uid": {}}
+        if not isinstance(data, dict):
+            return {"total_unread": 0, "total_urgent": 0, "max_score": 0, "per_uid": {}}
+        state_owner = data.get("owner")
+        # A safe-looking filename can still be another identity's historical
+        # lossy slug. Ownerless or mismatched state therefore fails closed.
+        if state_owner != (owner or ""):
             return {"total_unread": 0, "total_urgent": 0, "max_score": 0, "per_uid": {}}
         # Drop `notified_uids` from the payload — it's an internal scheduler
         # debounce, not UI-relevant.

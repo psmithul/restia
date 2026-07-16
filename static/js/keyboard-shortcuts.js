@@ -3,9 +3,10 @@
 // ============================================
 
 import { IS_MAC, isAltGrEvent } from './platform.js';
+import { toggleSidebarFromControl } from './sidebar-layout.js';
 
 const _defaultKeybinds = {
-  search: 'ctrl+k', toggle_sidebar: 'ctrl+alt+b', new_session: 'ctrl+alt+n',
+  search: 'ctrl+k', toggle_sidebar: 'ctrl+b', new_session: 'ctrl+alt+n',
   fav_session: 'ctrl+alt+f', delete_session: 'ctrl+alt+d',
   cancel: 'escape', tts: 'alt+shift+t',
   incognito: 'ctrl+alt+i', settings: 'ctrl+,', focus_input: 'ctrl+/',
@@ -153,15 +154,7 @@ export function initKeyboardShortcuts(modules) {
     }
     if (_matchesCombo(e, kb.toggle_sidebar)) {
       e.preventDefault();
-      var sb = document.getElementById('sidebar');
-      var ir = document.getElementById('icon-rail');
-      if (sb && !sb.classList.contains('hidden')) {
-        sb.classList.add('hidden');
-      } else {
-        if (ir) ir.classList.remove('rail-hidden');
-        if (sb) sb.classList.remove('hidden');
-      }
-      if (typeof syncRailSide === 'function') syncRailSide();
+      toggleSidebarFromControl(e);
       return;
     }
     if (_matchesCombo(e, kb.tts)) {

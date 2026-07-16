@@ -15,6 +15,7 @@ import asyncio
 import itertools
 import tempfile
 from types import SimpleNamespace
+from urllib.parse import parse_qs
 
 import pytest
 from fastapi import HTTPException
@@ -79,7 +80,7 @@ def _fresh(monkeypatch):
     lr._reset_summary_cache()
     with _ENGINE.begin() as conn:
         for t in ("direct_message_attachments", "direct_messages", "link_guests", "home_link",
-                  "link_invites", "remote_contact_prefs", "remote_blocks"):
+                  "outbound_chat_links", "link_invites", "remote_contact_prefs", "remote_blocks"):
             conn.exec_driver_sql(f"DELETE FROM {t}")
     yield
 
@@ -100,10 +101,12 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def _mint(username="mika", label=None, max_uses=None, expires_in_days=None):
+def _mint(username="mika", label=None, max_uses=None, expires_in_days=None,
+          hub_url=None):
     ep = HUB[("POST", "/api/link/admin/invites")]
     body = lr.InviteCreateRequest(label=label, max_uses=max_uses,
-                                  expires_in_days=expires_in_days)
+                                  expires_in_days=expires_in_days,
+                                  hub_url=hub_url)
     return _run(ep(body, _req(username)))
 
 
@@ -134,6 +137,41 @@ def test_mint_returns_plaintext_once_and_stores_only_hash():
         assert inv.code_hash == lr._hash_code(out["code"])
         assert inv.code_hash != out["code"]
         assert inv.label == "for a friend" and inv.created_by == "mika"
+    finally:
+        db.close()
+
+
+def test_mint_returns_origin_bound_portable_chat_invitation():
+    made = _mint(hub_url="https://PAIR.Example:443/")
+    assert made["hub_url"] == "https://pair.example"
+    assert made["invitation"].startswith(lr.CONNECTION_INVITE_PREFIX)
+    values = parse_qs(made["invitation"].split("?", 1)[1], strict_parsing=True)
+    assert values == {
+        "scope": ["chat"],
+        "hub": ["https://pair.example"],
+        "code": [made["code"]],
+    }
+
+
+def test_mint_rejects_unsafe_advertised_origins_before_storing():
+    db = _TS()
+    try:
+        before = db.query(cdb.LinkInvite).count()
+    finally:
+        db.close()
+    for unsafe in (
+        "http://peer.example",
+        "https://user:pass@peer.example",
+        "https://peer.example/path",
+        "https://peer.example?code=leak",
+        "javascript:alert(1)",
+    ):
+        with pytest.raises(HTTPException) as exc:
+            _mint(hub_url=unsafe)
+        assert exc.value.status_code == 400
+    db = _TS()
+    try:
+        assert db.query(cdb.LinkInvite).count() == before
     finally:
         db.close()
 
@@ -171,6 +209,33 @@ def test_redeem_creates_an_approved_guest_immediately():
     sent = _send(token, "hi mika")
     assert sent["message"]["recipient"] == lr.INSTANCE_REMOTE_ALIAS
     assert sent["message"]["mine"] is True
+
+
+def test_general_invitation_is_chat_only_on_both_installations():
+    redeemed = _redeem(_mint()["code"], "friend")
+    _send(redeemed["token"], "hello owner")
+    db = _TS()
+    try:
+        guest = db.query(cdb.LinkGuest).filter(cdb.LinkGuest.handle == "friend").one()
+        assert guest.scope == "chat"
+    finally:
+        db.close()
+
+    picker = _run(MSG[("GET", "/api/messages/profiles")](_req("mika")))
+    contact = next(row for row in picker["profiles"] if row["username"] == "friend@remote")
+    assert contact["remote"] is True
+    assert contact["chat_only"] is True
+    assert contact["can_call"] is False
+
+    thread = _run(MSG[("GET", "/api/messages/conversations/{other}")] (
+        "friend@remote", _req("mika"), 0
+    ))
+    assert thread["other"]["chat_only"] is True
+    assert thread["other"]["can_call"] is False
+
+    with pytest.raises(HTTPException) as exc:
+        lr.authorize_local_remote_call(_req("mika"), "mika", "friend@remote")
+    assert (exc.value.status_code, exc.value.detail) == (404, "Call not available")
 
 
 def test_redeem_consumes_a_single_use_code():
@@ -264,6 +329,63 @@ def test_guest_sees_and_messages_only_the_opaque_installation_identity():
     assert _run(MSG[("GET", "/api/messages/conversations")](
         _req("alice")
     ))["conversations"] == []
+
+
+def test_inbound_guest_picker_and_replies_are_hub_owner_only():
+    token = _redeem(_mint()["code"], "friend")["token"]
+    _send(token, "hello owner")
+    owner_picker = _run(MSG[("GET", "/api/messages/profiles")](_req("mika")))
+    other_picker = _run(MSG[("GET", "/api/messages/profiles")](_req("alice")))
+    assert "friend@remote" in {row["username"] for row in owner_picker["profiles"]}
+    assert "friend@remote" not in {row["username"] for row in other_picker["profiles"]}
+    with pytest.raises(HTTPException) as exc:
+        _run(MSG[("POST", "/api/messages/conversations/{other}")] (
+            "friend@remote", mr.SendMessageRequest(body="undeliverable"), _req("alice")
+        ))
+    assert (exc.value.status_code, exc.value.detail) == (404, "User not found")
+    reply = _run(MSG[("POST", "/api/messages/conversations/{other}")] (
+        "friend@remote", mr.SendMessageRequest(body="hello back"), _req("mika")
+    ))
+    assert reply["message"]["recipient"] == "friend@remote"
+
+
+def test_guest_approval_queue_and_actions_are_hub_owner_only(monkeypatch):
+    monkeypatch.setitem(USERS["alice"], "is_admin", True)
+    monkeypatch.setenv("LINK_OWNER", "mika")
+    db = _TS()
+    try:
+        db.add(cdb.LinkGuest(
+            handle="waiting",
+            token_hash="f" * 64,
+            status=lr.GUEST_PENDING,
+            created_at=cdb.utcnow_naive(),
+            scope="chat",
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    owner_convos = _run(MSG[("GET", "/api/messages/conversations")](_req("mika")))
+    other_admin_convos = _run(MSG[("GET", "/api/messages/conversations")](_req("alice")))
+    assert owner_convos["link_requests"][0]["handle"] == "waiting"
+    assert "link_requests" not in other_admin_convos
+
+    for method, path, args in (
+        ("GET", "/api/link/admin/guests", (_req("alice"),)),
+        (
+            "POST",
+            "/api/link/admin/guests/{handle}",
+            ("waiting", lr.GuestActionRequest(action="approve"), _req("alice")),
+        ),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            _run(HUB[(method, path)](*args))
+        assert exc.value.status_code == 403
+
+    approved = _run(HUB[("POST", "/api/link/admin/guests/{handle}")](
+        "waiting", lr.GuestActionRequest(action="approve"), _req("mika")
+    ))
+    assert approved["status"] == lr.GUEST_APPROVED
 
 
 def test_internal_profile_names_are_never_bearer_targets_or_directory_entries():

@@ -6,6 +6,7 @@
 // while giving desktop, rail, mobile, and command surfaces one registry.
 
 import missionControlModule from './missionControl.js';
+import { closeSidebar, SIDEBAR_STATES } from './sidebar-layout.js';
 import {
   NAVIGATION_GROUPS,
   NAVIGATION_ITEMS,
@@ -270,9 +271,7 @@ function prepareMobileNav() {
 
 function hideMobileSidebar() {
   if (!window.matchMedia('(max-width: 768px)').matches) return;
-  document.getElementById('sidebar')?.classList.add('hidden');
-  document.getElementById('sidebar-backdrop')?.classList.remove('visible');
-  window.syncRailSide?.();
+  closeSidebar({ state: SIDEBAR_STATES.OFF, persist: false });
 }
 
 function visibleOrExisting(ids) {
@@ -391,6 +390,14 @@ function initNavigationModalObserver() {
 }
 
 export async function activateNavigationItem(id, options = {}) {
+  // Notes is a fullscreen mobile sheet rather than a conventional `.modal`.
+  // Primary navigation must dismiss it before opening another destination;
+  // otherwise the new workspace changes behind an still-interactive Notes
+  // surface and the active tab no longer matches what the user can see.
+  if (!['notes', 'todos'].includes(id) && window.notesModule?.isPanelOpen?.()) {
+    window.notesModule.closePanel?.();
+  }
+
   if (id === 'more') {
     if (typeof window._odyOpenSidebar === 'function') window._odyOpenSidebar();
     else document.getElementById('mobile-menu-btn')?.click();
@@ -408,16 +415,13 @@ export async function activateNavigationItem(id, options = {}) {
     // aggregation loads. If a dirty Projects close is cancelled, reconcile
     // back to the still-visible workspace below.
     setActiveNavigationItem(id);
-    const opened = await missionControlModule.open();
+    const opened = await missionControlModule.open(id);
     if (opened === false) {
       syncActiveNavigationFromVisibleSurface();
       return false;
     }
     setActiveNavigationItem(id);
     hideMobileSidebar();
-    if (id === 'activity') {
-      requestAnimationFrame(() => document.getElementById('mission-health-title')?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
-    }
     return true;
   }
   if (id === 'chat') {

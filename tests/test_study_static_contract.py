@@ -481,6 +481,8 @@ def test_study_release_assets_use_one_cache_key_and_exclude_local_backups():
     assert "ResizeObserver(_syncDrawerClearance)" in module
     assert "_request('/review'" in module
     assert "querySelectorAll('[data-study-result]')" in module
+    assert "const reviewIsDue = !review.count || review.due" in module
+    assert "|| !reviewIsDue" in module
     assert "_request('/initialize'" in module
     assert "_closeControls({ restoreFocus: false })" in module
 

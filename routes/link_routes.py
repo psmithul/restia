@@ -1,31 +1,30 @@
 # routes/link_routes.py
-"""Home Link — DM the developer from any self-hosted instance.
+"""Home Link — connect and message between Restia installations.
 
 Two halves, both defined here:
 
-Hub (the developer's instance, ``LINK_HUB_ENABLED=true``): a small public API
-that remote instances register against. A guest picks a handle and receives a
+Hub (any Restia installation, ``LINK_HUB_ENABLED=true``): a small public API
+that remote installations register against. A guest picks a handle and receives a
 bearer token, but starts **pending**: nothing can be sent or read until the
 hub owner approves the request from the Messages UI (or blocks it). Approved
 guests' messages land in the owner's ordinary inbox as ``<handle>@remote`` —
 the owner replies from the normal DM UI (routes/messaging_routes.py resolves
 ``@remote`` recipients against the link_guests table).
 
-Client (every instance, ``RESTIA_HOME_SERVER``, default the upstream author's
-hub): the Messages UI shows one extra contact named after the home server's
-host. Opening it for the first time asks the user to pick a handle; after
-that this instance proxies that one conversation to the hub, authenticated by
-the token stored (encrypted) in the home_link table — one sentinel row per
-installation, reused by its internal profiles. Set
-``RESTIA_HOME_SERVER=`` (empty) to remove the contact entirely — the hub
-instance itself should do this so it doesn't offer a chat with itself.
+Client (an installation that accepts an invitation or requests access): the
+Messages UI shows a contact named after the connected Restia host. This
+instance proxies that conversation to the selected hub, authenticated by the
+token stored (encrypted) in the home_link table — one sentinel row per
+installation, reused by its internal profiles. ``RESTIA_HOME_SERVER`` remains
+as an optional deployment default for backwards compatibility; fresh installs
+start with no preselected contact and connect from the Messages UI instead.
 
 Security model, in one place:
   - A guest is never a user account on the hub. Its bearer authenticates one
     linked installation, not any local profile. It can reach the guest↔owner
     conversation and the closed Projects namespace; every Projects operation
     additionally requires an active, project-scoped owner grant.
-  - Registration is approval-gated (pending → approved/blocked by an admin),
+  - Registration is approval-gated (pending → approved/blocked by the owner),
     rate-limited per real client IP (CF-Connecting-IP aware — behind the
     Cloudflare tunnel every request reaches uvicorn from loopback), and
     capped (LINK_MAX_PENDING / LINK_MAX_GUESTS) so bots can't fill the DB.
@@ -49,10 +48,11 @@ import re
 import secrets
 import tempfile
 import time
+import uuid
 from datetime import timedelta
 from functools import wraps
 from typing import Any, BinaryIO, Dict, Literal, Optional
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import quote, unquote, urlencode, urlparse
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -64,22 +64,31 @@ from starlette.concurrency import run_in_threadpool
 
 from core.auth import RESERVED_USERNAMES
 from core.database import (
-    DirectMessage, DirectMessageAttachment, HomeLink, LinkGuest, LinkInvite, Project,
+    DirectMessage, DirectMessageAttachment, HomeLink, LinkGuest, LinkInvite,
+    OutboundChatLink, Project,
     ProjectRemoteGrant, ProjectWorkItem, RemoteBlock, RemoteContactPref,
     SessionLocal, utcnow_naive,
 )
 from core.middleware import require_admin
 from core.project_upload_limit import PROJECT_ATTACHMENT_REQUEST_MAX_BYTES
 from src.auth_helpers import require_user
+from src.public_origin import canonical_shared_origin, is_loopback_origin
 from src.rate_limiter import RateLimiter
+from src.project_office_preview import (
+    OFFICE_PREVIEW_MAX_RESPONSE_BYTES,
+    OfficePreviewError,
+    sanitize_office_preview_payload,
+)
 from src.upload_limits import PROJECT_ATTACHMENT_MAX_BYTES
+from src.settings import get_setting
 
 logger = logging.getLogger(__name__)
 
 # Guests are namespaced so they can never shadow a local account; the reverse
 # (a local signup grabbing an '@remote' name) is blocked in routes/auth_routes.py.
 GUEST_SUFFIX = "@remote"
-DEFAULT_HOME_SERVER = "https://app.restia.dev"
+DEFAULT_HOME_SERVER = ""
+CONNECTION_INVITE_PREFIX = "restia-invite:v1?"
 HANDLE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,31}$")
 MAX_BODY_LEN = 8000            # keep in sync with routes/messaging_routes.py
 MESSAGES_PAGE_LIMIT = 200
@@ -110,6 +119,7 @@ MAX_FEDERATED_PHOTO_DATA_CHARS = ((MAX_FEDERATED_PHOTO_BYTES + 2) // 3) * 4 + 12
 PHOTO_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 PHOTO_MIMES = {"image/png", "image/jpeg", "image/webp"}
 INSTANCE_LINK_USER = "__instance__"
+OUTBOUND_CHAT_PREFIX = "restia:"
 # The bearer-facing hub API represents the whole installation as one external
 # user.  Local login names are profiles and must never become routable or
 # discoverable through a Home Link credential.
@@ -145,6 +155,20 @@ PROJECT_UPLOAD_UPSTREAM_ERROR_DETAILS = {
     422: "Invalid project attachment upload request",
     507: "Home server could not store the project attachment",
 }
+PROJECT_ATTACHMENT_PREVIEW_MIMES = frozenset({
+    "application/pdf",
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/gif",
+    "text/plain",
+    "text/markdown",
+    "text/csv",
+    "application/json",
+})
+_PROJECT_PREVIEW_RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
+_PROJECT_CONTENT_RANGE_RE = re.compile(r"^bytes (\d+)-(\d+)/(\d+)$")
+_PROJECT_UNSATISFIED_RANGE_RE = re.compile(r"^bytes \*/(\d+)$")
 
 # Home Link's browser-facing Projects proxy is deliberately a closed protocol,
 # not a general-purpose forwarder. Each path segment is bounded and the allowed
@@ -161,6 +185,8 @@ _PROJECT_PROXY_RULES = tuple(
         (r"invitations", ("GET",)),
         (rf"invitations/{_PROJECT_PROXY_SEGMENT}/respond", ("POST",)),
         (rf"attachments/{_PROJECT_PROXY_SEGMENT}/download", ("GET",)),
+        (rf"attachments/{_PROJECT_PROXY_SEGMENT}/view", ("GET",)),
+        (rf"attachments/{_PROJECT_PROXY_SEGMENT}/preview", ("GET",)),
         (rf"{_PROJECT_PROXY_SEGMENT}", ("GET", "PATCH")),
         (rf"{_PROJECT_PROXY_SEGMENT}/(?:overview|context|board|stages|items|activity)", ("GET",)),
         (rf"{_PROJECT_PROXY_SEGMENT}/stages", ("POST",)),
@@ -243,6 +269,7 @@ def _serialize_guest_admission(db) -> None:
 
 class RegisterRequest(BaseModel):
     handle: str
+    scope: Literal["full", "chat"] = "full"
 
 
 class LinkPhotoRequest(BaseModel):
@@ -263,12 +290,14 @@ class LinkSendRequest(BaseModel):
 
 class ConnectRequest(BaseModel):
     handle: str
+    home_url: Optional[str] = Field(default=None, max_length=2048)
     force_replace: bool = False
 
 
 class RedeemHomeRequest(BaseModel):
     handle: str
     code: str
+    home_url: Optional[str] = Field(default=None, max_length=2048)
     force_replace: bool = False
 
 
@@ -291,12 +320,14 @@ class RedeemRequest(BaseModel):
     code: str
     handle: str
     pubkey: Optional[str] = None     # base64 X25519, published for E2EE
+    scope: Optional[Literal["chat", "project"]] = None
 
 
 class InviteCreateRequest(BaseModel):
     label: Optional[str] = None
     expires_in_days: Optional[int] = None
     max_uses: Optional[int] = None
+    hub_url: Optional[str] = Field(default=None, max_length=2048)
 
 
 class BlockRequest(BaseModel):
@@ -371,7 +402,11 @@ def _raw_client_ip(request: Request) -> str:
 # ── Hub side ────────────────────────────────────────────────────────────────
 
 def hub_enabled() -> bool:
-    return os.getenv("LINK_HUB_ENABLED", "false").lower() == "true"
+    # The bearer-facing routes expose no local account surface and every
+    # registration is approval- or invite-gated. Enable this safe boundary by
+    # default so every Restia install can issue and accept connection invites;
+    # operators can still opt out explicitly.
+    return os.getenv("LINK_HUB_ENABLED", "true").lower() == "true"
 
 
 def _require_hub():
@@ -416,6 +451,32 @@ def list_guests() -> list:
         db.close()
 
 
+def guest_contact_capabilities(name: str) -> dict:
+    """Return browser-safe capabilities for one inbound Restia contact.
+
+    The guest's stored scope is the authority. A general Messages invitation
+    must not inherit the historical remote-call capability merely because it
+    is visible to the hub owner.
+    """
+    key = _norm(name)
+    if not key.endswith(GUEST_SUFFIX):
+        return {"remote": False, "chat_only": False, "can_call": False}
+    handle = key[: -len(GUEST_SUFFIX)]
+    db = SessionLocal()
+    try:
+        guest = db.query(LinkGuest).filter(LinkGuest.handle == handle).first()
+        if guest is None or guest.status not in (GUEST_APPROVED, GUEST_BLOCKED):
+            return {"remote": True, "chat_only": True, "can_call": False}
+        chat_only = str(getattr(guest, "scope", "full") or "full") == "chat"
+        return {
+            "remote": True,
+            "chat_only": chat_only,
+            "can_call": not chat_only and guest.status == GUEST_APPROVED,
+        }
+    finally:
+        db.close()
+
+
 def pending_requests() -> list:
     """Pending registrations, oldest first — shown to hub admins in the
     Messages UI so they can approve or block."""
@@ -437,6 +498,43 @@ def pending_requests() -> list:
 
 def _hash_code(code: str) -> str:
     return hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+
+def invitation_origin(request: Request, supplied: Optional[str] = None) -> str:
+    """Return the origin advertised inside a portable Restia invitation.
+
+    Explicit input and the configured Public App URL must be HTTPS, except for
+    loopback development. A remote Host header is never trusted as an
+    internet-reachable identity; request.base_url is only a convenience on
+    loopback.
+    """
+    raw_supplied = str(supplied or "").strip()
+    if raw_supplied:
+        return canonical_shared_origin(raw_supplied, allow_loopback_http=True)
+    configured = canonical_shared_origin(
+        get_setting("app_public_url", ""),
+        allow_loopback_http=False,
+    )
+    if configured:
+        return configured
+    fallback = canonical_shared_origin(
+        str(getattr(request, "base_url", "") or "").rstrip("/"),
+        allow_loopback_http=True,
+    )
+    return fallback if is_loopback_origin(fallback) else ""
+
+
+def build_connection_invitation(hub_url: str, code: str) -> str:
+    """Build the pasteable invitation accepted by the Messages UI."""
+    origin = canonical_shared_origin(hub_url, allow_loopback_http=True)
+    clean_code = str(code or "").strip()
+    if not origin or not clean_code:
+        return ""
+    return CONNECTION_INVITE_PREFIX + urlencode({
+        "scope": "chat",
+        "hub": origin,
+        "code": clean_code,
+    })
 
 
 def _clean_pubkey(pubkey: Optional[str]) -> Optional[str]:
@@ -506,16 +604,27 @@ def _resolve_target(request: Request, db, guest: LinkGuest, to: Optional[str]) -
 
 
 def _owner_username(request: Request) -> str:
-    """Who guest messages are addressed to: LINK_OWNER, else the first admin,
-    else the first account."""
+    """Who guest messages are addressed to: an admin LINK_OWNER, then an admin.
+
+    Connection management is owner-only and admin-authenticated, so accepting
+    a configured non-admin here would make the approval queue impossible for
+    every profile. Anonymous/single-profile modes retain the final-account
+    fallback.
+    """
     env_owner = _norm(os.getenv("LINK_OWNER", ""))
     users = _known_users(request)
     names = sorted(_norm(u) for u in users.keys() if _norm(u))
+    mgr = getattr(request.app.state, "auth_manager", None)
     if env_owner:
         if env_owner in names:
-            return env_owner
-        logger.warning("LINK_OWNER=%r is not an existing account", env_owner)
-    mgr = getattr(request.app.state, "auth_manager", None)
+            try:
+                if not getattr(mgr, "is_configured", False) or mgr.is_admin(env_owner):
+                    return env_owner
+                logger.warning("LINK_OWNER=%r is not an administrator; using an admin owner", env_owner)
+            except Exception:
+                logger.warning("Could not validate LINK_OWNER=%r; using an admin owner", env_owner)
+        else:
+            logger.warning("LINK_OWNER=%r is not an existing account", env_owner)
     for name in names:
         try:
             if mgr and mgr.is_admin(name):
@@ -537,9 +646,16 @@ def is_hub_call_owner(request: Request, username: str) -> bool:
         return False
 
 
+def is_hub_owner(request: Request, username: Optional[str]) -> bool:
+    """Whether this profile is the installation identity behind hub guests."""
+    return is_hub_call_owner(request, _norm(username))
+
+
 def _require_call_pair(db, guest: LinkGuest, owner: str) -> tuple[str, str]:
     """Authorize the single guest↔hub-owner pair used by federated calls."""
     _require_approved(guest)
+    if str(getattr(guest, "scope", "full") or "full") == "chat":
+        raise HTTPException(404, "Call not available")
     owner = _norm(owner)
     gname = guest_username(guest.handle)
     if not owner or _is_blocked(db, owner, guest.handle):
@@ -1034,7 +1150,8 @@ def setup_link_hub_routes():
             if db.query(LinkGuest).count() >= _max_guests():
                 raise HTTPException(429, "The hub is not accepting new requests right now")
             db.add(LinkGuest(handle=handle, token_hash=_hash_token(token),
-                             status=GUEST_PENDING, created_at=utcnow_naive()))
+                             status=GUEST_PENDING, created_at=utcnow_naive(),
+                             scope=body.scope))
             db.commit()
         finally:
             db.close()
@@ -1042,7 +1159,7 @@ def setup_link_hub_routes():
         # The token is issued now (it's the guest's only credential) but stays
         # useless until approval. Deliberately no owner username / hub details.
         return {"ok": True, "handle": handle, "guest": gname,
-                "status": GUEST_PENDING, "token": token}
+                "status": GUEST_PENDING, "scope": body.scope, "token": token}
 
     @router.post("/redeem")
     async def redeem(body: RedeemRequest, request: Request):
@@ -1072,6 +1189,11 @@ def setup_link_hub_routes():
                 # Generic on purpose: never reveal whether the code was wrong,
                 # expired, revoked, or already spent.
                 raise HTTPException(403, "Invalid or expired invite code")
+            actual_scope = "project" if inv.project_id else "chat"
+            if body.scope is not None and body.scope != actual_scope:
+                # Generic on purpose: do not reveal valid codes from another
+                # capability namespace or consume them through the wrong UI.
+                raise HTTPException(403, "Invalid or expired invite code")
             if db.query(LinkGuest).filter(LinkGuest.handle == handle).first():
                 raise HTTPException(409, "Handle unavailable")
             if db.query(LinkGuest).count() >= _max_guests():
@@ -1094,13 +1216,14 @@ def setup_link_hub_routes():
                 created_at=utcnow_naive(),
                 invite_id=inv.id if inv else None,
                 pubkey=pubkey,
+                scope=actual_scope,
             ))
             db.commit()
         finally:
             db.close()
         logger.info("Home Link invite redeemed: %s (approved)", gname)
         return {"ok": True, "handle": handle, "guest": gname,
-                "status": GUEST_APPROVED, "token": token}
+                "status": GUEST_APPROVED, "scope": actual_scope, "token": token}
 
     @router.post("/revoke")
     async def revoke_link(request: Request):
@@ -1348,6 +1471,9 @@ def setup_link_hub_routes():
     async def admin_list_guests(request: Request):
         _require_hub()
         require_admin(request)
+        me = _norm(require_user(request))
+        if not is_hub_owner(request, me):
+            raise HTTPException(403, "Only the Restia owner can manage connection requests")
         db = SessionLocal()
         try:
             rows = db.query(LinkGuest).order_by(LinkGuest.created_at.asc()).all()
@@ -1368,6 +1494,9 @@ def setup_link_hub_routes():
         the handle and purges that identity's old conversation)."""
         _require_hub()
         require_admin(request)
+        me = _norm(require_user(request))
+        if not is_hub_owner(request, me):
+            raise HTTPException(403, "Only the Restia owner can manage connection requests")
         action = _norm(body.action)
         if action not in ("approve", "block", "delete"):
             raise HTTPException(400, "action must be approve, block, or delete")
@@ -1399,11 +1528,20 @@ def setup_link_hub_routes():
     @router.post("/admin/invites")
     async def admin_create_invite(body: InviteCreateRequest, request: Request):
         """Mint a one-off (or use-capped) invite code. The plaintext code is
-        returned exactly once here — only its hash is stored, so it can't be
-        recovered later; revoke and re-issue if it's lost."""
+        returned exactly once inside a portable Restia invitation — only its
+        hash is stored, so it can't be recovered later; revoke and re-issue if
+        it's lost."""
         _require_hub()
         require_admin(request)
         me = _norm(require_user(request)) or "admin"
+        if not is_hub_owner(request, me):
+            raise HTTPException(403, "Only the Restia owner can create chat invitations")
+        hub_url = invitation_origin(request, body.hub_url)
+        if body.hub_url and not hub_url:
+            raise HTTPException(
+                400,
+                "Restia address must be an HTTPS origin (loopback HTTP is allowed for local testing)",
+            )
         days = INVITE_DEFAULT_EXPIRY_DAYS if body.expires_in_days is None else body.expires_in_days
         try:
             days = int(days)
@@ -1431,6 +1569,8 @@ def setup_link_hub_routes():
             db.refresh(inv)
             logger.info("Home Link invite created by %s (max_uses=%d, %dd)", me, max_uses, days)
             return {"ok": True, "id": inv.id, "code": code, "label": label,
+                    "hub_url": hub_url,
+                    "invitation": build_connection_invitation(hub_url, code),
                     "max_uses": max_uses,
                     "expires_at": inv.expires_at.isoformat() + "Z"}
         finally:
@@ -1688,15 +1828,20 @@ def home_enabled() -> bool:
         return True
     db = SessionLocal()
     try:
-        return db.query(HomeLink.id).first() is not None
+        return (
+            db.query(HomeLink.id).first() is not None
+            or db.query(OutboundChatLink.id).first() is not None
+        )
     finally:
         db.close()
 
 
 def home_contact_name(base_url: Optional[str] = None) -> str:
-    """The special contact's username in the local Messages UI — the home
-    server's host, e.g. 'app.restia.dev'. A connected installation is labelled
-    from its pinned stored origin, never from a later environment change."""
+    """The connected installation's contact name in the local Messages UI.
+
+    It is labelled from its pinned stored origin, never from a later
+    environment change.
+    """
     selected = str(base_url or "").strip()
     if not selected:
         db = SessionLocal()
@@ -1725,8 +1870,73 @@ def home_contact_name(base_url: Optional[str] = None) -> str:
 
 
 def is_home_contact(name: Optional[str]) -> bool:
+    if is_outbound_chat_contact(name):
+        return True
     contact = home_contact_name()
     return bool(contact) and _norm(name) == contact
+
+
+def outbound_chat_contact(link_or_id: Any) -> str:
+    value = getattr(link_or_id, "id", link_or_id)
+    try:
+        return OUTBOUND_CHAT_PREFIX + str(uuid.UUID(str(value)))
+    except (TypeError, ValueError, AttributeError):
+        return ""
+
+
+def is_outbound_chat_contact(name: Optional[str]) -> bool:
+    value = _norm(name)
+    if not value.startswith(OUTBOUND_CHAT_PREFIX):
+        return False
+    try:
+        uuid.UUID(value[len(OUTBOUND_CHAT_PREFIX):])
+        return True
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
+def _outbound_chat_link(db, contact: str, owner: Optional[str] = None) -> Optional[OutboundChatLink]:
+    if not is_outbound_chat_contact(contact):
+        return None
+    link_id = str(uuid.UUID(_norm(contact)[len(OUTBOUND_CHAT_PREFIX):]))
+    query = db.query(OutboundChatLink).filter(OutboundChatLink.id == link_id)
+    if owner is not None:
+        query = query.filter(OutboundChatLink.owner == _norm(owner))
+    return query.first()
+
+
+def _require_outbound_chat_link(db, contact: str, owner: str) -> OutboundChatLink:
+    link = _outbound_chat_link(db, contact, owner)
+    if link is None:
+        # Keep forged/stale opaque IDs indistinguishable from unknown users.
+        raise HTTPException(404, "User not found")
+    return link
+
+
+def outbound_chat_contacts(owner: str) -> list[dict[str, Any]]:
+    """All additive chat contacts visible to one local owner profile."""
+    key = _norm(owner)
+    if not key:
+        return []
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(OutboundChatLink)
+            .filter(OutboundChatLink.owner == key)
+            .order_by(OutboundChatLink.created_at.asc(), OutboundChatLink.id.asc())
+            .all()
+        )
+        return [{
+            "username": outbound_chat_contact(row),
+            "display": home_contact_name(row.home_url),
+            "is_admin": False,
+            "home": True,
+            "chat_only": True,
+            "can_call": False,
+            "connected": True,
+        } for row in rows]
+    finally:
+        db.close()
 
 
 def _load_home_link(db, me: str) -> Optional[HomeLink]:
@@ -1954,6 +2164,19 @@ def _validated_home_base(base_url: Optional[str]) -> str:
     return f"{parsed.scheme}://{display_host}{port_part}"
 
 
+def _requested_home_base(value: Optional[str]) -> str:
+    """Validate a user-selected connection target with a useful 4xx error."""
+    candidate = str(value or "").strip() or home_server()
+    if not candidate:
+        raise HTTPException(400, "Enter the HTTPS address of the other Restia")
+    try:
+        return _validated_home_base(candidate)
+    except HTTPException as exc:
+        if exc.status_code == 502:
+            raise HTTPException(400, str(exc.detail)) from exc
+        raise
+
+
 def _raise_hub_response_error(
     status_code: int,
     content: bytes,
@@ -2079,6 +2302,43 @@ def _require_link(db, me: str) -> HomeLink:
     return link
 
 
+def _chat_link_snapshot(me: str, contact: Optional[str] = None) -> dict[str, Any]:
+    """Pin one outbound chat credential without exposing its ORM row."""
+    key = _norm(me)
+    requested = _norm(contact)
+    db = SessionLocal()
+    try:
+        if is_outbound_chat_contact(requested):
+            link = _require_outbound_chat_link(db, requested, key)
+            base_url = _validated_home_base(link.home_url)
+            return {
+                "identity": f"chat:{link.id}",
+                "token": str(link.token),
+                "base_url": base_url,
+                "contact": outbound_chat_contact(link),
+                "display": home_contact_name(base_url),
+                "chat_only": True,
+                "can_call": False,
+            }
+
+        link = _require_link(db, key)
+        base_url = _validated_home_base(link.home_url)
+        legacy_contact = home_contact_name(base_url)
+        if requested and requested != legacy_contact:
+            raise HTTPException(404, "User not found")
+        return {
+            "identity": f"home:{int(link.id)}",
+            "token": str(link.token),
+            "base_url": base_url,
+            "contact": legacy_contact,
+            "display": legacy_contact,
+            "chat_only": False,
+            "can_call": bool(_norm(link.owner) == key),
+        }
+    finally:
+        db.close()
+
+
 def _project_proxy_kind(method: str, remote_path: str) -> str:
     """Validate one relative Projects route and classify its transport."""
     normalized_method = str(method or "").upper()
@@ -2094,6 +2354,10 @@ def _project_proxy_kind(method: str, remote_path: str) -> str:
                 continue
             if normalized_path.endswith("/download"):
                 return "download"
+            if normalized_path.endswith("/view"):
+                return "preview"
+            if normalized_path.endswith("/preview"):
+                return "office_preview"
             if normalized_method == "POST" and normalized_path.endswith("/attachments"):
                 return "upload"
             return "json"
@@ -2345,16 +2609,51 @@ async def _proxy_home_project_upload(
     )
 
 
-def _safe_project_download_headers(response: httpx.Response) -> dict[str, str]:
+def _validated_project_preview_range(value: object) -> Optional[str]:
+    header = str(value or "").strip()
+    if not header:
+        return None
+    if len(header) > 100 or "," in header:
+        raise HTTPException(416, "Requested attachment range is not satisfiable")
+    match = _PROJECT_PREVIEW_RANGE_RE.fullmatch(header)
+    if not match:
+        raise HTTPException(416, "Requested attachment range is not satisfiable")
+    start_text, end_text = match.groups()
+    if not start_text and not end_text:
+        raise HTTPException(416, "Requested attachment range is not satisfiable")
+    try:
+        if start_text and end_text and int(end_text) < int(start_text):
+            raise HTTPException(416, "Requested attachment range is not satisfiable")
+        if not start_text and int(end_text) <= 0:
+            raise HTTPException(416, "Requested attachment range is not satisfiable")
+    except ValueError as exc:
+        raise HTTPException(
+            416, "Requested attachment range is not satisfiable"
+        ) from exc
+    return header
+
+
+def _safe_project_download_headers(
+    response: httpx.Response,
+    *,
+    inline: bool = False,
+    range_requested: object = False,
+) -> dict[str, str]:
     headers = {
         "Cache-Control": "private, no-store",
         "Pragma": "no-cache",
         "X-Content-Type-Options": "nosniff",
         "Content-Security-Policy": "default-src 'none'; sandbox",
+        "Cross-Origin-Resource-Policy": "same-origin",
+        "Referrer-Policy": "no-referrer",
     }
     content_type = response.headers.get("content-type")
     if content_type and len(content_type) <= 200:
         headers["Content-Type"] = content_type
+    if inline:
+        content_type_base = str(content_type or "").split(";", 1)[0].strip().lower()
+        if content_type_base not in PROJECT_ATTACHMENT_PREVIEW_MIMES:
+            raise HTTPException(502, "Home server returned an unsafe attachment preview type")
     content_length = response.headers.get("content-length")
     if not content_length:
         # The authoritative Restia endpoint is a FileResponse and always knows
@@ -2369,6 +2668,55 @@ def _safe_project_download_headers(response: httpx.Response) -> dict[str, str]:
     if size < 0 or size > PROJECT_ATTACHMENT_MAX_BYTES:
         raise HTTPException(502, "Home server returned an invalid attachment size")
     headers["Content-Length"] = str(size)
+    status_code = int(getattr(response, "status_code", 200) or 200)
+    if inline:
+        requested_range_value = (
+            str(range_requested)
+            if isinstance(range_requested, str)
+            else ""
+        )
+        has_requested_range = bool(range_requested)
+        if status_code not in (200, 206):
+            raise HTTPException(502, f"Home server error ({status_code})")
+        if has_requested_range != (status_code == 206):
+            raise HTTPException(502, "Home server returned inconsistent attachment range metadata")
+        headers["Accept-Ranges"] = "bytes"
+        if status_code == 206:
+            content_range = str(response.headers.get("content-range") or "").strip()
+            match = _PROJECT_CONTENT_RANGE_RE.fullmatch(content_range)
+            if not match:
+                raise HTTPException(502, "Home server returned invalid attachment range metadata")
+            start, end, total = (int(value) for value in match.groups())
+            if (
+                total < 1
+                or total > PROJECT_ATTACHMENT_MAX_BYTES
+                or start < 0
+                or end < start
+                or end >= total
+                or size != end - start + 1
+            ):
+                raise HTTPException(502, "Home server returned invalid attachment range metadata")
+            if requested_range_value:
+                requested = _PROJECT_PREVIEW_RANGE_RE.fullmatch(
+                    requested_range_value
+                )
+                if requested is None:
+                    raise HTTPException(502, "Home server returned inconsistent attachment range metadata")
+                requested_start, requested_end = requested.groups()
+                if requested_start:
+                    expected_start = int(requested_start)
+                    expected_end = (
+                        min(int(requested_end), total - 1)
+                        if requested_end
+                        else total - 1
+                    )
+                else:
+                    suffix = min(int(requested_end), total)
+                    expected_start = total - suffix
+                    expected_end = total - 1
+                if start != expected_start or end != expected_end:
+                    raise HTTPException(502, "Home server returned inconsistent attachment range metadata")
+            headers["Content-Range"] = content_range
     disposition = response.headers.get("content-disposition") or ""
     encoded_match = re.search(r"filename\*=utf-8''([^;]+)", disposition, re.IGNORECASE)
     plain_match = re.search(r'filename="?([^";]+)', disposition, re.IGNORECASE)
@@ -2380,7 +2728,8 @@ def _safe_project_download_headers(response: httpx.Response) -> dict[str, str]:
     name = name.replace('"', "_").replace("\\", "_") or "attachment"
     fallback = re.sub(r"[^A-Za-z0-9._ ()-]+", "_", name) or "attachment"
     headers["Content-Disposition"] = (
-        f'attachment; filename="{fallback}"; filename*=UTF-8\'\'{quote(name, safe="")}'
+        f'{"inline" if inline else "attachment"}; filename="{fallback}"; '
+        f"filename*=UTF-8''{quote(name, safe='')}"
     )
     return headers
 
@@ -2388,8 +2737,16 @@ def _safe_project_download_headers(response: httpx.Response) -> dict[str, str]:
 async def _proxy_home_project_download(
     remote_path: str,
     snapshot: dict[str, Any],
+    *,
+    inline: bool = False,
+    range_header: object = None,
 ) -> StreamingResponse:
     """Open a bounded, redirect-free attachment stream from the pinned hub."""
+    safe_range = (
+        _validated_project_preview_range(range_header)
+        if inline
+        else None
+    )
     target = snapshot["base_url"] + "/api/link/projects/" + remote_path
     client = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=10, read=60, write=60, pool=10),
@@ -2398,17 +2755,20 @@ async def _proxy_home_project_download(
     )
     response = None
     try:
+        upstream_headers = {
+            "Authorization": f"Bearer {snapshot['token']}",
+            # httpx transparently decodes gzip/br by default.  The proxy
+            # forwards the upstream Content-Length, so transformed bytes
+            # would otherwise be truncated or rejected by the downstream
+            # HTTP server.  Require an identity representation instead.
+            "Accept-Encoding": "identity",
+        }
+        if safe_range is not None:
+            upstream_headers["Range"] = safe_range
         upstream_request = client.build_request(
             "GET",
             target,
-            headers={
-                "Authorization": f"Bearer {snapshot['token']}",
-                # httpx transparently decodes gzip/br by default.  The proxy
-                # forwards the upstream Content-Length, so transformed bytes
-                # would otherwise be truncated or rejected by the downstream
-                # HTTP server.  Require an identity representation instead.
-                "Accept-Encoding": "identity",
-            },
+            headers=upstream_headers,
         )
         response = await client.send(upstream_request, stream=True)
         content_encoding = (response.headers.get("content-encoding") or "").strip().lower()
@@ -2416,6 +2776,26 @@ async def _proxy_home_project_download(
             raise HTTPException(
                 502,
                 "Home server returned an encoded attachment unexpectedly",
+            )
+        if inline and response.status_code == 416:
+            content_range = str(response.headers.get("content-range") or "").strip()
+            match = _PROJECT_UNSATISFIED_RANGE_RE.fullmatch(content_range)
+            if (
+                not match
+                or int(match.group(1)) < 1
+                or int(match.group(1)) > PROJECT_ATTACHMENT_MAX_BYTES
+            ):
+                raise HTTPException(502, "Home server returned invalid attachment range metadata")
+            await _read_bounded_upstream_response(response)
+            await response.aclose()
+            await client.aclose()
+            raise HTTPException(
+                416,
+                "Requested attachment range is not satisfiable",
+                headers={
+                    "Accept-Ranges": "bytes",
+                    "Content-Range": content_range,
+                },
             )
         if response.status_code >= 400:
             content = await _read_bounded_upstream_response(response)
@@ -2426,11 +2806,16 @@ async def _proxy_home_project_download(
                 content,
                 allow_not_found=True,
             )
-        if response.status_code != 200:
+        allowed_statuses = (200, 206) if inline else (200,)
+        if response.status_code not in allowed_statuses:
             await response.aclose()
             await client.aclose()
             raise HTTPException(502, f"Home server error ({response.status_code})")
-        headers = _safe_project_download_headers(response)
+        headers = _safe_project_download_headers(
+            response,
+            inline=inline,
+            range_requested=safe_range or False,
+        )
         _assert_home_project_link_current(snapshot)
     except httpx.HTTPError as exc:
         if response is not None:
@@ -2461,36 +2846,35 @@ async def _proxy_home_project_download(
 
     return StreamingResponse(
         body(),
-        status_code=200,
+        status_code=response.status_code,
         headers=headers,
         media_type=headers.get("Content-Type", "application/octet-stream"),
     )
 
 
-# Conversation-list / badge polls hit the hub at most once per TTL, per user.
+# Conversation-list / badge polls hit each hub at most once per TTL.
 _summary_cache: dict = {}
 
 
-def _reset_summary_cache(me: Optional[str] = None):
+def _reset_summary_cache(me: Optional[str] = None, contact: Optional[str] = None):
     if me is None:
         _summary_cache.clear()
     else:
-        _summary_cache.pop(_norm(me), None)
+        owner = _norm(me)
+        selected = _norm(contact)
+        for key in list(_summary_cache):
+            if key[0] == owner and (not selected or key[1] == selected):
+                _summary_cache.pop(key, None)
 
 
-async def _home_summary(me: str) -> Optional[dict]:
-    """Cached hub summary for this local user, or None when not connected /
+async def _home_summary(me: str, contact: Optional[str] = None) -> Optional[dict]:
+    """Cached hub summary for one contact, or None when not connected /
     pending / hub unreachable with nothing cached."""
-    key = _norm(me)
-    db = SessionLocal()
     try:
-        link = _load_home_link(db, key)
-        if not link:
-            return None
-        token = link.token
-        base_url = link.home_url
-    finally:
-        db.close()
+        snapshot = _chat_link_snapshot(me, contact)
+    except HTTPException:
+        return None
+    key = (_norm(me), snapshot["contact"])
     now = time.monotonic()
     entry = _summary_cache.get(key)
     if entry and now - entry["ts"] < SUMMARY_CACHE_TTL:
@@ -2500,8 +2884,8 @@ async def _home_summary(me: str) -> Optional[dict]:
         data = _clean_summary(await _hub_call(
             "GET",
             "/api/link/summary",
-            token=token,
-            base_url=base_url,
+            token=snapshot["token"],
+            base_url=snapshot["base_url"],
         ))
     except HTTPException:
         # Pending/unreachable: keep serving the last good summary (or None);
@@ -2511,53 +2895,87 @@ async def _home_summary(me: str) -> Optional[dict]:
     return data
 
 
-async def home_conversation_entry(me: str) -> Optional[dict]:
-    """An entry shaped like messaging_routes' conversation rows, or None."""
-    if not home_enabled() or not home_connected(me):
-        return None
+def _chat_contacts_for_owner(me: str) -> list[dict[str, Any]]:
+    contacts: list[dict[str, Any]] = []
     db = SessionLocal()
     try:
-        link = _require_link(db, me)
-        contact = home_contact_name(link.home_url)
+        try:
+            link = _load_home_link(db, me)
+        except HTTPException:
+            link = None
+        if link is not None:
+            contact = home_contact_name(link.home_url)
+            if contact:
+                contacts.append({
+                    "username": contact,
+                    "display": contact,
+                    "chat_only": False,
+                    "can_call": bool(_norm(link.owner) == _norm(me)),
+                })
     finally:
         db.close()
-    s = await _home_summary(me) or {}
+    contacts.extend(outbound_chat_contacts(me))
+    return contacts
+
+
+async def home_conversation_entries(me: str) -> list[dict]:
+    """Conversation rows for every connected outbound Restia."""
+    contacts = _chat_contacts_for_owner(me)
+    if not contacts:
+        return []
+    semaphore = asyncio.Semaphore(4)
+
+    async def build(meta: dict[str, Any]) -> dict:
+        async with semaphore:
+            summary = await _home_summary(me, meta["username"]) or {}
+        contact = meta["username"]
+        return {
+            "username": contact,
+            "display": meta.get("display") or contact,
+            "is_admin": False,
+            "home": True,
+            "chat_only": bool(meta.get("chat_only")),
+            "can_call": bool(meta.get("can_call")),
+            "last_body": summary.get("last_body"),
+            "last_sender": contact if not summary.get("last_mine") else None,
+            "last_at": summary.get("last_at"),
+            "last_mine": bool(summary.get("last_mine")),
+            "unread": int(summary.get("unread") or 0),
+        }
+
+    return list(await asyncio.gather(*(build(meta) for meta in contacts)))
+
+
+async def home_conversation_entry(me: str) -> Optional[dict]:
+    """Backwards-compatible first outbound conversation row."""
+    entries = await home_conversation_entries(me)
+    return entries[0] if entries else None
+
+
+async def home_unread_counts(me: str) -> dict[str, int]:
+    entries = await home_conversation_entries(me)
     return {
-        "username": contact,
-        "is_admin": False,
-        "home": True,
-        "last_body": s.get("last_body"),
-        "last_sender": contact if not s.get("last_mine") else None,
-        "last_at": s.get("last_at"),
-        "last_mine": bool(s.get("last_mine")),
-        "unread": int(s.get("unread") or 0),
+        row["username"]: int(row.get("unread") or 0)
+        for row in entries
+        if int(row.get("unread") or 0) > 0
     }
 
 
 async def home_unread(me: str) -> int:
-    if not home_enabled() or not home_connected(me):
-        return 0
-    s = await _home_summary(me) or {}
-    return int(s.get("unread") or 0)
+    return sum((await home_unread_counts(me)).values())
 
 
-async def home_get_conversation(me: str, after_id: int = 0) -> dict:
-    db = SessionLocal()
-    try:
-        link = _require_link(db, me)
-        token = link.token
-        base_url = link.home_url
-    finally:
-        db.close()
-    contact = home_contact_name(base_url)
+async def home_get_conversation(me: str, after_id: int = 0,
+                                contact: Optional[str] = None) -> dict:
+    snapshot = _chat_link_snapshot(me, contact)
     data = await _hub_call(
         "GET",
         "/api/link/messages",
-        token=token,
+        token=snapshot["token"],
         params={"after_id": int(after_id)},
-        base_url=base_url,
+        base_url=snapshot["base_url"],
     )
-    _reset_summary_cache(me)  # fetch marked hub-side messages read
+    _reset_summary_cache(me, snapshot["contact"])  # fetch marked hub-side messages read
     raw = data.get("messages")
     messages = []
     if isinstance(raw, list):
@@ -2567,19 +2985,21 @@ async def home_get_conversation(me: str, after_id: int = 0) -> dict:
                 messages.append(clean)
     return {
         "messages": messages,
-        "other": {"username": contact, "is_admin": False, "home": True},
+        "other": {
+            "username": snapshot["contact"],
+            "display": snapshot["display"],
+            "is_admin": False,
+            "home": True,
+            "chat_only": snapshot["chat_only"],
+            "can_call": snapshot["can_call"],
+        },
         "me": me,
     }
 
 
-async def home_send_message(me: str, body: str, prepared=None) -> dict:
-    db = SessionLocal()
-    try:
-        link = _require_link(db, me)
-        token = link.token
-        base_url = link.home_url
-    finally:
-        db.close()
+async def home_send_message(me: str, body: str, prepared=None,
+                            contact: Optional[str] = None) -> dict:
+    snapshot = _chat_link_snapshot(me, contact)
     attachments = []
     for item in list(prepared or [])[:MAX_PHOTOS_PER_MESSAGE]:
         if int(item.get("size") or 0) > MAX_FEDERATED_PHOTO_BYTES:
@@ -2594,33 +3014,28 @@ async def home_send_message(me: str, body: str, prepared=None) -> dict:
     data = await _hub_call(
         "POST",
         "/api/link/messages",
-        token=token,
+        token=snapshot["token"],
         json_body={"body": body, "attachments": attachments},
-        base_url=base_url,
+        base_url=snapshot["base_url"],
     )
-    _reset_summary_cache(me)
+    _reset_summary_cache(me, snapshot["contact"])
     msg = _clean_message(data.get("message"))
     if not msg:
         raise HTTPException(502, "Home server returned malformed data")
     return {"message": msg}
 
 
-async def home_get_media(me: str, attachment_id: str) -> dict:
+async def home_get_media(me: str, attachment_id: str,
+                         contact: Optional[str] = None) -> dict:
     if not PHOTO_ID_RE.fullmatch(str(attachment_id or "")):
         raise HTTPException(404, "Photo not found")
-    db = SessionLocal()
-    try:
-        link = _require_link(db, me)
-        token = link.token
-        base_url = link.home_url
-    finally:
-        db.close()
+    snapshot = _chat_link_snapshot(me, contact)
     data = await _hub_call(
         "GET",
         "/api/link/messages",
-        token=token,
+        token=snapshot["token"],
         params={"media_id": attachment_id},
-        base_url=base_url,
+        base_url=snapshot["base_url"],
         max_response_bytes=MAX_HUB_MEDIA_RESPONSE_BYTES,
     )
     meta = _clean_attachment_meta(data)
@@ -3080,6 +3495,162 @@ async def _persist_new_home_link(*, token: str, base_url: str, handle: str,
     raise error
 
 
+def _ensure_outbound_chat_origin_available(base_url: str) -> None:
+    db = SessionLocal()
+    try:
+        peer_exists = db.query(OutboundChatLink.id).filter(
+            OutboundChatLink.home_url == base_url
+        ).first() is not None
+        primary_exists = db.query(HomeLink.id).filter(
+            HomeLink.home_url == base_url
+        ).first() is not None
+        if peer_exists or primary_exists:
+            raise HTTPException(409, "This Restia installation is already connected")
+    finally:
+        db.close()
+
+
+def _ensure_no_outbound_chat_for_primary(base_url: str) -> None:
+    db = SessionLocal()
+    try:
+        if db.query(OutboundChatLink.id).filter(
+            OutboundChatLink.home_url == base_url
+        ).first() is not None:
+            raise HTTPException(
+                409,
+                "Disconnect the existing Messages-only link to this Restia before making it the primary Home Link",
+            )
+    finally:
+        db.close()
+
+
+def _acquire_chat_owner_identity(request: Request, owner: str):
+    """Serialize final chat-link persistence with profile identity changes.
+
+    A remote register/redeem call can outlive the profile that started it. The
+    auth configuration lock closes that race: deletion either observes the
+    committed link and stops, or reserves/retires the identity first and this
+    write fails so its newly issued remote credential is revoked.
+    """
+    manager = getattr(getattr(request, "app", None), "state", None)
+    manager = getattr(manager, "auth_manager", None)
+    lock = getattr(manager, "_config_lock", None)
+    if lock is not None:
+        lock.acquire()
+    try:
+        key = _norm(owner)
+        active = set(getattr(manager, "_identity_migrations", set()) or set())
+        if key in {_norm(value) for value in active}:
+            raise HTTPException(409, "Profile identity changed; retry")
+        auth_enabled = os.getenv("AUTH_ENABLED", "true").lower() != "false"
+        configured = bool(getattr(manager, "is_configured", False))
+        users = getattr(manager, "users", {}) or {}
+        known = {_norm(value) for value in users.keys()}
+        if auth_enabled and configured and key not in known:
+            raise HTTPException(409, "Profile identity changed; retry")
+        return lock
+    except BaseException:
+        if lock is not None:
+            lock.release()
+        raise
+
+
+async def _persist_new_outbound_chat_link(*, token: str, base_url: str,
+                                          handle: str, owner: str,
+                                          request: Request) -> OutboundChatLink:
+    """Persist one additive chat credential or revoke the remote orphan."""
+    link_id = str(uuid.uuid4())
+    error: Optional[BaseException] = None
+    identity_lock = None
+    db = SessionLocal()
+    try:
+        identity_lock = _acquire_chat_owner_identity(request, owner)
+        if db.query(OutboundChatLink.id).filter(
+            OutboundChatLink.home_url == base_url
+        ).first() is not None:
+            raise HTTPException(409, "This Restia installation is already connected")
+        db.add(OutboundChatLink(
+            id=link_id,
+            home_url=base_url,
+            handle=handle,
+            owner=_norm(owner),
+            token=token,
+            created_at=utcnow_naive(),
+        ))
+        db.commit()
+        row = db.query(OutboundChatLink).filter(OutboundChatLink.id == link_id).one()
+        db.expunge(row)
+        return row
+    except BaseException as exc:
+        error = exc
+        db.rollback()
+    finally:
+        db.close()
+        if identity_lock is not None:
+            identity_lock.release()
+
+    cleanup_task = asyncio.create_task(_request_remote_revoke(token, base_url))
+    try:
+        await asyncio.shield(cleanup_task)
+    except asyncio.CancelledError:
+        try:
+            await cleanup_task
+        except BaseException as cleanup_exc:
+            raise HTTPException(
+                502,
+                "Restia connection changed locally and the new remote credential could not be revoked",
+            ) from cleanup_exc
+    except BaseException as cleanup_exc:
+        raise HTTPException(
+            502,
+            "Restia connection changed locally and the new remote credential could not be revoked",
+        ) from cleanup_exc
+    assert error is not None
+    raise error
+
+
+async def _disconnect_outbound_chat(contact: str, owner: str, *, force: bool) -> bool:
+    db = SessionLocal()
+    try:
+        link = _require_outbound_chat_link(db, contact, owner)
+        snapshot = {
+            "id": str(link.id),
+            "home_url": str(link.home_url),
+            "token": str(link.token),
+            "token_hash": _hash_token(str(link.token)),
+        }
+    finally:
+        db.close()
+    try:
+        await _request_remote_revoke(snapshot["token"], snapshot["home_url"])
+    except HTTPException:
+        if not force:
+            raise HTTPException(409, REVOKE_REQUIRED)
+        logger.warning("Forcing one local chat-link removal after revoke failure")
+
+    db = SessionLocal()
+    try:
+        current = db.query(OutboundChatLink).filter(
+            OutboundChatLink.id == snapshot["id"],
+            OutboundChatLink.owner == _norm(owner),
+        ).first()
+        if current is None:
+            return False
+        if (
+            str(current.home_url) != snapshot["home_url"]
+            or not secrets.compare_digest(
+                _hash_token(str(current.token)), snapshot["token_hash"]
+            )
+        ):
+            raise HTTPException(409, "Restia connection changed; retry")
+        db.delete(current)
+        db.commit()
+    finally:
+        db.close()
+    _reset_summary_cache(owner, contact)
+    return True
+
+
 def setup_home_link_routes():
     router = APIRouter(prefix="/api/homelink", tags=["homelink"])
 
@@ -3097,24 +3668,145 @@ def setup_home_link_routes():
                 "connected": link is not None,
                 "handle": link.handle if link else None,
                 "owner": link.owner if link else None,
+                "invite_origin": invitation_origin(request),
+                "chat_contacts": outbound_chat_contacts(me),
             }
         finally:
             db.close()
 
-    @router.post("/connect")
+    @router.post("/chat/connect")
     @_serialized_home_link_lifecycle
-    async def connect(body: ConnectRequest, request: Request):
-        """Register this account with the home server under a handle. The
-        registration starts pending until the hub owner approves it."""
+    async def connect_chat(body: ConnectRequest, request: Request):
+        """Request approval from another Restia without replacing other chats."""
         me = _require_local_profile(request)
         require_admin(request)
-        if not home_enabled():
-            raise HTTPException(404, "Home Link is disabled on this instance")
         handle = _norm(body.handle)
         if not HANDLE_RE.match(handle):
             raise HTTPException(
                 400, "Handle must be 1-32 chars: lowercase letters, digits, . _ -")
-        selected_home = _validated_home_base(home_server())
+        selected_home = _requested_home_base(body.home_url)
+        _ensure_outbound_chat_origin_available(selected_home)
+        data = await _hub_call(
+            "POST",
+            "/api/link/register",
+            json_body={"handle": handle, "scope": "chat"},
+            base_url=selected_home,
+        )
+        token = data.get("token")
+        if not isinstance(token, str) or not (20 <= len(token) <= 128):
+            if isinstance(token, str) and token:
+                try:
+                    await asyncio.shield(_request_remote_revoke(token, selected_home))
+                except BaseException:
+                    logger.exception("Malformed chat-link credential could not be revoked")
+            raise HTTPException(502, "Restia returned malformed connection data")
+        linked_handle = _norm(data.get("handle")) if isinstance(data.get("handle"), str) else handle
+        if not HANDLE_RE.match(linked_handle):
+            linked_handle = handle
+        link = await _persist_new_outbound_chat_link(
+            token=token,
+            base_url=selected_home,
+            handle=linked_handle,
+            owner=me,
+            request=request,
+        )
+        _reset_summary_cache(me)
+        return {
+            "ok": True,
+            "handle": linked_handle,
+            "status": data.get("status") or GUEST_PENDING,
+            "contact": outbound_chat_contact(link),
+            "display": home_contact_name(selected_home),
+            "chat_only": True,
+        }
+
+    @router.post("/chat/redeem")
+    @_serialized_home_link_lifecycle
+    async def redeem_chat(body: RedeemHomeRequest, request: Request):
+        """Accept one chat invitation additively, preserving every other peer."""
+        me = _require_local_profile(request)
+        require_admin(request)
+        handle = _norm(body.handle)
+        if not HANDLE_RE.match(handle):
+            raise HTTPException(
+                400, "Handle must be 1-32 chars: lowercase letters, digits, . _ -")
+        code = str(body.code or "").strip()
+        if not code:
+            raise HTTPException(400, "Invite code is required")
+        selected_home = _requested_home_base(body.home_url)
+        _ensure_outbound_chat_origin_available(selected_home)
+        data = await _hub_call(
+            "POST",
+            "/api/link/redeem",
+            json_body={"handle": handle, "code": code, "scope": "chat"},
+            base_url=selected_home,
+        )
+        token = data.get("token")
+        if not isinstance(token, str) or not (20 <= len(token) <= 128):
+            if isinstance(token, str) and token:
+                try:
+                    await asyncio.shield(_request_remote_revoke(token, selected_home))
+                except BaseException:
+                    logger.exception("Malformed chat-link credential could not be revoked")
+            raise HTTPException(502, "Restia returned malformed connection data")
+        if data.get("scope") != "chat":
+            try:
+                await asyncio.shield(_request_remote_revoke(token, selected_home))
+            except BaseException as cleanup_exc:
+                raise HTTPException(
+                    502,
+                    "Restia returned the wrong invitation scope and the credential could not be revoked",
+                ) from cleanup_exc
+            raise HTTPException(400, "This invitation is not for Messages")
+        linked_handle = _norm(data.get("handle")) if isinstance(data.get("handle"), str) else handle
+        if not HANDLE_RE.match(linked_handle):
+            linked_handle = handle
+        link = await _persist_new_outbound_chat_link(
+            token=token,
+            base_url=selected_home,
+            handle=linked_handle,
+            owner=me,
+            request=request,
+        )
+        _reset_summary_cache(me)
+        return {
+            "ok": True,
+            "handle": linked_handle,
+            "status": data.get("status") or GUEST_APPROVED,
+            "contact": outbound_chat_contact(link),
+            "display": home_contact_name(selected_home),
+            "chat_only": True,
+        }
+
+    @router.post("/chat/{contact_id}/disconnect")
+    @_serialized_home_link_lifecycle
+    async def disconnect_chat(contact_id: str, request: Request,
+                              body: Optional[DisconnectHomeRequest] = None):
+        me = _require_local_profile(request)
+        require_admin(request)
+        contact = outbound_chat_contact(contact_id)
+        if not contact:
+            raise HTTPException(404, "User not found")
+        removed = await _disconnect_outbound_chat(
+            contact,
+            me,
+            force=bool(body and body.force_local),
+        )
+        return {"ok": True, "removed": removed, "contact": contact}
+
+    @router.post("/connect")
+    @_serialized_home_link_lifecycle
+    async def connect(body: ConnectRequest, request: Request):
+        """Register this installation with another Restia under a handle. The
+        registration starts pending until the hub owner approves it."""
+        me = _require_local_profile(request)
+        require_admin(request)
+        handle = _norm(body.handle)
+        if not HANDLE_RE.match(handle):
+            raise HTTPException(
+                400, "Handle must be 1-32 chars: lowercase letters, digits, . _ -")
+        selected_home = _requested_home_base(body.home_url)
+        _ensure_no_outbound_chat_for_primary(selected_home)
         await _revoke_stored_home_link(me, force=bool(body.force_replace))
         data = await _hub_call(
             "POST",
@@ -3149,13 +3841,14 @@ def setup_home_link_routes():
     @router.post("/redeem")
     @_serialized_home_link_lifecycle
     async def redeem_home(body: RedeemHomeRequest, request: Request):
-        """Join a hub with an invite code. Unlike /connect (register then wait
-        for the owner to approve), a redeemed code is approved on the spot, so
-        the conversation is usable immediately."""
+        """Accept an invitation from another Restia.
+
+        Unlike /connect (register then wait for the owner to approve), a
+        redeemed code is approved on the spot, so the conversation is usable
+        immediately.
+        """
         me = _require_local_profile(request)
         require_admin(request)
-        if not home_enabled():
-            raise HTTPException(404, "Home Link is disabled on this instance")
         handle = _norm(body.handle)
         if not HANDLE_RE.match(handle):
             raise HTTPException(
@@ -3163,12 +3856,13 @@ def setup_home_link_routes():
         code = (body.code or "").strip()
         if not code:
             raise HTTPException(400, "Invite code is required")
-        selected_home = _validated_home_base(home_server())
+        selected_home = _requested_home_base(body.home_url)
+        _ensure_no_outbound_chat_for_primary(selected_home)
         await _revoke_stored_home_link(me, force=bool(body.force_replace))
         data = await _hub_call(
             "POST",
             "/api/link/redeem",
-            json_body={"handle": handle, "code": code},
+            json_body={"handle": handle, "code": code, "scope": "project"},
             base_url=selected_home,
         )
         token = data.get("token")
@@ -3181,6 +3875,18 @@ def setup_home_link_routes():
                 except BaseException:
                     logger.exception("Malformed Home Link credential could not be revoked")
             raise HTTPException(502, "Home server returned malformed data")
+        if data.get("scope") != "project":
+            try:
+                await asyncio.shield(_request_remote_revoke(token, selected_home))
+            except BaseException as cleanup_exc:
+                raise HTTPException(
+                    502,
+                    "Restia returned the wrong invitation scope and the credential could not be revoked",
+                ) from cleanup_exc
+            raise HTTPException(
+                400,
+                "This invitation is for Messages; accept it from New message instead",
+            )
         linked_handle = _norm(data.get("handle")) if isinstance(data.get("handle"), str) else handle
         if not HANDLE_RE.match(linked_handle):
             linked_handle = handle
@@ -3380,6 +4086,13 @@ def setup_home_link_routes():
                 )
             if kind == "download":
                 return await _proxy_home_project_download(normalized_path, snapshot)
+            if kind == "preview":
+                return await _proxy_home_project_download(
+                    normalized_path,
+                    snapshot,
+                    inline=True,
+                    range_header=request.headers.get("range"),
+                )
             remote_api_path = "/api/link/projects"
             if normalized_path:
                 remote_api_path += "/" + normalized_path
@@ -3390,17 +4103,37 @@ def setup_home_link_routes():
                 json_body=body,
                 params=params or None,
                 base_url=snapshot["base_url"],
-                max_response_bytes=MAX_PROJECT_PROXY_JSON_RESPONSE_BYTES,
+                max_response_bytes=(
+                    OFFICE_PREVIEW_MAX_RESPONSE_BYTES
+                    if kind == "office_preview"
+                    else MAX_PROJECT_PROXY_JSON_RESPONSE_BYTES
+                ),
                 allow_not_found=True,
                 # Once sent, transport/read/size/shape failures are completion-
                 # ambiguous. The hub may have committed before its response was
                 # lost, so these failures must never invite a blind retry.
                 indeterminate_mutation=is_mutation,
             )
+            if kind == "office_preview":
+                try:
+                    data = sanitize_office_preview_payload(data)
+                except OfficePreviewError as exc:
+                    raise HTTPException(
+                        502, "Home server returned an invalid Office preview"
+                    ) from exc
             # A disconnect/reconnect in another process while the request was
             # in flight must not let an old bearer response repopulate the new
             # link's UI.
             _assert_home_project_link_current(snapshot, mutation=is_mutation)
+            if kind == "office_preview":
+                return JSONResponse(
+                    content=data,
+                    headers={
+                        "Cache-Control": "private, no-store",
+                        "Pragma": "no-cache",
+                        "X-Content-Type-Options": "nosniff",
+                    },
+                )
             return data
 
         try:

@@ -381,8 +381,12 @@ function _syncControls(live = _liveState()) {
   if (rename) rename.disabled = _busy || _closing || !_activeSessionId;
   const reviewActions = _elements['study-review-actions'];
   if (reviewActions?.querySelectorAll) {
+    const review = _review(live.review);
+    const dueSeconds = _reviewDueSeconds(review);
+    const reviewIsDue = !review.count || review.due || (dueSeconds != null && dueSeconds <= 0);
     reviewActions.querySelectorAll('[data-study-result]').forEach(button => {
-      button.disabled = _busy || _closing || !_activeSessionId || !hasLearningGoal;
+      button.disabled = _busy || _closing || !_activeSessionId || !hasLearningGoal || !reviewIsDue;
+      button.title = reviewIsDue ? '' : _reviewDueText(review);
     });
   }
   const quickActions = _elements['study-quick-actions'];

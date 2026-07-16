@@ -26,6 +26,7 @@ import { state } from './emailLibrary/state.js';
 import { collapseSidebarToRail } from './modalSnap.js';
 import { emailApiUrl } from './emailShared.js';
 import { bindMenuDismiss, dismissOrRemove } from './escMenuStack.js';
+import { closeSidebar, SIDEBAR_STATES } from './sidebar-layout.js';
 
 const API_BASE = window.location.origin;
 const EMAIL_LIST_PAGE_SIZE = 40;
@@ -1162,10 +1163,7 @@ export function openEmailLibrary(opts = {}) {
   // On mobile the sidebar overlays content — close it so the email view isn't
   // opened behind it (same pattern as session-switch/delete).
   if (window.innerWidth <= 768) {
-    const _sb = document.getElementById('sidebar');
-    if (_sb) _sb.classList.add('hidden');
-    const _bd = document.getElementById('sidebar-backdrop');
-    if (_bd) _bd.classList.remove('visible');
+    closeSidebar({ state: SIDEBAR_STATES.OFF, persist: false });
     // Email was opened last → bring the email windows IN FRONT of any open doc
     // (they alternate: whichever was opened last wins). The doc stays open
     // behind it; reopening the doc flips it back on top.

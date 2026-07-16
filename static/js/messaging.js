@@ -621,7 +621,7 @@ function _renderConversationList() {
         ${_avatarHtml(c.username, 'msg-avatar-lg')}
         <div class="msg-convo-mid">
           <div class="msg-convo-top">
-            <span class="msg-convo-name">${esc(c.display || c.username)}${c.home ? ' <span class="msg-admin-tag msg-dev-tag">dev</span>' : (c.is_admin ? ' <span class="msg-admin-tag">admin</span>' : '')}</span>
+            <span class="msg-convo-name">${esc(c.display || c.username)}${c.home ? ' <span class="msg-admin-tag msg-instance-tag">instance</span>' : (c.is_admin ? ' <span class="msg-admin-tag">admin</span>' : '')}</span>
             <span class="msg-convo-time">${esc(_fmtTime(c.last_at))}</span>
           </div>
           <div class="msg-convo-preview">${previewHtml}</div>
@@ -706,19 +706,22 @@ export async function openConversation(other) {
 function _renderThreadHeader(other, meta) {
   const host = document.getElementById('msg-thread-header');
   if (!host) return;
+  const cachedDisplay = _conversations.find(item => item.username === other)?.display;
+  const display = (meta && meta.display) || cachedDisplay || other;
   const identityTag = !meta ? ''
-    : meta.home ? ' <span class="msg-admin-tag msg-dev-tag">dev</span>'
-    : meta.remote ? ' <span class="msg-admin-tag">user</span>'
+    : meta.home ? ' <span class="msg-admin-tag msg-instance-tag">instance</span>'
+    : meta.remote ? ' <span class="msg-admin-tag msg-instance-tag">instance</span>'
     : ` <span class="msg-admin-tag">${meta.is_admin ? 'profile · admin' : 'profile'}</span>`;
   host.innerHTML = `
     <button type="button" class="msg-back-btn" id="msg-back-btn" title="Back" aria-label="Back to conversations">
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
     </button>
-    ${_avatarHtml((meta && meta.display) || other, '')}
+    ${_avatarHtml(display, '')}
     <div class="msg-thread-who">
-      <span class="msg-thread-name">${esc((meta && meta.display) || other)}${identityTag}</span>
+      <span class="msg-thread-name">${esc(display)}${identityTag}</span>
     </div>
     ${_callBtnsHtml(meta)}
+    ${_disconnectRestiaBtnHtml(meta)}
     ${_lockBtnHtml(meta)}`;
   const back = document.getElementById('msg-back-btn');
   if (back) back.addEventListener('click', _closeThread);
@@ -726,6 +729,49 @@ function _renderThreadHeader(other, meta) {
   if (lb) lb.addEventListener('click', () => { _e2eeEnsure(); });
   document.getElementById('msg-call-voice')?.addEventListener('click', () => _startCallSafe(other, false));
   document.getElementById('msg-call-video')?.addEventListener('click', () => _startCallSafe(other, true));
+  document.getElementById('msg-disconnect-restia')?.addEventListener('click', _disconnectActiveRestia);
+}
+
+function _disconnectRestiaBtnHtml(meta) {
+  if (!meta?.chat_only) return '';
+  return `
+    <button type="button" class="msg-call-btn" id="msg-disconnect-restia" title="Disconnect this Restia" aria-label="Disconnect this Restia">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 15 6-6"/><path d="m7.5 7.5-2-2a4 4 0 0 0-5.7 5.7l3 3a4 4 0 0 0 5.7 0"/><path d="m16.5 16.5 2 2a4 4 0 0 0 5.7-5.7l-3-3a4 4 0 0 0-5.7 0"/></svg>
+    </button>`;
+}
+
+async function _disconnectActiveRestia() {
+  const contact = String(_activeOther || '');
+  const prefix = 'restia:';
+  if (!contact.startsWith(prefix)) return;
+  const accepted = await uiModule.styledConfirm(
+    `Disconnect ${( _activeOtherMeta && _activeOtherMeta.display) || 'this Restia'}? Its local profiles and data remain private, but this conversation will be removed from your installation.`,
+    { confirmText: 'Disconnect', danger: true },
+  );
+  if (!accepted) return;
+  const contactId = contact.slice(prefix.length);
+  const disconnect = (forceLocal) => _api(`/api/homelink/chat/${encodeURIComponent(contactId)}/disconnect`, {
+    method: 'POST',
+    body: JSON.stringify({ force_local: forceLocal }),
+  });
+  try {
+    try {
+      await disconnect(false);
+    } catch (e) {
+      if (e.message !== 'home_revoke_required') throw e;
+      const force = await uiModule.styledConfirm(
+        'The other Restia could not be reached to revoke this credential. Remove only the local connection anyway?',
+        { confirmText: 'Remove locally', danger: true },
+      );
+      if (!force) return;
+      await disconnect(true);
+    }
+    _closeThread();
+    await _loadConversations();
+    uiModule.showToast && uiModule.showToast('Restia disconnected');
+  } catch (e) {
+    uiModule.showError && uiModule.showError(`Could not disconnect Restia: ${e.message}`);
+  }
 }
 
 function _startCallSafe(other, video) {
@@ -1252,18 +1298,19 @@ function _renderConnectCard(other, errText) {
   if (!body) return;
   body.innerHTML = `
     <div class="msg-connect-card">
-      <div class="msg-connect-icon">🔗</div>
+      <div class="msg-connect-icon" aria-hidden="true">${_restiaActionIcon('connect')}</div>
       <h4>Connect to ${esc(other)}</h4>
       <p>Pick a handle to register this instance with <strong>${esc(other)}</strong>.
-         Have an <strong>invite code</strong>? Enter it and you're approved
-         instantly — otherwise your request waits for the owner to accept it.</p>
+         Have a <strong>project-pairing code</strong>? Enter it to create the
+         full Home Link; without one, your request waits for the owner. Messages-only
+         invitations belong in New message.</p>
       <div class="msg-connect-row">
         <input type="text" id="msg-connect-handle" maxlength="32" autocomplete="off"
                placeholder="your-handle" aria-label="Handle" />
       </div>
       <div class="msg-connect-row">
         <input type="text" id="msg-connect-code" maxlength="64" autocomplete="off"
-               placeholder="invite code (optional)" aria-label="Invite code" />
+               placeholder="project-pairing code (optional)" aria-label="Project-pairing code" />
         <button type="button" id="msg-connect-btn">Connect</button>
       </div>
       <div class="msg-connect-err" id="msg-connect-err">${errText ? esc(errText) : ''}</div>
@@ -1319,13 +1366,17 @@ function _renderConnectCard(other, errText) {
 function _renderPendingCard(other) {
   const body = document.getElementById('msg-thread-body');
   if (!body) return;
+  const canCancel = String(other || '').startsWith('restia:');
+  const display = _conversations.find(item => item.username === other)?.display || other;
   body.innerHTML = `
     <div class="msg-connect-card">
-      <div class="msg-connect-icon">⏳</div>
+      <div class="msg-connect-icon" aria-hidden="true"><svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></div>
       <h4>Waiting for approval</h4>
-      <p>Your request to chat with <strong>${esc(other)}</strong> has been sent.
-         The conversation will open automatically once the developer accepts.</p>
+      <p>Your request to chat with <strong>${esc(display)}</strong> has been sent.
+         The conversation will open automatically once the other Restia owner accepts.</p>
+      ${canCancel ? '<button type="button" class="msg-restia-secondary" id="msg-cancel-restia-request">Cancel request</button>' : ''}
     </div>`;
+  document.getElementById('msg-cancel-restia-request')?.addEventListener('click', _disconnectActiveRestia);
   _stopPendingCheck();
   _pendingCheckTimer = setInterval(async () => {
     if (!_open || _activeOther !== other) { _stopPendingCheck(); return; }
@@ -1459,30 +1510,223 @@ async function _submitEdit(body) {
 
 // ── New-conversation picker ─────────────────────────────────────────────────
 
+const RESTIA_INVITE_PREFIX = 'restia-invite:v1?';
+
+function _parseRestiaInvitation(value) {
+  const raw = String(value || '').trim();
+  if (!raw.startsWith(RESTIA_INVITE_PREFIX)) {
+    throw new Error('This is not a valid Restia invitation.');
+  }
+  const params = new URLSearchParams(raw.slice(RESTIA_INVITE_PREFIX.length));
+  const scope = String(params.get('scope') || 'chat').trim();
+  const hub = String(params.get('hub') || '').trim();
+  const code = String(params.get('code') || '').trim();
+  if (scope !== 'chat' || !hub || !code || code.length > 128) {
+    throw new Error('This Restia invitation is incomplete.');
+  }
+  let parsed;
+  try { parsed = new URL(hub); } catch (_) {
+    throw new Error('The Restia address in this invitation is invalid.');
+  }
+  const loopbackHttp = parsed.protocol === 'http:' && (
+    parsed.hostname === 'localhost' || parsed.hostname === '::1' || parsed.hostname === '[::1]' ||
+    /^127(?:\.\d{1,3}){3}$/.test(parsed.hostname)
+  );
+  if ((parsed.protocol !== 'https:' && !loopbackHttp) || parsed.username || parsed.password || parsed.pathname !== '/' || parsed.search || parsed.hash) {
+    throw new Error('The Restia address in this invitation is invalid.');
+  }
+  return { homeUrl: parsed.origin, code };
+}
+
+function _setNewChatHeader(title, { back = false } = {}) {
+  const titleEl = document.getElementById('msg-newchat-title');
+  const backBtn = document.getElementById('msg-newchat-back');
+  if (titleEl) titleEl.textContent = title;
+  if (backBtn) backBtn.classList.toggle('hidden', !back);
+}
+
+function _restiaActionIcon(kind) {
+  if (kind === 'invite') {
+    return '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 8a5 5 0 1 0-6 4.9"/><path d="M2 21a7 7 0 0 1 10.5-6.1"/><path d="M19 13v6"/><path d="M16 16h6"/></svg>';
+  }
+  return '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/></svg>';
+}
+
+async function _connectRestiaRequest(path, payload) {
+  const send = (forceReplace) => _api(path, {
+    method: 'POST',
+    body: JSON.stringify({ ...payload, force_replace: forceReplace }),
+  });
+  try {
+    return await send(false);
+  } catch (e) {
+    if (e.message !== 'home_revoke_required') throw e;
+    const force = await uiModule.styledConfirm(
+      'The previous Restia connection could not be reached to revoke its credential. Replace it locally anyway? The old installation may retain that identity and its data.',
+      { confirmText: 'Force replace', danger: true },
+    );
+    if (!force) throw new Error('The previous Restia connection was kept for safety.');
+    return send(true);
+  }
+}
+
+function _showConnectRestiaForm() {
+  const list = document.getElementById('msg-newchat-list');
+  if (!list) return;
+  _setNewChatHeader('Connect another Restia', { back: true });
+  list.innerHTML = `
+    <form class="msg-restia-form" id="msg-restia-connect-form">
+      <p class="msg-restia-intro">Paste an invitation you received, or enter another Restia's address to request access.</p>
+      <label for="msg-restia-invitation">Restia invitation</label>
+      <textarea id="msg-restia-invitation" rows="3" spellcheck="false" autocomplete="off" placeholder="restia-invite:v1?…"></textarea>
+      <div class="msg-restia-divider"><span>or enter connection details</span></div>
+      <label for="msg-restia-url">Restia address</label>
+      <input id="msg-restia-url" type="url" inputmode="url" autocomplete="url" placeholder="https://restia.example.com" />
+      <label for="msg-restia-code">Invite code <span>(optional)</span></label>
+      <input id="msg-restia-code" type="text" maxlength="128" spellcheck="false" autocomplete="off" placeholder="Leave empty to request approval" />
+      <label for="msg-restia-handle">Your Restia handle</label>
+      <input id="msg-restia-handle" type="text" maxlength="32" pattern="[a-z0-9][a-z0-9._-]{0,31}" spellcheck="false" autocomplete="off" placeholder="my-restia" required />
+      <p class="msg-restia-help">This handle identifies your installation. Local profile names stay private.</p>
+      <div class="msg-restia-error" id="msg-restia-connect-error" role="alert" aria-live="polite"></div>
+      <button type="submit" class="msg-restia-primary" id="msg-restia-connect-submit">Connect</button>
+    </form>`;
+
+  const form = document.getElementById('msg-restia-connect-form');
+  const invitationInput = document.getElementById('msg-restia-invitation');
+  const homeInput = document.getElementById('msg-restia-url');
+  const codeInput = document.getElementById('msg-restia-code');
+  const handleInput = document.getElementById('msg-restia-handle');
+  const submit = document.getElementById('msg-restia-connect-submit');
+  const error = document.getElementById('msg-restia-connect-error');
+
+  invitationInput?.addEventListener('input', () => {
+    if (submit) submit.textContent = invitationInput.value.trim() ? 'Accept invitation' : 'Connect';
+  });
+  form?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (error) error.textContent = '';
+    const handle = String(handleInput?.value || '').trim().toLowerCase();
+    let homeUrl = String(homeInput?.value || '').trim();
+    let code = String(codeInput?.value || '').trim();
+    const invitation = String(invitationInput?.value || '').trim();
+    try {
+      if (invitation) {
+        const parsed = _parseRestiaInvitation(invitation);
+        homeUrl = parsed.homeUrl;
+        code = parsed.code;
+      }
+      if (!homeUrl) throw new Error('Enter the other Restia address or paste an invitation.');
+      if (!handle) throw new Error('Choose a handle for this Restia installation.');
+      if (submit) { submit.disabled = true; submit.textContent = code ? 'Accepting…' : 'Sending request…'; }
+      const path = code ? '/api/homelink/chat/redeem' : '/api/homelink/chat/connect';
+      const data = await _connectRestiaRequest(path, { handle, code, home_url: homeUrl });
+      document.getElementById('msg-newchat-overlay')?.classList.add('hidden');
+      await _loadConversations();
+      if (callModule.refreshConfig) await callModule.refreshConfig();
+      if (data.contact) await openConversation(data.contact);
+    } catch (e) {
+      if (error) error.textContent = e.message;
+      if (submit) { submit.disabled = false; submit.textContent = invitation ? 'Accept invitation' : 'Connect'; }
+    }
+  });
+  setTimeout(() => invitationInput?.focus(), 50);
+}
+
+function _showCreateRestiaInviteForm(defaultOrigin = '') {
+  const list = document.getElementById('msg-newchat-list');
+  if (!list) return;
+  _setNewChatHeader('Invite another Restia', { back: true });
+  list.innerHTML = `
+    <form class="msg-restia-form" id="msg-restia-invite-form">
+      <p class="msg-restia-intro">Create a private, single-use invitation. The other person pastes it into Messages on their Restia.</p>
+      <label for="msg-restia-share-url">This Restia's reachable address</label>
+      <input id="msg-restia-share-url" type="url" inputmode="url" autocomplete="url" value="${esc(defaultOrigin)}" placeholder="https://restia.example.com" required />
+      <p class="msg-restia-help">Use the HTTPS address that the other installation can reach. Loopback works only for local testing.</p>
+      <label for="msg-restia-invite-label">Private label <span>(optional)</span></label>
+      <input id="msg-restia-invite-label" type="text" maxlength="100" autocomplete="off" placeholder="For Sam's Restia" />
+      <div class="msg-restia-error" id="msg-restia-invite-error" role="alert" aria-live="polite"></div>
+      <button type="submit" class="msg-restia-primary" id="msg-restia-invite-submit">Create invitation</button>
+    </form>`;
+
+  const form = document.getElementById('msg-restia-invite-form');
+  const submit = document.getElementById('msg-restia-invite-submit');
+  const error = document.getElementById('msg-restia-invite-error');
+  form?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (error) error.textContent = '';
+    const hubUrl = String(document.getElementById('msg-restia-share-url')?.value || '').trim();
+    const label = String(document.getElementById('msg-restia-invite-label')?.value || '').trim();
+    try {
+      if (!hubUrl) throw new Error('Enter a reachable address for this Restia.');
+      if (submit) { submit.disabled = true; submit.textContent = 'Creating…'; }
+      const data = await _api('/api/link/admin/invites', {
+        method: 'POST',
+        body: JSON.stringify({ hub_url: hubUrl, label, max_uses: 1, expires_in_days: 7 }),
+      });
+      if (!data.invitation) throw new Error('Restia could not build a shareable invitation.');
+      list.innerHTML = `
+        <div class="msg-restia-form msg-restia-result">
+          <div class="msg-restia-success" aria-live="polite">Invitation ready</div>
+          <p class="msg-restia-intro">Share this only with the person you want to connect. It expires in seven days and works once.</p>
+          <label for="msg-restia-invite-result">Restia invitation</label>
+          <textarea id="msg-restia-invite-result" rows="5" spellcheck="false" readonly>${esc(data.invitation)}</textarea>
+          <button type="button" class="msg-restia-primary" id="msg-restia-copy-invite">Copy invitation</button>
+          <button type="button" class="msg-restia-secondary" id="msg-restia-invite-done">Done</button>
+        </div>`;
+      document.getElementById('msg-restia-copy-invite')?.addEventListener('click', async () => {
+        await uiModule.copyToClipboard(data.invitation);
+        uiModule.showToast && uiModule.showToast('Restia invitation copied');
+      });
+      document.getElementById('msg-restia-invite-done')?.addEventListener('click', () => {
+        document.getElementById('msg-newchat-overlay')?.classList.add('hidden');
+      });
+      document.getElementById('msg-restia-copy-invite')?.focus();
+    } catch (e) {
+      if (error) error.textContent = e.message;
+      if (submit) { submit.disabled = false; submit.textContent = 'Create invitation'; }
+    }
+  });
+  setTimeout(() => document.getElementById('msg-restia-share-url')?.focus(), 50);
+}
+
 async function _openNewChatPicker() {
   const overlay = document.getElementById('msg-newchat-overlay');
   const list = document.getElementById('msg-newchat-list');
   if (!overlay || !list) return;
   overlay.classList.remove('hidden');
-  list.innerHTML = `<div class="msg-thread-loading">Loading profiles…</div>`;
+  _setNewChatHeader('New message');
+  list.innerHTML = `<div class="msg-thread-loading">Loading contacts…</div>`;
   try {
     const data = await _api('/api/messages/profiles');
     const profiles = data.profiles || data.users || [];
-    if (!profiles.length) {
-      list.innerHTML = `<div class="msg-empty-list">Only your profile exists in this Restia installation.<br><span>Create another profile in Settings → Profiles to start a direct message.</span></div>`;
-      return;
-    }
-    list.innerHTML = profiles.map(u => {
-      const tag = u.home ? ' <span class="msg-admin-tag msg-dev-tag">dev</span>'
-        : u.remote ? ' <span class="msg-admin-tag">user</span>'
+    const actions = [
+      data.can_connect_restia ? `
+        <button type="button" class="msg-newchat-action" data-restia-action="connect">
+          <span class="msg-newchat-action-icon">${_restiaActionIcon('connect')}</span>
+          <span><strong>Connect another Restia</strong><small>Paste an invitation or request access</small></span>
+        </button>` : '',
+      data.can_invite_restia ? `
+        <button type="button" class="msg-newchat-action" data-restia-action="invite">
+          <span class="msg-newchat-action-icon">${_restiaActionIcon('invite')}</span>
+          <span><strong>Invite another Restia</strong><small>Create a private, one-time invitation</small></span>
+        </button>` : '',
+    ].join('');
+    const profileRows = profiles.map(u => {
+      const tag = u.home || u.remote
+        ? ' <span class="msg-admin-tag msg-instance-tag">instance</span>'
         : ` <span class="msg-admin-tag">${u.is_admin ? 'profile · admin' : 'profile'}</span>`;
-      const hint = u.home ? '<span class="msg-newchat-hint">Chat with the developer</span>' : '';
+      const hint = u.home ? '<span class="msg-newchat-hint">Connected Restia installation</span>' : '';
       return `
-      <div class="msg-newchat-item" data-user="${esc(u.username)}" role="button" tabindex="0">
-        ${_avatarHtml(u.username, 'msg-avatar-lg')}
-        <span class="msg-newchat-name">${esc(u.username)}${tag}${hint}</span>
-      </div>`;
+        <div class="msg-newchat-item" data-user="${esc(u.username)}" role="button" tabindex="0">
+          ${_avatarHtml(u.display || u.username, 'msg-avatar-lg')}
+          <span class="msg-newchat-name">${esc(u.display || u.username)}${tag}${hint}</span>
+        </div>`;
     }).join('');
+    const empty = profiles.length ? '' : `
+      <div class="msg-empty-list">No contacts yet.<br><span>${data.can_connect_restia ? 'Connect another Restia above, or create a profile in Settings → Profiles.' : 'Ask an owner profile to connect another Restia, or create a profile in Settings → Profiles.'}</span></div>`;
+    list.innerHTML = `${actions ? `<div class="msg-newchat-section"><span>Restia installations</span>${actions}</div>` : ''}${profileRows ? `<div class="msg-newchat-section"><span>Profiles and contacts</span>${profileRows}</div>` : empty}`;
+    list.querySelector('[data-restia-action="connect"]')?.addEventListener('click', _showConnectRestiaForm);
+    list.querySelector('[data-restia-action="invite"]')?.addEventListener('click', () => _showCreateRestiaInviteForm(data.invite_origin || ''));
     list.querySelectorAll('.msg-newchat-item').forEach(el => {
       const go = () => { overlay.classList.add('hidden'); openConversation(el.dataset.user); };
       el.addEventListener('click', go);
@@ -1712,8 +1956,12 @@ function _buildModal() {
       <div class="msg-newchat-overlay hidden" id="msg-newchat-overlay">
         <div class="msg-newchat-card">
           <div class="msg-newchat-header">
-            <span>New message</span>
-            <button type="button" class="close-btn" id="msg-newchat-cancel" title="Cancel">✖</button>
+            <button type="button" class="msg-newchat-back hidden" id="msg-newchat-back" title="Back" aria-label="Back to contacts">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="15 18 9 12 15 6"/></svg>
+            </button>
+            <span id="msg-newchat-title">New message</span>
+            <span style="flex:1"></span>
+            <button type="button" class="close-btn" id="msg-newchat-cancel" title="Cancel" aria-label="Close new message">✖</button>
           </div>
           <div class="msg-newchat-list" id="msg-newchat-list"></div>
         </div>
@@ -1729,6 +1977,7 @@ function _buildModal() {
   // Wiring
   document.getElementById('messages-close').addEventListener('click', close);
   document.getElementById('msg-newchat-btn').addEventListener('click', _openNewChatPicker);
+  document.getElementById('msg-newchat-back').addEventListener('click', _openNewChatPicker);
   document.getElementById('msg-newchat-cancel').addEventListener('click', () => {
     document.getElementById('msg-newchat-overlay').classList.add('hidden');
   });

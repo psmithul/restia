@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field, field_validator
 
 from core.database import Session as DbSession, SessionLocal
-from src.auth_helpers import effective_owner, require_user
+from src.auth_helpers import effective_owner, require_user, resolved_request_owner
 from src.study_mode import (
     StudyGoalConflictError,
     StudyGoalRequiredError,
@@ -81,6 +81,9 @@ def setup_study_routes() -> APIRouter:
         # preserving Restia's explicit auth-disabled / localhost modes.
         authenticated_owner = str(require_user(request) or "").strip() or None
         resolved_owner = str(effective_owner(request) or "").strip() or None
+        progression_owner = resolved_request_owner(
+            request, admitted_user=authenticated_owner or ""
+        )
         db = SessionLocal()
         try:
             row = db.query(
@@ -113,6 +116,7 @@ def setup_study_routes() -> APIRouter:
             "session_id": row.id,
             "title": row.name or "Study workspace",
             "mode": "study",
+            "progression_owner": progression_owner,
         }
 
     def tracked(state: dict, workspace: dict) -> dict:
@@ -219,7 +223,15 @@ def setup_study_routes() -> APIRouter:
     ):
         owner, workspace = workspace_for(request, session_id)
         try:
-            return tracked(record_study_review(owner, session_id, payload.outcome), workspace)
+            return tracked(
+                record_study_review(
+                    owner,
+                    session_id,
+                    payload.outcome,
+                    progression_owner=workspace["progression_owner"],
+                ),
+                workspace,
+            )
         except ValueError as exc:
             # Keep direct callers and future payload adapters fail-loud even
             # though the public request model already validates exact values.

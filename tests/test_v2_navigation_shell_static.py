@@ -98,9 +98,46 @@ def test_v2_assets_are_versioned_and_available_offline():
         "/static/js/navigation-registry.js",
         "/static/js/v2NavigationShell.js",
         "/static/js/missionControl.js",
+        "/static/js/calendar/reminderPayload.js",
     ):
         assert asset in (html + sw)
-    assert "const CACHE_NAME = 'restia-v358'" in sw
+    assert "const CACHE_NAME = 'restia-v365'" in sw
+
+
+def test_mobile_v2_bar_replaces_legacy_floating_hamburger():
+    css = _read("static/v2-shell.css")
+
+    assert "body.v2-navigation-ready .hamburger-btn" in css
+    assert "display: none !important" in css
+    assert "body:has(.projects-dialog) .v2-mobile-nav" in css
+
+
+def test_primary_navigation_closes_fullscreen_notes_before_switching_views():
+    shell = _read("static/js/v2NavigationShell.js")
+
+    close_notes = "window.notesModule?.isPanelOpen?.()"
+    assert close_notes in shell
+    assert "window.notesModule.closePanel?.()" in shell
+    assert shell.index(close_notes) < shell.index("if (id === 'more')")
+
+
+def test_home_activity_and_planning_are_first_class_workspaces():
+    app_js = _read("static/app.js")
+    shell = _read("static/js/v2NavigationShell.js")
+    mission = _read("static/js/missionControl.js")
+    modals = _read("static/js/modalManager.js")
+
+    assert "urlPath === '/today' || urlPath === '/activity'" in app_js
+    assert "queueMicrotask" in app_js
+    assert "missionControlModule.open(id)" in shell
+    assert "/api/mission-control/activity?limit=30" in mission
+    assert "before_id: String(current.next_before_id)" in mission
+    assert "'activity-more'" in mission
+    assert "void loadCurrentView()" in mission
+    assert "/api/planning" in mission
+    assert "planning-complete" in mission
+    assert "System progression" in mission
+    assert "minimizeVisibleModals" in modals
 
 
 def test_command_palette_is_derived_from_navigation_registry():

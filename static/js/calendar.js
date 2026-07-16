@@ -9,6 +9,7 @@ import { topPortalZ } from './toolWindowZOrder.js';
 import { makeWindowDraggable } from './windowDrag.js';
 import { attachColorPicker } from './colorPicker.js';
 import { bindMenuDismiss } from './escMenuStack.js';
+import { openSidebar, closeSidebar, SIDEBAR_STATES } from './sidebar-layout.js';
 import {
   WEEKDAYS, WEEKDAYS_SUN, MONTHS, MON_SHORT,
   CAL_PALETTE, CAL_COLORS, _CAL_CUSTOM_GRADIENT, _TYPE_PALETTE,
@@ -622,16 +623,17 @@ function _collapseSidebar() {
     // Only remember the prior state on desktop. On mobile the sidebar is an
     // overlay that the user intentionally swipes/taps away when the tool
     // opens — popping it back on close is unwanted.
-    if (window.innerWidth >= 700) _sidebarWasOpen = true;
-    sb.classList.add('hidden');
-    if (window.syncRailSide) window.syncRailSide();
+    if (window.innerWidth > 768) _sidebarWasOpen = true;
+    closeSidebar({
+      state: window.innerWidth <= 768 ? SIDEBAR_STATES.OFF : SIDEBAR_STATES.MINI,
+      persist: false,
+    });
   }
 }
 
 function _restoreSidebar() {
   if (_sidebarWasOpen) {
-    const sb = document.getElementById('sidebar');
-    if (sb) { sb.classList.remove('hidden'); if (window.syncRailSide) window.syncRailSide(); }
+    openSidebar({ persist: false });
     _sidebarWasOpen = false;
   }
 }

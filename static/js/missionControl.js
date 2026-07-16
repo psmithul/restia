@@ -4,13 +4,14 @@
 
 const SOURCE_KEYS = Object.freeze([
   'calendar', 'project_work', 'goals', 'tasks', 'study_reviews', 'health',
-  'important_mail', 'notes_today', 'daily_brief',
+  'important_mail', 'notes_today', 'daily_brief', 'planning', 'progression',
 ]);
 
 let API_BASE = typeof window !== 'undefined' ? window.location.origin : '';
 let refs = {};
 let sequence = 0;
 let controller = null;
+let activityMoreController = null;
 let previousFocus = null;
 
 const state = {
@@ -19,6 +20,8 @@ const state = {
   loading: false,
   error: '',
   data: null,
+  view: 'home',
+  activityLoadingMore: false,
 };
 
 function text(value, fallback = '') {
@@ -75,6 +78,16 @@ function ensureStylesheet() {
     id: 'mission-control-css',
     attrs: { rel: 'stylesheet', href: '/static/mission-control.css' },
   }));
+}
+
+async function minimizeWorkspaceModals() {
+  try {
+    const manager = await import('./modalManager.js');
+    return manager.minimizeVisibleModals?.() || 0;
+  } catch (error) {
+    console.warn('Could not minimize floating tools for workspace:', error);
+    return 0;
+  }
 }
 
 function localOffsetMinutes() {
@@ -143,15 +156,16 @@ function renderSummary() {
   clear(refs.summary);
   const summary = state.data?.summary || {};
   const health = source('health');
+  const progression = source('progression');
+  const profile = progression.profile || {};
   const overall = text(health.overall, healthUnavailable(health) ? 'Unavailable' : 'Ready');
   refs.summary.append(
     summaryCard('Calendar', number(summary.calendar), 'today'),
     summaryCard('Project work', number(summary.project_work), 'open or due'),
-    summaryCard('Important mail', number(summary.important_mail), 'needs attention'),
-    summaryCard('Notes Today', number(summary.notes_today), 'active plans'),
-    summaryCard('Goals', number(summary.goals), 'active'),
-    summaryCard('Tasks', number(summary.tasks), 'scheduled or running'),
-    summaryCard('Reviews', number(summary.study_reviews), 'due'),
+    summaryCard('Plan', number(summary.planning), 'open commitments'),
+    summaryCard('To Do', number(summary.notes_today), 'next steps'),
+    summaryCard('Rank', text(profile.rank_name, 'E-Rank'), `Level ${number(profile.level) || 1}`),
+    summaryCard('Automations', number(summary.tasks), 'scheduled or running'),
     summaryCard('System', overall, `${rows(health.services).length} services`, ['ok', 'healthy'].includes(overall.toLowerCase()) ? 'good' : 'attention'),
   );
 }
@@ -296,14 +310,107 @@ function renderImportantMail() {
   return section;
 }
 
+function renderPlanning() {
+  const { section, body, value } = sectionShell('Plan', 'planning');
+  section.classList.add('mission-plan-panel');
+  const form = make('form', {
+    className: 'mission-plan-form',
+    attrs: { 'aria-label': 'Add a planning item' },
+  }, [
+    make('label', { className: 'mission-sr-only', text: 'Planning item' , attrs: { for: 'mission-plan-title' } }),
+    make('input', {
+      id: 'mission-plan-title',
+      attrs: { name: 'title', type: 'text', maxlength: '240', required: 'required', placeholder: 'What needs to happen?' },
+    }),
+    make('label', { className: 'mission-sr-only', text: 'Due date', attrs: { for: 'mission-plan-due' } }),
+    make('input', { id: 'mission-plan-due', attrs: { name: 'due_date', type: 'date' } }),
+    make('button', { type: 'submit', className: 'mission-btn', text: 'Add' }),
+  ]);
+  body.appendChild(form);
+  if (sourceUnavailable(value)) {
+    body.appendChild(sourceError(value));
+    return section;
+  }
+  if (!value.items.length) {
+    body.appendChild(emptyState('Add your next concrete commitment here.'));
+    return section;
+  }
+  value.items.forEach((item) => {
+    const completed = item.status === 'completed';
+    const dateInput = make('input', {
+      className: 'mission-plan-date',
+      attrs: {
+        type: 'date',
+        value: text(item.due_date),
+        'aria-label': `Schedule ${text(item.title, 'planning item')}`,
+      },
+    });
+    const row = make('article', {
+      className: `mission-planning-item${completed ? ' is-complete' : ''}${item.overdue ? ' mission-tone-danger' : ''}`,
+      dataset: { planningId: item.id, version: item.version },
+    }, [
+      make('div', { className: 'mission-item-copy' }, [
+        make('strong', { text: text(item.title, 'Untitled item') }),
+        make('span', {
+          text: completed
+            ? `Completed ${formatDate(item.completed_at, { time: true })}`
+            : item.scheduled_start
+              ? `Scheduled ${formatDate(item.scheduled_start, { time: true })}`
+              : item.overdue ? `Overdue · ${text(item.due_date)}` : text(item.due_date, 'No due date'),
+        }),
+      ]),
+      make('div', { className: 'mission-plan-actions' }, [
+        ...(!completed ? [dateInput, button('Schedule', 'planning-schedule', { className: 'mission-text-btn' })] : []),
+        button(completed ? 'Reopen' : 'Complete', completed ? 'planning-reopen' : 'planning-complete', { className: 'mission-text-btn' }),
+      ]),
+    ]);
+    body.appendChild(row);
+  });
+  return section;
+}
+
+function renderProgression() {
+  const { section, body, value } = sectionShell('System progression', 'progression');
+  section.classList.add('mission-system-panel');
+  if (sourceUnavailable(value)) {
+    body.appendChild(sourceError(value));
+    return section;
+  }
+  const profile = value.profile || {};
+  const streak = value.streak || {};
+  const header = make('div', { className: 'mission-rank' }, [
+    make('span', { className: 'mission-rank-mark', text: text(profile.rank, 'E'), attrs: { 'aria-hidden': 'true' } }),
+    make('div', {}, [
+      make('strong', { text: `${text(profile.rank_name, 'E-Rank')} · Level ${number(profile.level) || 1}` }),
+      make('span', { text: `${number(profile.total_xp)} XP · ${number(streak.current_days)} day streak` }),
+      progressBar(profile.progress_percent),
+      make('small', { text: `${number(profile.xp_to_next_level)} XP to next level` }),
+    ]),
+  ]);
+  body.appendChild(header);
+  rows(value.today?.quests).forEach((quest) => {
+    const target = Math.max(1, number(quest.target));
+    const current = Math.min(target, number(quest.current));
+    const row = make('div', { className: `mission-quest${quest.complete ? ' is-complete' : ''}` }, [
+      make('div', {}, [
+        make('strong', { text: text(quest.title, 'Daily objective') }),
+        make('small', { text: `${current}/${target}` }),
+      ]),
+      progressBar((current / target) * 100),
+    ]);
+    body.appendChild(row);
+  });
+  return section;
+}
+
 function renderNotesToday() {
-  const { section, body, value } = sectionShell('Notes Today', 'notes_today', 'notes');
+  const { section, body, value } = sectionShell('To Do & goal steps', 'notes_today', 'todos');
   if (sourceUnavailable(value)) body.appendChild(sourceError(value));
-  else if (!value.items.length) body.appendChild(emptyState('Pin a note or add a due step to bring it into Today.'));
+  else if (!value.items.length) body.appendChild(emptyState('Add a checklist item or goal step to bring it into Home.'));
   else value.items.forEach((note) => {
     const progress = `${number(note.completed_steps)}/${number(note.total_steps)} steps`;
     const row = itemRow(text(note.title, 'Untitled note'), progress, {
-      target: 'notes',
+      target: note.kind === 'todo' ? 'todos' : 'notes',
       tone: note.due_date ? 'attention' : '',
       detail: text(note.next_step),
     });
@@ -348,6 +455,41 @@ function renderHealth() {
       target: 'activity',
     }));
   });
+  return section;
+}
+
+function renderActivityFeed() {
+  const value = state.data?.activity || { status: 'empty', items: [] };
+  const section = make('section', {
+    className: 'mission-panel mission-activity-feed',
+    attrs: { 'aria-labelledby': 'mission-activity-feed-title' },
+  });
+  const count = number(value.count ?? rows(value.items).length);
+  const heading = make('header', { className: 'mission-panel-heading' }, [
+    make('div', {}, [
+      make('h2', { id: 'mission-activity-feed-title', text: 'Recent activity' }),
+      make('p', { text: `${count} event${count === 1 ? '' : 's'}${value.truncated ? ' · more available' : ''}` }),
+    ]),
+    ...(value.truncated && value.next_before && value.next_before_id ? [
+      button(state.activityLoadingMore ? 'Loading…' : 'Load more', 'activity-more', {
+        className: 'mission-text-btn',
+        title: 'Load older activity',
+      }),
+    ] : []),
+  ]);
+  const moreButton = heading.querySelector('[data-action="activity-more"]');
+  if (moreButton) moreButton.disabled = state.activityLoadingMore;
+  const body = make('div', { className: 'mission-panel-body' });
+  if (sourceUnavailable(value)) body.appendChild(sourceError(value));
+  else if (!rows(value.items).length) body.appendChild(emptyState('No task, project, or progression activity yet.'));
+  else rows(value.items).forEach((item) => {
+    body.appendChild(itemRow(text(item.title, 'Activity'), formatDate(item.occurred_at, { time: true }), {
+      target: text(item.target, 'home'),
+      tone: item.status === 'error' ? 'danger' : item.xp ? 'good' : '',
+      detail: text(item.detail),
+    }));
+  });
+  section.append(heading, body);
   return section;
 }
 
@@ -401,10 +543,10 @@ function renderFocus() {
 
 function renderQuickActions() {
   clear(refs.quickActions);
-  [
-    ['New chat', 'new-chat'], ['Projects', 'projects'], ['Tasks', 'tasks'],
-    ['Calendar', 'calendar'], ['Study', 'study'],
-  ].forEach(([label, target]) => refs.quickActions.appendChild(button(label, 'open-target', { className: 'mission-quick-action', target })));
+  const actions = state.view === 'activity'
+    ? [['Home', 'home'], ['Projects', 'projects'], ['Automations', 'tasks'], ['Calendar', 'calendar']]
+    : [['New chat', 'new-chat'], ['Projects', 'projects'], ['Automations', 'tasks'], ['Calendar', 'calendar'], ['To Do', 'todos'], ['Study', 'study']];
+  actions.forEach(([label, target]) => refs.quickActions.appendChild(button(label, 'open-target', { className: 'mission-quick-action', target })));
 }
 
 function render() {
@@ -413,15 +555,34 @@ function render() {
   refs.error.textContent = state.error;
   refs.content.hidden = state.loading || Boolean(state.error) || !state.data;
   if (!state.data || state.loading || state.error) return;
-  refs.date.textContent = formatDate(`${state.data.date}T12:00:00`) || text(state.data.date, 'Today');
+  refs.title.textContent = state.view === 'activity' ? 'Activity' : 'Today';
+  refs.eyebrow.textContent = state.view === 'activity' ? 'Owner-scoped history' : 'Personal Mission Control';
+  refs.date.textContent = state.view === 'activity'
+    ? 'Tasks, projects, and verified clears'
+    : formatDate(`${state.data.date}T12:00:00`) || text(state.data.date, 'Today');
   refs.asOf.textContent = state.data.as_of ? `Updated ${formatDate(state.data.as_of, { time: true })}` : '';
-  renderSummary();
   renderQuickActions();
   clear(refs.grid);
+  if (state.view === 'activity') {
+    clear(refs.summary);
+    const activity = state.data.activity || {};
+    const counts = activity.source_counts || {};
+    const health = source('health');
+    refs.summary.append(
+      summaryCard('Events', number(activity.count), activity.truncated ? 'latest results' : 'recent'),
+      summaryCard('Automations', number(counts.automation), 'runs'),
+      summaryCard('Projects', number(counts.project), 'changes'),
+      summaryCard('XP clears', number(counts.progression), 'verified'),
+      summaryCard('System', text(health.overall, 'Unknown'), health.cached ? (health.stale ? 'cached · stale' : 'cached') : 'fresh'),
+    );
+    refs.grid.append(renderActivityFeed(), renderHealth());
+    return;
+  }
+  renderSummary();
   refs.grid.append(
-    renderFocus(), renderDailyBrief(), renderCalendar(), renderProjectWork(),
-    renderImportantMail(), renderNotesToday(), renderTasks(), renderGoals(),
-    renderReviews(), renderHealth(),
+    renderFocus(), renderPlanning(), renderProgression(), renderCalendar(),
+    renderProjectWork(), renderNotesToday(), renderImportantMail(), renderDailyBrief(),
+    renderTasks(), renderGoals(), renderReviews(), renderHealth(),
   );
 }
 
@@ -434,6 +595,8 @@ function triggerTarget(target) {
     study: ['tool-study-btn', 'rail-study'],
     email: ['email-section-title', 'rail-email'],
     notes: ['tool-notes-btn', 'rail-notes'],
+    todos: ['tool-todos-btn', 'rail-todos'],
+    home: ['v2-home-nav', 'rail-home'],
     activity: ['v2-activity-nav', 'rail-activity'],
   }[target] || [];
   const trigger = ids.map((id) => document.getElementById(id)).find(Boolean);
@@ -443,15 +606,22 @@ function triggerTarget(target) {
   return true;
 }
 
-async function loadToday() {
+async function loadCurrentView() {
   const token = ++sequence;
+  const requestedView = state.view;
   controller?.abort();
+  activityMoreController?.abort();
+  activityMoreController = null;
+  state.activityLoadingMore = false;
   controller = new AbortController();
   state.loading = true;
   state.error = '';
   render();
   try {
-    const response = await fetch(`${API_BASE}/api/mission-control/today?utc_offset_minutes=${localOffsetMinutes()}`, {
+    const endpoint = requestedView === 'activity'
+      ? `${API_BASE}/api/mission-control/activity?limit=30`
+      : `${API_BASE}/api/mission-control/today?utc_offset_minutes=${localOffsetMinutes()}`;
+    const response = await fetch(endpoint, {
       credentials: 'same-origin', signal: controller.signal,
     });
     if (!response.ok) {
@@ -460,9 +630,18 @@ async function loadToday() {
       throw new Error(detail || `Mission Control request failed (HTTP ${response.status})`);
     }
     const payload = await response.json();
-    if (token !== sequence || !state.open) return;
-    state.data = payload && typeof payload === 'object' ? payload : null;
-    if (!state.data?.sources) throw new Error('Mission Control returned an invalid response');
+    if (token !== sequence || !state.open || requestedView !== state.view) return;
+    if (requestedView === 'activity') {
+      if (!payload?.feed || !payload?.health) throw new Error('Activity returned an invalid response');
+      state.data = {
+        as_of: payload.as_of,
+        activity: payload.feed,
+        sources: { health: payload.health },
+      };
+    } else {
+      state.data = payload && typeof payload === 'object' ? payload : null;
+      if (!state.data?.sources) throw new Error('Mission Control returned an invalid response');
+    }
   } catch (error) {
     if (error?.name === 'AbortError' || token !== sequence) return;
     state.error = text(error?.message, 'Mission Control could not load');
@@ -471,6 +650,165 @@ async function loadToday() {
       state.loading = false;
       render();
     }
+  }
+}
+
+function activityCounts(items) {
+  return rows(items).reduce((counts, item) => {
+    const key = text(item?.source, 'unknown');
+    counts[key] = number(counts[key]) + 1;
+    return counts;
+  }, {});
+}
+
+async function loadMoreActivity() {
+  const current = state.data?.activity;
+  if (
+    state.view !== 'activity'
+    || state.activityLoadingMore
+    || !current?.truncated
+    || !current?.next_before
+    || !current?.next_before_id
+  ) return false;
+
+  const requestedView = state.view;
+  const token = sequence;
+  const params = new URLSearchParams({
+    limit: '30',
+    before: String(current.next_before),
+    before_id: String(current.next_before_id),
+  });
+  activityMoreController?.abort();
+  activityMoreController = new AbortController();
+  state.activityLoadingMore = true;
+  render();
+  try {
+    const response = await fetch(`${API_BASE}/api/mission-control/activity?${params}`, {
+      credentials: 'same-origin', signal: activityMoreController.signal,
+    });
+    if (!response.ok) {
+      let detail = '';
+      try { detail = text((await response.json()).detail); } catch (_) {}
+      throw new Error(detail || `Activity request failed (HTTP ${response.status})`);
+    }
+    const payload = await response.json();
+    if (token !== sequence || !state.open || requestedView !== state.view) return false;
+    if (!payload?.feed || !Array.isArray(payload.feed.items)) {
+      throw new Error('Activity returned an invalid response');
+    }
+    const seen = new Set(rows(current.items).map((item) => text(item?.id)).filter(Boolean));
+    const appended = rows(payload.feed.items).filter((item) => {
+      const id = text(item?.id);
+      if (!id || seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    });
+    const items = [...rows(current.items), ...appended];
+    state.data.activity = {
+      ...payload.feed,
+      items,
+      count: items.length,
+      source_counts: activityCounts(items),
+    };
+    if (payload.health) state.data.sources.health = payload.health;
+    return true;
+  } catch (error) {
+    if (error?.name !== 'AbortError') {
+      notify(text(error?.message, 'Could not load older activity'), true);
+    }
+    return false;
+  } finally {
+    if (token === sequence) {
+      state.activityLoadingMore = false;
+      activityMoreController = null;
+      render();
+    }
+  }
+}
+
+function notify(message, error = false) {
+  if (window.uiModule?.showToast && !error) window.uiModule.showToast(message);
+  else if (window.uiModule?.showError && error) window.uiModule.showError(message);
+  else if (error) console.error(message);
+}
+
+async function planningRequest(path, body) {
+  const response = await fetch(`${API_BASE}/api/planning${path}`, {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    let detail = '';
+    try { detail = text((await response.json()).detail); } catch (_) {}
+    throw new Error(detail || `Planning request failed (HTTP ${response.status})`);
+  }
+  return response.json();
+}
+
+async function createPlanningItem(form) {
+  const values = new FormData(form);
+  const title = text(values.get('title'));
+  if (!title) return;
+  const submit = form.querySelector('button[type="submit"]');
+  if (submit) submit.disabled = true;
+  try {
+    await planningRequest('', {
+      title,
+      due_date: text(values.get('due_date')) || null,
+    });
+    form.reset();
+    notify('Planning item added');
+    await loadCurrentView();
+  } catch (error) {
+    notify(text(error?.message, 'Could not add planning item'), true);
+  } finally {
+    if (submit?.isConnected) submit.disabled = false;
+  }
+}
+
+async function mutatePlanningItem(control) {
+  const row = control.closest?.('[data-planning-id]');
+  if (!row) return;
+  const itemId = text(row.dataset.planningId);
+  const version = number(row.dataset.version);
+  if (!itemId || !version) return;
+  const action = control.dataset.action;
+  let suffix = '';
+  let payload = { version };
+  if (action === 'planning-complete') suffix = `/${encodeURIComponent(itemId)}/complete`;
+  else if (action === 'planning-reopen') suffix = `/${encodeURIComponent(itemId)}/reopen`;
+  else if (action === 'planning-schedule') {
+    const due = text(row.querySelector('.mission-plan-date')?.value);
+    if (!due) {
+      notify('Choose a date before scheduling', true);
+      return;
+    }
+    const start = new Date(`${due}T09:00:00`);
+    if (Number.isNaN(start.getTime())) {
+      notify('Choose a valid schedule date', true);
+      return;
+    }
+    const end = new Date(start.getTime() + 30 * 60 * 1000);
+    suffix = `/${encodeURIComponent(itemId)}/schedule`;
+    payload = {
+      version,
+      start: start.toISOString(),
+      end: end.toISOString(),
+      due_date: due,
+      add_to_calendar: true,
+    };
+  } else return;
+  control.disabled = true;
+  try {
+    await planningRequest(suffix, payload);
+    notify(action === 'planning-schedule' ? 'Added to Calendar' : action === 'planning-reopen' ? 'Planning item reopened' : 'Objective cleared');
+    await loadCurrentView();
+  } catch (error) {
+    notify(text(error?.message, 'Could not update planning item'), true);
+  } finally {
+    if (control.isConnected) control.disabled = false;
   }
 }
 
@@ -506,14 +844,24 @@ function buildWorkspace() {
   document.body.appendChild(root);
   refs = {
     root, summary, quickActions, loading, error, content, grid,
+    title: heading.querySelector('#mission-title'),
+    eyebrow: heading.querySelector('.mission-eyebrow'),
     date: heading.querySelector('#mission-date'), asOf: heading.querySelector('#mission-as-of'),
   };
   root.addEventListener('click', (event) => {
     const control = event.target.closest?.('[data-action]');
     if (!control || !root.contains(control)) return;
     if (control.dataset.action === 'close') close();
-    else if (control.dataset.action === 'refresh') loadToday();
+    else if (control.dataset.action === 'refresh') loadCurrentView();
+    else if (control.dataset.action === 'activity-more') void loadMoreActivity();
     else if (control.dataset.action === 'open-target') triggerTarget(control.dataset.target);
+    else if (control.dataset.action.startsWith('planning-')) void mutatePlanningItem(control);
+  });
+  root.addEventListener('submit', (event) => {
+    const form = event.target.closest?.('.mission-plan-form');
+    if (!form || !root.contains(form)) return;
+    event.preventDefault();
+    void createPlanningItem(form);
   });
   root.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') { event.preventDefault(); close(); }
@@ -527,23 +875,39 @@ export function init(apiBase = '') {
   return missionControlModule;
 }
 
-export async function open() {
+export async function open(view = 'home') {
   if (!state.initialized) init();
-  if (window.studyModule?.isActive?.()) {
-    const closed = await window.studyModule.close({ startFresh: false });
-    if (!closed && window.studyModule?.isActive?.()) return false;
+  const nextView = view === 'activity' ? 'activity' : 'home';
+  if (!state.open) {
+    if (window.studyModule?.isActive?.()) {
+      const closed = await window.studyModule.close({ startFresh: false });
+      if (!closed && window.studyModule?.isActive?.()) return false;
+    }
+    if (window.projectsModule?.isOpen?.()) {
+      const closed = await window.projectsModule.close();
+      if (!closed) return false;
+    }
+    // Registered floating tools have z-indexes above full workspaces. Preserve
+    // their state in the dock instead of leaving Home hidden behind them.
+    await minimizeWorkspaceModals();
+    buildWorkspace();
+    previousFocus = document.activeElement;
+    state.open = true;
+    document.body.classList.add('mission-control-view');
+    refs.root.hidden = false;
+    refs.root.focus();
   }
-  if (window.projectsModule?.isOpen?.()) {
-    const closed = await window.projectsModule.close();
-    if (!closed) return false;
-  }
-  buildWorkspace();
-  previousFocus = document.activeElement;
-  state.open = true;
-  document.body.classList.add('mission-control-view');
-  refs.root.hidden = false;
-  refs.root.focus();
-  await loadToday();
+  state.view = nextView;
+  state.data = null;
+  state.error = '';
+  state.loading = true;
+  refs.loading.textContent = nextView === 'activity' ? 'Loading recent activity…' : 'Building today’s view…';
+  document.body.dataset.missionView = nextView;
+  render();
+  // First paint is independent from session restoration and backend
+  // aggregation. Navigation becomes visible now; data fills in asynchronously.
+  void loadCurrentView();
+  document.dispatchEvent(new CustomEvent('restia:mission-control-opened', { detail: { view: nextView } }));
   return true;
 }
 
@@ -552,8 +916,12 @@ export function close() {
   sequence += 1;
   controller?.abort();
   controller = null;
+  activityMoreController?.abort();
+  activityMoreController = null;
+  state.activityLoadingMore = false;
   state.open = false;
   document.body.classList.remove('mission-control-view');
+  delete document.body.dataset.missionView;
   if (refs.root) refs.root.hidden = true;
   document.dispatchEvent(new CustomEvent('restia:mission-control-closed'));
   try { previousFocus?.focus?.(); } catch (_) {}
@@ -570,7 +938,7 @@ export function isOpen() {
 }
 
 export function refresh() {
-  return state.open ? loadToday() : Promise.resolve(false);
+  return state.open ? loadCurrentView() : Promise.resolve(false);
 }
 
 export const __test = Object.freeze({

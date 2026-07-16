@@ -3,6 +3,7 @@
 
 import Storage from './storage.js';
 import { syncSidebarSectionCollapseControl } from './section-management.js';
+import { setSidebarState, SIDEBAR_STATES } from './sidebar-layout.js';
 
 function clearFreshComposerRestore() {
   const msgInput = document.getElementById('message');
@@ -267,7 +268,7 @@ window.addEventListener('pageshow', clearFreshComposerRestore);
       collapsed = false;
 
       // Unhide sidebar at 0 width so we can grow it
-      sidebar.classList.remove('hidden');
+      setSidebarState(SIDEBAR_STATES.FULL, { persist: false });
       sidebar.classList.add('resizing');
       sidebar.style.width = '0px';
       sidebar.style.opacity = '0.3';
@@ -303,13 +304,13 @@ window.addEventListener('pageshow', clearFreshComposerRestore);
 
     if (collapsed) {
       sidebar.style.width = '';
-      sidebar.classList.add('hidden');
-      if (typeof syncRailSide === 'function') syncRailSide();
+      setSidebarState(SIDEBAR_STATES.MINI, { persist: true });
     } else {
       const finalWidth = parseInt(sidebar.style.width, 10);
       if (finalWidth >= MIN_WIDTH) {
         Storage.set(STORAGE_KEY, String(finalWidth));
       }
+      setSidebarState(SIDEBAR_STATES.FULL, { persist: true });
     }
   }
 
@@ -339,15 +340,14 @@ window.addEventListener('pageshow', clearFreshComposerRestore);
     if (collapsed) {
       // Didn't drag far enough — snap back to icon rail
       sidebar.style.width = '';
-      sidebar.classList.add('hidden');
-      if (typeof syncRailSide === 'function') syncRailSide();
+      setSidebarState(SIDEBAR_STATES.MINI, { persist: true });
     } else {
       // Expanded — save width and sync
       const finalWidth = parseInt(sidebar.style.width, 10);
       if (finalWidth >= MIN_WIDTH) {
         Storage.set(STORAGE_KEY, String(finalWidth));
       }
-      if (typeof syncRailSide === 'function') syncRailSide();
+      setSidebarState(SIDEBAR_STATES.FULL, { persist: true });
     }
   }
 

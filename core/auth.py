@@ -87,7 +87,7 @@ TOKEN_TTL = 60 * 60 * 24 * 7  # 7 days
 RESERVED_USERNAMES = frozenset(
     {INTERNAL_TOOL_USER, "api", "demo", "system", "owner@localhost"}
 )
-RESERVED_USERNAME_PREFIXES = ("remote:", "remote-instance:")
+RESERVED_USERNAME_PREFIXES = ("remote:", "remote-instance:", "restia:")
 _SESSION_KEY_PREFIX = "sha256:"
 _BACKUP_KEY_PREFIX = "sha256:"
 
@@ -509,7 +509,22 @@ class AuthManager:
             # keep the user/session state intact so the admin can retry.
             try:
                 from core.database import get_db_session, ApiToken
+                try:
+                    from core.database import OutboundChatLink
+                except ImportError:  # Compatibility for isolated auth tests.
+                    OutboundChatLink = None
                 with get_db_session() as db:
+                    if OutboundChatLink is not None:
+                        link_query = db.query(OutboundChatLink.id).filter(
+                            OutboundChatLink.owner == username
+                        )
+                        first_link = getattr(link_query, "first", None)
+                        if callable(first_link) and first_link() is not None:
+                            logger.warning(
+                                "Refused to delete user '%s' with an active Restia chat connection",
+                                username,
+                            )
+                            return False
                     removed_tokens = db.query(ApiToken).filter(ApiToken.owner == username).delete()
                 if removed_tokens:
                     logger.info(

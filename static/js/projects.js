@@ -4,6 +4,16 @@
 // owns no chat composer state: project deliverables use a task-scoped queue so
 // files can never leak into chat attachments or another task draft.
 
+import {
+  attachmentDownloadPath,
+  attachmentFallbackCopy,
+  attachmentOfficePreviewPath,
+  attachmentPreviewKind,
+  attachmentViewPath,
+  loadOfficeAttachmentPreview,
+  loadTextAttachmentPreview,
+} from './projectAttachmentViewer.js';
+
 const PROJECT_VIEWS = new Set(['board', 'list', 'activity']);
 const ATTACHMENT_KINDS = new Set(['reference', 'draft', 'deliverable']);
 const ITEM_TYPES = Object.freeze(['task', 'story', 'bug', 'epic', 'subtask']);
@@ -244,6 +254,7 @@ const state = {
   mobileStageId: null,
   quickStageId: null,
   selectedItem: null,
+  briefAttachments: new Map(),
   drawerLoading: false,
   drawerDirty: false,
   drawerDraft: null,
@@ -2582,12 +2593,9 @@ function attachmentKindLabel(kind) {
   return kind === 'draft' ? 'Draft' : 'Reference';
 }
 
-function attachmentDownloadUrl(itemId, attachment) {
-  if (state.activeProjectSource === PROJECT_SOURCES.HOME) {
-    return `/api/homelink/projects/attachments/${encodeURIComponent(attachment.id)}/download`;
-  }
-  if (attachment.download_url) return attachment.download_url;
-  return `/api/projects/attachments/${encodeURIComponent(attachment.id)}/download`;
+function attachmentDownloadUrl(itemId, attachment, source = state.activeProjectSource) {
+  void itemId;
+  return attachmentDownloadPath(normalizeProjectSource(source), attachment);
 }
 
 function renderExistingAttachment(attachment, editable) {
@@ -2604,16 +2612,203 @@ function renderExistingAttachment(attachment, editable) {
   const link = make('a', {
     className: 'projects-row-action', text: 'Download',
     attrs: {
-      href: attachmentDownloadUrl(state.selectedItem.id, attachment),
+      href: attachmentDownloadUrl(state.selectedItem.id, attachment, state.activeProjectSource),
       download: attachment.name,
       rel: 'noopener',
     },
   });
-  row.append(copy, link);
+  const view = actionButton('View', 'preview-attachment', {
+    className: 'projects-row-action',
+    dataset: {
+      attachmentId: attachment.id,
+      projectSource: state.activeProjectSource,
+    },
+    title: `View ${attachment.name}`,
+  });
+  row.append(copy, view, link);
   if (editable && canDeleteAttachment(attachment)) row.appendChild(actionButton('Delete', 'delete-attachment', {
     className: 'projects-row-action projects-row-action--danger', dataset: { attachmentId: attachment.id },
   }));
   return row;
+}
+
+function findAttachmentForPreview(attachmentId) {
+  const id = asId(attachmentId);
+  return state.selectedItem?.attachments?.find((entry) => entry.id === id)
+    || state.briefAttachments.get(id)
+    || null;
+}
+
+function openAttachmentViewer(attachment, source = state.activeProjectSource) {
+  if (!attachment?.id) {
+    showToast('This attachment is unavailable.', 'error');
+    return false;
+  }
+  const normalized = normalizeAttachment(attachment);
+  const capturedSource = normalizeProjectSource(source);
+  const kind = attachmentPreviewKind(normalized);
+  const viewUrl = attachmentViewPath(capturedSource, normalized.id);
+  const officePreviewUrl = attachmentOfficePreviewPath(capturedSource, normalized.id);
+  const downloadUrl = attachmentDownloadPath(capturedSource, normalized);
+  const abortController = typeof AbortController === 'function' ? new AbortController() : null;
+  let embedded = null;
+
+  const metadata = make('div', { className: 'projects-viewer-meta' }, [
+    make('strong', { text: normalized.name }),
+    make('span', {
+      text: [
+        normalized.mime || 'Unknown file type',
+        formatBytes(normalized.size),
+        attachmentKindLabel(normalized.kind),
+      ].filter(Boolean).join(' · '),
+    }),
+  ]);
+  const download = make('a', {
+    className: 'projects-btn projects-btn--quiet projects-viewer-download',
+    text: 'Download',
+    attrs: {
+      href: downloadUrl,
+      download: normalized.name,
+      rel: 'noopener',
+    },
+  });
+  const toolbar = make('div', { className: 'projects-viewer-toolbar' }, [metadata, download]);
+  const status = make('p', {
+    className: 'projects-viewer-status',
+    text: kind === 'fallback' ? '' : 'Loading preview…',
+    attrs: { role: 'status', 'aria-live': 'polite' },
+  });
+  if (kind === 'fallback') status.hidden = true;
+  const surface = make('div', {
+    className: `projects-viewer-surface is-${kind}`,
+    attrs: { 'aria-label': `Preview of ${normalized.name}` },
+  });
+  const content = make('div', { className: 'projects-attachment-viewer' }, [toolbar, status, surface]);
+  const opened = openDialog(`View ${normalized.name}`, content, {
+    onClose: () => {
+      try { abortController?.abort(); } catch (_) {}
+      if (embedded?.tagName === 'IFRAME') {
+        try { embedded.src = 'about:blank'; } catch (_) {}
+      } else if (embedded?.tagName === 'IMG') {
+        try { embedded.removeAttribute('src'); } catch (_) {}
+      }
+    },
+  });
+  opened.dialog.classList.add('projects-dialog--viewer');
+
+  const fail = (message) => {
+    if (!opened.dialog.isConnected) return;
+    status.hidden = false;
+    status.classList.add('is-error');
+    status.setAttribute('role', 'alert');
+    status.textContent = `${message} Download the file to open it locally.`;
+    surface.replaceChildren(make('div', { className: 'projects-viewer-fallback' }, [
+      make('strong', { text: 'Preview unavailable' }),
+      make('p', { text: 'The file itself has not been changed.' }),
+    ]));
+  };
+
+  if (kind === 'pdf') {
+    embedded = make('iframe', {
+      className: 'projects-viewer-frame',
+      attrs: {
+        src: viewUrl,
+        title: `PDF preview of ${normalized.name}`,
+        referrerpolicy: 'no-referrer',
+      },
+    });
+    embedded.addEventListener('load', () => { status.hidden = true; }, { once: true });
+    embedded.addEventListener('error', () => fail('The PDF preview could not be loaded.'), { once: true });
+    surface.appendChild(embedded);
+  } else if (kind === 'image') {
+    embedded = make('img', {
+      className: 'projects-viewer-image',
+      attrs: {
+        src: viewUrl,
+        alt: `Preview of ${normalized.name}`,
+        referrerpolicy: 'no-referrer',
+      },
+    });
+    embedded.addEventListener('load', () => { status.hidden = true; }, { once: true });
+    embedded.addEventListener('error', () => fail('The image preview could not be loaded.'), { once: true });
+    surface.appendChild(embedded);
+  } else if (kind === 'text') {
+    const pre = make('pre', {
+      className: 'projects-viewer-text',
+      attrs: { tabindex: '0', 'aria-label': `Text content of ${normalized.name}` },
+    });
+    surface.appendChild(pre);
+    loadTextAttachmentPreview(viewUrl, { signal: abortController?.signal })
+      .then((result) => {
+        if (!opened.dialog.isConnected) return;
+        pre.textContent = result.text;
+        status.hidden = !result.truncated;
+        status.classList.remove('is-error');
+        status.setAttribute('role', 'status');
+        status.textContent = result.truncated
+          ? `This file is ${formatBytes(result.totalBytes)}. Showing a safe opening segment; download for the complete file.`
+          : 'Preview loaded.';
+        if (!result.truncated) status.hidden = true;
+      })
+      .catch((error) => {
+        if (error?.name !== 'AbortError') fail(error?.message || 'The text preview could not be loaded.');
+      });
+  } else if (kind === 'office') {
+    const office = make('div', {
+      className: 'projects-viewer-office',
+      attrs: { tabindex: '0', 'aria-label': `Office document content of ${normalized.name}` },
+    });
+    surface.appendChild(office);
+    loadOfficeAttachmentPreview(officePreviewUrl, { signal: abortController?.signal })
+      .then((result) => {
+        if (!opened.dialog.isConnected) return;
+        const content = make('div', { className: 'projects-viewer-office__content' });
+        result.sections.forEach((section) => {
+          const sectionNode = make('section', { className: `projects-viewer-office__section is-${section.kind}` }, [
+            make('h3', { text: section.title }),
+          ]);
+          if (section.kind === 'table') {
+            const table = make('table', {
+              className: 'projects-viewer-office__table',
+              attrs: { 'aria-label': section.title },
+            });
+            const body = make('tbody');
+            section.rows.forEach((row) => {
+              body.appendChild(make('tr', {}, row.map((cell) => make('td', { text: cell }))));
+            });
+            table.appendChild(body);
+            sectionNode.appendChild(make('div', { className: 'projects-viewer-office__table-wrap' }, [table]));
+          } else {
+            sectionNode.appendChild(make('div', {
+              className: 'projects-viewer-office__text',
+              text: section.text,
+            }));
+          }
+          content.appendChild(sectionNode);
+        });
+        content.appendChild(make('p', {
+          className: 'projects-viewer-office__note',
+          text: 'Private extracted preview. Complex layout, formulas, media, and animations may be simplified; download for the original.',
+        }));
+        office.replaceChildren(content);
+        status.hidden = !result.truncated;
+        status.classList.remove('is-error');
+        status.setAttribute('role', 'status');
+        status.textContent = result.truncated
+          ? 'Showing a bounded preview. Download the original to inspect all content.'
+          : 'Preview loaded.';
+      })
+      .catch((error) => {
+        if (error?.name !== 'AbortError') fail(error?.message || 'The Office preview could not be loaded.');
+      });
+  } else {
+    surface.appendChild(make('div', { className: 'projects-viewer-fallback' }, [
+      make('strong', { text: 'Open with a local app' }),
+      make('p', { text: attachmentFallbackCopy(normalized) }),
+      make('small', { text: 'Restia does not upload this document to an external preview service.' }),
+    ]));
+  }
+  return true;
 }
 
 function renderQueueEntry(entry) {
@@ -3174,12 +3369,15 @@ function projectBriefSection(title, body) {
 
 async function openProjectBrief() {
   if (!state.project) return;
+  state.briefAttachments.clear();
   const projectId = state.project.id;
   const source = state.activeProjectSource;
   const content = make('div', { className: 'projects-project-brief' }, [
     make('p', { className: 'projects-brief-loading', text: 'Building a current project brief…', attrs: { role: 'status' } }),
   ]);
-  const opened = openDialog('Project brief', content);
+  const opened = openDialog('Project brief', content, {
+    onClose: () => state.briefAttachments.clear(),
+  });
   try {
     const payload = await request(projectPath(projectId, '/context', source));
     if (!opened.dialog.isConnected || !activeProjectMatches(projectId, source)) return;
@@ -3219,22 +3417,29 @@ async function openProjectBrief() {
     });
 
     const evidence = make('div', { className: 'projects-brief-list' });
-    asArray(payload.evidence).forEach((attachment) => {
+    asArray(payload.evidence).forEach((rawAttachment) => {
+      const attachment = normalizeAttachment(rawAttachment);
+      state.briefAttachments.set(attachment.id, attachment);
       const row = make('div', { className: 'projects-brief-evidence' }, [
         make('div', {}, [
           make('strong', { text: String(attachment.name || 'Attachment') }),
           make('span', { text: `${attachmentKindLabel(attachment.kind)} · ${formatBytes(attachment.size)}` }),
         ]),
-        make('a', {
-          text: 'Download',
-          attrs: {
-            href: source === PROJECT_SOURCES.HOME
-              ? `/api/homelink/projects/attachments/${encodeURIComponent(attachment.id)}/download`
-              : (attachment.download_url || `/api/projects/attachments/${encodeURIComponent(attachment.id)}/download`),
-            download: attachment.name || 'attachment',
-            rel: 'noopener',
-          },
-        }),
+        make('div', { className: 'projects-brief-evidence__actions' }, [
+          actionButton('View', 'preview-attachment', {
+            className: 'projects-row-action',
+            dataset: { attachmentId: attachment.id, projectSource: source },
+            title: `View ${attachment.name}`,
+          }),
+          make('a', {
+            text: 'Download',
+            attrs: {
+              href: attachmentDownloadPath(source, attachment),
+              download: attachment.name || 'attachment',
+              rel: 'noopener',
+            },
+          }),
+        ]),
       ]);
       evidence.appendChild(row);
     });
@@ -5124,6 +5329,15 @@ async function onWorkspaceClick(event) {
       if (entry) await uploadQueueEntry(entry, { context });
       break;
     }
+    case 'preview-attachment': {
+      const attachment = findAttachmentForPreview(control.dataset.attachmentId);
+      if (!attachment) {
+        showToast('This attachment is no longer available. Reload the project and try again.', 'error');
+        break;
+      }
+      openAttachmentViewer(attachment, control.dataset.projectSource);
+      break;
+    }
     case 'delete-attachment': await deleteAttachment(control.dataset.attachmentId); break;
     default: break;
   }
@@ -5402,6 +5616,7 @@ export async function close({ force = false } = {}) {
     state[name] = null;
   });
   closeDialog();
+  state.briefAttachments.clear();
   attachmentQueues.clearAll();
   state.movingTasks.clear();
   state.submittingTasks.clear();
@@ -5484,6 +5699,9 @@ export const __test = Object.freeze({
   countIncompleteChecklistSteps,
   isAcceptedAttachment,
   attachmentKindLabel,
+  attachmentPreviewKind,
+  attachmentViewPath,
+  attachmentDownloadPath,
   attachmentUploadPath,
   buildAttachmentFormData,
   resolveUploadResponse,

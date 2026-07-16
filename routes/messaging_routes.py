@@ -390,7 +390,13 @@ def _resolve_other(request: Request, other: str) -> str:
     if key in canon:
         return key
     if link_routes.resolve_guest(key):
-        return key
+        me = _normalize_username(require_user(request))
+        if link_routes.is_hub_owner(request, me):
+            return key
+        # Remote bearers route only to the configured installation owner.
+        # Hide the guest from other profiles instead of creating a local-only
+        # thread the remote side can never read.
+        raise HTTPException(404, "User not found")
     raise HTTPException(404, "User not found")
 
 
@@ -604,21 +610,45 @@ def setup_messaging_routes():
             if not key or key == me:
                 continue
             out.append({"username": key, "is_admin": _is_admin(request, key)})
-        if link_routes.hub_enabled():
+        if link_routes.hub_enabled() and link_routes.is_hub_owner(request, me):
             local = {u["username"] for u in out}
             for gname in link_routes.list_guests():
                 if gname not in local and gname != me:
-                    out.append({"username": gname, "is_admin": False, "remote": True})
-        out.sort(key=lambda u: u["username"])
-        if link_routes.home_enabled():
+                    out.append({
+                        "username": gname,
+                        "is_admin": False,
+                        **link_routes.guest_contact_capabilities(gname),
+                    })
+        for peer in link_routes.outbound_chat_contacts(me):
+            if peer["username"] != me:
+                out.append(peer)
+        out.sort(key=lambda u: (str(u.get("display") or u["username"]), u["username"]))
+        if link_routes.home_connected(me) or link_routes.home_server():
             connected = link_routes.home_connected(me)
-            out.append({
-                "username": link_routes.home_contact_name(),
-                "is_admin": False,
-                "home": True,
-                "connected": connected,
-            })
-        return {"profiles": out, "users": out, "me": me}
+            primary_contact = link_routes.home_contact_name()
+            if primary_contact:
+                out.append({
+                    "username": primary_contact,
+                    "display": primary_contact,
+                    "is_admin": False,
+                    "home": True,
+                    "chat_only": False,
+                    "can_call": link_routes.home_call_available(me),
+                    "connected": connected,
+                })
+        can_manage_links = _is_admin(request, me)
+        return {
+            "profiles": out,
+            "users": out,
+            "me": me,
+            "can_connect_restia": can_manage_links,
+            "can_invite_restia": (
+                can_manage_links
+                and link_routes.hub_enabled()
+                and link_routes.is_hub_owner(request, me)
+            ),
+            "invite_origin": link_routes.invitation_origin(request),
+        }
 
     @router.get("/conversations")
     async def list_conversations(request: Request):
@@ -648,6 +678,8 @@ def setup_messaging_routes():
                         "last_mine": False,
                         "unread": 0,
                     }
+                    if other.endswith(link_routes.GUEST_SUFFIX):
+                        c.update(link_routes.guest_contact_capabilities(other))
                     convos[other] = c
                 # rows are ascending, so the final assignment is the latest.
                 c["last_body"] = (
@@ -659,8 +691,7 @@ def setup_messaging_routes():
                 c["last_at"] = (m.created_at.isoformat() + "Z") if m.created_at else None
                 if m.recipient == me and m.read_at is None:
                     c["unread"] += 1
-            home = await link_routes.home_conversation_entry(me)
-            if home:
+            for home in await link_routes.home_conversation_entries(me):
                 convos[home["username"]] = home
             ordered = sorted(
                 convos.values(),
@@ -679,7 +710,7 @@ def setup_messaging_routes():
             out = {"conversations": ordered, "me": me, "me_display": _my_display(me)}
             # Hub admins also get the queue of pending Home Link requests so
             # they can approve/block right from the Messages UI.
-            if link_routes.hub_enabled() and _is_admin(request, me):
+            if link_routes.hub_enabled() and link_routes.is_hub_owner(request, me):
                 out["link_requests"] = link_routes.pending_requests()
             return out
         finally:
@@ -699,9 +730,7 @@ def setup_messaging_routes():
             by_user: dict = {}
             for (sender,) in rows:
                 by_user[sender] = by_user.get(sender, 0) + 1
-            home_unread = await link_routes.home_unread(me)
-            if home_unread:
-                by_user[link_routes.home_contact_name()] = home_unread
+            by_user.update(await link_routes.home_unread_counts(me))
             return {"total": sum(by_user.values()), "by_user": by_user}
         finally:
             db.close()
@@ -723,7 +752,7 @@ def setup_messaging_routes():
             raise HTTPException(404, "Photo not found")
 
         if peer and link_routes.is_home_contact(peer):
-            remote = await link_routes.home_get_media(me, attachment_id)
+            remote = await link_routes.home_get_media(me, attachment_id, peer)
             data = _decode_stored_photo(remote.get("data"), remote.get("sha256", ""))
             # The configured hub is still an external trust boundary. Verify
             # and re-encode its bytes locally before a browser ever sees them;
@@ -773,7 +802,7 @@ def setup_messaging_routes():
         ?after_id=<id> to fetch only newer messages (polling)."""
         me = _require_me(request)
         if link_routes.is_home_contact(other):
-            out = await link_routes.home_get_conversation(me, after_id)
+            out = await link_routes.home_get_conversation(me, after_id, other)
             # The frontend gates edit/delete/react/typing on these flags.
             out["other"]["home"] = True
             out["other"]["remote"] = False
@@ -820,6 +849,15 @@ def setup_messaging_routes():
                 other_names = display_names_for([other_key])
             except Exception:
                 pass
+            other_meta = {
+                "username": other_key,
+                "display": other_names.get(other_key),
+                "is_admin": _is_admin(request, other_key),
+                "home": False,
+                "remote": other_key.endswith(link_routes.GUEST_SUFFIX),
+            }
+            if other_meta["remote"]:
+                other_meta.update(link_routes.guest_contact_capabilities(other_key))
             return {
                 "messages": [
                     _serialize(
@@ -831,13 +869,7 @@ def setup_messaging_routes():
                     )
                     for m in msgs
                 ],
-                "other": {
-                    "username": other_key,
-                    "display": other_names.get(other_key),
-                    "is_admin": _is_admin(request, other_key),
-                    "home": False,
-                    "remote": other_key.endswith(link_routes.GUEST_SUFFIX),
-                },
+                "other": other_meta,
                 "me": me,
                 "me_display": _my_display(me),
             }
@@ -860,7 +892,7 @@ def setup_messaging_routes():
             if req.reply_to_id:
                 raise HTTPException(400, "Replies are not available in this conversation")
             prepared = await run_in_threadpool(prepare_photo_attachments, req.attachments)
-            return await link_routes.home_send_message(me, body, prepared)
+            return await link_routes.home_send_message(me, body, prepared, other)
         other_key = _resolve_other(request, other)
         if other_key == me:
             raise HTTPException(400, "Cannot send a message to yourself")

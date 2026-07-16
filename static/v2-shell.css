@@ -146,6 +146,13 @@ body.v2-navigation-ready .settings-appearance-panel .vis-row:has(input[data-ui-k
 .v2-mobile-nav { display: none; }
 
 @media (max-width: 768px) {
+  /* The five-item mobile bar owns navigation in V2. Keeping the legacy
+     floating hamburger as well creates a duplicate target and can cover
+     workspace header actions such as Mission Control's Close button. */
+  body.v2-navigation-ready .hamburger-btn {
+    display: none !important;
+  }
+
   body.v2-navigation-ready .chat-container {
     padding-bottom: calc(68px + env(safe-area-inset-bottom, 0px));
   }
@@ -194,6 +201,7 @@ body.v2-navigation-ready .settings-appearance-panel .vis-row:has(input[data-ui-k
   }
 
   body:has(.modal:not(.hidden)) .v2-mobile-nav,
+  body:has(.projects-dialog) .v2-mobile-nav,
   body.call-active .v2-mobile-nav { display: none; }
 
   body.mission-control-view .mission-workspace,

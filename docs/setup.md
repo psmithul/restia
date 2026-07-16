@@ -403,8 +403,36 @@ uv pip sync requirements.lock                          # reproduce it exactly la
 ### Outlook / Office 365 email
 Restia email accounts currently use IMAP/SMTP username-password auth. Outlook
 and Microsoft 365 generally require OAuth instead, so normal Microsoft mailbox
-passwords will fail. See [docs/email-outlook.md](docs/email-outlook.md) for the
+passwords will fail. See [email-outlook.md](email-outlook.md) for the
 current limitation and the planned integration direction.
+
+## Connecting Restia installations
+
+Restia-to-Restia chat is configured in the app; fresh installs do not contain
+a special central or developer contact.
+
+1. On the inviting installation, open **Messages → New message → Invite
+   another Restia**.
+2. Enter that installation's reachable HTTPS origin and create the private,
+   single-use invitation.
+3. On the other installation, open **Messages → New message → Connect another
+   Restia**, paste the invitation, choose an installation handle, and accept.
+4. The connected installation appears as a normal `instance` contact. Repeat
+   the flow to connect additional Restia installations.
+
+Without an invitation, an owner can enter another Restia's address and send a
+pending connection request. The receiving owner explicitly approves or blocks
+it in Messages. `LINK_HUB_ENABLED=true` is the default; set it to `false` to
+make an installation refuse new inbound connections. `RESTIA_HOME_SERVER`
+remains available for deployment-managed legacy/full Home Link setups, but it
+is empty by default and is not needed for ordinary chat invitations.
+
+Non-loopback origins must use HTTPS. A local-only installation behind NAT is
+not reachable from the internet by itself; use a trusted reverse proxy, private
+network, or tunnel and share only the resulting authenticated Restia origin.
+The invitation code is shown once, stored only as a hash on the inviting
+installation, expires after seven days by default, and can be revoked before
+use.
 
 ## Security Notes
 Restia is a self-hosted workspace with powerful local tools: shell access, file uploads, model downloads, web research, email/calendar integrations, and API tokens. Treat it like an admin console.

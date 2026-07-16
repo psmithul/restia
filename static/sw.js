@@ -7,7 +7,7 @@
 //   - Other static assets (images/fonts/libs): cache-first with bg refresh.
 //   - API / non-GET: never cached.
 // Bump CACHE_NAME whenever the precache list or SW logic changes.
-const CACHE_NAME = 'restia-v358';
+const CACHE_NAME = 'restia-v365';
 
 // Core shell precached on install so repeat opens are instant without any
 // network wait. Keep this list in sync with the <script type="module"> tags
@@ -46,6 +46,7 @@ const PRECACHE = [
   '/static/js/theme.js',
   '/static/js/censor.js',
   '/static/js/settings.js',
+  '/static/js/telegramOnboarding.js',
   '/static/js/admin.js',
   '/static/js/init.js',
   '/static/js/slashCommands.js',
@@ -55,6 +56,7 @@ const PRECACHE = [
   '/static/js/emailLibrary/state.js',
   '/static/js/notes.js',
   '/static/js/projects.js',
+  '/static/js/projectAttachmentViewer.js',
   '/static/js/navigation-registry.js',
   '/static/js/v2NavigationShell.js',
   '/static/js/missionControl.js',
@@ -66,6 +68,7 @@ const PRECACHE = [
   '/static/js/calendar.js',
   '/static/js/calendar/utils.js',
   '/static/js/calendar/reminders.js',
+  '/static/js/calendar/reminderPayload.js',
   '/static/js/group.js',
   '/static/js/keyboard-shortcuts.js',
   '/static/js/sidebar-layout.js',

@@ -5,7 +5,33 @@
 import { setSidebarSectionCollapsed } from './section-management.js';
 
 let _syncRailSideFn = null;
+let _toggleSidebarFn = null;
+let _setSidebarStateFn = null;
 const MOBILE_BREAKPOINT = 768;
+export const SIDEBAR_STATES = Object.freeze({ FULL: 'full', MINI: 'mini', OFF: 'off' });
+
+export function toggleSidebarFromControl(event = null) {
+  if (_toggleSidebarFn) {
+    _toggleSidebarFn(event || { stopPropagation() {} });
+  }
+}
+
+/** Apply one authoritative sidebar state and reconcile rail, scrim and ARIA. */
+export function setSidebarState(state, options = {}) {
+  if (!_setSidebarStateFn) return false;
+  return _setSidebarStateFn(state, options);
+}
+
+export function openSidebar(options = {}) {
+  return setSidebarState(SIDEBAR_STATES.FULL, options);
+}
+
+export function closeSidebar(options = {}) {
+  return setSidebarState(
+    options.state || (_isMobileViewport() ? SIDEBAR_STATES.OFF : SIDEBAR_STATES.MINI),
+    options,
+  );
+}
 
 function _isMobileViewport() {
   return window.innerWidth <= MOBILE_BREAKPOINT;
@@ -43,9 +69,25 @@ export function initSidebarLayout(Storage, opts) {
   const hamburgerBtn = document.getElementById('hamburger-btn');
   const sidebarToggleBtn = document.getElementById('sidebar-toggle-btn');
   const sidebar = document.getElementById('sidebar');
+  let mobileBackdrop = document.getElementById('sidebar-backdrop');
+  if (!mobileBackdrop) {
+    mobileBackdrop = document.createElement('div');
+    mobileBackdrop.id = 'sidebar-backdrop';
+    document.body.appendChild(mobileBackdrop);
+  }
   let _temporaryMobileRightSide = false;
   let _wasMobileViewport = _isMobileViewport();
   let _sidebarWasVisible = Boolean(sidebar && !sidebar.classList.contains('hidden'));
+  let _userToggledSidebar = false;
+  let _wasAutoCollapsed = false;
+  let _autoCollapsedFromState = null;
+  let _pendingMobileOpenTimer = null;
+  let _sidebarTransitionGeneration = 0;
+  const stateStorageKey = Storage.KEYS.SIDEBAR_STATE || 'sidebar-layout-state';
+  const savedDesktopState = Storage.get(stateStorageKey);
+  let _desktopPreferredState = Object.values(SIDEBAR_STATES).includes(savedDesktopState)
+    ? savedDesktopState
+    : SIDEBAR_STATES.FULL;
 
   function _syncSidebarAccessibility(sidebarHidden) {
     if (!sidebar) return;
@@ -108,8 +150,11 @@ export function initSidebarLayout(Storage, opts) {
     [hamburgerBtn, sidebarToggleBtn].forEach((btn) => {
       if (!btn) return;
       btn.setAttribute('aria-expanded', sidebarHidden ? 'false' : 'true');
-      btn.setAttribute('aria-label', sidebarHidden ? 'Show sidebar' : 'Collapse sidebar');
-      btn.title = sidebarHidden ? 'Show sidebar' : 'Collapse sidebar';
+      const action = !sidebarHidden
+        ? 'Collapse sidebar to navigation rail'
+        : (railHidden ? 'Show sidebar' : 'Hide navigation rail');
+      btn.setAttribute('aria-label', action);
+      btn.title = action;
     });
     const mobileMore = document.querySelector('[data-mobile-nav="more"]');
     mobileMore?.setAttribute('aria-expanded', String(!sidebarHidden));
@@ -124,15 +169,95 @@ export function initSidebarLayout(Storage, opts) {
     }
   }
 
+  function updateMobileBackdrop() {
+    if (!_isMobileViewport()) { mobileBackdrop.classList.remove('visible'); return; }
+    const sidebarOpen = sidebar && !sidebar.classList.contains('hidden');
+    const miniOpen = iconRail && iconRail.classList.contains('mobile-mini');
+    mobileBackdrop.classList.toggle('visible', Boolean(sidebarOpen || miniOpen));
+  }
+
+  function _currentSidebarState() {
+    if (!sidebar || !iconRail) return SIDEBAR_STATES.OFF;
+    if (!sidebar.classList.contains('hidden')) return SIDEBAR_STATES.FULL;
+    if (_isMobileViewport()) {
+      return iconRail.classList.contains('mobile-mini') ? SIDEBAR_STATES.MINI : SIDEBAR_STATES.OFF;
+    }
+    return iconRail.classList.contains('rail-hidden') ? SIDEBAR_STATES.OFF : SIDEBAR_STATES.MINI;
+  }
+
+  function _cancelPendingMobileOpen() {
+    _sidebarTransitionGeneration += 1;
+    if (_pendingMobileOpenTimer !== null) {
+      clearTimeout(_pendingMobileOpenTimer);
+      _pendingMobileOpenTimer = null;
+      return true;
+    }
+    return false;
+  }
+
+  function _applySidebarState(state, { persist = false, userInitiated = false } = {}) {
+    if (!sidebar || !iconRail || !Object.values(SIDEBAR_STATES).includes(state)) return false;
+    _cancelPendingMobileOpen();
+    if (userInitiated) _userToggledSidebar = true;
+    const mobile = _isMobileViewport();
+    if (mobile) {
+      sidebar.classList.toggle('hidden', state !== SIDEBAR_STATES.FULL);
+      iconRail.classList.toggle('mobile-mini', state === SIDEBAR_STATES.MINI);
+      if (state !== SIDEBAR_STATES.MINI) iconRail.style.cssText = '';
+    } else if (state === SIDEBAR_STATES.FULL) {
+      iconRail.classList.remove('mobile-mini');
+      iconRail.style.cssText = '';
+      sidebar.classList.remove('hidden');
+      iconRail.classList.remove('rail-hidden');
+    } else if (state === SIDEBAR_STATES.MINI) {
+      iconRail.classList.remove('mobile-mini');
+      iconRail.style.cssText = '';
+      sidebar.classList.add('hidden');
+      iconRail.classList.remove('rail-hidden');
+    } else {
+      iconRail.classList.remove('mobile-mini');
+      iconRail.style.cssText = '';
+      sidebar.classList.add('hidden');
+      iconRail.classList.add('rail-hidden');
+    }
+
+    if (persist && !mobile) {
+      _desktopPreferredState = state;
+      delete document.body.dataset.routeCollapsedSidebar;
+      try { Storage.set(stateStorageKey, state); } catch (_) {}
+    }
+    syncRailSide();
+    return true;
+  }
+
+  function _scheduleMobileOpen() {
+    _cancelPendingMobileOpen();
+    const generation = _sidebarTransitionGeneration;
+    _pendingMobileOpenTimer = setTimeout(() => {
+      if (generation !== _sidebarTransitionGeneration) return;
+      _pendingMobileOpenTimer = null;
+      _applySidebarState(SIDEBAR_STATES.FULL);
+    }, 250);
+  }
+
   // Set initial reference and expose globally
-  _syncRailSideFn = _syncRailSideCore;
+  _syncRailSideFn = function() { _syncRailSideCore(); updateMobileBackdrop(); };
   window.syncRailSide = syncRailSide;
+  _setSidebarStateFn = _applySidebarState;
+  window.setSidebarState = setSidebarState;
+  window.openSidebar = openSidebar;
+  window.closeSidebar = closeSidebar;
 
   // Restore sidebar side preference
   if (Storage.get(Storage.KEYS.SIDEBAR_SIDE) === 'right') {
     _setSidebarRightSide(true, { syncDocument: false });
   }
-  syncRailSide();
+  if (_isMobileViewport()) {
+    _wasAutoCollapsed = true;
+    _applySidebarState(SIDEBAR_STATES.OFF);
+  } else {
+    _applySidebarState(_desktopPreferredState);
+  }
 
   // Header-only new-chat aliases. #sidebar-new-chat-btn is wired in app.js
   // because it needs the full default-model/pending-chat flow; wiring it here
@@ -145,9 +270,7 @@ export function initSidebarLayout(Storage, opts) {
     });
   });
 
-  // Hamburger cycles: full sidebar → mini → off → full
-  let _userToggledSidebar = false;
-  let _wasAutoCollapsed = false;
+  // Hamburger cycles: full sidebar → mini → off → full.
 
   // Deliberate "open the sidebar" used by the mobile swipe gesture (wired at
   // module scope). It MUST set _userToggledSidebar so the auto-collapse
@@ -168,30 +291,39 @@ export function initSidebarLayout(Storage, opts) {
       const wantRight = side === 'right';
       _setSidebarRightSide(wantRight, { persist: true });
       _temporaryMobileRightSide = false;
+    } else if (_isMobileViewport() && !sidebar.classList.contains('right-side')) {
+      // The mobile hamburger and V2 More entry both open from the right without
+      // overwriting the user's persisted desktop side.
+      _setSidebarRightSide(true);
+      _temporaryMobileRightSide = Storage.get(Storage.KEYS.SIDEBAR_SIDE) !== 'right';
     }
-    const backdrop = document.getElementById('sidebar-backdrop');
-    if (_isMobileViewport() && iconRail) { iconRail.classList.remove('mobile-mini'); iconRail.style.cssText = ''; }
-    sidebar.classList.remove('hidden');
-    if (backdrop && _isMobileViewport()) backdrop.classList.add('visible');
-    syncRailSide();
+    _wasAutoCollapsed = false;
+    _applySidebarState(SIDEBAR_STATES.FULL, { persist: !_isMobileViewport() });
   };
 
-  function toggleSidebarFromControl(e) {
-      e.stopPropagation();
+  function _toggleSidebarFromControl(e) {
+      e?.stopPropagation?.();
       if (!sidebar) return;
 
       _userToggledSidebar = true;
-      const isSidebarVisible = !sidebar.classList.contains('hidden');
+
+      if (e?.shiftKey && !_isMobileViewport()) {
+        _cancelPendingMobileOpen();
+        _setSidebarRightSide(!sidebar.classList.contains('right-side'), { persist: true });
+        syncRailSide();
+        return;
+      }
 
       if (_isMobileViewport()) {
         // Mobile: full sidebar ↔ hidden — simple toggle, no mini rail
-        const backdrop = document.getElementById('sidebar-backdrop');
-        if (iconRail) { iconRail.classList.remove('mobile-mini'); iconRail.style.cssText = ''; }
-
-        if (isSidebarVisible) {
-          // Closing sidebar
-          sidebar.classList.add('hidden');
-          if (backdrop) backdrop.classList.remove('visible');
+        const isSidebarVisible = !sidebar.classList.contains('hidden');
+        if (_pendingMobileOpenTimer !== null) {
+          // A second click while keyboard dismissal is pending is the inverse
+          // action: cancel the stale open instead of scheduling another one.
+          _cancelPendingMobileOpen();
+          _applySidebarState(SIDEBAR_STATES.OFF);
+        } else if (isSidebarVisible) {
+          _applySidebarState(SIDEBAR_STATES.OFF);
         } else {
           // Mobile: the hamburger always opens the sidebar from the RIGHT.
           // (Not persisted — keeps the desktop side preference untouched.)
@@ -203,37 +335,31 @@ export function initSidebarLayout(Storage, opts) {
           if (document.activeElement && document.activeElement !== document.body
               && (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA')) {
             document.activeElement.blur();
-            // Wait for keyboard dismiss to settle, then open
-            setTimeout(() => {
-              sidebar.classList.remove('hidden');
-              if (backdrop) backdrop.classList.add('visible');
-              syncRailSide();
-            }, 250);
+            _scheduleMobileOpen();
           } else {
-            sidebar.classList.remove('hidden');
-            if (backdrop) backdrop.classList.add('visible');
+            _applySidebarState(SIDEBAR_STATES.FULL);
           }
         }
-        syncRailSide();
         return;
       }
 
-      // Desktop: full sidebar ↔ mini (icon rail) — simple toggle
-      if (isSidebarVisible) {
-        sidebar.classList.add('hidden');
-      } else {
-        _wasAutoCollapsed = false;
-        iconRail.classList.remove('rail-hidden');
-        sidebar.classList.remove('hidden');
-      }
-      syncRailSide();
+      const current = _currentSidebarState();
+      const next = current === SIDEBAR_STATES.FULL
+        ? SIDEBAR_STATES.MINI
+        : (current === SIDEBAR_STATES.MINI ? SIDEBAR_STATES.OFF : SIDEBAR_STATES.FULL);
+      _wasAutoCollapsed = false;
+      _autoCollapsedFromState = null;
+      _applySidebarState(next, { persist: true });
   }
 
+  _toggleSidebarFn = _toggleSidebarFromControl;
+  window.toggleSidebarFromControl = toggleSidebarFromControl;
+
   if (hamburgerBtn) {
-    hamburgerBtn.addEventListener('click', toggleSidebarFromControl);
+    hamburgerBtn.addEventListener('click', _toggleSidebarFromControl);
   }
   if (sidebarToggleBtn) {
-    sidebarToggleBtn.addEventListener('click', toggleSidebarFromControl);
+    sidebarToggleBtn.addEventListener('click', _toggleSidebarFromControl);
   }
 
   // Icon rail section clicks — open sidebar and scroll to section
@@ -243,9 +369,7 @@ export function initSidebarLayout(Storage, opts) {
       if (!btn || btn.id === 'rail-new-session' || btn.id === 'rail-delete-session' || btn.id === 'rail-search-btn' || btn.id === 'rail-settings' || btn.id === 'rail-admin') return;
       const sectionId = btn.dataset.section;
       if (!sectionId) return;
-      const sidebar = document.getElementById('sidebar');
-      sidebar.classList.remove('hidden');
-      syncRailSide();
+      window._odyOpenSidebar?.();
       const section = document.getElementById(sectionId);
       if (section) {
         section.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -259,9 +383,9 @@ export function initSidebarLayout(Storage, opts) {
 
   function checkSidebarAutoCollapse() {
     if (_userToggledSidebar) return;
-    const sidebar = document.getElementById('sidebar');
     if (!sidebar) return;
-    const isHidden = sidebar.classList.contains('hidden');
+    const currentState = _currentSidebarState();
+    const isHidden = currentState !== SIDEBAR_STATES.FULL;
 
     // Check if chat area is too narrow (e.g. sidebar + doc panel both open).
     // BUT — if a tile-snapped modal exists, IT is what's making chat narrow,
@@ -273,28 +397,37 @@ export function initSidebarLayout(Storage, opts) {
     const chatTooNarrow = chatContainer && chatContainer.offsetWidth < MIN_CHAT_WIDTH && !isHidden && !hasTileSnapped;
 
     if ((_isMobileViewport() || chatTooNarrow) && !isHidden) {
-      sidebar.classList.add('hidden');
+      _autoCollapsedFromState = currentState;
       _wasAutoCollapsed = true;
-      syncRailSide();
+      _applySidebarState(_isMobileViewport() ? SIDEBAR_STATES.OFF : SIDEBAR_STATES.MINI);
     } else if (!_isMobileViewport() && isHidden && _wasAutoCollapsed) {
       // Only restore if chat won't be too narrow
-      sidebar.classList.remove('hidden');
+      const restoreState = _autoCollapsedFromState || _desktopPreferredState;
+      _applySidebarState(restoreState);
       void document.body.offsetWidth; // reflow
-      if (chatContainer && chatContainer.offsetWidth < MIN_CHAT_WIDTH) {
-        sidebar.classList.add('hidden');
+      if (restoreState === SIDEBAR_STATES.FULL && chatContainer && chatContainer.offsetWidth < MIN_CHAT_WIDTH) {
+        _applySidebarState(SIDEBAR_STATES.MINI);
       } else {
         _wasAutoCollapsed = false;
+        _autoCollapsedFromState = null;
       }
-      syncRailSide();
     }
   }
 
   window.addEventListener('resize', () => {
     const mobile = _isMobileViewport();
-    if (_wasMobileViewport && !mobile && _temporaryMobileRightSide) {
-      _setSidebarRightSide(Storage.get(Storage.KEYS.SIDEBAR_SIDE) === 'right');
-      _temporaryMobileRightSide = false;
-      syncRailSide();
+    if (_wasMobileViewport && !mobile) {
+      if (_temporaryMobileRightSide) {
+        _setSidebarRightSide(Storage.get(Storage.KEYS.SIDEBAR_SIDE) === 'right');
+        _temporaryMobileRightSide = false;
+      }
+      _wasAutoCollapsed = false;
+      _autoCollapsedFromState = null;
+      _applySidebarState(_desktopPreferredState);
+    } else if (!_wasMobileViewport && mobile) {
+      _autoCollapsedFromState = _currentSidebarState();
+      _wasAutoCollapsed = true;
+      _applySidebarState(SIDEBAR_STATES.OFF);
     }
     _wasMobileViewport = mobile;
     _userToggledSidebar = false; // allow auto-collapse on actual resize
@@ -304,29 +437,8 @@ export function initSidebarLayout(Storage, opts) {
   new MutationObserver(() => requestAnimationFrame(checkSidebarAutoCollapse))
     .observe(document.body, { attributes: true, attributeFilter: ['class'] });
 
-  // Auto-collapse on initial load if window is small
-  if (_isMobileViewport()) {
-    if (sidebar && !sidebar.classList.contains('hidden')) {
-      sidebar.classList.add('hidden');
-      _wasAutoCollapsed = true;
-      syncRailSide();
-    }
-  }
-
   // ── Mobile sidebar backdrop + swipe-to-close ──
   // Backdrop overlay: tapping it closes the sidebar
-  const mobileBackdrop = document.createElement('div');
-  mobileBackdrop.id = 'sidebar-backdrop';
-  document.body.appendChild(mobileBackdrop);
-
-  function updateMobileBackdrop() {
-    if (!_isMobileViewport()) { mobileBackdrop.classList.remove('visible'); return; }
-    const sb = document.getElementById('sidebar');
-    const rail = document.getElementById('icon-rail');
-    const sidebarOpen = sb && !sb.classList.contains('hidden');
-    const miniOpen = rail && rail.classList.contains('mobile-mini');
-    mobileBackdrop.classList.toggle('visible', sidebarOpen || miniOpen);
-  }
 
   // Suppress sidebar close briefly after dropdown actions
   window._suppressSidebarClose = false;
@@ -348,29 +460,17 @@ export function initSidebarLayout(Storage, opts) {
       if (openDD) openDD.style.display = 'none';
       return;
     }
-    const sb = document.getElementById('sidebar');
-    if (sb && !sb.classList.contains('hidden')) {
-      sb.classList.add('hidden');
-    }
-    mobileBackdrop.classList.remove('visible');
-    syncRailSide();
+    _applySidebarState(SIDEBAR_STATES.OFF);
   });
 
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape' || !_isMobileViewport()) return;
-    const sb = document.getElementById('sidebar');
-    if (!sb || sb.classList.contains('hidden')) return;
+    const hasPendingOpen = _pendingMobileOpenTimer !== null;
+    if ((!sidebar || sidebar.classList.contains('hidden')) && !hasPendingOpen) return;
     e.preventDefault();
     e.stopPropagation();
-    sb.classList.add('hidden');
-    mobileBackdrop.classList.remove('visible');
-    syncRailSide();
+    _applySidebarState(SIDEBAR_STATES.OFF);
   });
-
-  // Patch syncRailSide to also update backdrop
-  const _origSyncRailSideCore = _syncRailSideCore;
-  _syncRailSideFn = function() { _origSyncRailSideCore(); updateMobileBackdrop(); };
-  window.syncRailSide = syncRailSide;
 
   // Swipe sidebar toward edge to close
   if (sidebar && 'ontouchstart' in window) {
@@ -389,10 +489,7 @@ export function initSidebarLayout(Storage, opts) {
       const isRight = sidebar.classList.contains('right-side');
       if ((!isRight && dx < -60) || (isRight && dx > 60)) {
         _swSwiping = false;
-        const _backdrop = document.getElementById('sidebar-backdrop');
-        if (_backdrop) _backdrop.classList.remove('visible');
-        sidebar.classList.add('hidden');
-        syncRailSide();
+        _applySidebarState(SIDEBAR_STATES.OFF);
       }
     }, { passive: true });
     sidebar.addEventListener('touchend', () => { _swSwiping = false; }, { passive: true });
@@ -416,19 +513,12 @@ export function initSidebarLayout(Storage, opts) {
     if (e.target.closest('.session-dropdown, .folder-submenu, #styled-prompt-overlay, #styled-confirm-overlay')) return;
     // Close full sidebar if open (with animation)
     if (sb && !sb.classList.contains('hidden')) {
-      const backdrop = document.getElementById('sidebar-backdrop');
-      if (backdrop) backdrop.classList.remove('visible');
-      sb.classList.add('hidden');
-      syncRailSide();
+      _applySidebarState(SIDEBAR_STATES.OFF);
       return;
     }
     // Close mobile-mini icon rail overlay if open
     if (rail && rail.classList.contains('mobile-mini')) {
-      rail.classList.remove('mobile-mini');
-      rail.style.cssText = '';
-      const backdrop = document.getElementById('sidebar-backdrop');
-      if (backdrop) backdrop.classList.remove('visible');
-      syncRailSide();
+      _applySidebarState(SIDEBAR_STATES.OFF);
     }
   });
 
@@ -445,28 +535,16 @@ export function initSidebarLayout(Storage, opts) {
     if (!_isMobileViewport()) return;
     const btn = e.target.closest('[id^="tool-"], [id^="rail-"]');
     if (!btn) return;
+    // Capture runs before the button's own handler (Notes used to hide the
+    // drawer synchronously), so retain the true pre-launch state.
+    if (sidebar && !sidebar.classList.contains('hidden')) _sidebarWasOpenBeforeTool = true;
+    if (iconRail && iconRail.classList.contains('mobile-mini')) _railWasOpenBeforeTool = true;
     setTimeout(() => {
-      const sb = document.getElementById('sidebar');
-      const rail = document.getElementById('icon-rail');
-      const backdrop = document.getElementById('sidebar-backdrop');
-      let changed = false;
-      if (sb && !sb.classList.contains('hidden')) {
-        _sidebarWasOpenBeforeTool = true;
-        sb.classList.add('hidden');
-        changed = true;
-      }
-      if (rail && rail.classList.contains('mobile-mini')) {
-        _railWasOpenBeforeTool = true;
-        rail.classList.remove('mobile-mini');
-        rail.style.cssText = '';
-        changed = true;
-      }
-      if (changed) {
-        if (backdrop) backdrop.classList.remove('visible');
-        syncRailSide();
+      if (_sidebarWasOpenBeforeTool || _railWasOpenBeforeTool || _currentSidebarState() !== SIDEBAR_STATES.OFF) {
+        _applySidebarState(SIDEBAR_STATES.OFF);
       }
     }, 0);
-  });
+  }, true);
 
   // When a tool is dismissed by swiping it down (ui.js fires `modal-dismissed`),
   // don't bounce the sidebar back open — the swipe should just dismiss the tool.
@@ -482,9 +560,6 @@ export function initSidebarLayout(Storage, opts) {
   // remembered "sidebar-was-open" flag is set, undo the auto-close.
   if (_isMobileViewport()) {
     const _restoreSidebar = () => {
-      const sb = document.getElementById('sidebar');
-      const rail = document.getElementById('icon-rail');
-      const backdrop = document.getElementById('sidebar-backdrop');
       // Skip if any modal is still visible (.modal without .hidden) — we only
       // restore once the user is back to bare chat. A tool swiped DOWN to a
       // dock chip is minimized (display:none via .modal-minimized), not closed
@@ -504,17 +579,13 @@ export function initSidebarLayout(Storage, opts) {
         _railWasOpenBeforeTool = false;
         return;
       }
-      if (_sidebarWasOpenBeforeTool && sb && sb.classList.contains('hidden')) {
-        sb.classList.remove('hidden');
-        if (backdrop) backdrop.classList.add('visible');
-      }
-      if (_railWasOpenBeforeTool && rail && !rail.classList.contains('mobile-mini')) {
-        rail.classList.add('mobile-mini');
-      }
       const shouldSync = _sidebarWasOpenBeforeTool || _railWasOpenBeforeTool;
+      const restoreState = _sidebarWasOpenBeforeTool
+        ? SIDEBAR_STATES.FULL
+        : (_railWasOpenBeforeTool ? SIDEBAR_STATES.MINI : SIDEBAR_STATES.OFF);
       _sidebarWasOpenBeforeTool = false;
       _railWasOpenBeforeTool = false;
-      if (shouldSync) syncRailSide();
+      if (shouldSync) _applySidebarState(restoreState);
     };
     const _modalObs = new MutationObserver((muts) => {
       let triggered = false;
@@ -527,6 +598,7 @@ export function initSidebarLayout(Storage, opts) {
       if (triggered) setTimeout(_restoreSidebar, 50);
     });
     _modalObs.observe(document.body, { subtree: true, attributes: true, attributeFilter: ['class'] });
+    window.addEventListener('sidebar-tool-closed', _restoreSidebar);
   }
 
   // (Mobile swipe-to-open-sidebar is wired at MODULE scope — see
@@ -611,8 +683,7 @@ function _initChatSwipeToOpenSidebar() {
       if (typeof window._odyOpenSidebar === 'function') {
         window._odyOpenSidebar(side);
       } else {
-        const sb = document.getElementById('sidebar');
-        if (sb) { sb.classList.remove('hidden'); try { syncRailSide(); } catch (_) {} }
+        openSidebar();
       }
     }
   }, { passive: false, capture: true });
@@ -621,8 +692,10 @@ function _initChatSwipeToOpenSidebar() {
   document.addEventListener('touchcancel', reset, { passive: true, capture: true });
 }
 
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', _initChatSwipeToOpenSidebar);
-} else {
-  _initChatSwipeToOpenSidebar();
+if (typeof document !== 'undefined' && typeof window !== 'undefined') {
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', _initChatSwipeToOpenSidebar);
+  } else {
+    _initChatSwipeToOpenSidebar();
+  }
 }

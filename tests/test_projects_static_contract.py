@@ -13,6 +13,7 @@ APP_PY = ROOT / "app.py"
 APP_JS = ROOT / "static" / "app.js"
 INDEX_HTML = ROOT / "static" / "index.html"
 PROJECTS_JS = ROOT / "static" / "js" / "projects.js"
+VIEWER_JS = ROOT / "static" / "js" / "projectAttachmentViewer.js"
 PROJECTS_CSS = ROOT / "static" / "projects.css"
 SW_JS = ROOT / "static" / "sw.js"
 
@@ -99,6 +100,7 @@ def test_projects_module_is_wired_as_a_full_workspace():
 
 def test_projects_frontend_wires_closed_home_link_federation_surfaces():
     projects_js = PROJECTS_JS.read_text(encoding="utf-8")
+    viewer_js = VIEWER_JS.read_text(encoding="utf-8")
     css = PROJECTS_CSS.read_text(encoding="utf-8")
 
     for endpoint in (
@@ -110,7 +112,7 @@ def test_projects_frontend_wires_closed_home_link_federation_surfaces():
         "/api/homelink/projects/invitations",
         "/api/homelink/projects/attachments/",
     ):
-        assert endpoint in projects_js
+        assert endpoint in projects_js + viewer_js
     assert "transport === PROJECT_SOURCES.HOME ? '/api/homelink/projects' : '/api/projects'" in projects_js
     assert "On this Restia" in projects_js
     assert "Linked projects" in projects_js
@@ -128,10 +130,16 @@ def test_projects_assets_are_precached_and_respect_responsive_accessibility():
     css = PROJECTS_CSS.read_text(encoding="utf-8")
     assert "'/static/projects.css'" in service_worker
     assert "'/static/js/projects.js'" in service_worker
+    assert "'/static/js/projectAttachmentViewer.js'" in service_worker
     assert "@media" in css
     assert "max-width: 768px" in css
     assert "prefers-reduced-motion" in css
     assert ":focus-visible" in css
+    assert ".projects-dialog--viewer" in css
+    assert ".projects-viewer-frame" in css
+    assert ".projects-viewer-text" in css
+    assert ".projects-viewer-office" in css
+    assert ".projects-viewer-office__table" in css
 
 
 def test_projects_drawer_toolbar_commands_cannot_overlap():

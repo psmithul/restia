@@ -1,7 +1,9 @@
 import tempfile
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 import core.database as cdb
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
@@ -50,3 +52,34 @@ def test_unread_message_notifications_are_owner_scoped_and_grouped(monkeypatch):
 
 def test_message_notifications_require_concrete_owner():
     assert ncr._messages_unread("") == []
+
+
+@pytest.mark.asyncio
+async def test_notification_center_resolves_local_request_to_concrete_owner(monkeypatch):
+    seen = []
+
+    monkeypatch.setattr(
+        ncr,
+        "resolved_request_owner",
+        lambda request, admitted_user: "owner@localhost",
+    )
+    for name in (
+        "_emails_needing_reply",
+        "_todos_due",
+        "_events_upcoming",
+        "_messages_unread",
+    ):
+        monkeypatch.setattr(
+            ncr,
+            name,
+            lambda owner, section=name: seen.append((section, owner)) or [],
+        )
+
+    router = ncr.setup_notification_center_routes()
+    endpoint = next(
+        route.endpoint for route in router.routes if route.path == "/api/notifications/center"
+    )
+    result = await endpoint(SimpleNamespace(), admitted_user="")
+
+    assert result["count"] == 0
+    assert {owner for _, owner in seen} == {"owner@localhost"}

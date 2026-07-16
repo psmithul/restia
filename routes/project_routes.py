@@ -20,7 +20,7 @@ from typing import Any, BinaryIO, Callable, Literal, Optional
 from urllib.parse import quote
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, func, or_, text, update
 from sqlalchemy.exc import IntegrityError
@@ -53,7 +53,14 @@ from src.project_storage import (
     read_project_attachment,
     write_project_attachment_cancellation_safe,
 )
+from src.project_office_preview import (
+    OFFICE_PREVIEW_MIME_BY_EXTENSION,
+    OfficePreviewError,
+    extract_office_preview,
+)
+from src.progression import award_progression_event
 from src.upload_limits import (
+    PROJECT_ATTACHMENT_MAX_BYTES,
     PROJECT_MAX_ATTACHMENTS_PER_ITEM,
     PROJECT_MAX_ATTACHMENTS_PER_PROJECT,
     PROJECT_MAX_ACTIVE_ITEMS,
@@ -98,6 +105,19 @@ ITEM_LIST_MAX_LIMIT = min(PROJECT_MAX_ITEMS, 2_000)
 ITEM_DETAIL_COMMENT_LIMIT = min(PROJECT_MAX_COMMENTS_PER_ITEM, 200)
 ATTACHMENT_INTEGRITY_CHUNK_BYTES = 1024 * 1024
 PROJECT_PAIRING_EXPIRY_MINUTES = 30
+PROJECT_ATTACHMENT_PREVIEW_MIMES = {
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".txt": "text/plain; charset=utf-8",
+    ".md": "text/markdown; charset=utf-8",
+    ".csv": "text/csv; charset=utf-8",
+    ".json": "application/json",
+}
+_PROJECT_ATTACHMENT_RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
 
 
 def _bounded_download_concurrency_env(name: str, default: int, maximum: int) -> int:
@@ -1319,14 +1339,23 @@ def _attachment_download_principal(actor: str) -> str:
     return f"profile:{_canonical_actor(actor)}"
 
 
-async def _stream_verified_attachment(snapshot: BinaryIO):
-    while True:
+async def _stream_verified_attachment(
+    snapshot: BinaryIO,
+    remaining: Optional[int] = None,
+):
+    bytes_left = None if remaining is None else max(0, int(remaining))
+    while bytes_left is None or bytes_left > 0:
+        read_size = ATTACHMENT_INTEGRITY_CHUNK_BYTES
+        if bytes_left is not None:
+            read_size = min(read_size, bytes_left)
         chunk = await asyncio.to_thread(
             snapshot.read,
-            ATTACHMENT_INTEGRITY_CHUNK_BYTES,
+            read_size,
         )
         if not chunk:
             break
+        if bytes_left is not None:
+            bytes_left -= len(chunk)
         yield chunk
 
 
@@ -1338,11 +1367,18 @@ class _VerifiedAttachmentResponse(StreamingResponse):
         snapshot: BinaryIO,
         *args,
         on_close: Optional[Callable[[], None]] = None,
+        offset: int = 0,
+        length: Optional[int] = None,
         **kwargs,
     ):
         self._verified_snapshot = snapshot
         self._verified_on_close = on_close
-        super().__init__(_stream_verified_attachment(snapshot), *args, **kwargs)
+        snapshot.seek(max(0, int(offset)))
+        super().__init__(
+            _stream_verified_attachment(snapshot, length),
+            *args,
+            **kwargs,
+        )
 
     async def __call__(self, scope, receive, send) -> None:
         try:
@@ -1395,14 +1431,86 @@ async def _prepare_verified_attachment_snapshot(
         raise
 
 
-def _attachment_content_disposition(filename: object) -> str:
+def _attachment_content_disposition(
+    filename: object,
+    *,
+    disposition: Literal["attachment", "inline"] = "attachment",
+) -> str:
     name = str(filename or "attachment").replace("\r", "_").replace("\n", "_")
     fallback = re.sub(r"[^A-Za-z0-9._-]", "_", name).strip("._")[:180]
     fallback = fallback or "attachment"
     return (
-        f'attachment; filename="{fallback}"; '
+        f'{disposition}; filename="{fallback}"; '
         f"filename*=UTF-8''{quote(name, safe='')}"
     )
+
+
+def _project_attachment_preview_media_type(storage_key: object, mime: object) -> str:
+    """Return a canonical inert inline MIME or reject the attachment type.
+
+    The database MIME is metadata, not an authority. Requiring it to agree
+    with the opaque storage-key extension prevents a corrupted row from
+    turning an Office/archive/CAD download into browser-active content.
+    """
+
+    extension = Path(str(storage_key or "")).suffix.lower()
+    expected = PROJECT_ATTACHMENT_PREVIEW_MIMES.get(extension)
+    supplied = str(mime or "").strip().lower()
+    supplied_base = supplied.split(";", 1)[0].strip()
+    expected_base = str(expected or "").split(";", 1)[0].strip().lower()
+    if not expected or supplied_base != expected_base:
+        raise HTTPException(
+            415,
+            "This attachment type cannot be previewed safely. Download it to open it locally.",
+        )
+    return expected
+
+
+def _attachment_range_not_satisfiable(size: int) -> HTTPException:
+    return HTTPException(
+        416,
+        "Requested attachment range is not satisfiable",
+        headers={
+            "Accept-Ranges": "bytes",
+            "Content-Range": f"bytes */{max(0, int(size))}",
+        },
+    )
+
+
+def _parse_project_attachment_range(
+    header: object,
+    size: int,
+) -> Optional[tuple[int, int]]:
+    """Parse one RFC 7233 byte range; multipart ranges are not supported."""
+
+    value = str(header or "").strip()
+    if not value:
+        return None
+    if len(value) > 100 or "," in value:
+        raise _attachment_range_not_satisfiable(size)
+    match = _PROJECT_ATTACHMENT_RANGE_RE.fullmatch(value)
+    if not match or size < 1:
+        raise _attachment_range_not_satisfiable(size)
+    start_text, end_text = match.groups()
+    if not start_text and not end_text:
+        raise _attachment_range_not_satisfiable(size)
+    try:
+        if start_text:
+            start = int(start_text)
+            end = int(end_text) if end_text else size - 1
+            if start >= size or end < start:
+                raise _attachment_range_not_satisfiable(size)
+            end = min(end, size - 1)
+        else:
+            suffix_length = int(end_text)
+            if suffix_length <= 0:
+                raise _attachment_range_not_satisfiable(size)
+            suffix_length = min(suffix_length, size)
+            start = size - suffix_length
+            end = size - 1
+    except ValueError as exc:
+        raise _attachment_range_not_satisfiable(size) from exc
+    return start, end
 
 
 def _activity_dict(row: ProjectActivity) -> dict[str, Any]:
@@ -1748,6 +1856,48 @@ def _move_item(db, item: ProjectWorkItem, stage: ProjectStage, position: Optiona
             item.completed_at = None
         elif not old_stage or old_stage.category != "done" or not item.completed_at:
             item.completed_at = utcnow_naive()
+
+
+def _award_project_item_completion(
+    db,
+    *,
+    project: Project,
+    item: ProjectWorkItem,
+    actor: str,
+    was_completed: bool,
+) -> None:
+    """Record one durable XP event for every path that completes an item.
+
+    Stage-category edits, stage deletion, restore, direct moves, and submitted
+    work all mutate the same ``completed_at`` field. Keeping the idempotent
+    event here prevents bulk lifecycle paths from silently bypassing
+    progression while still making reopen/re-complete safe.
+    """
+
+    if was_completed or not item.completed_at or item.archived:
+        return
+    progression_owner = (
+        project.owner
+        if str(actor).startswith(
+            (REMOTE_GRANT_PRINCIPAL_PREFIX, REMOTE_INSTANCE_PRINCIPAL_PREFIX)
+        )
+        else actor
+    )
+    award_progression_event(
+        db,
+        owner=progression_owner,
+        event_key=f"project-item:{item.id}:completed",
+        source_type="project_work_item_completed",
+        source_id=item.id,
+        title=item.title,
+        details={
+            "project_id": project.id,
+            "project_key": project.key,
+            "item_number": item.item_number,
+            "actor": actor,
+        },
+        occurred_at=item.completed_at,
+    )
 
 
 def _normalize_stage_order(db, project_id: str) -> list[ProjectStage]:
@@ -2181,7 +2331,7 @@ def setup_project_routes(
     async def linked_instances(project_id: str, request: Request):
         actor = _actor(request)
         _require_local_grant_admin(actor)
-        enabled = os.getenv("LINK_HUB_ENABLED", "false").strip().lower() == "true"
+        enabled = os.getenv("LINK_HUB_ENABLED", "true").strip().lower() == "true"
         with _db_session(write=False) as db:
             project, _ = _get_project(db, project_id, actor, minimum="owner")
             blocked_handles = {
@@ -2269,7 +2419,7 @@ def setup_project_routes(
         actor = _actor(request)
         _require_local_grant_admin(actor)
         require_admin(request)
-        if os.getenv("LINK_HUB_ENABLED", "false").strip().lower() != "true":
+        if os.getenv("LINK_HUB_ENABLED", "true").strip().lower() != "true":
             raise HTTPException(
                 409,
                 "Enable LINK_HUB_ENABLED on this Restia before pairing another installation",
@@ -2959,6 +3109,16 @@ def setup_project_routes(
                     "project_completed",
                     f"Completed project {project.key}",
                 )
+                award_progression_event(
+                    db,
+                    owner=actor,
+                    event_key=f"project:{project.id}:completed",
+                    source_type="project_completed",
+                    source_id=project.id,
+                    title=project.name,
+                    details={"project_id": project.id, "project_key": project.key},
+                    occurred_at=project.completed_at,
+                )
             db.flush()
             return {"project": {**_project_dict(project), "role": "owner"}}
 
@@ -3342,8 +3502,16 @@ def setup_project_routes(
                     ProjectWorkItem.stage_id == stage.id,
                     ProjectWorkItem.archived.is_(False),
                 ).options(defer(ProjectWorkItem.description)).all():
+                    was_completed = bool(item.completed_at)
                     item.completed_at = now if stage.category == "done" else None
                     item.version = int(item.version or 1) + 1
+                    _award_project_item_completion(
+                        db,
+                        project=project,
+                        item=item,
+                        actor=actor,
+                        was_completed=was_completed,
+                    )
             if changes:
                 project.updated_at = utcnow_naive()
                 _activity(
@@ -3404,9 +3572,23 @@ def setup_project_routes(
                 _guard_wip(db, destination, extra=active_moving)
                 destination_rows = _active_stage_items(db, project.id, destination.id)
                 for item in all_items:
+                    was_completed = bool(item.completed_at)
                     item.stage_id = destination.id
-                    item.completed_at = utcnow_naive() if destination.category == "done" else None
+                    # Moving the storage stage of an archived item is not a
+                    # completion transition. Its state becomes active again
+                    # only through restore, which owns that progression event.
+                    if not item.archived:
+                        item.completed_at = (
+                            utcnow_naive() if destination.category == "done" else None
+                        )
                     item.version = int(item.version or 1) + 1
+                    _award_project_item_completion(
+                        db,
+                        project=project,
+                        item=item,
+                        actor=actor,
+                        was_completed=was_completed,
+                    )
                     if not item.archived:
                         destination_rows.append(item)
                 _set_item_order(destination.id, destination_rows)
@@ -3661,6 +3843,7 @@ def setup_project_routes(
             item = _get_item(db, project.id, item_id, writable=True)
             _claim_version(db, item, body.version)
             destination = _get_stage(db, project.id, body.stage_id)
+            was_completed = bool(item.completed_at)
             old_stage_id = item.stage_id
             _move_item(db, item, destination, body.position)
             item.updated_at = utcnow_naive()
@@ -3669,6 +3852,13 @@ def setup_project_routes(
                 db, project.id, actor, "work_item_moved", f"Moved {project.key}-{item.item_number} to {destination.name}",
                 work_item_id=item.id,
                 payload={"from_stage_id": old_stage_id, "to_stage_id": destination.id, "position": item.position},
+            )
+            _award_project_item_completion(
+                db,
+                project=project,
+                item=item,
+                actor=actor,
+                was_completed=was_completed,
             )
             db.flush()
             return {"item": _item_dict(item, project.key)}
@@ -3759,6 +3949,7 @@ def setup_project_routes(
                     )
             _claim_version(db, item, body.version)
             if item.archived:
+                was_completed = bool(item.completed_at)
                 _guard_active_work_item_quota(db, project)
                 stage = _get_stage(db, project.id, item.stage_id) if item.stage_id else db.query(ProjectStage).filter(
                     ProjectStage.project_id == project.id
@@ -3773,6 +3964,13 @@ def setup_project_routes(
                 item.completed_at = utcnow_naive() if stage.category == "done" else None
                 item.updated_at = utcnow_naive()
                 project.updated_at = item.updated_at
+                _award_project_item_completion(
+                    db,
+                    project=project,
+                    item=item,
+                    actor=actor,
+                    was_completed=was_completed,
+                )
                 _activity(
                     db, project.id, actor, "work_item_restored", f"Restored {project.key}-{item.item_number}",
                     work_item_id=item.id,
@@ -3884,6 +4082,28 @@ def setup_project_routes(
             if body.done is not None and bool(body.done) != bool(row.is_done):
                 row.is_done = bool(body.done)
                 row.completed_at = utcnow_naive() if row.is_done else None
+                if row.is_done:
+                    progression_owner = (
+                        project.owner
+                        if str(actor).startswith((REMOTE_GRANT_PRINCIPAL_PREFIX, REMOTE_INSTANCE_PRINCIPAL_PREFIX))
+                        else actor
+                    )
+                    award_progression_event(
+                        db,
+                        owner=progression_owner,
+                        event_key=f"project-checklist:{row.id}:completed",
+                        source_type="project_checklist_completed",
+                        source_id=row.id,
+                        title=row.text,
+                        details={
+                            "project_id": project.id,
+                            "project_key": project.key,
+                            "work_item_id": item.id,
+                            "item_number": item.item_number,
+                            "actor": actor,
+                        },
+                        occurred_at=row.completed_at,
+                    )
                 changed = True
             if body.position is not None:
                 rows = [value for value in _normalize_checklist_order(db, item.id) if value.id != row.id]
@@ -4173,10 +4393,18 @@ def setup_project_routes(
                 )
                 db.add(attachment)
                 old_stage_id = item.stage_id
+                was_completed = bool(item.completed_at)
                 is_submission = bool(clean_note or transition_stage_id or normalized_kind == "deliverable")
                 if destination:
                     _move_item(db, item, destination, None)
                     item.updated_at = utcnow_naive()
+                    _award_project_item_completion(
+                        db,
+                        project=project,
+                        item=item,
+                        actor=actor,
+                        was_completed=was_completed,
+                    )
                 project.updated_at = utcnow_naive()
                 event_type = "work_submitted" if is_submission else "attachment_added"
                 summary = (
@@ -4242,8 +4470,12 @@ def setup_project_routes(
             store.delete(storage_key)
         return {"ok": True}
 
-    @router.get("/attachments/{attachment_id}/download")
-    async def download_attachment(attachment_id: str, request: Request):
+    async def attachment_binary_response(
+        attachment_id: str,
+        request: Request,
+        *,
+        inline: bool,
+    ):
         actor = _actor(request)
         with _db_session(write=False) as db:
             row = db.query(ProjectAttachment).filter(ProjectAttachment.id == attachment_id).first()
@@ -4253,6 +4485,11 @@ def setup_project_routes(
             if not item:
                 raise HTTPException(404, "Attachment not found")
             project, _ = _get_project(db, item.project_id, actor)
+            media_type = (
+                _project_attachment_preview_media_type(row.storage_key, row.mime)
+                if inline
+                else row.mime
+            )
             # Resolve only after the owner/member check, preventing filesystem
             # existence from becoming an authorization side channel.
             try:
@@ -4267,8 +4504,26 @@ def setup_project_routes(
                 ) from exc
             expected_size = row.size
             expected_sha256 = row.sha256
-            mime = row.mime
             filename = row.original_name
+        try:
+            attachment_size = int(expected_size)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                500, "Stored attachment failed integrity verification"
+            ) from exc
+        if attachment_size < 1 or (
+            inline and attachment_size > PROJECT_ATTACHMENT_MAX_BYTES
+        ):
+            raise HTTPException(
+                500, "Stored attachment failed integrity verification"
+            )
+        requested_range = (
+            _parse_project_attachment_range(
+                request.headers.get("range"), attachment_size
+            )
+            if inline
+            else None
+        )
         release_download = _attachment_download_gate.try_acquire(
             _attachment_download_principal(actor)
         )
@@ -4294,24 +4549,161 @@ def setup_project_routes(
                     500, "Stored attachment failed integrity verification"
                 )
             snapshot, verified_size = verified
+            start, end = (
+                requested_range
+                if requested_range is not None
+                else (0, verified_size - 1)
+            )
+            response_length = end - start + 1
+            headers = {
+                "Content-Length": str(response_length),
+                "Content-Disposition": _attachment_content_disposition(
+                    filename,
+                    disposition="inline" if inline else "attachment",
+                ),
+                "Cache-Control": "private, no-store",
+                "Pragma": "no-cache",
+                "X-Content-Type-Options": "nosniff",
+                "Content-Security-Policy": "default-src 'none'; sandbox",
+                "Cross-Origin-Resource-Policy": "same-origin",
+                "Referrer-Policy": "no-referrer",
+            }
+            status_code = 200
+            if inline:
+                headers["Accept-Ranges"] = "bytes"
+            if requested_range is not None:
+                status_code = 206
+                headers["Content-Range"] = (
+                    f"bytes {start}-{end}/{verified_size}"
+                )
             return _VerifiedAttachmentResponse(
                 snapshot,
                 on_close=release_download,
-                media_type=mime,
-                headers={
-                    "Content-Length": str(verified_size),
-                    "Content-Disposition": _attachment_content_disposition(filename),
-                    "Cache-Control": "private, no-store",
-                    "Pragma": "no-cache",
-                    "X-Content-Type-Options": "nosniff",
-                    "Content-Security-Policy": "default-src 'none'; sandbox",
-                },
+                offset=start,
+                length=response_length,
+                status_code=status_code,
+                media_type=media_type,
+                headers=headers,
             )
         except BaseException:
             if snapshot is not None:
                 snapshot.close()
             release_download()
             raise
+
+    @router.get("/attachments/{attachment_id}/download")
+    async def download_attachment(attachment_id: str, request: Request):
+        return await attachment_binary_response(
+            attachment_id,
+            request,
+            inline=False,
+        )
+
+    @router.get("/attachments/{attachment_id}/view")
+    async def view_attachment(attachment_id: str, request: Request):
+        """Serve a safe, same-origin inline representation for Projects UI."""
+
+        return await attachment_binary_response(
+            attachment_id,
+            request,
+            inline=True,
+        )
+
+    @router.get("/attachments/{attachment_id}/preview")
+    async def preview_office_attachment(attachment_id: str, request: Request):
+        """Return a bounded text/table preview for one authenticated OOXML file."""
+
+        actor = _actor(request)
+        with _db_session(write=False) as db:
+            row = db.query(ProjectAttachment).filter(
+                ProjectAttachment.id == attachment_id
+            ).first()
+            if not row:
+                raise HTTPException(404, "Attachment not found")
+            item = db.query(ProjectWorkItem).filter(
+                ProjectWorkItem.id == row.work_item_id
+            ).first()
+            if not item:
+                raise HTTPException(404, "Attachment not found")
+            _get_project(db, item.project_id, actor)
+            extension = Path(str(row.storage_key or "")).suffix.lower()
+            expected_mime = OFFICE_PREVIEW_MIME_BY_EXTENSION.get(extension)
+            supplied_mime = str(row.mime or "").split(";", 1)[0].strip().lower()
+            if not expected_mime or supplied_mime != expected_mime:
+                raise HTTPException(
+                    415,
+                    "This attachment is not a supported Office preview. Download it to open the original file.",
+                )
+            # Resolve only after authorization so file existence is not an
+            # owner/member side channel.
+            try:
+                path = store.resolve(row.storage_key)
+            except (HTTPException, OSError) as exc:
+                raise HTTPException(
+                    500, "Stored attachment failed integrity verification"
+                ) from exc
+            expected_size = row.size
+            expected_sha256 = row.sha256
+
+        try:
+            attachment_size = int(expected_size)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                500, "Stored attachment failed integrity verification"
+            ) from exc
+        if attachment_size < 1 or attachment_size > PROJECT_ATTACHMENT_MAX_BYTES:
+            raise HTTPException(
+                500, "Stored attachment failed integrity verification"
+            )
+
+        release_download = _attachment_download_gate.try_acquire(
+            _attachment_download_principal(actor)
+        )
+        if release_download is None:
+            raise HTTPException(
+                429,
+                "Too many project attachment previews are already active",
+                headers={"Retry-After": "2"},
+            )
+        snapshot: Optional[BinaryIO] = None
+        try:
+            verified = await _prepare_verified_attachment_snapshot(
+                path,
+                expected_size,
+                expected_sha256,
+            )
+            if verified is None:
+                raise HTTPException(
+                    500, "Stored attachment failed integrity verification"
+                )
+            snapshot, _ = verified
+            try:
+                preview = await asyncio.to_thread(
+                    extract_office_preview,
+                    snapshot,
+                    extension,
+                )
+            except OfficePreviewError as exc:
+                raise HTTPException(
+                    422,
+                    "This Office document could not be previewed safely. Download it to open the original file.",
+                ) from exc
+        finally:
+            if snapshot is not None:
+                snapshot.close()
+            release_download()
+
+        return JSONResponse(
+            content=preview,
+            headers={
+                "Cache-Control": "private, no-store",
+                "Pragma": "no-cache",
+                "X-Content-Type-Options": "nosniff",
+                "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+                "Cross-Origin-Resource-Policy": "same-origin",
+                "Referrer-Policy": "no-referrer",
+            },
+        )
 
     @router.get("/{project_id}/activity")
     async def project_activity(

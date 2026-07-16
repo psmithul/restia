@@ -666,6 +666,73 @@ class ProjectActivity(Base):
         Index("ix_project_activity_item_created", "work_item_id", "created_at"),
     )
 
+
+class ProgressionEvent(Base):
+    """Immutable, owner-scoped evidence used by Restia's progression system.
+
+    Progress is awarded only from a verified state transition in an existing
+    feature (for example a todo moving from open to done). ``event_key`` is a
+    stable idempotency key, so reopening and re-completing the same work cannot
+    mint XP repeatedly.
+    """
+
+    __tablename__ = "progression_events"
+
+    id = Column(String(36), primary_key=True)
+    owner = Column(String, nullable=False, index=True)
+    event_key = Column(String(180), nullable=False)
+    source_type = Column(String(48), nullable=False, index=True)
+    source_id = Column(String(180), nullable=False, default="")
+    title = Column(String(240), nullable=False, default="Completed work")
+    xp = Column(Integer, nullable=False)
+    details = Column(JSON, nullable=False, default=dict)
+    occurred_at = Column(DateTime, nullable=False, default=utcnow_naive, index=True)
+
+    __table_args__ = (
+        UniqueConstraint("owner", "event_key", name="uq_progression_owner_event"),
+        Index("ix_progression_owner_occurred", "owner", "occurred_at"),
+        Index("ix_progression_owner_source", "owner", "source_type"),
+    )
+
+
+class PlanningItem(TimestampMixin, Base):
+    """Owner-scoped human work that can be completed or placed on Calendar.
+
+    ``ScheduledTask`` represents an automation Restia runs.  Planning items are
+    deliberately separate: they are commitments the user intends to do.  The
+    optimistic ``version`` field prevents two open clients from silently
+    overwriting each other, while the optional calendar link keeps scheduling
+    explicit instead of turning every to-do into an event.
+    """
+
+    __tablename__ = "planning_items"
+
+    id = Column(String(36), primary_key=True)
+    owner = Column(String, nullable=False, index=True)
+    title = Column(String(240), nullable=False)
+    details = Column(Text, nullable=False, default="")
+    status = Column(String(16), nullable=False, default="open", index=True)
+    priority = Column(String(16), nullable=False, default="normal")
+    due_date = Column(String(10), nullable=True, index=True)
+    scheduled_start = Column(DateTime, nullable=True, index=True)
+    scheduled_end = Column(DateTime, nullable=True)
+    calendar_id = Column(
+        String, ForeignKey("calendars.id", ondelete="SET NULL"), nullable=True,
+    )
+    calendar_event_uid = Column(
+        String, ForeignKey("calendar_events.uid", ondelete="SET NULL"), nullable=True,
+        unique=True,
+    )
+    completed_at = Column(DateTime, nullable=True, index=True)
+    source = Column(String(24), nullable=False, default="user")
+    version = Column(Integer, nullable=False, default=1)
+
+    __table_args__ = (
+        Index("ix_planning_owner_status_due", "owner", "status", "due_date"),
+        Index("ix_planning_owner_updated", "owner", "updated_at"),
+    )
+
+
 class Document(TimestampMixin, Base):
     """Living document that the AI can create and edit in-place."""
     __tablename__ = "documents"
@@ -1091,6 +1158,10 @@ class LinkGuest(Base):
     # Guest's E2EE public key (base64 X25519), published at redeem time so local
     # users can encrypt to it. NULL until the guest's instance supports E2EE.
     pubkey     = Column(Text, nullable=True)
+    # Capability negotiated when the credential was admitted. General
+    # Messages invitations are chat-only; legacy and project-pairing guests
+    # retain the historical full capability unless explicitly scoped.
+    scope      = Column(String(16), nullable=False, default="full", server_default="full")
 
 
 class LinkInvite(Base):
@@ -1149,7 +1220,7 @@ class RemoteBlock(Base):
 
 class HomeLink(Base):
     """This instance's registration with its home server — the credential
-    behind the 'chat with the developer' contact (routes/link_routes.py).
+    behind a connected Restia contact (routes/link_routes.py).
     New pairings use one installation sentinel in ``local_user``; older
     profile-scoped rows remain readable for migration compatibility. The
     profile that established the shared pairing is kept in ``owner`` as a
@@ -1161,6 +1232,25 @@ class HomeLink(Base):
     home_url   = Column(String, nullable=False)
     handle     = Column(String, nullable=False)
     owner      = Column(String, nullable=True)                  # hub owner's username
+    token      = Column(EncryptedText, nullable=False)
+    created_at = Column(DateTime, default=utcnow_naive, nullable=False)
+
+
+class OutboundChatLink(Base):
+    """One additive outbound chat connection to another Restia installation.
+
+    Full-capability ``HomeLink`` remains deliberately singular because calls
+    and linked Projects use it as their primary credential. General Messages
+    invitations live here instead, keyed by an opaque UUID so multiple remote
+    installations can coexist without hostname collisions or credential
+    ambiguity.
+    """
+    __tablename__ = "outbound_chat_links"
+
+    id         = Column(String(36), primary_key=True)
+    home_url   = Column(String(2048), nullable=False, unique=True, index=True)
+    handle     = Column(String(32), nullable=False)
+    owner      = Column(String, nullable=False, index=True)
     token      = Column(EncryptedText, nullable=False)
     created_at = Column(DateTime, default=utcnow_naive, nullable=False)
 
@@ -1473,6 +1563,7 @@ def _migrate_add_link_invite_columns():
                     "link_guests": {
                         "invite_id": "INTEGER",
                         "pubkey": "TEXT",
+                        "scope": "VARCHAR(16) DEFAULT 'full'",
                     },
                     "link_invites": {
                         "project_id": "VARCHAR(36)",
@@ -1493,6 +1584,10 @@ def _migrate_add_link_invite_columns():
                                 f"{column_name} {column_type}"
                             )
                 if "link_guests" in table_names:
+                    connection.exec_driver_sql(
+                        "UPDATE link_guests SET scope = 'full' "
+                        "WHERE scope IS NULL OR scope = ''"
+                    )
                     guest_indexes = {
                         str(index["name"]) for index in inspector.get_indexes("link_guests")
                     }
@@ -1533,6 +1628,13 @@ def _migrate_add_link_invite_columns():
                 conn.execute("ALTER TABLE link_guests ADD COLUMN invite_id INTEGER")
             if "pubkey" not in cols:
                 conn.execute("ALTER TABLE link_guests ADD COLUMN pubkey TEXT")
+            if "scope" not in cols:
+                conn.execute(
+                    "ALTER TABLE link_guests ADD COLUMN scope VARCHAR(16) DEFAULT 'full'"
+                )
+            conn.execute(
+                "UPDATE link_guests SET scope = 'full' WHERE scope IS NULL OR scope = ''"
+            )
         invite_cols = [
             row[1]
             for row in conn.execute("PRAGMA table_info(link_invites)").fetchall()

@@ -251,8 +251,23 @@ def test_editor_upload_crosses_two_real_instances_and_viewer_stays_read_only(
                 data={"kind": "deliverable", "description": "Remote result"},
             )
             assert uploaded.status_code == 201, uploaded.text
-            assert uploaded.json()["attachment"]["name"] == "evidence.txt"
+            attachment = uploaded.json()["attachment"]
+            assert attachment["name"] == "evidence.txt"
             assert TOKEN not in uploaded.text
+
+            preview_path = (
+                f"/api/homelink/projects/attachments/{attachment['id']}/view"
+            )
+            preview = client.get(
+                preview_path,
+                headers={"X-Test-User": "owner", "Range": "bytes=0-7"},
+            )
+            assert preview.status_code == 206, preview.text
+            assert preview.content == payload[:8]
+            assert preview.headers["content-range"] == f"bytes 0-7/{len(payload)}"
+            assert preview.headers["content-disposition"].startswith("inline;")
+            assert preview.headers["x-content-type-options"] == "nosniff"
+            assert TOKEN not in preview.text
 
             rows = _attachment_rows(hub_db)
             assert len(rows) == 1
@@ -271,6 +286,11 @@ def test_editor_upload_crosses_two_real_instances_and_viewer_stays_read_only(
             assert wrong_profile.json()["detail"] == (
                 "Only an admin or the Home Link owner can access linked projects"
             )
+            wrong_profile_preview = client.get(
+                preview_path,
+                headers={"X-Test-User": "another-profile", "Range": "bytes=0-7"},
+            )
+            assert wrong_profile_preview.status_code == 403
             assert len(_attachment_rows(hub_db)) == 1
 
             with sqlite3.connect(hub_db) as db:
@@ -288,6 +308,12 @@ def test_editor_upload_crosses_two_real_instances_and_viewer_stays_read_only(
             )
             assert viewer.status_code == 403
             assert viewer.json()["detail"] == "Project role does not allow this action"
+            viewer_preview = client.get(
+                preview_path,
+                headers={"X-Test-User": "owner", "Range": "bytes=0-7"},
+            )
+            assert viewer_preview.status_code == 206, viewer_preview.text
+            assert viewer_preview.content == payload[:8]
             assert len(_attachment_rows(hub_db)) == 1
     finally:
         stop_event.set()

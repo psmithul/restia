@@ -537,20 +537,22 @@ async def test_today_snapshot_is_owner_scoped_deterministic_and_redacted(mission
     assert body["summary"] == {
         "calendar": 2,
         "project_work": 3,
+        "planning": 0,
         "goals": 1,
         "tasks": 3,
         "study_reviews": 1,
         "important_mail": 1,
         "notes_today": 1,
         "daily_brief": 1,
+        "progression": 0,
         "next_actions": 3,
         "health": "degraded",
     }
 
     sources = body["sources"]
     assert set(sources) == {
-        "calendar", "project_work", "goals", "tasks", "study_reviews",
-        "important_mail", "notes_today", "daily_brief", "health"
+        "calendar", "project_work", "planning", "goals", "tasks", "study_reviews",
+        "important_mail", "notes_today", "daily_brief", "progression", "health"
     }
     assert {row["id"] for row in sources["calendar"]["items"]} == {
         "event-local", "event-utc-boundary"
@@ -1183,12 +1185,14 @@ async def test_auth_disabled_single_profile_matches_each_source_owner_convention
     assert response.json()["summary"] == {
         "calendar": 1,
         "project_work": 1,
+        "planning": 0,
         "goals": 1,
         "tasks": 1,
         "study_reviews": 1,
         "important_mail": 1,
         "notes_today": 1,
         "daily_brief": 1,
+        "progression": 0,
         "next_actions": 3,
         "health": "degraded",
     }
@@ -1306,3 +1310,223 @@ async def test_auth_disabled_ambiguous_profiles_fail_closed_per_source(
         assert body["sources"][name]["status"] == "unavailable"
         assert body["sources"][name]["error"]["code"] == "owner_unavailable"
     assert body["sources"]["health"]["status"] == "degraded"
+
+
+@pytest.mark.anyio
+async def test_home_includes_ordinary_todo_checklist_steps(mission_env):
+    app, factory, _data_dir = mission_env
+    db = factory()
+    db.add_all([
+        cdb.Note(
+            id="todo-alice",
+            owner="alice",
+            title="Application checklist",
+            note_type="todo",
+            items=json.dumps([
+                {"id": "done", "text": "Collect transcript", "done": True},
+                {"id": "next", "text": "Request recommendation", "done": False},
+            ]),
+        ),
+        cdb.Note(
+            id="todo-bob",
+            owner="bob",
+            title="Private Bob todo",
+            note_type="todo",
+            items=json.dumps([{"text": "BOB_PRIVATE_STEP", "done": False}]),
+        ),
+    ])
+    db.commit()
+    db.close()
+
+    async with _client(app) as client:
+        response = await client.get("/api/mission-control/today", headers=_headers())
+
+    assert response.status_code == 200
+    todos = response.json()["sources"]["notes_today"]["items"]
+    assert todos == [{
+        **todos[0],
+        "id": "todo-alice",
+        "kind": "todo",
+        "next_step": "Request recommendation",
+        "completed_steps": 1,
+        "total_steps": 2,
+    }]
+    assert "BOB_PRIVATE_STEP" not in response.text
+
+
+@pytest.mark.anyio
+async def test_activity_is_distinct_bounded_and_owner_scoped(mission_env):
+    app, factory, _data_dir = mission_env
+    now = _NOW.replace(tzinfo=None)
+    db = factory()
+    alice_project = cdb.Project(
+        id="activity-project-alice", owner="alice", key="ACT", name="Controls rig"
+    )
+    bob_project = cdb.Project(
+        id="activity-project-bob", owner="bob", key="BOB", name="BOB_SECRET_PROJECT"
+    )
+    alice_task = cdb.ScheduledTask(
+        id="activity-automation-alice", owner="alice", name="Daily sync"
+    )
+    bob_task = cdb.ScheduledTask(
+        id="activity-automation-bob", owner="bob", name="BOB_SECRET_AUTOMATION"
+    )
+    db.add_all([alice_project, bob_project, alice_task, bob_task])
+    db.flush()
+    db.add_all([
+        cdb.ProjectActivity(
+            id="project-activity-alice",
+            project_id=alice_project.id,
+            actor="alice",
+            event_type="work_item_completed",
+            summary="Closed ACT-1",
+            created_at=now - timedelta(minutes=2),
+        ),
+        cdb.ProjectActivity(
+            id="project-activity-bob",
+            project_id=bob_project.id,
+            actor="bob",
+            event_type="updated",
+            summary="BOB_SECRET_ACTIVITY",
+            created_at=now - timedelta(minutes=1),
+        ),
+        cdb.TaskRun(
+            id="automation-run-alice",
+            task_id=alice_task.id,
+            status="success",
+            started_at=now - timedelta(minutes=4),
+            finished_at=now - timedelta(minutes=3),
+        ),
+        cdb.TaskRun(
+            id="automation-run-bob",
+            task_id=bob_task.id,
+            status="error",
+            started_at=now - timedelta(minutes=5),
+        ),
+        cdb.ProgressionEvent(
+            id="progression-activity-alice",
+            owner="alice",
+            event_key="activity:test",
+            source_type="todo_item_completed",
+            source_id="todo-1",
+            title="Request recommendation",
+            xp=20,
+            occurred_at=now - timedelta(minutes=1),
+        ),
+    ])
+    db.commit()
+    db.close()
+
+    async with _client(app) as client:
+        response = await client.get(
+            "/api/mission-control/activity?limit=2", headers=_headers()
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["feed"]["count"] == 2
+    assert body["feed"]["truncated"] is True
+    assert [row["source"] for row in body["feed"]["items"]] == [
+        "progression", "project"
+    ]
+    assert body["feed"]["next_before"]
+    assert "BOB_SECRET" not in response.text
+    assert body["health"]["overall"] == "degraded"
+
+
+@pytest.mark.anyio
+async def test_activity_composite_cursor_keeps_equal_timestamp_events(mission_env):
+    app, factory, _data_dir = mission_env
+    occurred = _NOW.replace(tzinfo=None) - timedelta(minutes=1)
+    db = factory()
+    try:
+        for suffix in ("a", "b", "c"):
+            db.add(cdb.ProgressionEvent(
+                id=f"tied-{suffix}",
+                owner="alice",
+                event_key=f"activity:tied:{suffix}",
+                source_type="todo_item_completed",
+                source_id=f"todo-{suffix}",
+                title=f"Tied {suffix}",
+                xp=20,
+                occurred_at=occurred,
+            ))
+        db.commit()
+    finally:
+        db.close()
+
+    async with _client(app) as client:
+        first = await client.get(
+            "/api/mission-control/activity",
+            params={"limit": 2},
+            headers=_headers(),
+        )
+        first_feed = first.json()["feed"]
+        second = await client.get(
+            "/api/mission-control/activity",
+            params={
+                "limit": 2,
+                "before": first_feed["next_before"],
+                "before_id": first_feed["next_before_id"],
+            },
+            headers=_headers(),
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    first_ids = [row["id"] for row in first_feed["items"]]
+    second_ids = [row["id"] for row in second.json()["feed"]["items"]]
+    assert first_ids == ["progression:tied-c", "progression:tied-b"]
+    assert second_ids == ["progression:tied-a"]
+    assert not set(first_ids) & set(second_ids)
+
+
+@pytest.mark.anyio
+async def test_activity_routes_planning_completion_back_to_home(mission_env):
+    app, factory, _data_dir = mission_env
+    db = factory()
+    try:
+        db.add(cdb.ProgressionEvent(
+            id="planning-clear",
+            owner="alice",
+            event_key="planning:item-1:completed",
+            source_type="todo_item_completed",
+            source_id="item-1",
+            title="Finish control report",
+            xp=20,
+            details={"planning_item_id": "item-1"},
+            occurred_at=_NOW.replace(tzinfo=None),
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    async with _client(app) as client:
+        response = await client.get(
+            "/api/mission-control/activity", headers=_headers()
+        )
+
+    assert response.status_code == 200
+    event = response.json()["feed"]["items"][0]
+    assert event["id"] == "progression:planning-clear"
+    assert event["target"] == "home"
+
+
+@pytest.mark.anyio
+async def test_health_snapshot_is_shared_between_today_and_activity(mission_env):
+    _app, factory, data_dir = mission_env
+    calls = 0
+
+    async def counted_health(_rag, _memory):
+        nonlocal calls
+        calls += 1
+        return {"overall": "ok", "services": []}
+
+    app = _build_app(factory, health_collector=counted_health, data_dir=data_dir)
+    async with _client(app) as client:
+        today = await client.get("/api/mission-control/today", headers=_headers())
+        activity = await client.get("/api/mission-control/activity", headers=_headers())
+
+    assert today.status_code == 200
+    assert activity.status_code == 200
+    assert calls == 1

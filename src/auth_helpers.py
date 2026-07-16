@@ -1,8 +1,73 @@
 """Shared auth helpers used by all route files."""
 
+import hashlib
 import os
+import re
 from typing import Optional
 from fastapi import Request, HTTPException
+
+
+def _local_owner_from_env() -> str:
+    for name in ("RESTIA_FALLBACK_OWNER", "ODYSSEUS_FALLBACK_OWNER"):
+        value = str(os.getenv(name) or "").strip().lower()
+        if value:
+            return value
+    return "owner@localhost"
+
+
+# One concrete owner for auth-disabled and first-run stores. Keep the legacy
+# environment alias for existing deployments, but make every new owner-scoped
+# feature import this value instead of inventing its own "local" sentinel.
+DEFAULT_LOCAL_OWNER = _local_owner_from_env()
+
+
+def _owner_storage_identity(owner: str | None, fallback: str) -> str:
+    """Return the canonical identity used to derive owner-scoped paths."""
+
+    value = str(owner or fallback).strip().lower()
+    return value or fallback
+
+
+def legacy_owner_storage_key(owner: str | None, *, fallback: str = "default") -> str:
+    """Reproduce the pre-V2 lossy owner filename component.
+
+    This is only for privacy-checked migration reads. New state must always use
+    :func:`owner_storage_key`; otherwise identities such as ``a/b`` and
+    ``a_b`` share a file.
+    """
+
+    value = _owner_storage_identity(owner, fallback)
+    return "".join(
+        char if (char.isalnum() or char in "-_.@") else "_"
+        for char in value
+    )
+
+
+def owner_storage_key(owner: str | None, *, fallback: str = "default") -> str:
+    """Return a stable, collision-resistant filename component for an owner.
+
+    Existing simple ASCII usernames keep their historical component so normal
+    upgrades retain state without a migration. Any identity that needs
+    escaping or truncation enters a reserved ``~`` namespace and includes a
+    SHA-256 suffix. Since ``~`` itself is not in the unescaped alphabet, an
+    escaped identity cannot collide with a literal legacy-safe username.
+    """
+
+    value = _owner_storage_identity(owner, fallback)
+    if (
+        len(value) <= 80
+        and value not in {".", ".."}
+        and re.fullmatch(r"[a-z0-9_.@-]+", value)
+    ):
+        return value
+
+    readable = re.sub(r"[^a-z0-9_.@-]+", "_", value)
+    readable = readable.strip("._-")[:48] or "owner"
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
+    return f"~{readable}-{digest}"
+
+
+_UNSET_OWNER = object()
 
 
 def get_current_user(request: Request) -> Optional[str]:
@@ -94,6 +159,63 @@ def effective_owner(request: Request) -> Optional[str]:
     if _loopback_request(request) and os.getenv("LOCALHOST_BYPASS", "false").lower() == "true":
         return configured_single_user_owner(request)
     return None
+
+
+def resolved_runtime_owner(owner: str | None = None) -> str:
+    """Resolve a concrete owner for admitted non-request runtimes/tools."""
+
+    value = str(owner or configured_single_user_owner() or DEFAULT_LOCAL_OWNER).strip()
+    return value.lower() or DEFAULT_LOCAL_OWNER
+
+
+def resolved_request_owner(
+    request: Request,
+    *,
+    admitted_user: str | None | object = _UNSET_OWNER,
+) -> str:
+    """Return one concrete owner after applying the route admission gate.
+
+    Owner-scoped features historically made their own choice between ``None``,
+    ``"local"``, and ``owner@localhost`` when authentication was disabled.
+    That split completion evidence from the profile returned by Progression.
+    This helper is the single write/read identity for those routes:
+
+    * an authenticated user remains the owner;
+    * an auth-disabled single-profile install uses its configured profile;
+    * a first-run/legacy local install uses :data:`DEFAULT_LOCAL_OWNER`.
+
+    Passing ``admitted_user`` avoids running :func:`require_user` twice when a
+    route already called it.  The empty string is meaningful and represents an
+    explicitly admitted local/single-user request.
+    """
+
+    admitted = (
+        require_user(request)
+        if admitted_user is _UNSET_OWNER
+        else str(admitted_user or "").strip()
+    )
+    value = effective_owner(request) or admitted
+    return resolved_runtime_owner(value)
+
+
+def allows_legacy_null_owner(
+    request: Request,
+    *,
+    admitted_user: str | None | object = _UNSET_OWNER,
+) -> bool:
+    """Whether this admitted request may access pre-profile ``owner IS NULL`` rows.
+
+    Legacy shared rows are kept only for explicit single-user/local modes.  A
+    cookie-authenticated profile never gains access to another scope merely
+    because an old row has no owner.
+    """
+
+    admitted = (
+        require_user(request)
+        if admitted_user is _UNSET_OWNER
+        else str(admitted_user or "").strip()
+    )
+    return not bool(admitted)
 
 
 def _is_api_token_request(request: Request) -> bool:

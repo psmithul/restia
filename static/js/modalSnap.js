@@ -17,6 +17,8 @@
 // is harder to hit precisely since most users drag broadly toward the
 // side rather than aiming at a 1px line. 60px feels generous without
 // false-positive triggers from casual repositioning.
+import { setSidebarState, openSidebar, SIDEBAR_STATES } from './sidebar-layout.js';
+
 const SNAP_PX = 60;
 const UNSNAP_PX = 80;
 const MIN_CHAT_WIDTH = 380;
@@ -314,9 +316,10 @@ function _collapseSidebarToRail() {
   if (!sidebar.classList.contains('hidden')) {
     document.body.dataset.routeCollapsedSidebar = '1';
   }
-  sidebar.classList.add('hidden');
-  rail.classList.remove('rail-hidden');
-  try { window.syncRailSide && window.syncRailSide(); } catch (_) {}
+  setSidebarState(
+    window.innerWidth <= 768 ? SIDEBAR_STATES.OFF : SIDEBAR_STATES.MINI,
+    { persist: false },
+  );
 }
 
 // Resolve the dock target. For .modal containers, the inner .modal-content
@@ -597,8 +600,7 @@ function _onDockedModalGone(modal, dockClass) {
 function _expandSidebarFromRail() {
   const sidebar = document.getElementById('sidebar');
   if (!sidebar) return;
-  sidebar.classList.remove('hidden');
-  try { window.syncRailSide && window.syncRailSide(); } catch (_) {}
+  openSidebar({ persist: false });
 }
 
 // Un-dock a previously docked modal. Restores the exact rendered size +

@@ -12,6 +12,7 @@ import { snapModalToZone } from './tileManager.js';
 import { clearDockSide } from './modalSnap.js';
 import { topToolWindowZ, topPortalZ } from './toolWindowZOrder.js';
 import { bindMenuDismiss, dismissOrRemove } from './escMenuStack.js';
+import { closeSidebar, SIDEBAR_STATES } from './sidebar-layout.js';
 
 const API_BASE = window.location.origin;
 let _open = false;
@@ -30,6 +31,9 @@ let _viewMode = (typeof localStorage !== 'undefined' && localStorage.getItem('od
 let _showingArchived = false;
 let _selectMode = false;
 let _reminderTimer = null;
+const _reminderInFlight = new Set();
+const _reminderRetryAt = new Map();
+const REMINDER_RETRY_MS = 5 * 60 * 1000;
 // Tracks the global keydown listener so closePanel can remove it
 // (previously leaked one per openPanel; on multi-open sessions this
 // stacked dozens of identical handlers).
@@ -660,6 +664,18 @@ function _toLocalDatetimeStr(d) {
   const pad = n => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
+
+function _dueDateForServer(value) {
+  const raw = String(value || '').trim();
+  if (!raw || !raw.includes('T') || /(?:Z|[+-]\d{2}:\d{2})$/i.test(raw)) return raw || null;
+  const parsed = new Date(raw);
+  return Number.isNaN(parsed.getTime()) ? raw : parsed.toISOString();
+}
+
+function _browserTimeZone() {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; }
+  catch (_) { return 'UTC'; }
+}
 function _formatReminderTag(dateStr) {
   if (!dateStr) return '';
   const d = new Date(dateStr);
@@ -905,38 +921,33 @@ function _checkReminders() {
   const fired = _loadFiredReminders();
   let changed = false;
   for (const note of _notes) {
-    if (!note.due_date || note.archived) continue;
+    if (!note.due_date || note.archived || _isNoteFullyDone(note)) continue;
     if (!_hasTimeComponent(note.due_date)) continue;
     if (fired.has(note.id)) continue;
+    if (_reminderInFlight.has(note.id)) continue;
+    if ((_reminderRetryAt.get(note.id) || 0) > now) continue;
     const due = new Date(note.due_date).getTime();
     if (isNaN(due)) continue;
-    if (due <= now && due > now - 60000) {
-      _fireReminder(note);
-      // Recurring? advance the due_date instead of marking as fired
-      if (note.repeat && note.repeat !== 'none') {
-        const next = _advanceRecurring(note.due_date, note.repeat);
-        if (next) {
-          note.due_date = next;
-          _patchNote(note.id, { due_date: next }).catch(() => {});
-          // Don't add to fired — new due_date is in the future
-          continue;
-        }
+    if (due > now) continue;
+    _reminderInFlight.add(note.id);
+    _fireReminder(note).then(acknowledged => {
+      if (!acknowledged) {
+        _reminderRetryAt.set(note.id, Date.now() + REMINDER_RETRY_MS);
+        return;
       }
-      fired.add(note.id);
-      changed = true;
-    } else if (due <= now - 60000) {
-      // Past, never seen — silently advance recurring or mark fired
-      if (note.repeat && note.repeat !== 'none') {
-        const next = _advanceRecurring(note.due_date, note.repeat);
-        if (next) {
-          note.due_date = next;
-          _patchNote(note.id, { due_date: next }).catch(() => {});
-          continue;
-        }
-      }
-      fired.add(note.id);
-      changed = true;
-    }
+      _reminderRetryAt.delete(note.id);
+      // Recurring reminder advancement is server-owned. The background
+      // scanner rotates both due_date and the private progression cycle only
+      // after durable delivery acknowledgement; a browser must never mint a
+      // new completion cycle by patching due_date itself.
+      if (note.repeat && note.repeat !== 'none') return;
+      const latestFired = _loadFiredReminders();
+      latestFired.add(note.id);
+      _saveFiredReminders(latestFired);
+      _updateRailBadge();
+    }).finally(() => {
+      _reminderInFlight.delete(note.id);
+    });
   }
   if (changed) _saveFiredReminders(fired);
   // Always refresh badge — fired state may have changed visually without note mutation
@@ -965,10 +976,9 @@ function _fireReminder(note) {
     rawBody = (note.content || '').slice(0, 400);
   }
 
-  // Ask the server to dispatch according to user settings. The server may
-  // return an LLM-written synthesis line and/or send an email. We still show
-  // a local browser notification so the user gets immediate feedback even if
-  // the server path is disabled or slow.
+  // Ask the server to dispatch according to user settings. Local UI is shown
+  // only when the server confirms the browser channel. In particular, topic
+  // suppression and quiet-hour deferral must remain silent.
   const showLocal = (body) => {
     if ('Notification' in window && Notification.permission === 'granted') {
       try {
@@ -977,43 +987,63 @@ function _fireReminder(note) {
       } catch {}
     }
     if (uiModule?.showToast) uiModule.showToast(title);
+    _setReminderCardGlow(note.id, true);
+    const card = document.querySelector(`.note-card[data-note-id="${note.id}"]`);
+    if (card) {
+      card.classList.add('note-card-reminder-fired');
+      setTimeout(() => card.classList.remove('note-card-reminder-fired'), 3000);
+    } else {
+      _queuePendingHighlight(note.id);
+    }
+    return true;
   };
 
-  // Fire-and-forget server dispatch. If synthesis comes back quickly enough,
-  // use it as the notification body; otherwise the local notification has
-  // already shown with the raw body.
-  let shown = false;
-  const timer = setTimeout(() => { if (!shown) { shown = true; showLocal(rawBody); } }, 1500);
-
-  fetch('/api/notes/fire-reminder', {
+  const delivery = fetch('/api/notes/fire-reminder', {
     method: 'POST',
     credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ note_id: note.id, title, body: rawBody }),
   })
-    .then(r => r.ok ? r.json() : null)
-    .then(data => {
-      clearTimeout(timer);
-      if (shown) return;
-      shown = true;
-      const body = (data && data.synthesis) ? data.synthesis : rawBody;
-      showLocal(body);
+    .then(r => {
+      if (!r.ok) throw new Error(`reminder dispatch failed (${r.status})`);
+      return r.json();
+    })
+    .then(async data => {
+      if (data && data.current_note && data.current_note.id === note.id) {
+        Object.assign(note, data.current_note);
+        _renderNotes();
+        _updateRailBadge();
+      }
+      if (data && data.suppressed) return true;
+      if (data && data.deferred && !data.show_browser) return false;
+      const browserDelivery = !!(data && data.browser_sent && data.show_browser);
+      let browserAcknowledged = false;
+      if (browserDelivery) {
+        const body = (data && data.synthesis) ? data.synthesis : rawBody;
+        const displayed = showLocal(body);
+        if (displayed && data.browser_notification_id) {
+          try {
+            const ackRes = await fetch('/api/tasks/notifications/ack', {
+              method: 'POST',
+              credentials: 'same-origin',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ ids: [data.browser_notification_id] }),
+            });
+            const ack = ackRes.ok ? await ackRes.json() : null;
+            browserAcknowledged = !!(ack && ack.reminder_acknowledged > 0);
+          } catch (_) {}
+        }
+      }
+      return browserAcknowledged || !!(data && (data.acknowledged || data.delivered || data.skipped || data.suppressed));
     })
     .catch(() => {
-      clearTimeout(timer);
-      if (!shown) { shown = true; showLocal(rawBody); }
+      // No structured server response means preferences are unknown. Preserve
+      // the local safety net, while leaving the reminder unacknowledged so the
+      // durable server scanner can retry.
+      showLocal(rawBody);
+      return false;
     });
-
-  // Pulse the card if visible; otherwise queue it so the next time the user
-  // opens the notes panel the card gets a brief glow.
-  _setReminderCardGlow(note.id, true);
-  const card = document.querySelector(`.note-card[data-note-id="${note.id}"]`);
-  if (card) {
-    card.classList.add('note-card-reminder-fired');
-    setTimeout(() => card.classList.remove('note-card-reminder-fired'), 3000);
-  } else {
-    _queuePendingHighlight(note.id);
-  }
+  return delivery;
 }
 
 function _startReminderLoop() {
@@ -1156,9 +1186,7 @@ function openPanel(mode = 'note') {
   // On mobile the notes panel takes the whole screen — auto-close the
   // sidebar so the panel isn't cropped underneath it.
   if (window.innerWidth <= 768) {
-    const sb = document.getElementById('sidebar');
-    if (sb) sb.classList.add('hidden');
-    document.body.classList.add('sidebar-collapsed');
+    closeSidebar({ state: SIDEBAR_STATES.OFF, persist: false });
   }
   // Mobile mode: tiles become read-only previews (no inline checkbox /
   // edit / archive / etc.), tap opens a fullscreen edit overlay,
@@ -1663,6 +1691,9 @@ function closePanel(direction) {
   _closeMobileFullscreenEdit({ save: true });
   // /notes route may have collapsed the wide sidebar to a rail; restore.
   try { window._restoreSidebarIfRouteCollapsed?.(); } catch (_) {}
+  if (!_minimize) {
+    try { window.dispatchEvent(new CustomEvent('sidebar-tool-closed')); } catch (_) {}
+  }
 
   const btn = document.getElementById('tool-notes-btn');
   if (btn) btn.classList.remove('active');
@@ -2386,11 +2417,21 @@ function _bindCardEvents(body) {
         if (next) {
           const prevDue = habit.due_date;
           const prevItems = Array.isArray(habit.items) ? habit.items.map(it => ({ ...it })) : habit.items;
-          habit.due_date = next;
-          if (Array.isArray(habit.items)) habit.items.forEach(it => { it.done = false; });
+          // First persist the real completion transition (which awards the
+          // current cycle), then ask the server to calculate and rotate the
+          // recurrence. The client never submits the next due date/cycle.
+          if (Array.isArray(habit.items)) habit.items.forEach(it => { it.done = true; });
           _renderNotes();
-          _patchNote(id, { due_date: next, items: habit.items }).then(() => {
-            uiModule.showToast(`Done for now — next ${_formatReminderTag(next)}`, { duration: 5000 });
+          _patchNote(id, { items: habit.items }).then(async () => {
+            const response = await fetch(`${API_BASE}/api/notes/${encodeURIComponent(id)}/advance-recurrence`, {
+              method: 'POST', credentials: 'same-origin',
+            });
+            if (!response.ok) throw new Error('Failed to advance recurrence');
+            return response.json();
+          }).then(saved => {
+            Object.assign(habit, saved);
+            _renderNotes();
+            uiModule.showToast(`Done for now — next ${_formatReminderTag(saved.due_date)}`, { duration: 5000 });
           }).catch(() => {
             habit.due_date = prevDue;
             habit.items = prevItems;
@@ -2927,7 +2968,7 @@ function _collectFormDraft(form) {
     color: form.dataset.noteColor || '',
     title: form.querySelector('.note-form-title')?.value || '',
     label: form.querySelector('.note-form-label')?.value || '',
-    due_date: form.querySelector('.note-form-due')?.value || null,
+    due_date: _dueDateForServer(form.querySelector('.note-form-due')?.value),
     repeat: form.querySelector('.note-form-repeat')?.value || 'none',
   };
   if (type === 'note') d.content = form.querySelector('.note-form-content')?.value || '';
@@ -3702,9 +3743,10 @@ function _buildForm(note = null) {
       note_type: currentType,
       color: currentColor,
       label: labelVal,
-      due_date: form.querySelector('.note-form-due').value || null,
+      due_date: _dueDateForServer(form.querySelector('.note-form-due').value),
       repeat: form.querySelector('.note-form-repeat')?.value || 'none',
       image_url: currentImageUrl || null,
+      client_timezone: _browserTimeZone(),
     };
     if (currentType === 'note') {
       payload.content = form.querySelector('.note-form-content')?.value || '';

@@ -22,6 +22,7 @@ import settingsModule from './settings.js';
 import cookbookModule from './cookbook.js';
 import { EVAL_PROMPTS } from './compare/index.js';
 import { PROVIDER_DEVICE_FLOWS, formatDeviceFlowError, runProviderDeviceFlow } from './providerDeviceFlow.js';
+import { setSidebarState, openSidebar } from './sidebar-layout.js';
 
 // ── Module state ──────────────────────────────────────────────────────
 
@@ -1316,18 +1317,7 @@ async function _cmdToggleSidebar(args, ctx) {
     else target = 'full';
   }
 
-  // Apply
-  if (target === 'full') {
-    sidebar.classList.remove('hidden');
-    if (iconRail) iconRail.classList.remove('rail-hidden');
-  } else if (target === 'mini') {
-    sidebar.classList.add('hidden');
-    if (iconRail) iconRail.classList.remove('rail-hidden');
-  } else {
-    sidebar.classList.add('hidden');
-    if (iconRail) iconRail.classList.add('rail-hidden');
-  }
-  if (window.syncRailSide) window.syncRailSide();
+  setSidebarState(target, { persist: true, userInitiated: true });
   await typewriterReply(`Sidebar: ${target}`);
   return true;
 }
@@ -2510,7 +2500,7 @@ async function _cmdDemo(args, ctx) {
 
   const steps = [
     { sel: '#sidebar-new-chat-btn', text: 'Start a new chat here. <b>Click it.</b> You can do it!', mode: 'click',
-      before() { if (sidebar?.classList.contains('hidden')) sidebar.classList.remove('hidden'); } },
+      before() { if (sidebar?.classList.contains('hidden')) openSidebar({ persist: false, userInitiated: true }); } },
     { sel: '#model-picker-btn',   text: 'Pick your LLM, Local or API.', advanceOnClick: true },
     { sel: '#mode-agent-btn',     text: '<b>Agent mode</b> gives Restia more control of the app when your model supports tools: create a theme, download a model, make a daily task, organize things, and more.', mode: 'click' },
     { sel: '#web-toggle-btn',     text: 'Toggle tools like <b>web search</b>. Restia comes with private built-in <b>SearXNG</b> search.', mode: 'click' },

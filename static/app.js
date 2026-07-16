@@ -50,7 +50,10 @@ import * as researchPanelModule from './js/research/panel.js?v=20260630researcht
 import ttsModule from './js/tts-ai.js';
 import spinnerModule from './js/spinner.js';
 import { initKeyboardShortcuts } from './js/keyboard-shortcuts.js';
-import { initSidebarLayout, syncRailSide } from './js/sidebar-layout.js';
+import {
+  initSidebarLayout, syncRailSide, toggleSidebarFromControl,
+  setSidebarState, openSidebar, SIDEBAR_STATES,
+} from './js/sidebar-layout.js';
 import { initSectionCollapse, initSectionDrag } from './js/section-management.js';
 import { activateNavigationItem, initV2NavigationShell } from './js/v2NavigationShell.js';
 import { NAVIGATION_ITEMS, findNavigationItemByLegacyId } from './js/navigation-registry.js';
@@ -1193,14 +1196,11 @@ function initializeEventListeners() {
     const rail = document.getElementById('icon-rail');
     if (!sb || !rail) return;
     const wasVisible = !sb.classList.contains('hidden');
-    if (wasVisible) {
+    const mobile = window.innerWidth <= 768;
+    if (wasVisible && !mobile) {
       document.body.dataset.routeCollapsedSidebar = '1';
     }
-    sb.classList.add('hidden');
-    rail.classList.remove('rail-hidden');
-    // syncRailSide() flips iconRail.style.display based on the classes
-    // we just set. Exposed by sidebar-layout.js on window.
-    try { window.syncRailSide && window.syncRailSide(); } catch (_) {}
+    setSidebarState(mobile ? SIDEBAR_STATES.OFF : SIDEBAR_STATES.MINI, { persist: false });
   };
   // Paired restore: if the route opener collapsed the sidebar, re-expand
   // it when the fullscreen view closes. Only restores if the user didn't
@@ -1211,8 +1211,7 @@ function initializeEventListeners() {
     delete document.body.dataset.routeCollapsedSidebar;
     const sb = document.getElementById('sidebar');
     if (!sb) return;
-    sb.classList.remove('hidden');
-    try { window.syncRailSide && window.syncRailSide(); } catch (_) {}
+    openSidebar({ persist: false });
   };
   // Expose so closeEmailLibrary / notes close can call this without
   // needing to import app.js directly.
@@ -1301,12 +1300,27 @@ function initializeEventListeners() {
     '/library':  () => sessionModule && sessionModule.openLibrary && sessionModule.openLibrary(),
   };
   const _opener = _routeOpen[urlPath];
+  if (_opener && (urlPath === '/today' || urlPath === '/activity')) {
+    // Home and Activity do not depend on chat-session restoration. Open the
+    // requested workspace as soon as navigation is wired, even when a large
+    // or unhealthy session store leaves loadSessions() pending.
+    const loader = document.getElementById('app-loader');
+    if (loader) {
+      loader.style.opacity = '0';
+      setTimeout(() => loader.remove(), 180);
+    }
+    queueMicrotask(() => {
+      try { _opener(); } catch (error) { console.error('Workspace route open failed:', error); }
+    });
+  }
   // Defer the opener — at this point in init, the modules whose handlers
   // we trigger (#rail-new-session click handler, the email-section header
   // click handler in emailInbox, sessionModule's loaded session list) are
   // still being wired up further down in this same function. Stash the
   // opener so it runs from sessionModule.loadSessions().finally() below.
-  if (_opener) window._odysseusRouteOpener = _opener;
+  if (_opener && urlPath !== '/today' && urlPath !== '/activity') {
+    window._odysseusRouteOpener = _opener;
+  }
 
   // Archive browser tool button
   const toolLibraryBtn = el('tool-library-btn');
@@ -1359,10 +1373,7 @@ function initializeEventListeners() {
   // Sidebar toggle
   const toggleSidebarOption = el('toggle-sidebar-option');
   if (toggleSidebarOption) {
-    toggleSidebarOption.addEventListener('click', () => {
-      const sidebar = el('sidebar');
-      sidebar.classList.toggle('hidden');
-    });
+    toggleSidebarOption.addEventListener('click', toggleSidebarFromControl);
   }
 
   // Sidebar user bar — settings, admin, profile
@@ -3817,9 +3828,7 @@ function startRestiaApp() {
   const _railSettings = el('rail-settings');
   if (_railSettings) {
     _railSettings.addEventListener('click', () => {
-      const sidebar = document.getElementById('sidebar');
-      if (sidebar) sidebar.classList.remove('hidden');
-      syncRailSide();
+      openSidebar({ persist: true, userInitiated: true });
       // Scroll to bottom where settings typically are
       const sidebarInner = document.querySelector('.sidebar-inner');
       if (sidebarInner) sidebarInner.scrollTo({ top: sidebarInner.scrollHeight, behavior: 'smooth' });

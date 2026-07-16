@@ -9,6 +9,15 @@ import logging
 import re
 from typing import Dict, Optional
 
+from src.auth_helpers import resolved_runtime_owner
+from src.note_progression import (
+    award_note_item_completions,
+    completion_items_fully_done,
+    normalize_created_items,
+    normalize_updated_items,
+    public_note_items,
+)
+from src.note_reminder_state import cancel_note_reminder, rearm_note_reminder
 from src.tools._common import _parse_tool_args
 
 logger = logging.getLogger(__name__)
@@ -219,7 +228,6 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
                     if line.strip().lstrip("-*•").strip()
                 ]
                 content_raw = None
-            items_json = json.dumps(items_raw) if items_raw is not None else None
             # Accept natural-language due_date ("tomorrow at 1pm") in
             # addition to ISO. Use the user-tz-aware parser so the LLM's
             # naive times ("today at 9pm") are anchored to the USER's clock,
@@ -274,6 +282,16 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
                             "exit_code": 0,
                         }
             repeat_norm = _norm_repeat(args.get("repeat"))
+            normalized_items = (
+                normalize_created_items(
+                    items_raw,
+                    repeat=repeat_norm or "none",
+                    due_date=due_iso,
+                )
+                if items_raw is not None
+                else None
+            )
+            items_json = json.dumps(normalized_items) if normalized_items is not None else None
             note = Note(
                 id=str(_uuid.uuid4()),
                 owner=owner,
@@ -312,6 +330,15 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
                 return {"error": f"Note '{note_id}' not found", "exit_code": 1}
             if not _note_visible_to_owner(note, owner):
                 return {"error": "Note not found", "exit_code": 1}
+            try:
+                old_items = json.loads(note.items or "[]")
+                if not isinstance(old_items, list):
+                    old_items = []
+            except (json.JSONDecodeError, TypeError):
+                old_items = []
+            previous_repeat = getattr(note, "repeat", "none")
+            previous_due_date = getattr(note, "due_date", None)
+            previous_fully_done = completion_items_fully_done(note.note_type, old_items)
             for field in ("title", "content", "color", "label"):
                 if field in args and args[field] is not None:
                     setattr(note, field, args[field])
@@ -340,13 +367,93 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
             if new_items is None:
                 new_items = args.get("items")
             if new_items is not None:
-                note.items = json.dumps(new_items)
+                if isinstance(new_items, list):
+                    new_items = [
+                        item if isinstance(item, dict) else {"text": str(item), "done": False}
+                        for item in new_items
+                    ]
+                canonical_old, normalized_items = normalize_updated_items(
+                    old_items,
+                    new_items,
+                    repeat=previous_repeat,
+                    due_date=previous_due_date,
+                )
+                if str(note.note_type or "").lower() in _TODO_LIKE:
+                    award_note_item_completions(
+                        db,
+                        note=note,
+                        owner=resolved_runtime_owner(owner),
+                        old_items=canonical_old,
+                        new_items=normalized_items,
+                    )
+                note.items = json.dumps(normalized_items)
+                flag_modified(note, "items")
+            elif old_items:
+                # Initialize private evidence before mutable due/repeat fields
+                # change, so a later HTTP save cannot adopt the new due date as
+                # a fresh cycle for already-completed work.
+                _canonical_old, normalized_items = normalize_updated_items(
+                    old_items,
+                    public_note_items(old_items),
+                    repeat=previous_repeat,
+                    due_date=previous_due_date,
+                )
+                note.items = json.dumps(normalized_items)
                 flag_modified(note, "items")
             if "pinned" in args:
                 note.pinned = args["pinned"]
             if "archived" in args:
                 note.archived = args["archived"]
-            db.commit()
+            current_fully_done = completion_items_fully_done(note.note_type, note.items)
+            due_changed = getattr(note, "due_date", None) != previous_due_date
+            repeat_changed = getattr(note, "repeat", "none") != previous_repeat
+            reminder_owner = resolved_runtime_owner(owner)
+            cancel_needed = bool(
+                args.get("archived") is True
+                or due_changed
+                or repeat_changed
+                or current_fully_done
+            )
+            cancel_occurrence = None if args.get("archived") is True else previous_due_date
+            if cancel_needed:
+                cancel_note_reminder(
+                    reminder_owner,
+                    note.id,
+                    occurrence=cancel_occurrence,
+                )
+            rearm_needed = bool(
+                not getattr(note, "archived", False)
+                and getattr(note, "due_date", None)
+                and (
+                    args.get("archived") is False
+                    or due_changed
+                    or repeat_changed
+                    or (previous_fully_done and not current_fully_done)
+                )
+            )
+            rearm_occurrence = None if args.get("archived") is False else note.due_date
+            if rearm_needed:
+                rearm_note_reminder(
+                    reminder_owner,
+                    note.id,
+                    occurrence=rearm_occurrence,
+                )
+            try:
+                db.commit()
+            except Exception:
+                if rearm_needed:
+                    cancel_note_reminder(
+                        reminder_owner,
+                        note.id,
+                        occurrence=rearm_occurrence,
+                    )
+                if cancel_needed:
+                    rearm_note_reminder(
+                        reminder_owner,
+                        note.id,
+                        occurrence=cancel_occurrence,
+                    )
+                raise
             return {"response": f"Note updated: \"{note.title or '(untitled)'}\"", "exit_code": 0}
 
         elif action == "delete":
@@ -357,8 +464,15 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
             if not _note_visible_to_owner(note, owner):
                 return {"error": "Note not found", "exit_code": 1}
             title = note.title
+            deleted_id = note.id
+            reminder_owner = resolved_runtime_owner(owner)
+            cancel_note_reminder(reminder_owner, deleted_id)
             db.delete(note)
-            db.commit()
+            try:
+                db.commit()
+            except Exception:
+                rearm_note_reminder(reminder_owner, deleted_id)
+                raise
             return {"response": f"Deleted note: \"{title or '(untitled)'}\"", "exit_code": 0}
 
         elif action == "toggle_item":
@@ -371,13 +485,57 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
                 return {"error": "Note not found", "exit_code": 1}
             if not note.items:
                 return {"error": "Note has no checklist items", "exit_code": 1}
-            items = json.loads(note.items)
-            if index < 0 or index >= len(items):
-                return {"error": f"Item index {index} out of range (0-{len(items)-1})", "exit_code": 1}
-            items[index]["done"] = not items[index].get("done", False)
+            old_items = json.loads(note.items)
+            if index < 0 or index >= len(old_items):
+                return {"error": f"Item index {index} out of range (0-{len(old_items)-1})", "exit_code": 1}
+            submitted = public_note_items(old_items)
+            submitted[index]["done"] = not submitted[index].get("done", False)
+            canonical_old, items = normalize_updated_items(
+                old_items,
+                submitted,
+                repeat=getattr(note, "repeat", "none"),
+                due_date=getattr(note, "due_date", None),
+            )
+            if str(note.note_type or "").lower() in _TODO_LIKE:
+                award_note_item_completions(
+                    db,
+                    note=note,
+                    owner=resolved_runtime_owner(owner),
+                    old_items=canonical_old,
+                    new_items=items,
+                )
             note.items = json.dumps(items)
             flag_modified(note, "items")
-            db.commit()
+            reminder_owner = resolved_runtime_owner(owner)
+            completed_now = completion_items_fully_done(note.note_type, items)
+            if completed_now:
+                cancel_note_reminder(
+                    reminder_owner,
+                    note.id,
+                    occurrence=note.due_date,
+                )
+            elif note.due_date:
+                rearm_note_reminder(
+                    reminder_owner,
+                    note.id,
+                    occurrence=note.due_date,
+                )
+            try:
+                db.commit()
+            except Exception:
+                if completed_now:
+                    rearm_note_reminder(
+                        reminder_owner,
+                        note.id,
+                        occurrence=note.due_date,
+                    )
+                elif note.due_date:
+                    cancel_note_reminder(
+                        reminder_owner,
+                        note.id,
+                        occurrence=note.due_date,
+                    )
+                raise
             mark = "done" if items[index]["done"] else "undone"
             return {"response": f"Item '{items[index].get('text', '')}' marked {mark}", "exit_code": 0}
 

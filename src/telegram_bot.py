@@ -211,7 +211,17 @@ def telegram_chat_ids_for_owner(config: TelegramConfig, owner: str) -> list[str]
     if config.owner and config.owner.strip().lower() == owner_key:
         linked |= legacy
     elif not config.chat_owners and not config.owner:
-        linked |= legacy
+        # Old installs stored only a global allowlist. Never hand that same
+        # chat list to every profile: resolve at most one local profile for a
+        # privacy-safe migration, and fail closed for every other owner.
+        try:
+            from src.auth_helpers import DEFAULT_LOCAL_OWNER, configured_single_user_owner
+
+            legacy_owner = str(configured_single_user_owner() or DEFAULT_LOCAL_OWNER).strip().lower()
+        except Exception:
+            legacy_owner = ""
+        if legacy_owner and owner_key == legacy_owner:
+            linked |= legacy
     return sorted(linked)
 
 

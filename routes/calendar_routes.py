@@ -13,7 +13,7 @@ from sqlalchemy import or_, and_
 from dateutil.rrule import rrulestr
 
 from core.database import SessionLocal, CalendarCal, CalendarDeletedEvent, CalendarEvent
-from src.auth_helpers import require_user
+from src.auth_helpers import DEFAULT_LOCAL_OWNER, require_user
 from src.upload_limits import read_upload_limited, ICS_MAX_BYTES
 
 logger = logging.getLogger(__name__)
@@ -66,7 +66,7 @@ def _env_alias(new_name: str, old_name: str, default: str = "") -> str:
     return _os.environ.get(new_name) or _os.environ.get(old_name) or default
 
 
-FALLBACK_OWNER = _env_alias("RESTIA_FALLBACK_OWNER", "ODYSSEUS_FALLBACK_OWNER", "owner@localhost")
+FALLBACK_OWNER = DEFAULT_LOCAL_OWNER
 _SINGLE_USER_MODE = _env_alias("RESTIA_SINGLE_USER", "ODYSSEUS_SINGLE_USER", "1") != "0"
 
 

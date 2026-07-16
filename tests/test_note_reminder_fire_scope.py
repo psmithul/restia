@@ -79,6 +79,19 @@ def _note(**overrides):
         "title": "Stored title",
         "content": "Stored body",
         "items": None,
+        "note_type": "note",
+        "color": None,
+        "label": None,
+        "pinned": False,
+        "archived": False,
+        "due_date": "2000-01-01T00:00:00Z",
+        "source": "user",
+        "session_id": None,
+        "sort_order": 0,
+        "image_url": None,
+        "repeat": "none",
+        "created_at": None,
+        "updated_at": None,
     }
     data.update(overrides)
     return SimpleNamespace(**data)
@@ -115,6 +128,7 @@ def test_real_reminder_uses_stored_note_and_ignores_overrides(monkeypatch):
         "owner": "alice",
         "queue_browser": False,
         "settings_override": None,
+        "occurrence": "2000-01-01T00:00:00Z",
     }]
 
 

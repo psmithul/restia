@@ -2,8 +2,25 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
+import pytest
 from sqlalchemy import create_engine, Column, String, DateTime, Integer, Boolean, Text
 from sqlalchemy.orm import sessionmaker, declarative_base
+
+
+@pytest.fixture(autouse=True)
+def _restore_core_database_globals():
+    """Keep this module's isolated ORM doubles from leaking to later tests."""
+    import core.database as database
+
+    originals = {
+        "engine": database.engine,
+        "SessionLocal": database.SessionLocal,
+        "ScheduledTask": database.ScheduledTask,
+        "TaskRun": database.TaskRun,
+    }
+    yield
+    for name, value in originals.items():
+        setattr(database, name, value)
 
 
 def _test_utcnow():

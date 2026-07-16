@@ -8,6 +8,7 @@ import { providerLogo } from './providers.js';
 import { initModelPicker, updateModelPicker } from './modelPicker.js';
 import themeModule from './theme.js';
 import spinnerModule from './spinner.js';
+import { openSidebar, closeSidebar, SIDEBAR_STATES } from './sidebar-layout.js';
 
 const API_BASE = window.location.origin;
 
@@ -880,10 +881,7 @@ function createSessionItem(s) {
     } catch (e) {}
     // On mobile, close sidebar if we deleted the active session so user sees welcome screen
     if (wasCurrentSession && window.innerWidth <= 768) {
-      const sidebar = document.getElementById('sidebar');
-      if (sidebar) sidebar.classList.add('hidden');
-      const backdrop = document.getElementById('sidebar-backdrop');
-      if (backdrop) backdrop.classList.remove('visible');
+      closeSidebar({ state: SIDEBAR_STATES.OFF, persist: false });
     } else {
       _forceSidebarOpen();
     }
@@ -1416,8 +1414,7 @@ function _forceSidebarOpen() {
   requestAnimationFrame(() => {
     const sb = document.getElementById('sidebar');
     if (sb && sb.classList.contains('hidden')) {
-      sb.classList.remove('hidden');
-      if (window.syncRailSide) window.syncRailSide();
+      openSidebar({ persist: false, userInitiated: true });
     }
   });
 }
@@ -1432,9 +1429,7 @@ function _guardSidebarDuringRename() {
   if (!sb) return () => {};
   const obs = new MutationObserver(() => {
     if (sb.classList.contains('hidden')) {
-      sb.classList.remove('hidden');
-      const bd = document.getElementById('sidebar-backdrop');
-      if (bd) bd.classList.add('visible');
+      openSidebar({ persist: false, userInitiated: true });
     }
   });
   obs.observe(sb, { attributes: true, attributeFilter: ['class'] });
@@ -1708,8 +1703,7 @@ export async function loadSessions() {
               await createDirectChat(dc.endpoint_url, dc.model, dc.endpoint_id);
               // On mobile, hide sidebar so user lands directly in chat
               if (window.innerWidth < 768) {
-                const sb = document.getElementById('sidebar');
-                if (sb) sb.classList.add('hidden');
+                closeSidebar({ state: SIDEBAR_STATES.OFF, persist: false });
               }
               return; // createDirectChat handles selectSession internally
             }
@@ -1868,10 +1862,7 @@ export async function selectSession(id, { keepSidebar = false, showLoading = tru
     // loader so the status sits over the chat pane instead of being hidden by
     // the sidebar. Startup auto-restore passes keepSidebar + showLoading=false.
     if (showLoading && !keepSidebar && window.innerWidth <= 768) {
-      const sidebar = document.getElementById('sidebar');
-      const backdrop = document.getElementById('sidebar-backdrop');
-      if (sidebar) sidebar.classList.add('hidden');
-      if (backdrop) backdrop.classList.remove('visible');
+      closeSidebar({ state: SIDEBAR_STATES.OFF, persist: false });
     }
 
     // Highlight active session in sidebar

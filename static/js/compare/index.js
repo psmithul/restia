@@ -38,6 +38,7 @@ import sessionModule from '../sessions.js';
 import spinnerModule from '../spinner.js';
 import themeModule from '../theme.js';
 import presetsModule from '../presets.js';
+import { setSidebarState, openSidebar, SIDEBAR_STATES } from '../sidebar-layout.js';
 import markdownModule from '../markdown.js';
 import fileHandlerModule from '../fileHandler.js';
 import { bindMenuDismiss } from '../escMenuStack.js';
@@ -271,11 +272,11 @@ async function _buildCompareUI() {
   if (n > 3) {
     const sidebar = document.getElementById('sidebar');
     if (sidebar && !sidebar.classList.contains('hidden')) {
-      sidebar.classList.add('hidden');
+      setSidebarState(
+        window.innerWidth <= 768 ? SIDEBAR_STATES.OFF : SIDEBAR_STATES.MINI,
+        { persist: false },
+      );
       state._sidebarWasHidden = true;
-      const iconRail = document.getElementById('icon-rail');
-      if (iconRail) iconRail.classList.remove('rail-hidden');
-      if (typeof window.syncRailSide === 'function') window.syncRailSide();
     }
   }
 
@@ -1425,8 +1426,7 @@ function cleanupResults() {
 
   // Restore sidebar
   if (state._sidebarWasHidden) {
-    const sidebar = document.getElementById('sidebar');
-    if (sidebar) sidebar.classList.remove('hidden');
+    openSidebar({ persist: false });
     state._sidebarWasHidden = false;
   }
   const _mobileNewRestore = document.getElementById('mobile-new-chat-btn');

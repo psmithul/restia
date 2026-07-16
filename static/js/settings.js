@@ -9,10 +9,29 @@ import { sortModelIds } from './modelSort.js';
 import { providerLogo } from './providers.js';
 import { isAltGrEvent } from './platform.js';
 import { bindMenuDismiss } from './escMenuStack.js';
+import { createTelegramLinkStatusPoller } from './telegramOnboarding.js';
 
 let initialized = false;
 let modalEl = null;
 let _authPolicy = { password_min_length: 8 };
+let telegramLinkStatusPoller = null;
+let telegramLinkExpiresAt = 0;
+let refreshTelegramLinkStatusFn = null;
+
+function stopTelegramLinkStatusPolling() {
+  telegramLinkStatusPoller?.stop();
+}
+
+async function resumeTelegramLinkStatus() {
+  const status = await refreshTelegramLinkStatusFn?.();
+  if (status?.linked) {
+    telegramLinkExpiresAt = 0;
+    return;
+  }
+  if (telegramLinkExpiresAt * 1000 > Date.now()) {
+    telegramLinkStatusPoller?.start(telegramLinkExpiresAt);
+  }
+}
 
 function el(id) { return document.getElementById(id); }
 function esc(s) { return uiModule.esc(s); }
@@ -28,6 +47,8 @@ function initTabs() {
   modalEl.querySelectorAll('[data-settings-tab]').forEach(btn => {
     btn.addEventListener('click', () => {
       const tab = btn.dataset.settingsTab;
+      if (tab !== 'reminders') stopTelegramLinkStatusPolling();
+      else resumeTelegramLinkStatus();
       // Lazy-init admin when first clicking an admin tab
       if (ADMIN_TABS.has(tab) && window.adminModule && typeof window.adminModule.open === 'function') {
         window.adminModule.open(tab);
@@ -1890,7 +1911,7 @@ const SHORTCUT_LABELS = {
   open_library:   'Open Library',
   open_memory:    'Open Memory',
   open_notes:     'Open Notes',
-  open_tasks:     'Open Tasks',
+  open_tasks:     'Open Automations',
   open_theme:     'Open Theme',
 };
 
@@ -2398,6 +2419,16 @@ async function initReminderSettings() {
   const telegramLinkCommandRow = el('set-telegram-link-command-row');
   const telegramLinkCommand = el('set-telegram-link-command');
   const telegramLinkMsg = el('set-telegram-link-msg');
+  const telegramTestBtn = el('set-telegram-test-btn');
+  const telegramBotToken = el('set-telegram-bot-token');
+  const telegramMode = el('set-telegram-mode');
+  const telegramWebhookUrl = el('set-telegram-webhook-url');
+  const telegramWebhookUrlRow = el('set-telegram-webhook-url-row');
+  const telegramWebhookReplaceRow = el('set-telegram-webhook-replace-row');
+  const telegramWebhookReplace = el('set-telegram-webhook-replace');
+  const telegramBotSave = el('set-telegram-bot-save');
+  const telegramBotRemove = el('set-telegram-bot-remove');
+  const telegramBotMsg = el('set-telegram-bot-msg');
   const hint = el('set-reminder-channel-hint');
   const llmToggle = el('set-reminder-llm-toggle');
   // "Integrations" link in the channel-hint copy. Jumps to the
@@ -2413,6 +2444,95 @@ async function initReminderSettings() {
     });
   }
   if (!channelSel || !llmToggle) return;
+
+  function syncTelegramModeRows() {
+    const webhook = telegramMode?.value === 'webhook';
+    if (telegramWebhookUrlRow) telegramWebhookUrlRow.style.display = webhook ? 'flex' : 'none';
+    // Telegram permits only one webhook per bot. Moving a bot from an old
+    // instance to local polling also needs explicit permission to remove that
+    // foreign webhook, so the guarded takeover control must remain available.
+    if (telegramWebhookReplaceRow) telegramWebhookReplaceRow.style.display = 'flex';
+  }
+
+  async function refreshTelegramBotConfig() {
+    if (!telegramBotSave) return null;
+    try {
+      const res = await fetch('/api/telegram/config', { credentials: 'same-origin' });
+      if (!res.ok) return null; // regular profiles do not have bot-admin access
+      const data = await res.json();
+      if (telegramMode) telegramMode.value = data.mode || 'polling';
+      if (telegramWebhookUrl) telegramWebhookUrl.value = data.public_url || '';
+      if (telegramBotToken) {
+        telegramBotToken.value = '';
+        telegramBotToken.placeholder = data.bot_token_configured
+          ? (data.bot_token_managed_by_env ? 'Managed by instance environment' : 'Configured — leave blank to keep')
+          : 'Paste token from @BotFather';
+        telegramBotToken.disabled = !!data.bot_token_managed_by_env;
+      }
+      if (telegramBotRemove) telegramBotRemove.style.display = data.bot_token_configured && !data.bot_token_managed_by_env ? '' : 'none';
+      if (telegramBotMsg) {
+        const botName = data.bot?.username ? `@${data.bot.username}` : (data.bot_token_configured ? 'Bot configured' : 'No bot configured');
+        const runtimeError = data.runtime?.last_error ? ` — ${data.runtime.last_error}` : '';
+        telegramBotMsg.textContent = `${botName} · ${data.mode === 'webhook' ? 'webhook' : 'local polling'}${runtimeError}`;
+        telegramBotMsg.style.color = data.runtime?.last_error ? 'var(--red)' : 'var(--fg)';
+      }
+      syncTelegramModeRows();
+      return data;
+    } catch (_) { return null; }
+  }
+
+  if (telegramMode && !telegramMode.dataset.wired) {
+    telegramMode.dataset.wired = '1';
+    telegramMode.addEventListener('change', syncTelegramModeRows);
+  }
+  if (telegramBotSave && !telegramBotSave.dataset.wired) {
+    telegramBotSave.dataset.wired = '1';
+    telegramBotSave.addEventListener('click', async () => {
+      telegramBotSave.disabled = true;
+      if (telegramBotMsg) { telegramBotMsg.textContent = 'Validating bot with Telegram…'; telegramBotMsg.style.color = 'var(--fg)'; }
+      try {
+        const res = await fetch('/api/telegram/config', {
+          method: 'PUT', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            bot_token: telegramBotToken?.value.trim() || '',
+            enabled: true,
+            mode: telegramMode?.value || 'polling',
+            public_url: telegramWebhookUrl?.value.trim().replace(/\/+$/, '') || '',
+            replace_existing_webhook: !!telegramWebhookReplace?.checked,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'Could not configure Telegram');
+        if (telegramWebhookReplace) telegramWebhookReplace.checked = false;
+        await refreshTelegramBotConfig();
+        await refreshTelegramLinkStatus();
+        if (telegramBotMsg) { telegramBotMsg.textContent = `Connected ${data.bot?.username ? '@' + data.bot.username : 'Telegram bot'} via ${data.mode}.`; telegramBotMsg.style.color = 'var(--green,#50fa7b)'; }
+      } catch (e) {
+        if (telegramBotMsg) { telegramBotMsg.textContent = e.message; telegramBotMsg.style.color = 'var(--red)'; }
+      } finally { telegramBotSave.disabled = false; }
+    });
+  }
+  if (telegramBotRemove && !telegramBotRemove.dataset.wired) {
+    telegramBotRemove.dataset.wired = '1';
+    telegramBotRemove.addEventListener('click', async () => {
+      if (!window.confirm('Remove this instance\'s Telegram bot and unlink every profile?')) return;
+      telegramBotRemove.disabled = true;
+      try {
+        const res = await fetch('/api/telegram/config', { method: 'DELETE', credentials: 'same-origin' });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'Could not remove Telegram bot');
+        stopTelegramLinkStatusPolling();
+        telegramLinkExpiresAt = 0;
+        await refreshTelegramBotConfig();
+        await refreshTelegramLinkStatus();
+      } catch (e) {
+        if (telegramBotMsg) { telegramBotMsg.textContent = e.message; telegramBotMsg.style.color = 'var(--red)'; }
+      } finally { telegramBotRemove.disabled = false; }
+    });
+  }
+  syncTelegramModeRows();
+  await refreshTelegramBotConfig();
 
   // Detect configured email accounts. The legacy single-account
   // `/api/email/config` endpoint was a no-op stub for most installs;
@@ -2490,16 +2610,17 @@ async function initReminderSettings() {
       telegramLinked = !!data.linked;
       if (telegramLinkStatus) {
         telegramLinkStatus.textContent = !telegramConfigured
-          ? 'Telegram is not configured for this Restia instance. The administrator must register a bot first.'
+          ? 'Telegram is not configured for this Restia instance. An administrator can paste a BotFather token above.'
           : telegramLinked
-            ? `Connected to ${data.linked_chat_count || 1} Telegram chat${(data.linked_chat_count || 1) === 1 ? '' : 's'}.`
-            : 'Bot ready. Generate a one-time code to connect your Telegram chat.';
+            ? `Connected to ${data.linked_chat_count || 1} Telegram chat${(data.linked_chat_count || 1) === 1 ? '' : 's'}${data.bot_username ? ` via @${data.bot_username}` : ''}.`
+            : `Bot ready${data.bot_username ? ` (@${data.bot_username})` : ''}. Generate a one-time code to connect your Telegram chat.`;
       }
       if (telegramLinkBtn) {
         telegramLinkBtn.disabled = !telegramConfigured;
         telegramLinkBtn.style.display = telegramLinked ? 'none' : '';
       }
       if (telegramUnlinkBtn) telegramUnlinkBtn.style.display = telegramLinked ? '' : 'none';
+      if (telegramTestBtn) telegramTestBtn.style.display = telegramLinked ? '' : 'none';
       if (telegramOpt) {
         telegramOpt.disabled = !telegramConfigured || !telegramLinked;
         telegramOpt.textContent = !telegramConfigured ? 'Telegram (administrator setup required)'
@@ -2512,9 +2633,34 @@ async function initReminderSettings() {
       telegramLinked = false;
       if (telegramLinkStatus) telegramLinkStatus.textContent = 'Telegram status unavailable.';
       if (telegramLinkBtn) telegramLinkBtn.disabled = true;
+      if (telegramTestBtn) telegramTestBtn.style.display = 'none';
       return null;
     }
   }
+  telegramLinkStatusPoller = createTelegramLinkStatusPoller({
+    refresh: refreshTelegramLinkStatus,
+    isActive: () => {
+      const panel = root.querySelector('[data-settings-panel="reminders"]');
+      return !root.classList.contains('hidden') && !!panel && !panel.classList.contains('hidden');
+    },
+    onLinked: () => {
+      telegramLinkExpiresAt = 0;
+      if (telegramLinkCommandRow) telegramLinkCommandRow.style.display = 'none';
+      if (telegramLinkMsg) {
+        telegramLinkMsg.textContent = 'Telegram chat connected.';
+        telegramLinkMsg.style.color = 'var(--green,#50fa7b)';
+      }
+    },
+    onExpired: () => {
+      telegramLinkExpiresAt = 0;
+      if (telegramLinkCommandRow) telegramLinkCommandRow.style.display = 'none';
+      if (telegramLinkMsg) {
+        telegramLinkMsg.textContent = 'That link code expired. Generate a new code to continue.';
+        telegramLinkMsg.style.color = 'var(--red)';
+      }
+    },
+  });
+  refreshTelegramLinkStatusFn = refreshTelegramLinkStatus;
   await refreshTelegramLinkStatus();
   if (telegramLinkBtn && !telegramLinkBtn.dataset.wired) {
     telegramLinkBtn.dataset.wired = '1';
@@ -2528,6 +2674,8 @@ async function initReminderSettings() {
         if (telegramLinkCommand) telegramLinkCommand.textContent = data.command;
         if (telegramLinkCommandRow) telegramLinkCommandRow.style.display = 'block';
         if (telegramLinkMsg) { telegramLinkMsg.textContent = 'Code ready. It expires in 10 minutes.'; telegramLinkMsg.style.color = 'var(--green,#50fa7b)'; }
+        telegramLinkExpiresAt = Number(data.expires_at) || 0;
+        telegramLinkStatusPoller?.start(telegramLinkExpiresAt);
       } catch (e) {
         if (telegramLinkMsg) { telegramLinkMsg.textContent = e.message; telegramLinkMsg.style.color = 'var(--red)'; }
       } finally {
@@ -2544,13 +2692,37 @@ async function initReminderSettings() {
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || data.error || 'Could not disconnect Telegram');
         if (telegramLinkCommandRow) telegramLinkCommandRow.style.display = 'none';
+        telegramLinkExpiresAt = 0;
         if (telegramLinkMsg) telegramLinkMsg.textContent = 'Telegram disconnected.';
+        if (data.reminder_channel === 'browser' && channelSel) {
+          channelSel.value = 'browser';
+          if (hint) hint.textContent = CHANNEL_HINTS.browser;
+          syncChannelRows();
+        }
+        if (telegramMirrorToggle && data.reminder_telegram_mirror === false) {
+          telegramMirrorToggle.checked = false;
+        }
         await refreshTelegramLinkStatus();
       } catch (e) {
         if (telegramLinkMsg) { telegramLinkMsg.textContent = e.message; telegramLinkMsg.style.color = 'var(--red)'; }
       } finally {
         telegramUnlinkBtn.disabled = false;
       }
+    });
+  }
+  if (telegramTestBtn && !telegramTestBtn.dataset.wired) {
+    telegramTestBtn.dataset.wired = '1';
+    telegramTestBtn.addEventListener('click', async () => {
+      telegramTestBtn.disabled = true;
+      if (telegramLinkMsg) { telegramLinkMsg.textContent = 'Sending Telegram test…'; telegramLinkMsg.style.color = 'var(--fg)'; }
+      try {
+        const res = await fetch('/api/telegram/test', { method: 'POST', credentials: 'same-origin' });
+        const data = await res.json();
+        if (!res.ok || !data.telegram_sent) throw new Error(data.detail || 'Telegram test was not delivered');
+        if (telegramLinkMsg) { telegramLinkMsg.textContent = 'Test delivered to your linked Telegram chat.'; telegramLinkMsg.style.color = 'var(--green,#50fa7b)'; }
+      } catch (e) {
+        if (telegramLinkMsg) { telegramLinkMsg.textContent = e.message; telegramLinkMsg.style.color = 'var(--red)'; }
+      } finally { telegramTestBtn.disabled = false; }
     });
   }
 
@@ -2564,6 +2736,23 @@ async function initReminderSettings() {
   const webhookIntgSel = el('set-reminder-webhook-intg');
   const webhookTemplateRow = el('set-reminder-webhook-template-row');
   const webhookTemplateIn = el('set-reminder-webhook-template');
+  const notificationTopicInputs = [...root.querySelectorAll('[data-notification-topic]')];
+  const digestCadenceSel = el('set-notification-digest-cadence');
+  const digestTimeIn = el('set-notification-digest-time');
+  const notificationTimezoneIn = el('set-notification-timezone');
+  const quietEnabled = el('set-notification-quiet-enabled');
+  const quietStartIn = el('set-notification-quiet-start');
+  const quietEndIn = el('set-notification-quiet-end');
+  const notificationPrefsMsg = el('set-notification-prefs-msg');
+
+  function syncDigestTime() {
+    if (digestTimeIn) digestTimeIn.style.display = digestCadenceSel?.value === 'daily' ? '' : 'none';
+  }
+  function syncQuietHours() {
+    const enabled = !!quietEnabled?.checked;
+    if (quietStartIn) quietStartIn.disabled = !enabled;
+    if (quietEndIn) quietEndIn.disabled = !enabled;
+  }
 
   function populateReminderEmailAccounts(selectedId = '') {
     if (!emailAcctSel) return;
@@ -2641,6 +2830,7 @@ async function initReminderSettings() {
     if (currentChannel === 'email' && !smtpConfigured) channelSel.value = 'browser';
     else if (currentChannel === 'ntfy' && !ntfyConfigured) channelSel.value = 'browser';
     else if (currentChannel === 'webhook' && !webhookConfigured) channelSel.value = 'browser';
+    else if (currentChannel === 'telegram' && (!telegramConfigured || !telegramLinked)) channelSel.value = 'browser';
     else channelSel.value = currentChannel;
     if (hint) hint.textContent = CHANNEL_HINTS[channelSel.value] || '';
     syncChannelRows();
@@ -2688,18 +2878,32 @@ async function initReminderSettings() {
   };
 
   try {
-    const res = await fetch('/api/auth/settings', { credentials: 'same-origin' });
+    const res = await fetch('/api/telegram/preferences', { credentials: 'same-origin' });
     const s = await res.json();
     let savedChannel = s.reminder_channel || 'browser';
     if (savedChannel === 'email' && !smtpConfigured) savedChannel = 'browser';
     if (savedChannel === 'ntfy' && !ntfyConfigured) savedChannel = 'browser';
     if (savedChannel === 'webhook' && !webhookConfigured) savedChannel = 'browser';
-    if (savedChannel === 'telegram' && !telegramConfigured) savedChannel = 'browser';
+    if (savedChannel === 'telegram' && (!telegramConfigured || !telegramLinked)) savedChannel = 'browser';
     channelSel.value = savedChannel;
     llmToggle.checked = !!s.reminder_llm_synthesis;
+    const selectedTopics = new Set(s.notification_topics || []);
+    notificationTopicInputs.forEach(input => { input.checked = selectedTopics.has(input.dataset.notificationTopic); });
+    if (digestCadenceSel) digestCadenceSel.value = s.digest_cadence || 'off';
+    if (digestTimeIn) digestTimeIn.value = s.digest_time || '08:00';
+    const browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+    if (notificationTimezoneIn) {
+      notificationTimezoneIn.value = s.timezone_configured ? (s.timezone || 'UTC') : browserTimezone;
+      if (!s.timezone_configured) save({ timezone: browserTimezone });
+    }
+    if (quietEnabled) quietEnabled.checked = !!s.quiet_hours_enabled;
+    if (quietStartIn) quietStartIn.value = s.quiet_hours_start || '22:00';
+    if (quietEndIn) quietEndIn.value = s.quiet_hours_end || '07:00';
+    syncDigestTime();
+    syncQuietHours();
     if (telegramMirrorToggle) {
       telegramMirrorToggle.checked = !!s.reminder_telegram_mirror;
-      telegramMirrorToggle.disabled = !telegramConfigured || !telegramLinked;
+      telegramMirrorToggle.disabled = (!telegramConfigured || !telegramLinked) && !telegramMirrorToggle.checked;
       if (!telegramMirrorToggle.dataset.wired) {
         telegramMirrorToggle.dataset.wired = '1';
         telegramMirrorToggle.addEventListener('change', () => {
@@ -2768,14 +2972,69 @@ async function initReminderSettings() {
 
   async function save(patch) {
     try {
-      await fetch('/api/auth/settings', {
-        method: 'POST',
+      const res = await fetch('/api/telegram/preferences', {
+        method: 'PUT',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(patch),
       });
-    } catch (e) { console.warn('Failed to save reminder settings', e); }
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || 'Notification preference save failed');
+      }
+      if (notificationPrefsMsg) {
+        notificationPrefsMsg.textContent = 'Saved for this profile';
+        notificationPrefsMsg.style.color = 'var(--green,#50fa7b)';
+        setTimeout(() => { notificationPrefsMsg.textContent = ''; }, 1800);
+      }
+      return true;
+    } catch (e) {
+      console.warn('Failed to save reminder settings', e);
+      if (notificationPrefsMsg) { notificationPrefsMsg.textContent = e.message; notificationPrefsMsg.style.color = 'var(--red)'; }
+      return false;
+    }
   }
+
+  notificationTopicInputs.forEach(input => {
+    if (input.dataset.wired) return;
+    input.dataset.wired = '1';
+    input.addEventListener('change', () => save({
+      notification_topics: notificationTopicInputs.filter(i => i.checked).map(i => i.dataset.notificationTopic),
+    }));
+  });
+  if (digestCadenceSel && !digestCadenceSel.dataset.wired) {
+    digestCadenceSel.dataset.wired = '1';
+    digestCadenceSel.addEventListener('change', () => {
+      syncDigestTime();
+      save({ digest_cadence: digestCadenceSel.value });
+    });
+  }
+  if (digestTimeIn && !digestTimeIn.dataset.wired) {
+    digestTimeIn.dataset.wired = '1';
+    digestTimeIn.addEventListener('change', () => save({ digest_time: digestTimeIn.value || '08:00' }));
+  }
+  if (notificationTimezoneIn && !notificationTimezoneIn.dataset.wired) {
+    notificationTimezoneIn.dataset.wired = '1';
+    let timezoneDebounce;
+    notificationTimezoneIn.addEventListener('input', () => {
+      clearTimeout(timezoneDebounce);
+      timezoneDebounce = setTimeout(() => save({ timezone: notificationTimezoneIn.value.trim() || 'UTC' }), 600);
+    });
+  }
+  if (quietEnabled && !quietEnabled.dataset.wired) {
+    quietEnabled.dataset.wired = '1';
+    quietEnabled.addEventListener('change', () => {
+      syncQuietHours();
+      save({ quiet_hours_enabled: quietEnabled.checked });
+    });
+  }
+  [quietStartIn, quietEndIn].forEach((input, index) => {
+    if (!input || input.dataset.wired) return;
+    input.dataset.wired = '1';
+    input.addEventListener('change', () => save({
+      [index === 0 ? 'quiet_hours_start' : 'quiet_hours_end']: input.value || (index === 0 ? '22:00' : '07:00'),
+    }));
+  });
 
   channelSel.addEventListener('change', () => {
     if (hint) hint.textContent = CHANNEL_HINTS[channelSel.value] || '';
@@ -2889,11 +3148,15 @@ async function initReminderSettings() {
           const activeChannel = data.channel ? ` (server used channel: "${data.channel}")` : '';
           throw new Error((data.webhook_error || 'Webhook reminder was not sent') + activeChannel);
         }
+        if ((channelSel.value === 'telegram' || telegramMirrorToggle?.checked) && !data.telegram_sent) {
+          throw new Error(data.telegram_error || 'Telegram reminder was not sent');
+        }
         let status = 'Delivered via ' + channelSel.value;
         if (data.synthesis) status += ' (AI: "' + data.synthesis.slice(0, 60) + '...")';
         if (data.email_sent) status += ' — email sent';
         if (data.ntfy_sent) status += ' — ntfy sent';
         if (data.webhook_sent) status += ' — webhook sent';
+        if (data.telegram_sent) status += ' — Telegram sent';
         if (testMsg) { testMsg.textContent = status; testMsg.style.color = 'var(--green, #50fa7b)'; }
         // Also fire a browser notification so user can see it
         if ('Notification' in window && Notification.permission === 'granted') {
@@ -5849,6 +6112,8 @@ export function open(tab) {
   }
   // Auto-init admin data if showing an admin tab
   const activeTab = tab || (modalEl.querySelector('[data-settings-tab].active') || {}).dataset?.settingsTab || 'services';
+  if (activeTab !== 'reminders') stopTelegramLinkStatusPolling();
+  else resumeTelegramLinkStatus();
   document.body.classList.toggle('settings-appearance-open', activeTab === 'appearance');
   syncAppearanceOpacity(activeTab === 'appearance');
   if (activeTab === 'ai') refreshAiModelEndpoints();
@@ -5859,6 +6124,7 @@ export function open(tab) {
 
 export function close() {
   if (!modalEl) return;
+  stopTelegramLinkStatusPolling();
   // Always clear the appearance-tab body class so the rest of the app
   // doesn't keep its dimmed state if the modal got closed mid-tab.
   document.body.classList.remove('settings-appearance-open');

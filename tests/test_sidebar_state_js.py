@@ -143,6 +143,53 @@ def test_sidebar_uses_one_inclusive_mobile_breakpoint_and_migrates_legacy_state(
     assert "Storage.setJSON(KEY, saved)" in init
 
 
+def test_sidebar_visibility_mutations_use_the_central_state_controller():
+    layout = (ROOT / "static/js/sidebar-layout.js").read_text(encoding="utf-8")
+    storage = (ROOT / "static/js/storage.js").read_text(encoding="utf-8")
+
+    assert "SIDEBAR_STATE: 'sidebar-layout-state'" in storage
+    assert "export function setSidebarState" in layout
+    assert "Storage.set(stateStorageKey, state)" in layout
+    assert "_pendingMobileOpenTimer" in layout
+    assert "const hasPendingOpen = _pendingMobileOpenTimer !== null" in layout
+    assert "e?.shiftKey && !_isMobileViewport()" in layout
+    assert "_setSidebarRightSide(!sidebar.classList.contains('right-side'), { persist: true })" in layout
+
+    direct_mutation = re.compile(
+        r"\b(?:sidebar|sb|_sb)\.classList\.(?:add|remove|toggle)\(['\"]hidden"
+    )
+    entrypoint_files = [
+        "static/app.js",
+        "static/js/calendar.js",
+        "static/js/compare/index.js",
+        "static/js/documentLibrary.js",
+        "static/js/emailLibrary.js",
+        "static/js/init.js",
+        "static/js/modalSnap.js",
+        "static/js/notes.js",
+        "static/js/sessions.js",
+        "static/js/slashCommands.js",
+        "static/js/v2NavigationShell.js",
+    ]
+    violations = {
+        path: direct_mutation.findall((ROOT / path).read_text(encoding="utf-8"))
+        for path in entrypoint_files
+        if direct_mutation.search((ROOT / path).read_text(encoding="utf-8"))
+    }
+    assert violations == {}
+
+
+def test_mobile_notes_close_and_tool_capture_share_sidebar_controller():
+    layout = (ROOT / "static/js/sidebar-layout.js").read_text(encoding="utf-8")
+    notes = (ROOT / "static/js/notes.js").read_text(encoding="utf-8")
+
+    assert "closeSidebar({ state: SIDEBAR_STATES.OFF, persist: false })" in notes
+    assert "window.dispatchEvent(new CustomEvent('sidebar-tool-closed'))" in notes
+    assert "window.addEventListener('sidebar-tool-closed', _restoreSidebar)" in layout
+    assert "if (sidebar && !sidebar.classList.contains('hidden')) _sidebarWasOpenBeforeTool = true" in layout
+    assert re.search(r"document\.addEventListener\('click', \(e\) => \{[\s\S]*?\}, true\);", layout)
+
+
 def test_mobile_backdrop_click_is_an_isolated_sidebar_dismissal():
     values = _node_eval(
         r"""
@@ -154,24 +201,13 @@ def test_mobile_backdrop_click_is_an_isolated_sidebar_dismissal():
         );
         if (!match) throw new Error('mobile backdrop click handler not found');
 
-        const names = new Set(['visible']);
-        const sidebar = {
-          classList: {
-            contains(name) { return names.has(name); },
-            add(name) { names.add(name); },
-          },
-        };
-        const backdropNames = new Set(['visible']);
-        const mobileBackdrop = {
-          classList: { remove(name) { backdropNames.delete(name); } },
-        };
         const document = {
-          getElementById(id) { return id === 'sidebar' ? sidebar : null; },
           querySelector() { return null; },
         };
         const window = { _suppressSidebarClose: false };
-        let syncCalls = 0;
-        const syncRailSide = () => { syncCalls += 1; };
+        const SIDEBAR_STATES = { OFF: 'off' };
+        const appliedStates = [];
+        const _applySidebarState = (state) => { appliedStates.push(state); };
         const event = {
           defaultPrevented: false,
           propagationStopped: false,
@@ -182,17 +218,15 @@ def test_mobile_backdrop_click_is_an_isolated_sidebar_dismissal():
         let tasksOpened = false;
 
         const handler = new Function(
-          'e', 'window', 'document', 'mobileBackdrop', 'syncRailSide',
+          'e', 'window', 'document', 'SIDEBAR_STATES', '_applySidebarState',
           match[1],
         );
-        handler(event, window, document, mobileBackdrop, syncRailSide);
+        handler(event, window, document, SIDEBAR_STATES, _applySidebarState);
 
         console.log(JSON.stringify({
-          sidebarHidden: names.has('hidden'),
-          backdropVisible: backdropNames.has('visible'),
+          appliedStates,
           defaultPrevented: event.defaultPrevented,
           propagationStopped: event.propagationStopped,
-          syncCalls,
           missionControlOpen,
           tasksOpened,
         }));
@@ -200,11 +234,9 @@ def test_mobile_backdrop_click_is_an_isolated_sidebar_dismissal():
     )
 
     assert values == {
-        "sidebarHidden": True,
-        "backdropVisible": False,
+        "appliedStates": ["off"],
         "defaultPrevented": True,
         "propagationStopped": True,
-        "syncCalls": 1,
         "missionControlOpen": True,
         "tasksOpened": False,
     }
@@ -231,4 +263,4 @@ def test_chats_collapse_control_stays_visible_beside_header_actions():
     assert "/static/projects.css?v=20260715v2" in html
     assert "/static/v2-shell.css?v=20260715v2" in html
     assert "/static/mission-control.css?v=20260715v2" in html
-    assert "const CACHE_NAME = 'restia-v358'" in service_worker
+    assert "const CACHE_NAME = 'restia-v365'" in service_worker

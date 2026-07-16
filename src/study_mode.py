@@ -17,6 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from core.database import Session as DbSession
 from core.database import SessionLocal, StudyState, utcnow_naive
 from core.models import get_session_manager_instance
+from src.progression import award_progression_event
 
 
 LOCAL_OWNER_KEY = "local:default"
@@ -50,6 +51,10 @@ class StudyGoalConflictError(ValueError):
 
 class StudyGoalRequiredError(ValueError):
     """Raised when a client tries to start focus time without a Study prompt."""
+
+
+class StudyReviewNotDueError(ValueError):
+    """Raised when a client tries to mint new evidence before retrieval is due."""
 
 
 class StudyWorkspaceNotFoundError(LookupError):
@@ -858,7 +863,13 @@ def save_study_goal(
 
 
 @_serialized_state_access
-def record_study_review(owner: Optional[str], session_id: str, outcome: str) -> dict:
+def record_study_review(
+    owner: Optional[str],
+    session_id: str,
+    outcome: str,
+    *,
+    progression_owner: Optional[str] = None,
+) -> dict:
     """Record demonstrated review evidence and schedule its next retrieval."""
 
     if outcome not in STUDY_REVIEW_OUTCOMES:
@@ -871,12 +882,32 @@ def record_study_review(owner: Optional[str], session_id: str, outcome: str) -> 
         state = _get_or_create(db, owner, session_id)
         now = _now()
         _checkpoint_prompt_idle(state, now)
+        if (
+            int(state.review_count or 0) > 0
+            and state.next_review_at is not None
+            and now < state.next_review_at
+        ):
+            remaining = max(1, int((state.next_review_at - now).total_seconds()))
+            raise StudyReviewNotDueError(
+                f"The next closed-book review is not due yet ({remaining} seconds remaining)."
+            )
         level = _review_level_after(state.review_level, outcome)
         state.review_level = level
         state.review_count = max(0, int(state.review_count or 0)) + 1
         state.last_review_result = outcome
         state.last_reviewed_at = now
         state.next_review_at = now + _REVIEW_INTERVALS[level]
+        if outcome in {"clean", "transfer"}:
+            award_progression_event(
+                db,
+                owner=progression_owner or owner,
+                event_key=f"study:{session_id}:review:{state.review_count}",
+                source_type="study_review_passed",
+                source_id=session_id,
+                title=state.goal_text or "Study review",
+                details={"outcome": outcome, "review_level": level},
+                occurred_at=now,
+            )
         db.commit()
         db.refresh(state)
         return serialize_study_state(state, now=now)

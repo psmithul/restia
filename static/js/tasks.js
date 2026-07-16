@@ -1086,8 +1086,8 @@ function _showPresetPicker() {
   if (!body) return;
 
   let html = '<div class="admin-card" style="flex:1;display:flex;flex-direction:column;overflow:hidden;">';
-  html += '<div style="display:flex;align-items:baseline;gap:8px;margin-bottom:2px;"><h2 style="margin:0;padding:0;line-height:1;">Add Task</h2></div>';
-  html += '<p class="memory-desc" style="position:relative;top:4px;">Describe a task for the AI to draft, or pick a type below to set one up manually.</p>';
+  html += '<div style="display:flex;align-items:baseline;gap:8px;margin-bottom:2px;"><h2 style="margin:0;padding:0;line-height:1;">Add Automation</h2></div>';
+  html += '<p class="memory-desc" style="position:relative;top:4px;">Describe an automation for the AI to draft, or pick a type below to set one up manually.</p>';
   // flex-wrap + min-width:0 on the input lets the row collapse cleanly
   // on narrow modal widths instead of pushing the AI button past the
   // right edge. margin-left:-4px nudges the compose row 4px into the
@@ -1140,7 +1140,7 @@ function _showForm(existing, initTaskType, initTriggerType) {
   body.innerHTML = `
     <div class="admin-card" style="flex:1;display:flex;flex-direction:column;overflow:hidden;">
       <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:2px;">
-        <h2 style="margin:0;padding:0;line-height:1;">${existing?.id ? 'Edit Task' : 'New Task'}</h2>
+        <h2 style="margin:0;padding:0;line-height:1;">${existing?.id ? 'Edit Automation' : 'New Automation'}</h2>
       </div>
       <p class="memory-desc">${existing?.id ? 'Update this task’s schedule, prompt, and output.' : 'Configure a prompt, research, or action to run automatically.'}</p>
     <div class="task-form" style="flex:1;overflow-y:auto;min-height:0;">
@@ -2656,7 +2656,7 @@ function _renderMainView() {
   body.innerHTML = `
     <div class="admin-card" style="flex:1;display:flex;flex-direction:column;overflow:hidden;position:relative;top:-2px;">
       <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:2px;">
-        <h2 style="margin:0;padding:0;line-height:1;position:relative;top:-4px;">Ongoing Tasks <span id="tasks-head-count" class="memory-count" style="font-size:0.6em;opacity:0.6;font-weight:normal"></span></h2>
+        <h2 style="margin:0;padding:0;line-height:1;position:relative;top:-4px;">Automations <span id="tasks-head-count" class="memory-count" style="font-size:0.6em;opacity:0.6;font-weight:normal"></span></h2>
         <button class="memory-toolbar-btn" id="tasks-pause-all-btn" title="Pause all active tasks" style="margin-left:auto;">Pause all</button>
       </div>
       <p class="memory-desc" style="position:relative;top:-4px;">Scheduled prompts and actions that run automatically. Results appear in a dedicated session.</p>
@@ -2738,14 +2738,14 @@ export function openTasks(focusId, opts) {
   modal.innerHTML = `
     <div class="modal-content tasks-modal-content">
       <div class="modal-header">
-        <h4 style="position:relative;top:-2px;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:6px"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2 2"/><path d="M5 3L2 6"/><path d="M22 6l-3-3"/></svg>Tasks</h4>
+        <h4 style="position:relative;top:-2px;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:6px"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2 2"/><path d="M5 3L2 6"/><path d="M22 6l-3-3"/></svg>Automations</h4>
         <span style="flex:1"></span>
         <button class="close-btn" id="tasks-close">✖</button>
       </div>
       <div class="memory-tabs tasks-tabs" role="tablist">
         <button class="memory-tab tasks-tab active" data-tab="tasks" role="tab" aria-selected="true">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
-          Tasks <span id="tasks-tab-count" class="memory-count" style="font-size:0.8em;opacity:0.6;font-weight:normal;margin-left:4px">0</span>
+          Automations <span id="tasks-tab-count" class="memory-count" style="font-size:0.8em;opacity:0.6;font-weight:normal;margin-left:4px">0</span>
         </button>
         <button class="memory-tab tasks-tab" data-tab="activity" role="tab" aria-selected="false">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
@@ -2899,6 +2899,7 @@ async function _pollTaskNotifications() {
     if (!res.ok) return;
     const data = await res.json();
     const notes = data.notifications || [];
+    const acknowledgedIds = [];
     for (const n of notes) {
       const ok = n.status === 'success';
       // Tasks with output_target='notification' carry the result text in `body`
@@ -2913,7 +2914,11 @@ async function _pollTaskNotifications() {
             fired = true;
           }
         } catch (_) {}
-        if (!fired && uiModule) uiModule.showToast(title + ': ' + n.body.slice(0, 140), { duration: 7000 });
+        if (!fired && uiModule) {
+          uiModule.showToast(title + ': ' + n.body.slice(0, 140), { duration: 7000 });
+          fired = true;
+        }
+        if (fired && n.id) acknowledgedIds.push(n.id);
         continue;
       }
       const msg = `Task ${ok ? 'finished' : 'failed'}: ${n.task_name}`;
@@ -2926,6 +2931,18 @@ async function _pollTaskNotifications() {
           _renderActivityView();
         }
       }
+      if (n.id) acknowledgedIds.push(n.id);
+    }
+    if (acknowledgedIds.length) {
+      // GET is intentionally non-destructive. Ack only after a Notification,
+      // toast, or error surface was actually produced; a failed ack safely
+      // leaves the rows for at-least-once redelivery.
+      await fetch(`${API_BASE}/api/tasks/notifications/ack`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: acknowledgedIds }),
+      });
     }
   } catch (e) {
     // Silently ignore — server may be unreachable
@@ -2934,6 +2951,7 @@ async function _pollTaskNotifications() {
 
 function startNotificationPolling() {
   if (_notifInterval) return;
+  _pollTaskNotifications();
   _notifInterval = setInterval(_pollTaskNotifications, 30000);
 }
 
@@ -2942,6 +2960,15 @@ function stopNotificationPolling() {
     clearInterval(_notifInterval);
     _notifInterval = null;
   }
+}
+
+// The outbox is a global delivery surface, not an Automations-modal feature.
+// Start after the page/auth bootstrap and immediately recover anything queued
+// while the browser was closed. The function is idempotent for openTasks().
+if (document.readyState === 'complete') {
+  startNotificationPolling();
+} else {
+  window.addEventListener('load', startNotificationPolling, { once: true });
 }
 
 const tasksModule = { openTasks, closeTasks, isTasksOpen, startNotificationPolling, stopNotificationPolling };
