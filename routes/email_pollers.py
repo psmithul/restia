@@ -40,6 +40,7 @@ from routes.email_helpers import (
     _pre_retrieve_context,
     _attach_compose_uploads, _cleanup_compose_uploads, _q,
     SCHEDULED_DB, _EMAIL_REPLY_SYS_PROMPT_BASE, _email_cache_owner_clause,
+    EMAIL_CLASSIFICATION_TAGS, normalize_email_tags,
 )
 
 logger = logging.getLogger(__name__)
@@ -906,9 +907,7 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
                         class_sys = (
                             "Classify the email. Return ONLY a JSON object, no prose, no markdown fences. "
                             "Schema: {\"tags\": [\"tag1\"], \"spam\": false, \"reason\": \"short\"}. "
-                            "Pick 1-3 tags from: work, personal, urgent, action-needed, finance, bills, "
-                            "receipt, legal, travel, newsletter, promo, notification, security, social, "
-                            "shopping, calendar, support.\n\n"
+                            f"Pick 1-3 tags from: {', '.join(sorted(EMAIL_CLASSIFICATION_TAGS))}.\n\n"
                             "Use work for professional/company/client/operations messages. "
                             "Use personal for friends/family/private-life messages. "
                             "Use urgent for real time-sensitive consequences. "
@@ -948,15 +947,12 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
                             except Exception:
                                 parsed = None
                         if parsed is not None:
-                            _ALLOWED_TAGS = {"work","personal","urgent","action-needed","finance","bills",
-                                             "receipt","legal","travel","newsletter","marketing","notification",
-                                             "security","social","shopping","calendar","support"}
                             raw_tags = parsed.get("tags") or []
-                            if isinstance(raw_tags, str):
-                                raw_tags = [raw_tags]
-                            tags = [t.strip().lower().replace("_", "-") for t in raw_tags if isinstance(t, str)]
-                            tags = ["marketing" if t == "promo" else t for t in tags]
-                            tags = [t for t in tags if t in _ALLOWED_TAGS][:3]
+                            tags = normalize_email_tags(
+                                raw_tags,
+                                allowed_tags=EMAIL_CLASSIFICATION_TAGS,
+                                limit=3,
+                            )
                             is_spam = bool(parsed.get("spam"))
                             spam_reason = str(parsed.get("reason") or "")[:200]
 

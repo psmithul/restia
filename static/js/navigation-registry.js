@@ -135,7 +135,6 @@ export const NAVIGATION_ITEMS = deepFreeze([
     legacyIds: {
       rail: ['rail-new-session'],
       sidebar: ['sidebar-new-chat-btn'],
-      auxiliary: ['sidebar-brand-btn'],
     },
     visibility: {
       preferences: { rail: 'rail-new-chat', sidebar: 'sidebar-new-chat' },

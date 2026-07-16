@@ -117,9 +117,13 @@ function railButton(id, label, iconNodes) {
 }
 
 function ensureNewDestinations(container) {
+  const homeItem = getNavigationItem('home');
   let home = document.getElementById('v2-home-nav');
   if (!home) {
-    home = destinationButton('v2-home-nav', 'Home', icon([
+    // The group heading already says "Home". Use the registry's compact
+    // "Today" label for the destination so the expanded sidebar does not
+    // repeat the same visible word on adjacent controls.
+    home = destinationButton('v2-home-nav', homeItem?.shortLabel || homeItem?.label || 'Today', icon([
       { d: 'M3 11.5 12 4l9 7.5' }, { d: 'M5.5 10v10h13V10' }, { d: 'M9.5 20v-6h5v6' },
     ]));
     container.appendChild(home);
@@ -447,7 +451,7 @@ export async function activateNavigationItem(id, options = {}) {
     } else if (sessionId) {
       document.getElementById('sidebar-new-chat-btn')?.click();
     } else if (!leftStudy) {
-      document.getElementById('sidebar-brand-btn')?.click();
+      document.getElementById('sidebar-new-chat-btn')?.click();
     }
     setActiveNavigationItem('chat');
     hideMobileSidebar();

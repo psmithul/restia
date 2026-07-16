@@ -16,6 +16,8 @@ set -e
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_NAME="Restia"
 INSTALL_DIR="$REPO_DIR"
+APP_VERSION="$(sed -nE 's/^APP_VERSION = "([^"]+)"/\1/p' "$REPO_DIR/src/constants.py" | head -1)"
+[ -n "$APP_VERSION" ] || { echo "Could not read APP_VERSION from src/constants.py" >&2; exit 1; }
 PORT="${RESTIA_PORT:-${ODYSSEUS_PORT:-7860}}"
 DIST="$REPO_DIR/dist"
 APP="$DIST/$APP_NAME.app"
@@ -50,8 +52,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleName</key>            <string>$APP_NAME</string>
     <key>CFBundleDisplayName</key>     <string>$APP_NAME</string>
     <key>CFBundleIdentifier</key>      <string>com.restia.launcher</string>
-    <key>CFBundleVersion</key>         <string>2.0.0</string>
-    <key>CFBundleShortVersionString</key><string>2.0.0</string>
+    <key>CFBundleVersion</key>         <string>$APP_VERSION</string>
+    <key>CFBundleShortVersionString</key><string>$APP_VERSION</string>
     <key>CFBundlePackageType</key>     <string>APPL</string>
     <key>CFBundleExecutable</key>      <string>$APP_NAME</string>
     <key>CFBundleIconFile</key>        <string>restia</string>

@@ -59,6 +59,7 @@ from routes.email_helpers import (
     SendEmailRequest, ExtractStyleRequest,
     ATTACHMENTS_DIR, COMPOSE_UPLOADS_DIR, SCHEDULED_DB,
     attachment_extract_dir, _email_cache_owner_clause, email_translation_body_hash,
+    EMAIL_VISIBLE_TAGS, normalize_email_tags,
 )
 from routes.email_pollers import _start_poller
 
@@ -145,22 +146,14 @@ def _email_tag_account_clause(account_id: str | None) -> tuple[str, list[str]]:
     return "1=1", []
 
 
-_VISIBLE_EMAIL_TAGS = {"urgent", "reply-soon", "action-needed", "calendar", "bills", "receipt", "travel"}
+_VISIBLE_EMAIL_TAGS = EMAIL_VISIBLE_TAGS
 _DONE_RESPONSE_TAGS = {"urgent", "reply-soon", "action-needed"}
 
 
 def _sanitize_visible_email_tags(tags, *, is_answered: bool = False) -> list[str]:
-    out = []
-    for tag in tags if isinstance(tags, list) else []:
-        tag = str(tag or "").strip().lower().replace("_", "-")
-        if tag == "promo":
-            tag = "marketing"
-        if tag not in _VISIBLE_EMAIL_TAGS:
-            continue
-        if is_answered and tag in _DONE_RESPONSE_TAGS:
-            continue
-        if tag not in out:
-            out.append(tag)
+    out = normalize_email_tags(tags, allowed_tags=_VISIBLE_EMAIL_TAGS)
+    if is_answered:
+        out = [tag for tag in out if tag not in _DONE_RESPONSE_TAGS]
     return out
 
 

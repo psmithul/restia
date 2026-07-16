@@ -944,7 +944,7 @@ app.include_router(setup_webhook_routes(webhook_manager, auth_manager, session_m
 
 # Telegram bot bridge
 from routes.telegram_routes import setup_telegram_routes
-app.include_router(setup_telegram_routes(session_manager, webhook_manager, task_scheduler))
+app.include_router(setup_telegram_routes(session_manager, webhook_manager))
 
 # API Tokens
 from routes.api_token_routes import setup_api_token_routes
@@ -1368,6 +1368,20 @@ async def _startup_event():
         except Exception as e:
             logger.debug(f"Default tasks: {e}")
 
+    # Telegram inbound chat has its own lifecycle. Start it before any Tasks
+    # reconciliation/runner work so disabling or degrading that subsystem does
+    # not prevent inbound chat. start() is idempotent, so a repeated lifespan
+    # cannot create competing Bot API getUpdates loops.
+    from src.telegram_runtime import (
+        inprocess_telegram_polling_enabled,
+        telegram_polling_service,
+    )
+
+    if inprocess_telegram_polling_enabled():
+        telegram_polling_service.start()
+    else:
+        logger.info("In-process Telegram polling disabled (RESTIA_INPROCESS_TELEGRAM=0)")
+
     # Reconcile built-in tasks before the runner starts. Otherwise legacy
     # scheduled built-ins can fire once before being converted to event tasks.
     await _ensure_default_tasks()
@@ -1405,18 +1419,6 @@ async def _startup_event():
             "In-process task scheduler disabled (RESTIA_INPROCESS_TASKS=0); "
             "drive task firing externally (e.g. cron)."
         )
-    # Telegram defaults to local Bot API long polling, which works behind NAT
-    # without a public URL. Webhook mode is optional and the same worker simply
-    # idles when it is selected. Keep a strong task reference for clean shutdown.
-    _telegram_inprocess = _env_alias(
-        "RESTIA_INPROCESS_TELEGRAM", "ODYSSEUS_INPROCESS_TELEGRAM", "1"
-    ).strip().lower()
-    if _telegram_inprocess not in ("0", "false", "no", "off", ""):
-        from src.telegram_runtime import telegram_polling_service
-
-        _startup_tasks.append(asyncio.create_task(telegram_polling_service.run()))
-    else:
-        logger.info("In-process Telegram polling disabled (RESTIA_INPROCESS_TELEGRAM=0)")
     # Periodic null-owner sweep — re-runs the legacy-owner assignment hourly
     # so any data created while auth was disabled / localhost-bypassed gets
     # claimed by the admin instead of staying world-visible (M19).
@@ -1499,6 +1501,14 @@ async def _shutdown_event():
             await upload_cleanup_task
         except asyncio.CancelledError:
             pass
+    # Telegram owns its task independently from both the generic startup loops
+    # and TaskScheduler, so stop it explicitly before those dependencies close.
+    try:
+        from src.telegram_runtime import telegram_polling_service
+
+        await telegram_polling_service.stop()
+    except Exception:
+        logger.warning("Telegram polling shutdown failed", exc_info=True)
     # Stop every strong-referenced startup task before tearing down the
     # services they can call. In particular, the asynchronous MCP connector
     # must be fully cancelled before disconnect_all(), or a slow registration

@@ -32893,9 +32893,12 @@ body.doc-find-active mark.doc-find-mark.current {
 .email-tag-security { background: rgba(248, 113, 113, 0.22); color: #f87171; }
 .email-tag-urgent { background: color-mix(in srgb, var(--color-error, #e06c75) 25%, transparent); color: var(--color-error, #e06c75); font-weight: 600; }
 .email-tag-reply-soon { background: rgba(240, 173, 78, 0.22); color: #f0ad4e; }
+.email-tag-action-needed { background: rgba(240, 173, 78, 0.22); color: #f0ad4e; }
 .email-tag-social { background: rgba(56, 189, 248, 0.22); color: #38bdf8; }
 .email-tag-shopping { background: rgba(236, 72, 153, 0.22); color: #ec4899; }
 .email-tag-calendar { background: rgba(167, 139, 250, 0.22); color: #a78bfa; }
+.email-tag-legal { background: rgba(192, 132, 252, 0.22); color: #c084fc; }
+.email-tag-support { background: rgba(45, 212, 191, 0.22); color: #2dd4bf; }
 .email-menu-wrap { position: relative; flex-shrink: 0; }
 .email-menu-btn {
   background: none; border: none; color: var(--fg); opacity: 0; cursor: pointer;

@@ -42,6 +42,40 @@ def test_shell_uses_registry_and_preserves_existing_controls():
     assert "document.getElementById('tool-library-row')" in shell
 
 
+def test_expanded_sidebar_deduplicates_home_and_new_chat_controls():
+    shell = _read("static/js/v2NavigationShell.js")
+    layout = _read("static/js/sidebar-layout.js")
+    registry = _read("static/js/navigation-registry.js")
+    app = _read("static/app.js")
+    html = _read("static/index.html")
+
+    # The Home group already supplies the group label, so its destination uses
+    # the registry's distinct compact label ("Today") instead of saying Home
+    # twice on adjacent rows.
+    assert "const homeItem = getNavigationItem('home');" in shell
+    assert "homeItem?.shortLabel || homeItem?.label || 'Today'" in shell
+
+    # Branding remains readable/semantic but is no longer a second New Chat
+    # trigger beside the explicit row.
+    assert '<div class="sidebar-brand" id="sidebar-brand-btn">' in html
+    assert '<span class="sidebar-brand-title">Restia</span>' in html
+    assert 'class="sidebar-brand-title" role="heading"' not in html
+    assert 'id="sidebar-brand-btn" style="cursor:pointer;"' not in html
+    assert "const brandBtn = el('sidebar-brand-btn');" not in app
+    assert "document.getElementById('sidebar-brand-btn')?.click()" not in shell
+    assert "auxiliary: ['sidebar-brand-btn']" not in registry
+    assert "document.getElementById('sidebar-new-chat-btn')?.click();" in layout
+    assert "document.getElementById('sidebar-new-chat-btn')?.click();" in shell
+
+
+def test_rail_hover_label_replaces_native_tooltip_accessibly():
+    app = _read("static/app.js")
+
+    assert "btn.setAttribute('aria-label', cleanLabel)" in app
+    assert "btn.removeAttribute('title')" in app
+    assert "span.setAttribute('aria-hidden', 'true')" in app
+
+
 def test_adaptive_shell_has_five_item_mobile_nav_and_accessible_states():
     shell = _read("static/js/v2NavigationShell.js")
     mission = _read("static/js/missionControl.js")
@@ -101,7 +135,7 @@ def test_v2_assets_are_versioned_and_available_offline():
         "/static/js/calendar/reminderPayload.js",
     ):
         assert asset in (html + sw)
-    assert "const CACHE_NAME = 'restia-v365'" in sw
+    assert "const CACHE_NAME = 'restia-v366'" in sw
 
 
 def test_mobile_v2_bar_replaces_legacy_floating_hamburger():

@@ -427,6 +427,53 @@ COMPOSE_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 SCHEDULED_DB = Path(SCHEDULED_EMAILS_DB)
 
 
+# One taxonomy for every email-classification producer and consumer.  Keep
+# response urgency separate from content categories: the Email Tags task
+# derives ``urgent`` / ``reply-soon`` from its score, while the legacy
+# auto-classifier may still emit ``urgent`` directly.
+EMAIL_CONTENT_TAGS = frozenset({
+    "work", "personal", "action-needed", "finance", "bills", "receipt",
+    "legal", "travel", "newsletter", "marketing", "notification",
+    "security", "social", "shopping", "calendar", "support",
+})
+EMAIL_CLASSIFICATION_TAGS = EMAIL_CONTENT_TAGS | {"urgent"}
+EMAIL_VISIBLE_TAGS = EMAIL_CLASSIFICATION_TAGS | {"reply-soon"}
+EMAIL_MANAGED_TAGS = EMAIL_VISIBLE_TAGS | {"promo"}
+
+
+def normalize_email_tags(tags, *, allowed_tags=EMAIL_VISIBLE_TAGS, limit: int | None = None) -> list[str]:
+    """Normalize, validate, and de-duplicate classifier tag output.
+
+    ``promo`` is a legacy/model alias for the canonical ``marketing`` tag.
+    Strings are accepted as a one-item collection because small local models
+    occasionally return ``"tags": "newsletter"`` instead of an array.
+    """
+    if isinstance(tags, str):
+        values = [tags]
+    elif isinstance(tags, (list, tuple, set, frozenset)):
+        values = tags
+    else:
+        return []
+
+    allowed = set(allowed_tags or ())
+    max_items = None if limit is None else max(0, int(limit))
+    if max_items == 0:
+        return []
+    out = []
+    for raw_tag in values:
+        if not isinstance(raw_tag, str):
+            continue
+        tag = raw_tag.strip().lower().replace("_", "-")
+        if tag == "promo":
+            tag = "marketing"
+        if tag not in allowed or tag in out:
+            continue
+        out.append(tag)
+        if max_items is not None and len(out) >= max_items:
+            break
+    return out
+
+
 OWNER_SCOPED_EMAIL_CACHE_TABLES = {
     "email_summaries",
     "email_ai_replies",

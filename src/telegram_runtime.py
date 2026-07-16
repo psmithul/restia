@@ -27,6 +27,24 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN_RE = re.compile(r"^\d{6,}:[A-Za-z0-9_-]{20,}$")
 TELEGRAM_TRANSPORTS = frozenset({"polling", "webhook"})
+_DISABLED_VALUES = frozenset({"0", "false", "no", "off", ""})
+
+
+def inprocess_telegram_polling_enabled() -> bool:
+    """Return whether this process owns Telegram long polling.
+
+    This gate is intentionally independent from the scheduled-task runner.
+    ``RESTIA_INPROCESS_TASKS=0`` can disable outbound schedules without
+    disabling inbound Telegram chat.  The legacy variable remains supported
+    for existing installations.
+    """
+
+    value = os.getenv("RESTIA_INPROCESS_TELEGRAM")
+    if value in (None, ""):
+        value = os.getenv("ODYSSEUS_INPROCESS_TELEGRAM")
+    if value is None:
+        value = "1"
+    return str(value).strip().lower() not in _DISABLED_VALUES
 
 
 class TelegramAPIError(RuntimeError):
@@ -233,6 +251,7 @@ class TelegramPollingService:
     def __init__(self) -> None:
         self._update_handler: Callable[[dict[str, Any]], Awaitable[None]] | None = None
         self._wake = asyncio.Event()
+        self._runner_task: asyncio.Task | None = None
         self._offset: int | None = None
         self._token_fingerprint = ""
         self._running = False
@@ -354,7 +373,56 @@ class TelegramPollingService:
             pass
         self._wake.clear()
 
+    def start(self) -> asyncio.Task:
+        """Start the sole in-process poller and return its owned task.
+
+        FastAPI lifespan hooks can be entered more than once in test runners
+        and embedded deployments.  Reusing the active task prevents two
+        ``getUpdates`` loops from racing for the same bot in one process.
+        """
+
+        task = self._runner_task
+        if task is not None and not task.done():
+            return task
+        # asyncio primitives bind lazily to an event loop. Recreate the wake
+        # event for a clean restart in another lifespan/event loop.
+        self._wake = asyncio.Event()
+        task = asyncio.create_task(self.run(), name="restia-telegram-poller")
+        self._runner_task = task
+        return task
+
+    async def stop(self) -> None:
+        """Cancel and await the owned poller task; safe to call repeatedly."""
+
+        task = self._runner_task
+        if task is None:
+            self._running = False
+            return
+        if task is asyncio.current_task():
+            task.cancel()
+            return
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if self._runner_task is task:
+                self._runner_task = None
+            self._running = False
+
     async def run(self) -> None:
+        current = asyncio.current_task()
+        registered = self._runner_task
+        if registered is not None and registered is not current and not registered.done():
+            logger.warning("Duplicate Telegram polling runner ignored")
+            return
+        if registered is None or registered.done():
+            # ``run`` remains usable as a compatibility entrypoint, while
+            # still taking ownership and preventing another direct runner.
+            self._wake = asyncio.Event()
+            self._runner_task = current
         self._running = True
         backoff = 1.0
         try:
@@ -410,6 +478,8 @@ class TelegramPollingService:
             self._token_fingerprint = ""
             self._offset = None
             self._update_failures.clear()
+            if self._runner_task is current:
+                self._runner_task = None
 
 
 telegram_polling_service = TelegramPollingService()

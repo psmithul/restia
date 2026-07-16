@@ -170,14 +170,20 @@ initForegroundActivityHeartbeat();
 
 function initRailHoverLabels() {
   document.querySelectorAll('#icon-rail .icon-rail-btn').forEach(btn => {
-    if (btn.querySelector('.rail-hover-label')) return;
     const navigationItem = findNavigationItemByLegacyId(btn.id);
     const label = navigationItem?.shortLabel || navigationItem?.label
       || btn.getAttribute('aria-label') || btn.getAttribute('title') || '';
     if (!label) return;
+    const cleanLabel = String(label).replace(/\s*\([^)]*\)\s*/g, '').trim();
+    if (!btn.getAttribute('aria-label')) btn.setAttribute('aria-label', cleanLabel);
+    // The custom rail label replaces the native title tooltip. Keeping both
+    // made every rail name appear twice after a short hover.
+    btn.removeAttribute('title');
+    if (btn.querySelector('.rail-hover-label')) return;
     const span = document.createElement('span');
     span.className = 'rail-hover-label';
-    span.textContent = String(label).replace(/\s*\([^)]*\)\s*/g, '').trim();
+    span.setAttribute('aria-hidden', 'true');
+    span.textContent = cleanLabel;
     btn.appendChild(span);
   });
 }
@@ -3373,15 +3379,8 @@ function initializeEventListeners() {
     });
   }
 
-  // Logo click → new chat (same logic as rail new-session button)
-  const brandBtn = el('sidebar-brand-btn');
-  if (brandBtn) {
-    brandBtn.addEventListener('click', async (e) => {
-      if (e) { e.preventDefault(); e.stopPropagation(); }
-      await _handleNewChatAction();
-    });
-  }
-
+  // The Restia brand is display-only. Keep the explicit New Chat row as the
+  // single sidebar action so adjacent controls do not perform the same work.
   const sidebarNewChatBtn = el('sidebar-new-chat-btn');
   if (sidebarNewChatBtn) {
     sidebarNewChatBtn.addEventListener('click', async (e) => {

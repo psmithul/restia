@@ -147,6 +147,7 @@ def test_lookup_helpers_resolve_aliases_routes_modals_and_trigger_order():
           registeredModal: nav.findNavigationItemByModalId('#calendar-modal')?.id,
           fallbackModal: nav.findNavigationItemByModalId('library-modal')?.id,
           triggers: nav.getLegacyTriggerIds('email'),
+          newChatTriggers: nav.getLegacyTriggerIds('new-chat'),
         }));
         """
     )
@@ -163,6 +164,7 @@ def test_lookup_helpers_resolve_aliases_routes_modals_and_trigger_order():
         "registeredModal": "calendar",
         "fallbackModal": "library",
         "triggers": ["email-section-title", "rail-email"],
+        "newChatTriggers": ["sidebar-new-chat-btn", "rail-new-session"],
     }
 
 

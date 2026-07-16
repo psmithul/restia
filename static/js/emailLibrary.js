@@ -25,6 +25,7 @@ import {
 import { state } from './emailLibrary/state.js';
 import { collapseSidebarToRail } from './modalSnap.js';
 import { emailApiUrl } from './emailShared.js';
+import { EMAIL_TAG_FILTERS } from './emailTagTaxonomy.js';
 import { bindMenuDismiss, dismissOrRemove } from './escMenuStack.js';
 import { closeSidebar, SIDEBAR_STATES } from './sidebar-layout.js';
 
@@ -1238,13 +1239,7 @@ export function openEmailLibrary(opts = {}) {
                 <option value="pending_30d">Pending · 30d</option>
                 <option value="stale_30d">Stale · &gt;30d</option>
                 <optgroup label="Tags">
-                  <option value="tag:urgent">Urgent</option>
-                  <option value="tag:reply-soon">Reply soon</option>
-                  <option value="tag:action-needed">Action needed</option>
-                  <option value="tag:bills">Bills</option>
-                  <option value="tag:receipt">Receipt</option>
-                  <option value="tag:travel">Travel</option>
-                  <option value="tag:spam">Spam</option>
+                  ${EMAIL_TAG_FILTERS.map(({ tag, label }) => `<option value="tag:${_esc(tag)}">${_esc(label)}</option>`).join('')}
                 </optgroup>
               </select>
               <div class="email-filter-picker" id="email-filter-picker" style="flex:1;min-width:0;position:relative;">
@@ -2271,13 +2266,11 @@ const _LIB_FILTER_OPTIONS = [
   { value: 'filter:unanswered',      label: 'Unanswered',      keywords: ['unanswered', 'unreplied', 'no reply'] },
   { value: 'filter:pending_30d',     label: 'Pending · 30d',   keywords: ['pending 30d', 'pending', 'recent pending'] },
   { value: 'filter:stale_30d',       label: 'Stale · >30d',    keywords: ['stale', 'old', 'stale 30d'] },
-  { value: 'filter:tag:urgent',      label: 'Urgent',          keywords: ['urgent', 'critical'] },
-  { value: 'filter:tag:reply-soon',  label: 'Reply soon',      keywords: ['reply soon', 'reply', 'follow up'] },
-  { value: 'filter:tag:action-needed', label: 'Action needed', keywords: ['action needed', 'action', 'needs action'] },
-  { value: 'filter:tag:bills',       label: 'Bills',           keywords: ['bill', 'bills', 'billing'] },
-  { value: 'filter:tag:receipt',     label: 'Receipt',         keywords: ['receipt', 'receipts', 'purchase'] },
-  { value: 'filter:tag:travel',      label: 'Travel',          keywords: ['travel', 'trip', 'booking'] },
-  { value: 'filter:tag:spam',        label: 'Spam',            keywords: ['spam', 'junk'] },
+  ...EMAIL_TAG_FILTERS.map(({ tag, label, keywords }) => ({
+    value: `filter:tag:${tag}`,
+    label,
+    keywords,
+  })),
 ];
 
 function _libFilterIconFor(value) {

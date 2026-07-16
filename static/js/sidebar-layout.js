@@ -259,14 +259,14 @@ export function initSidebarLayout(Storage, opts) {
     _applySidebarState(_desktopPreferredState);
   }
 
-  // Header-only new-chat aliases. #sidebar-new-chat-btn is wired in app.js
-  // because it needs the full default-model/pending-chat flow; wiring it here
-  // as well caused duplicate click handling and occasional no-op/race behavior.
+  // Header-only new-chat aliases delegate to the one canonical sidebar action.
+  // #sidebar-new-chat-btn is wired in app.js because it needs the full
+  // default-model/pending-chat flow; wiring that action here as well caused
+  // duplicate click handling and occasional no-op/race behavior.
   const chatNewBtn = document.getElementById('chat-new-btn');
   [chatNewBtn].forEach(btn => {
     if (btn) btn.addEventListener('click', () => {
-      const brandBtn = document.getElementById('sidebar-brand-btn');
-      if (brandBtn) brandBtn.click();
+      document.getElementById('sidebar-new-chat-btn')?.click();
     });
   });
 

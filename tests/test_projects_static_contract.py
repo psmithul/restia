@@ -73,7 +73,7 @@ def test_projects_launchers_and_customization_controls_are_semantic_and_unique()
     assert 'data-ui-key="tool-projects"' in html
     assert "'/projects': 'Projects — Restia'" in html
     assert "'/projects':" in html
-    assert '/static/projects.css?v=20260715v2' in html
+    assert '/static/projects.css?v=20260716v21' in html
 
 
 def test_projects_module_is_wired_as_a_full_workspace():

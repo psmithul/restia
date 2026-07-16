@@ -306,7 +306,7 @@ def _sync_digest_task(owner: str, preferences: dict) -> None:
         db.close()
 
 
-def setup_telegram_routes(session_manager, webhook_manager=None, task_scheduler=None) -> APIRouter:
+def setup_telegram_routes(session_manager, webhook_manager=None) -> APIRouter:
     router = APIRouter(prefix="/api/telegram", tags=["telegram"])
 
     async def _handle_polled_update(update: dict) -> None:

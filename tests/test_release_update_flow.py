@@ -50,3 +50,11 @@ def test_release_event_publishes_latest_and_bakes_commit():
     assert "types: [published]" in workflow
     assert "BUILD_COMMIT=${{ github.sha }}" in workflow
     assert "github.event_name == 'release'" in workflow
+
+
+def test_macos_bundle_reads_the_shared_release_version():
+    script = (ROOT / "build-macos-app.sh").read_text(encoding="utf-8")
+
+    assert 'APP_VERSION="$(sed' in script
+    assert script.count("<string>$APP_VERSION</string>") == 2
+    assert "<string>2.0.0</string>" not in script

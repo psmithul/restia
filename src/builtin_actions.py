@@ -2735,7 +2735,14 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
         from datetime import datetime as _dt, timedelta as _td
         from pathlib import Path as _P
         from core.database import SessionLocal as _SL, EmailAccount as _EA
-        from routes.email_helpers import _imap_connect, _decode_header
+        from routes.email_helpers import (
+            EMAIL_CONTENT_TAGS,
+            EMAIL_MANAGED_TAGS,
+            EMAIL_VISIBLE_TAGS,
+            _decode_header,
+            _imap_connect,
+            normalize_email_tags,
+        )
         from src.llm_core import llm_call_async_with_fallback
 
         # Per-owner state file so multi-user runs don't clobber each other's
@@ -2749,18 +2756,13 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         AGE_CUTOFF = _dt.utcnow() - _td(days=7)
-        # v11: LLM triage restored as primary (a hard-wired heuristic shortcut
-        # had made the LLM block unreachable, freezing keyword-guess tags).
-        # Bump forces re-classification of everything the heuristic mis-tagged.
-        TRIAGE_VERSION = 11
-        CATEGORY_TAGS = {
-            "bills", "receipt", "travel", "calendar", "action-needed",
-        }
-        VISIBLE_EMAIL_TAGS = CATEGORY_TAGS | {"urgent", "reply-soon"}
-        MANAGED_TAGS = VISIBLE_EMAIL_TAGS | {
-            "newsletter", "marketing", "notification", "finance", "security",
-            "shopping", "social", "work", "personal", "legal", "support", "promo",
-        }
+        # v12 restores the complete category taxonomy.  v11 cached valid LLM
+        # responses after discarding newsletter/work/notification/etc., so a
+        # version bump is required to repair already-seen messages.
+        TRIAGE_VERSION = 12
+        CATEGORY_TAGS = EMAIL_CONTENT_TAGS
+        VISIBLE_EMAIL_TAGS = EMAIL_VISIBLE_TAGS
+        MANAGED_TAGS = EMAIL_MANAGED_TAGS
 
         # ── 1. Resolve LLM candidates (utility primary + utility fallbacks; fall
         # through to default chat as a last resort).
@@ -2824,8 +2826,10 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
                 r"\b(advertisement|sponsored|promo|promotion|sale|discount|offer|limited time|deal|coupon|shop now|buy now|membership|rewards?)\b",
                 blob,
             ))
-            if bulkish or marketingish:
+            if bulkish:
                 add_type("newsletter")
+            if marketingish:
+                add_type("marketing")
             if _re.search(r"\b(receipt|your order|order (?:confirmation|shipped|placed|#|no\.?|number)|注文|payment confirmation|delivery|shipment|tracking|お届け|購入)\b", blob):
                 add_type("receipt")
             if _re.search(r"\b(bill|billing|amount due|overdue|pay by|payment due|subscription could not be renewed)\b", blob):
@@ -2844,7 +2848,14 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
             ):
                 add_response("action-needed")
 
-            type_priority = ("bills", "receipt", "travel")
+            # Prefer specific transactional categories, then keep the broad
+            # categories the heuristic actually detected.  The old three-tag
+            # tuple silently discarded newsletter/marketing/legal/support.
+            type_priority = (
+                "bills", "receipt", "travel", "security", "finance",
+                "notification", "legal", "support", "shopping", "social",
+                "work", "personal", "newsletter", "marketing",
+            )
             tags = [*response_tags]
             for type_tag in type_priority:
                 if type_tag in type_candidates and type_tag not in tags:
@@ -3029,7 +3040,7 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
                     "\"reason\":\"one short phrase\"}.\n"
                     "0 = trivial / promotional · 1 = informational, no reply needed · "
                     "2 = should reply within a day · 3 = urgent, reply now (deadline, blocker).\n\n"
-                    "Allowed visible tags: urgent, reply-soon, action-needed, calendar, bills, receipt, travel.\n"
+                    f"Allowed category tags: {', '.join(sorted(CATEGORY_TAGS))}.\n"
                     "Use action-needed when the user likely needs to reply, pay, sign, book, or decide. "
                     "Use bills for bills or debts, receipt for purchases/deliveries, travel for reservations/trips, "
                     "and calendar only when a calendar event/reminder is involved. spam=true for scams, phishing, "
@@ -3069,18 +3080,11 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
                     obj = _json.loads(txt[s:e + 1])
                     score = int(obj.get("score", 0))
                     reason = str(obj.get("reason", ""))[:200]
-                    raw_tags = obj.get("tags") or []
-                    if isinstance(raw_tags, str):
-                        raw_tags = [raw_tags]
-                    tags = []
-                    for t in raw_tags:
-                        if not isinstance(t, str):
-                            continue
-                        tag = t.strip().lower().replace("_", "-")
-                        if tag == "promo":
-                            tag = "marketing"
-                        if tag in CATEGORY_TAGS and tag not in tags:
-                            tags.append(tag)
+                    tags = normalize_email_tags(
+                        obj.get("tags") or [],
+                        allowed_tags=CATEGORY_TAGS,
+                        limit=4,
+                    )
                     _spam_raw = obj.get("spam")
                     if isinstance(_spam_raw, bool):
                         spam = _spam_raw
