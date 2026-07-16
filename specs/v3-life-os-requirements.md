@@ -318,3 +318,18 @@ Add dated entries here only after verification. Each entry must name the exact
 requirements advanced, source files, tests, runtime/browser evidence, migration
 result, and commit. A green narrow test may support one entry; it cannot mark an
 entire section complete by itself.
+
+- **2026-07-16 — V3 foundation (`bfa51bc`)**: advanced the release-precision
+  gate, Universal Inbox (Section 2), Today Inbox attention (Section 3), stable
+  principal groundwork, typed cross-domain references (Section 20), and
+  mutation audit groundwork (Section 22). Implementation is in
+  `src/release_version.py`, `src/database_runtime.py`, `src/identity.py`,
+  `src/life_core.py`, `src/audit_context.py`, `routes/inbox_routes.py`,
+  `routes/mission_control_routes.py`, `static/js/inbox.js`, and their migration,
+  shell, and style files. The complete suite passed with **5,507 passed, 3
+  skipped**; focused identity/Inbox/release contracts passed; Alembic legacy
+  status/stamp was exercised against an isolated database; and live browser QA
+  on the isolated local runtime verified capture, classification, processing,
+  archive, filters, Today attention, navigation, console state, and 375 px
+  mobile behavior. Shared PostgreSQL/auth sessions, connected-source adapters,
+  and the remaining Life OS sections deliberately remain incomplete.
