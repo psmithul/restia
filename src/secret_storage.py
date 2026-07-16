@@ -51,16 +51,41 @@ def _harden_key_permissions(path: Path) -> None:
         pass
 
 
+def _configured_key_path() -> tuple[Path, bool]:
+    configured = (
+        os.getenv("RESTIA_ENCRYPTION_KEY_FILE")
+        or os.getenv("ODYSSEUS_ENCRYPTION_KEY_FILE")
+        or ""
+    ).strip()
+    return (Path(configured).expanduser(), True) if configured else (_KEY_PATH, False)
+
+
 def _load_or_create_key() -> bytes:
-    if _KEY_PATH.exists():
-        return _KEY_PATH.read_bytes()
-    _KEY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    inline = (
+        os.getenv("RESTIA_ENCRYPTION_KEY")
+        or os.getenv("ODYSSEUS_ENCRYPTION_KEY")
+        or ""
+    ).strip()
+    if inline:
+        # Fernet validates the material in _get_fernet(). Shared deployments
+        # use this explicit key (or the file override below) so every process
+        # can decrypt the same rows; the secret is never written to disk here.
+        return inline.encode("ascii")
+
+    key_path, explicitly_configured = _configured_key_path()
+    if key_path.exists():
+        return key_path.read_bytes()
+    if explicitly_configured:
+        raise FileNotFoundError(
+            "RESTIA_ENCRYPTION_KEY_FILE must name a readable existing file"
+        )
+    key_path.parent.mkdir(parents=True, exist_ok=True)
     key = Fernet.generate_key()
-    _KEY_PATH.write_bytes(key)
+    key_path.write_bytes(key)
     # POSIX: lock the key to 0o600. Windows: no-op (the user-profile data dir is
     # already ACL-restricted); safe_chmod swallows both cases.
-    _harden_key_permissions(_KEY_PATH)
-    logger.info(f"Generated new app key at {_KEY_PATH}")
+    _harden_key_permissions(key_path)
+    logger.info("Generated new app key at %s", key_path)
     return key
 
 

@@ -90,3 +90,103 @@ def test_mission_control_bounds_long_item_metadata_in_narrow_cards():
     assert "text-overflow: ellipsis" in css
     assert "white-space: nowrap" in css
     assert "attrs: { title: meta }" in source
+
+
+def test_inbox_attention_normalization_is_bounded_and_content_free():
+    result = _node_eval(
+        """
+        const items = Array.from({ length: 7 }, (_, index) => ({
+          id: `capture-${index}`,
+          title: `Capture ${index}`,
+          kind: index % 2 ? 'project_information' : 'task',
+          confidence: index === 0 ? undefined : index === 1 ? 'unknown' : 72 + index,
+          reason: `Reason ${index}`,
+          content: `PRIVATE_CONTENT_${index}`,
+          metadata: { token: `PRIVATE_METADATA_${index}` },
+          source_ref: `PRIVATE_SOURCE_REF_${index}`,
+        }));
+        console.log(JSON.stringify(mission.__test.normalizeInboxAttention({
+          status: 'ok',
+          unprocessed_count: 7,
+          kinds: { task: 4, project_information: 3, empty: 0 },
+          oldest_at: '2026-07-01T00:00:00Z',
+          truncated: true,
+          items,
+          content: 'PRIVATE_SOURCE_CONTENT',
+          metadata: { password: 'PRIVATE_SOURCE_METADATA' },
+          source_ref: 'PRIVATE_SOURCE_REFERENCE',
+        })));
+        """
+    )
+
+    assert result["unprocessedCount"] == 7
+    assert result["oldestAt"] == "2026-07-01T00:00:00Z"
+    assert result["truncated"] is True
+    assert [(row["kind"], row["count"]) for row in result["kinds"]] == [
+        ("task", 4),
+        ("project_information", 3),
+    ]
+    assert len(result["items"]) == 5
+    assert set(result["items"][0]) == {
+        "title", "kind", "kindLabel", "confidence", "reason"
+    }
+    assert result["items"][0]["confidence"] is None
+    assert result["items"][1]["confidence"] is None
+    rendered = json.dumps(result, sort_keys=True)
+    for private_value in (
+        "PRIVATE_CONTENT",
+        "PRIVATE_METADATA",
+        "PRIVATE_SOURCE_REF",
+        "PRIVATE_SOURCE_CONTENT",
+        "PRIVATE_SOURCE_REFERENCE",
+    ):
+        assert private_value not in rendered
+
+
+def test_inbox_attention_uses_the_canonical_navigation_activator():
+    result = _node_eval(
+        """
+        const calls = [];
+        const opened = await mission.__test.activateInboxNavigation(async (id) => {
+          calls.push(id);
+          return true;
+        });
+        const rejected = await mission.__test.activateInboxNavigation(async (id) => {
+          calls.push(id);
+          return false;
+        });
+        console.log(JSON.stringify({ opened, rejected, calls }));
+        """
+    )
+
+    assert result == {
+        "opened": True,
+        "rejected": False,
+        "calls": ["inbox", "inbox"],
+    }
+
+
+def test_today_renders_accessible_inbox_attention_via_canonical_navigation():
+    source = MODULE.read_text(encoding="utf-8")
+    css = (ROOT / "static" / "mission-control.css").read_text(encoding="utf-8")
+
+    assert "function renderInboxAttention()" in source
+    assert "const value = source('inbox');" in source
+    assert "safeValue.unprocessed_count ?? safeValue.count" in source
+    assert "Inbox classification breakdown" in source
+    assert "Oldest Inbox captures awaiting attention" in source
+    assert "Oldest capture ${formatDate(inbox.oldestAt, { time: true })}" in source
+    assert "renderFocus(), renderInboxAttention(), renderPlanning()" in source
+    assert "activateInboxNavigation(window.activateNavigationItem)" in source
+    assert "return (await handler('inbox')) !== false;" in source
+    assert "target: 'inbox', title: 'Open Universal Inbox'" in source
+    assert "Confidence unavailable" in source
+    assert "window.location" not in source[source.index("function triggerTarget"):source.index("async function loadCurrentView")]
+    for selector in (
+        ".mission-inbox-attention",
+        ".mission-inbox-breakdown",
+        ".mission-inbox-previews",
+        ".mission-inbox-preview-reason",
+        ".mission-inbox-age",
+    ):
+        assert selector in css

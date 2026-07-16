@@ -7,14 +7,9 @@ from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Importing core.database below runs init_db() at import time, and its default
-# (sqlite:///./data/app.db) can't be opened in a clean worktree because SQLite
-# won't create the missing ./data parent dir - pytest then dies during
-# collection, before any test module loads. Default to an in-memory DB for the
-# test session so collection is deterministic and writes no repo-local
-# artifacts. An explicit DATABASE_URL (a real test/CI database) is preserved.
-# This only unblocks collection/import-time init; it does not provide a shared
-# file-backed DB across processes - tests needing that must set DATABASE_URL.
+# The suite uses one explicitly initialized in-memory schema by default. An
+# explicit DATABASE_URL (a real test/CI database) is preserved; tests needing a
+# shared file-backed database must still configure one themselves.
 os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 # Pre-import real heavy modules BEFORE any test file's module-level stubs can
@@ -26,6 +21,9 @@ try:
     import sqlalchemy  # noqa: F401
     import sqlalchemy.orm  # noqa: F401
     import core.database  # noqa: F401
+    from src.database_runtime import initialize_database
+
+    initialize_database()
 except ImportError:
     pass  # not installed - the stubs below will handle it
 

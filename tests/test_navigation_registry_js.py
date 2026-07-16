@@ -36,7 +36,7 @@ def test_registry_is_valid_immutable_and_covers_current_destinations():
         """
         const required = [
           'home', 'chat', 'new-chat', 'search', 'delete-session', 'toggle-sidebar',
-          'projects', 'tasks', 'calendar', 'todos', 'library', 'documents',
+          'inbox', 'projects', 'tasks', 'calendar', 'todos', 'library', 'documents',
           'notes', 'memory', 'study', 'research', 'messages', 'email',
           'compare', 'cookbook', 'gallery', 'theme', 'settings', 'activity', 'profile',
           'quick-note', 'quick-todo', 'new-message', 'share-moment',
@@ -73,7 +73,7 @@ def test_every_current_icon_rail_control_has_one_stable_owner():
           'rail-chats', 'rail-documents', 'rail-messages', 'rail-calendar',
           'rail-compare', 'rail-cookbook', 'rail-research', 'rail-email',
           'rail-gallery', 'rail-archive', 'rail-memory', 'rail-notes',
-          'rail-projects', 'rail-study', 'rail-todos', 'rail-tasks',
+          'rail-inbox', 'rail-projects', 'rail-study', 'rail-todos', 'rail-tasks',
           'rail-theme', 'rail-settings',
         ];
         console.log(JSON.stringify(Object.fromEntries(railIds.map(id => [
@@ -98,6 +98,7 @@ def test_every_current_icon_rail_control_has_one_stable_owner():
         "rail-archive": "library",
         "rail-memory": "memory",
         "rail-notes": "notes",
+        "rail-inbox": "inbox",
         "rail-projects": "projects",
         "rail-study": "study",
         "rail-todos": "todos",
@@ -119,7 +120,7 @@ def test_command_palette_metadata_preserves_existing_public_ids():
 
     by_id = {entry["id"]: entry for entry in result}
     assert set(by_id) == {
-        "projects", "study", "messages", "notes", "tasks", "todos", "calendar", "documents",
+        "inbox", "projects", "study", "messages", "notes", "tasks", "todos", "calendar", "documents",
         "gallery", "research", "compare", "cookbook", "memory", "email",
         "settings", "search", "quick-note", "quick-todo", "new-chat",
         "new-message", "share-moment", "theme", "home", "activity",
@@ -255,14 +256,14 @@ def test_list_helper_keeps_group_order_and_exposes_hidden_commands_by_surface():
     )
 
     assert "quick-note" not in result["defaultIds"]
-    assert result["work"] == ["projects", "tasks", "calendar", "todos"]
+    assert result["work"] == ["inbox", "projects", "tasks", "calendar", "todos"]
     assert result["quick"] == [
         "quick-note", "quick-todo", "new-message", "share-moment",
         "compose-email", "new-document", "manage-chats", "new-model-chat",
     ]
     assert "research" not in result["sidebarWithResearchHidden"]
     assert set(result["commands"]) == {
-        "projects", "study", "messages", "notes", "tasks", "todos", "calendar", "documents",
+        "inbox", "projects", "study", "messages", "notes", "tasks", "todos", "calendar", "documents",
         "gallery", "research", "compare", "cookbook", "memory", "email",
         "settings", "search", "quick-note", "quick-todo", "new-chat",
         "new-message", "share-moment", "theme", "home", "activity",

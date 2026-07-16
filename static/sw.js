@@ -7,7 +7,7 @@
 //   - Other static assets (images/fonts/libs): cache-first with bg refresh.
 //   - API / non-GET: never cached.
 // Bump CACHE_NAME whenever the precache list or SW logic changes.
-const CACHE_NAME = 'restia-v366';
+const CACHE_NAME = 'restia-v367';
 
 // Core shell precached on install so repeat opens are instant without any
 // network wait. Keep this list in sync with the <script type="module"> tags
@@ -15,6 +15,7 @@ const CACHE_NAME = 'restia-v366';
 const PRECACHE = [
   '/static/style.css',
   '/static/projects.css',
+  '/static/inbox.css',
   '/static/v2-shell.css',
   '/static/mission-control.css',
   '/static/app.js',
@@ -58,6 +59,7 @@ const PRECACHE = [
   '/static/js/emailLibrary/state.js',
   '/static/js/notes.js',
   '/static/js/projects.js',
+  '/static/js/inbox.js',
   '/static/js/projectAttachmentViewer.js',
   '/static/js/navigation-registry.js',
   '/static/js/v2NavigationShell.js',

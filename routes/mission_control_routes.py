@@ -23,8 +23,10 @@ from fastapi import APIRouter, Query, Request
 from sqlalchemy import and_, case, func, or_, select
 
 from core.database import (
+    AuthIdentity,
     CalendarCal,
     CalendarEvent,
+    InboxItem,
     Note,
     PlanningItem,
     Project,
@@ -55,6 +57,7 @@ from src.constants import DATA_DIR
 from src.study_mode import build_study_tracker, serialize_study_state
 from src.planning import normalize_planning_owner, serialize_planning_item
 from src.progression import build_progression_summary, normalize_progression_owner
+from src.identity import LOCAL_IDENTITY_PROVIDER, normalize_identity
 
 
 logger = logging.getLogger(__name__)
@@ -70,6 +73,7 @@ PLANNING_ITEM_LIMIT = 20
 DAILY_BRIEF_ITEM_LIMIT = 1
 NEXT_ACTION_LIMIT = 3
 ACTIVITY_ITEM_LIMIT = 50
+INBOX_PREVIEW_LIMIT = 5
 
 _CALENDAR_RECURRING_SCAN_LIMIT = 500
 _CALENDAR_OCCURRENCE_WORK_LIMIT = 210
@@ -460,6 +464,111 @@ def _load_planning(
         source = _items_source(payload, truncated=len(rows) > PLANNING_ITEM_LIMIT)
         source["open_count"] = sum(1 for row in payload if row.get("status") == "open")
         return source
+    finally:
+        db.close()
+
+
+def _empty_inbox_source() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "items": [],
+        "count": 0,
+        "truncated": False,
+        "unprocessed_count": 0,
+        "kinds": {},
+        "oldest_at": None,
+        "latest_at": None,
+    }
+
+
+def _load_inbox(
+    session_factory: Callable[[], Any],
+    scope: _OwnerScope,
+) -> dict[str, Any]:
+    """Return a bounded, content-free view of the owner's Inbox workload.
+
+    Mission Control is read-only, so an owner who has never opened Universal
+    Inbox must not gain Account/AuthIdentity rows merely by loading Today.  We
+    resolve only an existing local identity/account and otherwise return the
+    same empty shape as an owner with no captures.
+    """
+
+    owner = normalize_identity(
+        scope.owner
+        or scope.project_actor
+        or scope.calendar_owner
+        or DEFAULT_LOCAL_OWNER
+    )
+    if not owner:
+        return _empty_inbox_source()
+
+    db = session_factory()
+    try:
+        account_id = (
+            db.query(AuthIdentity.account_id)
+            .filter(
+                AuthIdentity.provider == LOCAL_IDENTITY_PROVIDER,
+                AuthIdentity.subject == owner,
+            )
+            .scalar()
+        )
+        if not account_id:
+            return _empty_inbox_source()
+
+        owned_unprocessed = (
+            InboxItem.owner_id == account_id,
+            InboxItem.status == "inbox",
+        )
+        count, oldest_at, latest_at = (
+            db.query(
+                func.count(InboxItem.id),
+                func.min(InboxItem.created_at),
+                func.max(InboxItem.created_at),
+            )
+            .filter(*owned_unprocessed)
+            .one()
+        )
+        unprocessed_count = int(count or 0)
+        if not unprocessed_count:
+            return _empty_inbox_source()
+
+        kind_rows = (
+            db.query(InboxItem.kind, func.count(InboxItem.id))
+            .filter(*owned_unprocessed)
+            .group_by(InboxItem.kind)
+            .order_by(InboxItem.kind.asc())
+            .all()
+        )
+        preview_rows = (
+            db.query(InboxItem)
+            .filter(*owned_unprocessed)
+            .order_by(InboxItem.created_at.asc(), InboxItem.id.asc())
+            .limit(INBOX_PREVIEW_LIMIT)
+            .all()
+        )
+        previews = [
+            {
+                "id": item.id,
+                "title": item.title or "",
+                "kind": item.kind,
+                "confidence": int(item.classification_confidence or 0),
+                "reason": item.classification_reason or "",
+            }
+            for item in preview_rows
+        ]
+        return {
+            "status": "ok",
+            "items": previews,
+            "count": unprocessed_count,
+            "truncated": unprocessed_count > INBOX_PREVIEW_LIMIT,
+            "unprocessed_count": unprocessed_count,
+            "kinds": {
+                str(kind): int(kind_count or 0)
+                for kind, kind_count in kind_rows
+            },
+            "oldest_at": _iso_utc(oldest_at),
+            "latest_at": _iso_utc(latest_at),
+        }
     finally:
         db.close()
 
@@ -1502,6 +1611,10 @@ def setup_mission_control_routes(
                 "planning",
                 lambda: _load_planning(session_factory, scope, today=local_date),
             )
+            inbox = _safe_load(
+                "inbox",
+                lambda: _load_inbox(session_factory, scope),
+            )
             goals = _safe_load(
                 "goals",
                 lambda: _load_goals(session_factory, scope, now_naive=now_naive),
@@ -1549,6 +1662,7 @@ def setup_mission_control_routes(
             calendar = _source_problem("calendar", **owner_problem)
             project_work = _source_problem("project_work", **owner_problem)
             planning = _source_problem("planning", **owner_problem)
+            inbox = _source_problem("inbox", **owner_problem)
             goals = _source_problem("goals", **owner_problem)
             tasks = _source_problem("tasks", **owner_problem)
             study_reviews = _source_problem("study_reviews", **owner_problem)
@@ -1583,6 +1697,7 @@ def setup_mission_control_routes(
             "calendar": calendar,
             "project_work": project_work,
             "planning": planning,
+            "inbox": inbox,
             "goals": goals,
             "tasks": tasks,
             "study_reviews": study_reviews,
@@ -1601,6 +1716,7 @@ def setup_mission_control_routes(
                 "calendar": calendar["count"],
                 "project_work": project_work["count"],
                 "planning": int(planning.get("open_count", planning["count"])),
+                "inbox": int(inbox.get("unprocessed_count", inbox["count"])),
                 "goals": goals["count"],
                 "tasks": tasks["count"],
                 "study_reviews": study_reviews["count"],

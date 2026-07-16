@@ -8,8 +8,19 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_semantic_release_comparison():
     assert version_tuple("v1.2.3") == (1, 2, 3)
+    assert version_tuple("v3") == (3, 0, 0)
+    assert version_tuple("v2.1") == (2, 1, 0)
+    assert release_is_newer("2.0.0", "v2.1") is True
+    assert release_is_newer("2.1.0", "v3") is True
+    assert release_is_newer("2.1.0", "v2.1") is False
     assert release_is_newer("1.0.1", "v1.0.2") is True
     assert release_is_newer("1.0.2", "v1.0.2") is False
+
+
+def test_release_comparison_rejects_non_policy_versions():
+    for invalid in ("V3", "v03", "v3.01", "v3.1.0-rc.1", "v3+build", "3.1.0.0"):
+        assert version_tuple(invalid) is None
+        assert release_is_newer("2.1.0", invalid) is False
 
 
 def test_release_update_works_even_when_build_commit_is_unknown():
@@ -31,6 +42,26 @@ def test_release_update_works_even_when_build_commit_is_unknown():
     assert result["latest_version"] == "1.0.2"
     assert result["image"] == "ghcr.io/psmithul/restia:latest"
     assert result["update_command"] == "./update.sh"
+
+
+def test_draft_and_prerelease_releases_never_trigger_stable_updates():
+    base = {
+        "tag_name": "v3",
+        "name": "Restia v3",
+        "html_url": "https://github.com/psmithul/restia/releases/tag/v3",
+        "published_at": "2026-07-16T00:00:00Z",
+    }
+
+    for flag in ("draft", "prerelease"):
+        release = {**base, flag: True}
+        result = build_update_result(
+            repo="psmithul/restia",
+            current_version="2.1.0",
+            current_commit="unknown",
+            release=release,
+        )
+        assert result["update_available"] is False
+        assert result["channel"] == "current"
 
 
 def test_downloaded_compose_uses_public_release_image_and_preserves_host_data():

@@ -157,6 +157,10 @@
           "<line x1='6' y1='10' x2='9' y2='10' stroke='" + ac + "' stroke-width='2' stroke-linecap='round'/>" +
           "<line x1='14.5' y1='14' x2='17.5' y2='14' stroke='" + ac + "' stroke-width='2' stroke-linecap='round'/>" +
           "<line x1='23' y1='19' x2='26' y2='19' stroke='" + ac + "' stroke-width='2' stroke-linecap='round'/>",
+        '/inbox':
+          "<rect x='4' y='6' width='24' height='20' rx='2.5' fill='none' stroke='" + ac + "' stroke-width='2.5'/>" +
+          "<path d='M4 18 H10 L13 22 H19 L22 18 H28' fill='none' stroke='" + ac + "' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/>" +
+          "<path d='M16 3 V15 M11 10 L16 15 L21 10' fill='none' stroke='" + ac + "' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/>",
         '/library':
           "<rect x='5' y='5' width='5' height='22' rx='1' fill='none' stroke='" + ac + "' stroke-width='2.5'/>" +
           "<rect x='13' y='5' width='5' height='22' rx='1' fill='none' stroke='" + ac + "' stroke-width='2.5'/>" +
@@ -184,6 +188,7 @@
         '/memory': 'Memory — Restia',
         '/gallery': 'Gallery — Restia',
         '/projects': 'Projects — Restia',
+        '/inbox': 'Inbox — Restia',
         '/tasks': 'Automations — Restia',
         '/library': 'Library — Restia',
       };
@@ -239,11 +244,13 @@
   <link id="projects-workspace-css" rel="stylesheet" href="/static/projects.css?v=20260716v21">
   <link id="v2-shell-css" rel="stylesheet" href="/static/v2-shell.css?v=20260716v21">
   <link id="mission-control-css" rel="stylesheet" href="/static/mission-control.css?v=20260716v21">
+  <link id="inbox-workspace-css" rel="stylesheet" href="/static/inbox.css?v=20260716v21">
   <link rel="modulepreload" href="/static/app.js?v=20260716v21">
   <link rel="modulepreload" href="/static/js/chat.js">
   <link rel="modulepreload" href="/static/js/ui.js">
   <link rel="modulepreload" href="/static/js/sessions.js">
   <link rel="modulepreload" href="/static/js/markdown.js">
+  <link rel="modulepreload" href="/static/js/inbox.js">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, interactive-widget=resizes-content, viewport-fit=cover" />
 </head>
 <body>
@@ -714,6 +721,7 @@
     <button class="icon-rail-btn" id="rail-archive" title="Library"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/><path d="M9 7h6M9 11h4"/></svg></button>
     <button class="icon-rail-btn" id="rail-memory" title="Brain"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/><path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/></svg></button>
     <button class="icon-rail-btn" id="rail-notes" title="Notes"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3h10l4 4v14H5z"/><path d="M15 3v5h5"/><path d="M8 17.5 15.5 10l2.5 2.5L10.5 20H8z"/></svg></button>
+    <button class="icon-rail-btn" id="rail-inbox" title="Inbox" aria-label="Inbox"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 4h16l2 9v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-6z"/><path d="M2 13h5l2 3h6l2-3h5"/><path d="M12 3v7m-3-3 3 3 3-3"/></svg></button>
     <button class="icon-rail-btn" id="rail-projects" title="Projects"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="4" width="19" height="16" rx="2"/><line x1="9" y1="4" x2="9" y2="20"/><line x1="15.5" y1="4" x2="15.5" y2="20"/><line x1="5" y1="8" x2="7" y2="8"/><line x1="11.25" y1="11" x2="13.25" y2="11"/><line x1="17.5" y1="14" x2="19.5" y2="14"/></svg></button>
     <button class="icon-rail-btn" id="rail-study" title="Study Mode"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5.5c3-1 6-.5 9 2v13c-3-2-6-2.5-9-1.5z"/><path d="M21 5.5c-3-1-6-.5-9 2v13c3-2 6-2.5 9-1.5z"/></svg></button>
     <button class="icon-rail-btn" id="rail-todos" title="To Do"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg></button>
@@ -939,6 +947,16 @@
           </svg>
           <span class="grow">Notes</span>
         </div>
+        <button type="button" class="list-item" id="tool-inbox-btn">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+            stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+            style="flex-shrink:0;opacity:0.5;" aria-hidden="true">
+            <path d="M4 4h16l2 9v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-6z"/>
+            <path d="M2 13h5l2 3h6l2-3h5"/>
+            <path d="M12 3v7m-3-3 3 3 3-3"/>
+          </svg>
+          <span class="grow">Inbox</span>
+        </button>
         <button type="button" class="list-item" id="tool-projects-btn" aria-haspopup="true">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
             stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
@@ -1010,6 +1028,68 @@
       </div>
     </div>
   </nav>
+
+  <section id="inbox-workspace" class="inbox-workspace" hidden tabindex="-1"
+    aria-labelledby="inbox-title" data-no-swipe-dismiss="true">
+    <header class="inbox-topbar">
+      <div>
+        <p class="inbox-eyebrow">Universal Inbox</p>
+        <h1 id="inbox-title">Inbox</h1>
+        <p class="inbox-subtitle">Capture first. Review, classify, and process when you are ready.</p>
+      </div>
+      <div class="inbox-topbar-actions">
+        <button type="button" id="inbox-refresh" class="inbox-button">Refresh</button>
+        <button type="button" id="inbox-close" class="inbox-button" aria-label="Close Inbox">Close</button>
+      </div>
+    </header>
+
+    <div class="inbox-content">
+      <section class="inbox-capture-card" aria-labelledby="inbox-capture-label">
+        <form id="inbox-capture-form" autocomplete="off">
+          <label id="inbox-capture-label" for="inbox-capture-input">Quick capture</label>
+          <div class="inbox-capture-row">
+            <textarea id="inbox-capture-input" name="content" rows="2" maxlength="100000"
+              required aria-describedby="inbox-capture-help inbox-capture-status"
+              placeholder="Drop a thought, task, link, or note…"></textarea>
+            <button type="submit" id="inbox-capture-submit" class="inbox-button inbox-button-primary">Capture</button>
+          </div>
+          <p id="inbox-capture-help" class="inbox-capture-help">No destination needed. Restia keeps the source and classification visible for review.</p>
+          <p id="inbox-capture-status" class="inbox-capture-status" role="status" aria-live="polite"></p>
+        </form>
+      </section>
+
+      <section class="inbox-list-section" aria-labelledby="inbox-items-heading">
+        <header class="inbox-list-heading">
+          <div>
+            <h2 id="inbox-items-heading">Captured items</h2>
+            <p id="inbox-count">0 items</p>
+          </div>
+          <div id="inbox-status-filters" class="inbox-status-filters" role="group" aria-label="Filter Inbox by status">
+            <button type="button" class="inbox-filter is-active" data-inbox-filter="inbox" aria-pressed="true">Inbox</button>
+            <button type="button" class="inbox-filter" data-inbox-filter="processed" aria-pressed="false">Processed</button>
+            <button type="button" class="inbox-filter" data-inbox-filter="archived" aria-pressed="false">Archived</button>
+            <button type="button" class="inbox-filter" data-inbox-filter="all" aria-pressed="false">All</button>
+          </div>
+        </header>
+
+        <div id="inbox-loading" class="inbox-state" role="status">Loading Inbox…</div>
+        <div id="inbox-error" class="inbox-state" role="alert" hidden>
+          <p id="inbox-error-message" class="inbox-error-message">Could not load Inbox.</p>
+          <button type="button" id="inbox-retry" class="inbox-button">Retry</button>
+        </div>
+        <div id="inbox-empty" class="inbox-state" role="status" hidden>
+          <p>Nothing is in this status yet. Use Quick capture above to add the first item.</p>
+        </div>
+        <div id="inbox-list" class="inbox-list" role="list" tabindex="-1" hidden></div>
+        <div id="inbox-pagination" class="inbox-pagination" hidden>
+          <p id="inbox-pagination-error" class="inbox-pagination-error" role="alert" hidden></p>
+          <button type="button" id="inbox-load-more" class="inbox-button"
+            aria-describedby="inbox-pagination-error">Load more</button>
+        </div>
+      </section>
+    </div>
+    <p id="inbox-live-region" class="a11y-visually-hidden" role="status" aria-live="polite" aria-atomic="true"></p>
+  </section>
 
   <main class="chat-container welcome-active" id="chat-container" aria-label="Chat area" aria-busy="false">
     <!-- Persistent page heading for assistive tech. Visually hidden so it

@@ -51,6 +51,14 @@ from dotenv import load_dotenv
 # utf-8-sig reads plain UTF-8 (no BOM) identically, so this is safe everywhere.
 load_dotenv(encoding="utf-8-sig")
 
+# ``app:app`` is the canonical production entrypoint. Establish the schema
+# explicitly before importing managers and routers that may open sessions.
+# The runtime guard is idempotent, so test/app reloads do not rerun the legacy
+# migration chain for the same engine.
+from src.database_runtime import initialize_database
+
+initialize_database()
+
 import asyncio
 import logging
 import secrets
@@ -97,8 +105,13 @@ _root_logger = logging.getLogger()
 _root_logger.setLevel(logging.INFO)
 _formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-# Clear existing handlers to avoid duplicates
+# Clear existing production handlers to avoid duplicates. Pytest installs its
+# capture handlers on the root logger; removing those during an app import or
+# reload makes every later ``caplog`` assertion silently empty in the full
+# suite, even though each test passes in isolation.
 for _h in list(_root_logger.handlers):
+    if _h.__class__.__module__.startswith("_pytest."):
+        continue
     _root_logger.removeHandler(_h)
 
 _console_h = logging.StreamHandler()
@@ -1022,6 +1035,10 @@ async def serve_study(request: Request):
 
 @app.get("/projects")
 async def serve_projects(request: Request):
+    return await serve_index(request)
+
+@app.get("/inbox")
+async def serve_inbox(request: Request):
     return await serve_index(request)
 
 @app.get("/today")

@@ -20,7 +20,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
-from core.database import SessionLocal, EmailAccount, Base, engine  # noqa: E402
+from core.database import SessionLocal, EmailAccount  # noqa: E402
+from src.database_runtime import initialize_database  # noqa: E402
 from src.secret_storage import encrypt  # noqa: E402
 
 NAME = "Demo"
@@ -32,7 +33,6 @@ OWNER = ""
 
 
 def setup() -> int:
-    Base.metadata.create_all(bind=engine)
     db = SessionLocal()
     try:
         acct = db.query(EmailAccount).filter(
@@ -79,6 +79,7 @@ def teardown() -> int:
 
 
 if __name__ == "__main__":
+    initialize_database()
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd == "setup":
         raise SystemExit(setup())

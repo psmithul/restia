@@ -173,4 +173,4 @@ def _build_parser():
 
 
 if __name__ == "__main__":
-    sys.exit(run(_build_parser()))
+    sys.exit(run(_build_parser(), initialize_db=True))

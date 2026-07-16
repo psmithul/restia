@@ -18,6 +18,7 @@ from sqlalchemy import (
     JSON,
     Index,
     UniqueConstraint,
+    DDL,
     func,
     text,
 )
@@ -182,6 +183,164 @@ class EncryptedJSON(TypeDecorator):
             logger.error("Failed to decode encrypted session headers")
             return {}
         return decoded if isinstance(decoded, dict) else {}
+
+
+class Account(TimestampMixin, Base):
+    """Stable internal identity shared by every Restia interface.
+
+    Existing authentication continues to use usernames and the local auth
+    store.  ``Account.id`` is the durable ownership key for new V3 domains so
+    browser cookies and owner-attributed API tokens resolve to the same data,
+    while a later username change does not need to rename every V3 row.
+    """
+
+    __tablename__ = "accounts"
+
+    id = Column(String(36), primary_key=True)
+    username = Column(String(160), nullable=False, unique=True, index=True)
+    display_name = Column(String(160), nullable=True)
+
+
+class AuthIdentity(TimestampMixin, Base):
+    """One authentication-provider subject mapped to an internal account."""
+
+    __tablename__ = "auth_identities"
+
+    id = Column(String(36), primary_key=True)
+    account_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    provider = Column(String(32), nullable=False, default="local")
+    subject = Column(String(255), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("provider", "subject", name="uq_auth_identity_subject"),
+        Index("ix_auth_identity_account_provider", "account_id", "provider"),
+    )
+
+
+class InboxItem(TimestampMixin, Base):
+    """Owner-scoped universal capture awaiting or recording triage."""
+
+    __tablename__ = "inbox_items"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    # Universal Inbox can contain health, finance, and private message data.
+    # Keep only routing/classification fields queryable; user content is
+    # encrypted with the same local envelope used by other sensitive domains.
+    title = Column(EncryptedText, nullable=False, default="")
+    content = Column(EncryptedText, nullable=False, default="")
+    kind = Column(String(32), nullable=False, default="note", index=True)
+    status = Column(String(24), nullable=False, default="inbox", index=True)
+    source_type = Column(String(48), nullable=False, default="user")
+    source_ref = Column(EncryptedText, nullable=True)
+    meta_data = Column("metadata", EncryptedJSON, nullable=False, default=dict)
+    classification_confidence = Column(Integer, nullable=False, default=0)
+    classification_reason = Column(String(500), nullable=False, default="")
+    processed_target_type = Column(String(48), nullable=True)
+    processed_target_id = Column(String(255), nullable=True)
+    processed_at = Column(DateTime, nullable=True)
+    archived_at = Column(DateTime, nullable=True)
+    idempotency_key = Column(String(128), nullable=True)
+    version = Column(Integer, nullable=False, default=1)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_id", "idempotency_key", name="uq_inbox_owner_idempotency"
+        ),
+        Index("ix_inbox_owner_status_updated", "owner_id", "status", "updated_at"),
+        Index("ix_inbox_owner_kind_status", "owner_id", "kind", "status"),
+    )
+
+
+class EntityLink(Base):
+    """Typed, owner-scoped edge between an Inbox item and an existing entity."""
+
+    __tablename__ = "entity_links"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    source_type = Column(String(48), nullable=False)
+    source_id = Column(String(255), nullable=False)
+    relation = Column(String(64), nullable=False)
+    target_type = Column(String(48), nullable=False)
+    target_id = Column(String(255), nullable=False)
+    meta_data = Column("metadata", JSON, nullable=False, default=dict)
+    created_at = Column(DateTime, nullable=False, default=utcnow_naive)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_id", "source_type", "source_id", "relation",
+            "target_type", "target_id", name="uq_entity_link_edge",
+        ),
+        Index("ix_entity_links_source", "owner_id", "source_type", "source_id"),
+        Index("ix_entity_links_target", "owner_id", "target_type", "target_id"),
+    )
+
+
+class ActionAudit(Base):
+    """Append-only record of every V3 life-core state transition."""
+
+    __tablename__ = "action_audit"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="RESTRICT"),
+        nullable=False, index=True,
+    )
+    action = Column(String(80), nullable=False, index=True)
+    entity_type = Column(String(48), nullable=False)
+    entity_id = Column(String(255), nullable=False, index=True)
+    before_state = Column(JSON, nullable=False, default=dict)
+    after_state = Column(JSON, nullable=False, default=dict)
+    details = Column(JSON, nullable=False, default=dict)
+    created_at = Column(DateTime, nullable=False, default=utcnow_naive, index=True)
+
+    __table_args__ = (
+        Index("ix_action_audit_owner_created", "owner_id", "created_at"),
+        Index("ix_action_audit_entity", "owner_id", "entity_type", "entity_id"),
+    )
+
+
+@event.listens_for(ActionAudit, "before_update")
+@event.listens_for(ActionAudit, "before_delete")
+def _protect_append_only_action_audit(*_args, **_kwargs):
+    raise RuntimeError("ActionAudit rows are append-only")
+
+
+# Mapper hooks protect normal ORM usage; SQLite triggers also reject bulk ORM
+# statements and raw SQL.  init_db installs the same idempotent triggers for a
+# database where the table was created before these guards were introduced.
+event.listen(
+    ActionAudit.__table__,
+    "after_create",
+    DDL("""
+        CREATE TRIGGER IF NOT EXISTS action_audit_no_update
+        BEFORE UPDATE ON action_audit
+        BEGIN
+            SELECT RAISE(ABORT, 'ActionAudit rows are append-only');
+        END
+    """).execute_if(dialect="sqlite"),
+)
+event.listen(
+    ActionAudit.__table__,
+    "after_create",
+    DDL("""
+        CREATE TRIGGER IF NOT EXISTS action_audit_no_delete
+        BEFORE DELETE ON action_audit
+        BEGIN
+            SELECT RAISE(ABORT, 'ActionAudit rows are append-only');
+        END
+    """).execute_if(dialect="sqlite"),
+)
 
 
 class Session(TimestampMixin, Base):
@@ -2963,6 +3122,7 @@ def init_db():
     harden_database_permissions()
     _migrate_model_endpoints()
     Base.metadata.create_all(bind=engine)
+    _migrate_action_audit_guards()
     harden_database_permissions()
     _migrate_add_study_review_columns()
     _migrate_add_study_setup_initialized_column()
@@ -3018,6 +3178,28 @@ def init_db():
     _migrate_encrypt_signatures()
     _migrate_encrypt_endpoint_keys()
     _migrate_backfill_task_folders()
+
+
+def _migrate_action_audit_guards():
+    """Install append-only SQLite guards for an already-created audit table."""
+
+    if engine.dialect.name != "sqlite":
+        return
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS action_audit_no_update
+            BEFORE UPDATE ON action_audit
+            BEGIN
+                SELECT RAISE(ABORT, 'ActionAudit rows are append-only');
+            END
+        """))
+        conn.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS action_audit_no_delete
+            BEFORE DELETE ON action_audit
+            BEGIN
+                SELECT RAISE(ABORT, 'ActionAudit rows are append-only');
+            END
+        """))
 
 
 def _migrate_backfill_task_folders():
@@ -3612,7 +3794,6 @@ def archive_session(session_id: str):
             return True
     return False
 
-# Initialize the database by creating all tables
-
-
-init_db()
+# Schema initialization is intentionally explicit. Production entrypoints call
+# ``src.database_runtime.initialize_database`` before using a session; importing
+# model definitions must never create or migrate a database.

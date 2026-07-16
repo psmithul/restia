@@ -135,7 +135,7 @@ def test_v2_assets_are_versioned_and_available_offline():
         "/static/js/calendar/reminderPayload.js",
     ):
         assert asset in (html + sw)
-    assert "const CACHE_NAME = 'restia-v366'" in sw
+    assert "const CACHE_NAME = 'restia-v367'" in sw
 
 
 def test_mobile_v2_bar_replaces_legacy_floating_hamburger():

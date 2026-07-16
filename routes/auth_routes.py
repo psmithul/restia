@@ -96,7 +96,15 @@ def username_reserved(name: str) -> bool:
     return username_is_reserved(key) or key.endswith(GUEST_SUFFIX)
 
 
-def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
+def setup_auth_routes(auth_manager: AuthManager, *, identity_renamer=None) -> APIRouter:
+    # Keep V3 identity migration independently testable from the route's many
+    # legacy owner stores. Production always resolves the real fail-closed
+    # migrator; only focused tests that replace SQLAlchemy inject a test double.
+    if identity_renamer is None:
+        from src.identity import rename_local_identity
+
+        identity_renamer = rename_local_identity
+
     router = APIRouter(prefix="/api/auth", tags=["auth"])
 
     def _reserve_identity_migration(*usernames: str) -> bool:
@@ -507,6 +515,10 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
             )
             db = SessionLocal()
             try:
+                # V3 domains use Account.id as their durable owner key.  Keep
+                # that UUID stable while this same SQL transaction migrates
+                # the legacy username-owned rows.
+                identity_renamer(db, old_username, new_username)
                 for mapper in Base.registry.mappers:
                     model = mapper.class_
                     if not hasattr(model, "owner"):

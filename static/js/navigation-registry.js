@@ -213,6 +213,24 @@ export const NAVIGATION_ITEMS = deepFreeze([
 
   // Work.
   navigationItem({
+    id: 'inbox',
+    aliases: ['capture', 'universal-inbox'],
+    label: 'Inbox',
+    description: 'Capture, classify, process, and archive incoming items.',
+    icon: 'inbox',
+    group: 'work',
+    order: 5,
+    route: '/inbox',
+    surfaces: ['rail', 'sidebar', 'mobile', 'command-palette', 'route'],
+    legacyIds: { rail: ['rail-inbox'], sidebar: ['tool-inbox-btn'] },
+    containerId: 'inbox-workspace',
+    command: {
+      id: 'inbox', title: 'Inbox', hint: 'Open universal Inbox', icon: '▣',
+      keywords: ['inbox', 'capture', 'triage', 'classify', 'process'],
+      triggerIds: ['tool-inbox-btn', 'rail-inbox'], afterTriggerId: null, handler: null,
+    },
+  }),
+  navigationItem({
     id: 'projects',
     label: 'Projects',
     description: 'Open the full project and workflow workspace.',

@@ -6,7 +6,9 @@ import re
 from typing import Any
 
 
-_VERSION_RE = re.compile(r"^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:[-+].*)?$", re.IGNORECASE)
+_VERSION_RE = re.compile(
+    r"^v?(0|[1-9]\d*)(?:\.(0|[1-9]\d*))?(?:\.(0|[1-9]\d*))?$"
+)
 
 
 def version_tuple(value: str) -> tuple[int, int, int] | None:
@@ -33,7 +35,12 @@ def build_update_result(
     """Build the stable JSON contract consumed by ``updateChecker.js``."""
     release = release or {}
     tag = str(release.get("tag_name") or "").strip()
-    release_update = bool(tag and not release.get("draft") and release_is_newer(current_version, tag))
+    release_update = bool(
+        tag
+        and not release.get("draft")
+        and not release.get("prerelease")
+        and release_is_newer(current_version, tag)
+    )
     remote_sha = str((branch_commit or {}).get("sha") or "")[:12]
     commit_update = bool(
         not release_update

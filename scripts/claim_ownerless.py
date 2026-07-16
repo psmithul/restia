@@ -58,6 +58,9 @@ def main():
         print(f"  {label}: claimed {count} entries")
 
     # 2. Database tables (sessions, gallery, comparisons, documents)
+    from src.database_runtime import initialize_database
+
+    initialize_database()
     from core.database import SessionLocal, Session, Document
     try:
         from core.database import GalleryImage

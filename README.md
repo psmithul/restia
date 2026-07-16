@@ -185,6 +185,12 @@ On Windows, run `update_windows.bat`. Published releases use
 [backup and restore guide](docs/backup-restore.md) before major upgrades or
 storage changes.
 
+Restia keeps an internal three-component `X.Y.Z` version, while public release
+precision communicates scope: `X.0.0` publishes as `vX`, `X.Y.0` as `vX.Y`,
+and a minor `X.Y.Z` change (`Z > 0`) as `vX.Y.Z`. Container tags omit
+the leading `v`. See the [release guide](docs/releasing.md) for the enforced
+preflight and publication flow.
+
 ## Development
 
 `dev` receives active V2 development; `main` is the more curated branch. For a

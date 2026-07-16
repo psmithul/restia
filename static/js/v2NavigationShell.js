@@ -22,12 +22,12 @@ const SEMANTIC_BUTTON_IDS = Object.freeze([
   'sidebar-new-chat-btn', 'sidebar-search-btn', 'tool-memory-btn',
   'tool-messages-btn', 'tool-calendar-btn', 'tool-compare-btn',
   'tool-cookbook-btn', 'tool-research-btn', 'tool-gallery-btn',
-  'tool-notes-btn', 'tool-todos-btn', 'tool-tasks-btn', 'tool-theme-btn',
+  'tool-notes-btn', 'tool-inbox-btn', 'tool-todos-btn', 'tool-tasks-btn', 'tool-theme-btn',
 ]);
 
 const RAIL_PRIMARY = new Set([
   'rail-home', 'rail-search-btn', 'rail-new-session', 'rail-chats',
-  'rail-documents', 'rail-projects', 'rail-tasks', 'rail-calendar',
+  'rail-documents', 'rail-inbox', 'rail-projects', 'rail-tasks', 'rail-calendar',
   'rail-messages', 'rail-study', 'rail-activity', 'rail-settings',
 ]);
 
@@ -295,6 +295,20 @@ export function setActiveNavigationItem(id) {
   });
 }
 
+function leaveInboxFor(id) {
+  if (id === 'inbox' || !window.inboxModule?.isOpen?.()) return false;
+  const item = getNavigationItem(id);
+  if (item?.kind === 'action' && id !== 'new-chat') return false;
+  const route = item?.route || (['chat', 'new-chat'].includes(id) ? '/' : null);
+  const wasInboxRoute = window.location.pathname === '/inbox';
+  window.inboxModule.close({ restoreFocus: false });
+  if (wasInboxRoute && route && window.location.pathname !== route) {
+    window.history.pushState({ restiaNavigation: item?.id || 'chat' }, '', route);
+    document.title = item?.label ? `${item.label} — Restia` : 'Restia';
+  }
+  return true;
+}
+
 function topVisibleModalNavigationItem(excludedModalId = '') {
   const rows = NAVIGATION_ITEMS.flatMap((item) => asModalRows(item, excludedModalId));
   rows.sort((left, right) => left.zIndex - right.zIndex);
@@ -314,6 +328,10 @@ function asModalRows(item, excludedModalId = '') {
 }
 
 function syncActiveNavigationFromVisibleSurface(excludedModalId = '') {
+  if (window.inboxModule?.isOpen?.()) {
+    setActiveNavigationItem('inbox');
+    return;
+  }
   if (missionControlModule.isOpen()) {
     const activityIsActive = document.querySelector('[data-nav-id="activity"][aria-current="page"], [data-mobile-nav="activity"][aria-current="page"]');
     setActiveNavigationItem(activityIsActive ? 'activity' : 'home');
@@ -414,6 +432,7 @@ export async function activateNavigationItem(id, options = {}) {
     });
     return true;
   }
+  leaveInboxFor(id);
   if (id === 'home' || id === 'activity') {
     // Reflect the requested destination immediately while the bounded Today
     // aggregation loads. If a dirty Projects close is cancelled, reconcile
@@ -460,6 +479,12 @@ export async function activateNavigationItem(id, options = {}) {
 
   const item = getNavigationItem(id);
   if (!item) return false;
+  if (id === 'inbox' && window.inboxModule?.isOpen?.()) {
+    window.inboxModule.focus?.();
+    setActiveNavigationItem('inbox');
+    hideMobileSidebar();
+    return true;
+  }
   if (id === 'projects' && window.projectsModule?.isOpen?.()) {
     window.projectsModule.focus?.();
     setActiveNavigationItem('projects');
@@ -532,6 +557,12 @@ export function initV2NavigationShell() {
   document.addEventListener('restia:projects-closed', () => {
     scheduleNavigationSurfaceSync();
   });
+  document.addEventListener('restia:inbox-opened', () => {
+    setActiveNavigationItem('inbox');
+  });
+  document.addEventListener('restia:inbox-closed', () => {
+    scheduleNavigationSurfaceSync();
+  });
   document.addEventListener('restia:study-opened', () => {
     setActiveNavigationItem('study');
   });
@@ -554,6 +585,7 @@ export function initV2NavigationShell() {
     const item = findNavigationItemByLegacyId(control.id);
     if (item && !['home', 'activity'].includes(item.id)) {
       if (SHELL_ONLY_ACTIONS.has(item.id)) return;
+      if (item.id !== 'inbox') leaveInboxFor(item.id);
       if (
         item.id !== 'projects' &&
         window.projectsModule?.isOpen?.() &&

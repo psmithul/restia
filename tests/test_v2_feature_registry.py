@@ -208,6 +208,7 @@ def test_product_registry_declares_the_v2_feature_areas_in_one_order():
         "mission-control",
         "progression",
         "planning",
+        "inbox",
         "projects",
         "linked-projects",
         "calendar",
@@ -234,6 +235,8 @@ def test_product_registry_installs_each_actual_v2_route_once():
     assert ("GET", "/api/mission-control/activity") in signatures
     assert ("GET", "/api/progression") in signatures
     assert ("GET", "/api/planning") in signatures
+    assert ("GET", "/api/inbox") in signatures
+    assert ("POST", "/api/inbox/{*}/process") in signatures
     assert ("GET", "/api/projects") in signatures
     assert ("GET", "/api/link/projects") in signatures
     assert ("GET", "/api/calendar/events") in signatures

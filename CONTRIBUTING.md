@@ -13,6 +13,21 @@ Restia has two branches:
 
 End-users cloning the repo will land on `dev` by default. To run the curated/stable version: `git checkout main` after clone.
 
+## Release version policy
+
+`APP_VERSION` is always a canonical three-component `X.Y.Z` value. Public
+release precision expresses the scope of the change:
+
+| Scope | Internal version | GitHub tag | Container tag |
+| --- | --- | --- | --- |
+| Major | `X.0.0` | `vX` | `X` |
+| Slightly major | `X.Y.0`, where `Y > 0` | `vX.Y` | `X.Y` |
+| Minor | `X.Y.Z`, where `Z > 0` | `vX.Y.Z` | `X.Y.Z` |
+
+Run the [release preflight](docs/releasing.md) before publishing. The Docker
+release workflow enforces the same mapping before it starts architecture
+builds, and immutable stable version tags are emitted only for GitHub releases.
+
 ## Before You Start
 
 - Search existing issues and pull requests before opening a new one.
@@ -130,4 +145,3 @@ Issues with only "help", "does not work", or a screenshot without context may be
 Do not post secrets, API keys, private logs, personal documents, or public IPs in issues or pull requests.
 
 For security reports, follow [SECURITY.md](SECURITY.md).
-

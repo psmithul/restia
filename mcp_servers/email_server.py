@@ -2554,6 +2554,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 # ── Main ──
 
 async def run():
+    # This stdio server is a standalone production entrypoint; importing ORM
+    # models no longer performs an implicit schema bootstrap.
+    from src.database_runtime import initialize_database
+
+    await asyncio.to_thread(initialize_database)
     async with stdio_server() as (read_stream, write_stream):
         await server.run(
             read_stream, write_stream, server.create_initialization_options()

@@ -47,12 +47,12 @@ def create_dirs():
 
 
 def init_database():
-    """Create all SQLAlchemy tables."""
+    """Run the explicit, validated database bootstrap."""
     sys.path.insert(0, BASE_DIR)
     os.environ.setdefault("DATABASE_URL", f"sqlite:///{os.path.join(DATA_DIR, 'app.db')}")
 
-    from core.database import Base, engine
-    Base.metadata.create_all(bind=engine)
+    from src.database_runtime import initialize_database
+    initialize_database()
     print("  [ok] Database initialized")
 
 
@@ -194,7 +194,10 @@ def create_env():
 def check_deps():
     """Check for common missing dependencies."""
     missing = []
-    for mod in ["fastapi", "uvicorn", "sqlalchemy", "bcrypt", "httpx", "dotenv"]:
+    for mod in [
+        "fastapi", "uvicorn", "sqlalchemy", "alembic", "psycopg",
+        "bcrypt", "httpx", "dotenv",
+    ]:
         try:
             __import__(mod)
         except ImportError:
@@ -287,6 +290,11 @@ def main():
     try:
         init_database()
     except Exception as e:
+        from src.database_runtime import DatabaseConfigurationError
+
+        if isinstance(e, DatabaseConfigurationError):
+            print(f"  [error] Database configuration is unsafe: {e}")
+            raise SystemExit(1) from e
         print(f"  [warn] Database init failed: {e}")
         print("         This is OK if dependencies aren't installed yet.")
 

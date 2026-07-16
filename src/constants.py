@@ -6,6 +6,14 @@ from src.runtime_paths import get_app_root, get_default_data_dir
 
 APP_VERSION = "2.1.0"
 
+# Validate the single internal version at import time. Public release tags use
+# scope precision (X.0.0 -> vX, X.Y.0 -> vX.Y, X.Y.Z -> vX.Y.Z); see
+# src.release_version and docs/releasing.md. Keeping this guard beside the
+# constant prevents an invalid local build from reaching CI or packaging.
+from src.release_version import release_identity as _release_identity
+
+APP_RELEASE_IDENTITY = _release_identity(APP_VERSION)
+
 # Git commit SHA baked in at Docker build time (via BUILD_COMMIT build arg).
 # Falls back to reading .git/HEAD at startup for non-Docker installs. Used by
 # /api/version and /api/update-check to tell users when a newer version exists.

@@ -90,6 +90,7 @@ def test_profile_rename_migrates_every_project_identity_column(monkeypatch, tmp_
     db.flush()
     db.add_all(
         [
+            cdb.Account(id="stable-account-id", username="alice"),
             cdb.ProjectQuotaLock(
                 key=cdb.project_owner_quota_lock_key("alice"),
             ),
@@ -147,6 +148,21 @@ def test_profile_rename_migrates_every_project_identity_column(monkeypatch, tmp_
             ),
         ]
     )
+    db.flush()
+    db.add_all([
+        cdb.AuthIdentity(
+            id="local-identity",
+            account_id="stable-account-id",
+            provider="local",
+            subject="alice",
+        ),
+        cdb.AuthIdentity(
+            id="external-identity",
+            account_id="stable-account-id",
+            provider="oidc",
+            subject="provider-subject-123",
+        ),
+    ])
     db.commit()
     db.close()
 
@@ -207,6 +223,18 @@ def test_profile_rename_migrates_every_project_identity_column(monkeypatch, tmp_
     assert db.query(cdb.ProjectQuotaLock).filter(
         cdb.ProjectQuotaLock.key == cdb.project_owner_quota_lock_key("alice")
     ).count() == 0
+    account = db.query(cdb.Account).one()
+    assert account.id == "stable-account-id"
+    assert account.username == "alice2"
+    assert db.query(cdb.AuthIdentity).filter_by(
+        provider="local", subject="alice"
+    ).count() == 0
+    assert db.query(cdb.AuthIdentity).filter_by(
+        provider="local", subject="alice2", account_id=account.id
+    ).count() == 1
+    assert db.query(cdb.AuthIdentity).filter_by(
+        provider="oidc", subject="provider-subject-123", account_id=account.id
+    ).count() == 1
     db.close()
     engine.dispose()
 

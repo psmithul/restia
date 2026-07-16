@@ -42,14 +42,39 @@ def _route(router, name):
     raise AssertionError(name)
 
 
+def _neutralize_sql_owner_migration(monkeypatch):
+    """Stub SQL boundaries for this non-SQL owner-store regression suite.
+
+    ``MagicMock.first()`` is truthy, so passing the mocked ``SessionLocal`` to
+    the real fail-closed V3 identity migrator fabricates conflicting Account
+    and AuthIdentity rows. Real SQL identity integration is covered in
+    test_project_identity_rename.py and test_v3_life_core.py; this suite keeps
+    an explicit call spy so removing the route integration still fails here.
+    """
+
+    import core.database as cdb
+    identity_calls = []
+    monkeypatch.setattr(cdb, "SessionLocal", lambda: MagicMock())
+    monkeypatch.setattr(
+        cdb,
+        "Base",
+        SimpleNamespace(registry=SimpleNamespace(mappers=[])),
+        raising=False,
+    )
+
+    def record_identity_rename(db, old_username, new_username):
+        identity_calls.append((db, old_username, new_username))
+        return None
+
+    return record_identity_rename, identity_calls
+
+
 @pytest.fixture
 def rename_endpoint(monkeypatch, tmp_path):
     import routes.auth_routes as ar
-    import core.database as cdb
 
     # Neutralize the DB owner-rename loop.
-    monkeypatch.setattr(cdb, "SessionLocal", lambda: MagicMock())
-    monkeypatch.setattr(cdb, "Base", SimpleNamespace(registry=SimpleNamespace(mappers=[])), raising=False)
+    identity_renamer, identity_calls = _neutralize_sql_owner_migration(monkeypatch)
     # Neutralize the JSON-prefs rename.
     pr = types.ModuleType("routes.prefs_routes")
     pr._load = lambda: {}
@@ -67,7 +92,15 @@ def rename_endpoint(monkeypatch, tmp_path):
     am.get_username_for_token.return_value = "admin"
     am.users = {"alice": {}}
     am.rename_user.return_value = True
-    return _route(ar.setup_auth_routes(am), "rename_user"), am, tmp_path
+    am.v3_identity_rename_calls = identity_calls
+    return (
+        _route(
+            ar.setup_auth_routes(am, identity_renamer=identity_renamer),
+            "rename_user",
+        ),
+        am,
+        tmp_path,
+    )
 
 
 def _request(
@@ -145,6 +178,20 @@ def _force_sql_owner_migration_failure(monkeypatch):
 # ---------------------------------------------------------------------------
 # 1. In-memory session cache
 # ---------------------------------------------------------------------------
+
+def test_mocked_owner_sync_keeps_v3_identity_route_integration(rename_endpoint):
+    endpoint, am, tmp_path = rename_endpoint
+
+    result = asyncio.run(
+        endpoint("alice", SimpleNamespace(username="alice2"), _request(tmp_path))
+    )
+
+    assert result["ok"] is True
+    assert [
+        (old_username, new_username)
+        for _db, old_username, new_username in am.v3_identity_rename_calls
+    ] == [("alice", "alice2")]
+
 
 def test_rename_updates_in_memory_session_owner(rename_endpoint):
     endpoint, _am, tmp_path = rename_endpoint
@@ -358,15 +405,13 @@ def test_rename_research_respects_custom_data_dir(monkeypatch, tmp_path):
     the rename silently patch a different directory from where research files
     actually live, so reports still disappeared after rename."""
     import routes.auth_routes as ar
-    import core.database as cdb
 
     custom_dr = tmp_path / "custom_data" / "deep_research"
     custom_dr.mkdir(parents=True)
     p = custom_dr / "rp-abc.json"
     p.write_text(json.dumps({"query": "q", "owner": "alice", "status": "done"}), encoding="utf-8")
 
-    monkeypatch.setattr(cdb, "SessionLocal", lambda: MagicMock())
-    monkeypatch.setattr(cdb, "Base", SimpleNamespace(registry=SimpleNamespace(mappers=[])), raising=False)
+    identity_renamer, _identity_calls = _neutralize_sql_owner_migration(monkeypatch)
     pr = types.ModuleType("routes.prefs_routes")
     pr._load = lambda: {}
     pr._save = lambda d: None
@@ -379,7 +424,10 @@ def test_rename_research_respects_custom_data_dir(monkeypatch, tmp_path):
     am.get_username_for_token.return_value = "admin"
     am.users = {"alice": {}}
     am.rename_user.return_value = True
-    endpoint = _route(ar.setup_auth_routes(am), "rename_user")
+    endpoint = _route(
+        ar.setup_auth_routes(am, identity_renamer=identity_renamer),
+        "rename_user",
+    )
 
     asyncio.run(endpoint("alice", SimpleNamespace(username="alice2"), _request(tmp_path)))
 

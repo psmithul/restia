@@ -9,6 +9,8 @@ This page keeps the detailed install, deployment, troubleshooting, and configura
 Defaults work out of the box: clone, run, then configure models/search/email
 inside **Settings**. Only edit `.env` for deployment-level overrides like
 `APP_BIND`, `APP_PORT`, `AUTH_ENABLED`, `DATABASE_URL`, or a pre-seeded admin password.
+Database deployment modes and the guarded PostgreSQL migration path are
+documented in [database-modes.md](database-modes.md).
 
 On first setup, Restia creates an owner/admin profile (`admin` unless
 `ODYSSEUS_ADMIN_USER` is set) and prints a temporary password in the terminal.

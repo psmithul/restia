@@ -53,6 +53,11 @@ def build_v2_feature_registry(
 
         return setup_planning_routes()
 
+    def inbox(_ctx: FeatureContext):
+        from routes.inbox_routes import setup_inbox_routes
+
+        return setup_inbox_routes()
+
     def linked_projects(ctx: FeatureContext):
         from routes.project_routes import setup_project_routes
 
@@ -70,6 +75,7 @@ def build_v2_feature_registry(
     registry.register(FeatureSpec("mission-control", 100, router_factory=mission_control))
     registry.register(FeatureSpec("progression", 105, router_factory=progression))
     registry.register(FeatureSpec("planning", 107, router_factory=planning))
+    registry.register(FeatureSpec("inbox", 108, router_factory=inbox))
     registry.register(FeatureSpec("projects", 110, router_factory=projects))
     registry.register(FeatureSpec("linked-projects", 120, router_factory=linked_projects))
     registry.register(FeatureSpec("calendar", 130, router_factory=calendar))

@@ -44,7 +44,13 @@ def rename_endpoint(monkeypatch):
     am.get_username_for_token.return_value = "admin"
     am.users = {"alice": {}}
     am.rename_user.return_value = True
-    return _route(ar.setup_auth_routes(am), "rename_user"), am
+    return _route(
+        ar.setup_auth_routes(
+            am,
+            identity_renamer=MagicMock(return_value=None),
+        ),
+        "rename_user",
+    ), am
 
 
 def _request(invalidator):

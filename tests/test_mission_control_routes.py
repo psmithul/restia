@@ -18,6 +18,7 @@ from sqlalchemy.pool import NullPool
 import core.database as cdb
 import routes.calendar_routes as calendar_routes
 import routes.mission_control_routes as mission
+from src.identity import ensure_account
 
 
 _PEER = ("203.0.113.52", 54321)
@@ -538,6 +539,7 @@ async def test_today_snapshot_is_owner_scoped_deterministic_and_redacted(mission
         "calendar": 2,
         "project_work": 3,
         "planning": 0,
+        "inbox": 0,
         "goals": 1,
         "tasks": 3,
         "study_reviews": 1,
@@ -551,7 +553,7 @@ async def test_today_snapshot_is_owner_scoped_deterministic_and_redacted(mission
 
     sources = body["sources"]
     assert set(sources) == {
-        "calendar", "project_work", "planning", "goals", "tasks", "study_reviews",
+        "calendar", "project_work", "planning", "inbox", "goals", "tasks", "study_reviews",
         "important_mail", "notes_today", "daily_brief", "progression", "health"
     }
     assert {row["id"] for row in sources["calendar"]["items"]} == {
@@ -636,6 +638,159 @@ async def test_today_snapshot_requires_auth_and_bounds_timezone_offset(mission_e
 
     assert unauthenticated.status_code == 401
     assert invalid_offset.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_today_inbox_empty_state_is_read_only(mission_env):
+    app, factory, _data_dir = mission_env
+
+    async with _client(app) as client:
+        response = await client.get(
+            "/api/mission-control/today", headers=_headers()
+        )
+
+    assert response.status_code == 200
+    assert response.json()["sources"]["inbox"] == {
+        "status": "ok",
+        "items": [],
+        "count": 0,
+        "truncated": False,
+        "unprocessed_count": 0,
+        "kinds": {},
+        "oldest_at": None,
+        "latest_at": None,
+    }
+    assert response.json()["summary"]["inbox"] == 0
+
+    db = factory()
+    try:
+        assert db.query(cdb.Account).count() == 0
+        assert db.query(cdb.AuthIdentity).count() == 0
+    finally:
+        db.close()
+
+
+@pytest.mark.anyio
+async def test_today_inbox_is_owner_scoped_and_omits_encrypted_content(mission_env):
+    app, factory, _data_dir = mission_env
+    db = factory()
+    try:
+        alice = ensure_account(db, "alice")
+        bob = ensure_account(db, "bob")
+        db.add_all([
+            cdb.InboxItem(
+                id="inbox-alice",
+                owner_id=alice.id,
+                title="Alice action",
+                content="ALICE_ENCRYPTED_CONTENT_MUST_NOT_LEAK",
+                kind="task",
+                status="inbox",
+                classification_confidence=91,
+                classification_reason="action language",
+                created_at=datetime(2026, 7, 14, 5, 0),
+                updated_at=datetime(2026, 7, 14, 5, 0),
+            ),
+            cdb.InboxItem(
+                id="inbox-alice-processed",
+                owner_id=alice.id,
+                title="Already processed",
+                content="PROCESSED_CONTENT_MUST_NOT_LEAK",
+                kind="note",
+                status="processed",
+                created_at=datetime(2026, 7, 14, 6, 0),
+                updated_at=datetime(2026, 7, 14, 6, 0),
+            ),
+            cdb.InboxItem(
+                id="inbox-bob",
+                owner_id=bob.id,
+                title="BOB_ONLY_INBOX_TITLE",
+                content="BOB_ONLY_INBOX_CONTENT",
+                kind="decision",
+                status="inbox",
+                classification_confidence=88,
+                classification_reason="decision language",
+                created_at=datetime(2026, 7, 14, 7, 0),
+                updated_at=datetime(2026, 7, 14, 7, 0),
+            ),
+        ])
+        db.commit()
+    finally:
+        db.close()
+
+    async with _client(app) as client:
+        alice_response = await client.get(
+            "/api/mission-control/today", headers=_headers("alice")
+        )
+        bob_response = await client.get(
+            "/api/mission-control/today", headers=_headers("bob")
+        )
+
+    assert alice_response.status_code == 200
+    alice_source = alice_response.json()["sources"]["inbox"]
+    assert alice_source["count"] == 1
+    assert alice_source["unprocessed_count"] == 1
+    assert alice_source["kinds"] == {"task": 1}
+    assert alice_source["items"] == [{
+        "id": "inbox-alice",
+        "title": "Alice action",
+        "kind": "task",
+        "confidence": 91,
+        "reason": "action language",
+    }]
+    assert alice_source["oldest_at"] == "2026-07-14T05:00:00Z"
+    assert alice_source["latest_at"] == "2026-07-14T05:00:00Z"
+    rendered = json.dumps(alice_response.json(), sort_keys=True)
+    assert "ALICE_ENCRYPTED_CONTENT_MUST_NOT_LEAK" not in rendered
+    assert "PROCESSED_CONTENT_MUST_NOT_LEAK" not in rendered
+    assert "BOB_ONLY" not in rendered
+
+    assert bob_response.status_code == 200
+    bob_source = bob_response.json()["sources"]["inbox"]
+    assert bob_source["count"] == 1
+    assert [row["id"] for row in bob_source["items"]] == ["inbox-bob"]
+
+
+@pytest.mark.anyio
+async def test_today_inbox_preview_and_kind_breakdown_are_bounded(mission_env):
+    app, factory, _data_dir = mission_env
+    db = factory()
+    try:
+        alice = ensure_account(db, "alice")
+        for index in range(7):
+            db.add(cdb.InboxItem(
+                id=f"inbox-{index}",
+                owner_id=alice.id,
+                title=f"Capture {index}",
+                content=f"PRIVATE_CAPTURE_CONTENT_{index}",
+                kind="task" if index % 2 == 0 else "note",
+                status="inbox",
+                classification_confidence=70 + index,
+                classification_reason=f"reason {index}",
+                created_at=datetime(2026, 7, 1, index, 0),
+                updated_at=datetime(2026, 7, 1, index, 0),
+            ))
+        db.commit()
+    finally:
+        db.close()
+
+    async with _client(app) as client:
+        response = await client.get(
+            "/api/mission-control/today", headers=_headers()
+        )
+
+    assert response.status_code == 200
+    source = response.json()["sources"]["inbox"]
+    assert source["count"] == 7
+    assert source["unprocessed_count"] == 7
+    assert source["kinds"] == {"note": 3, "task": 4}
+    assert source["truncated"] is True
+    assert len(source["items"]) == mission.INBOX_PREVIEW_LIMIT
+    assert [row["id"] for row in source["items"]] == [
+        "inbox-0", "inbox-1", "inbox-2", "inbox-3", "inbox-4"
+    ]
+    assert source["oldest_at"] == "2026-07-01T00:00:00Z"
+    assert source["latest_at"] == "2026-07-01T06:00:00Z"
+    assert "PRIVATE_CAPTURE_CONTENT" not in response.text
 
 
 @pytest.mark.anyio
@@ -1065,6 +1220,7 @@ async def test_auth_disabled_single_profile_matches_each_source_owner_convention
     monkeypatch.setenv("AUTH_ENABLED", "false")
     now = _NOW.replace(tzinfo=None)
     db = factory()
+    local_account = ensure_account(db, "alice")
     calendar = cdb.CalendarCal(
         id="local-calendar",
         owner=mission.CALENDAR_FALLBACK_OWNER,
@@ -1141,6 +1297,18 @@ async def test_auth_disabled_single_profile_matches_each_source_owner_convention
             note_type="goal",
             items=json.dumps([{"text": "Local next step", "done": False}]),
         ),
+        cdb.InboxItem(
+            id="local-inbox",
+            owner_id=local_account.id,
+            title="Local Inbox capture",
+            content="LOCAL_INBOX_CONTENT_MUST_NOT_LEAK",
+            kind="note",
+            status="inbox",
+            classification_confidence=60,
+            classification_reason="default unstructured note",
+            created_at=now - timedelta(hours=2),
+            updated_at=now - timedelta(hours=2),
+        ),
         local_daily_brief,
         cdb.TaskRun(
             id="local-daily-brief-run",
@@ -1186,6 +1354,7 @@ async def test_auth_disabled_single_profile_matches_each_source_owner_convention
         "calendar": 1,
         "project_work": 1,
         "planning": 0,
+        "inbox": 1,
         "goals": 1,
         "tasks": 1,
         "study_reviews": 1,
@@ -1196,6 +1365,14 @@ async def test_auth_disabled_single_profile_matches_each_source_owner_convention
         "next_actions": 3,
         "health": "degraded",
     }
+    assert response.json()["sources"]["inbox"]["items"] == [{
+        "id": "local-inbox",
+        "title": "Local Inbox capture",
+        "kind": "note",
+        "confidence": 60,
+        "reason": "default unstructured note",
+    }]
+    assert "LOCAL_INBOX_CONTENT_MUST_NOT_LEAK" not in response.text
 
 
 @pytest.mark.anyio
@@ -1218,6 +1395,7 @@ async def test_source_failures_are_explicit_and_do_not_leak_exception_text(
     for source_name in (
         "calendar",
         "project_work",
+        "inbox",
         "goals",
         "tasks",
         "study_reviews",
@@ -1263,7 +1441,7 @@ async def test_malformed_mail_state_fails_only_that_source_without_leaking_text(
         "message": "Could not load important mail.",
     }
     for name in (
-        "calendar", "project_work", "goals", "tasks", "study_reviews",
+        "calendar", "project_work", "inbox", "goals", "tasks", "study_reviews",
         "notes_today", "daily_brief",
     ):
         assert body["sources"][name]["status"] == "ok"
@@ -1300,6 +1478,7 @@ async def test_auth_disabled_ambiguous_profiles_fail_closed_per_source(
     for name in (
         "calendar",
         "project_work",
+        "inbox",
         "goals",
         "tasks",
         "study_reviews",

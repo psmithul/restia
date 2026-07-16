@@ -29,6 +29,7 @@ import galleryModule from './js/gallery.js';
 import tasksModule from './js/tasks.js?v=20260630tasksactivity';
 import calendarModule from './js/calendar.js';
 import notesModule from './js/notes.js';
+import inboxModule from './js/inbox.js';
 import projectsModule from './js/projects.js';
 import studyModule from './js/study.js';
 import notificationCenterModule from './js/notificationCenter.js';
@@ -64,6 +65,7 @@ window.sessionModule = sessionModule;
 window.uiModule = uiModule;
 window.adminModule = adminModule;
 window.cookbookModule = cookbookModule;
+window.inboxModule = inboxModule;
 window.projectsModule = projectsModule;
 window.studyModule = studyModule;
 
@@ -1121,8 +1123,22 @@ function initializeEventListeners() {
     });
   }
 
-  // Projects is a full workspace rather than a floating modal. Keep the
-  // compact icon rail available while giving the board the rest of the screen.
+  // Inbox and Projects are full workspaces rather than floating modals. Keep
+  // the compact icon rail available while giving each view the rest of the screen.
+  const toolInboxBtn = el('tool-inbox-btn');
+  if (toolInboxBtn) {
+    toolInboxBtn.addEventListener('click', async () => {
+      if (!inboxModule) return;
+      if (inboxModule.isOpen()) {
+        inboxModule.focus();
+        return;
+      }
+      _collapseSidebarToRail();
+      const opened = await inboxModule.open();
+      if (opened === false) _restoreSidebarIfRouteCollapsed();
+    });
+  }
+
   const toolProjectsBtn = el('tool-projects-btn');
   if (toolProjectsBtn) {
     toolProjectsBtn.addEventListener('click', () => {
@@ -1238,6 +1254,10 @@ function initializeEventListeners() {
   const _routeOpen = {
     '/today':    () => activateNavigationItem('home'),
     '/activity': () => activateNavigationItem('activity'),
+    '/inbox':    () => {
+      _collapseSidebarToRail();
+      void inboxModule.open({ historyMode: 'none' });
+    },
     '/study':    () => document.getElementById('tool-study-btn')?.click(),
     '/projects': () => {
       if (!projectsModule) return;
@@ -1306,7 +1326,7 @@ function initializeEventListeners() {
     '/library':  () => sessionModule && sessionModule.openLibrary && sessionModule.openLibrary(),
   };
   const _opener = _routeOpen[urlPath];
-  if (_opener && (urlPath === '/today' || urlPath === '/activity')) {
+  if (_opener && (urlPath === '/today' || urlPath === '/activity' || urlPath === '/inbox')) {
     // Home and Activity do not depend on chat-session restoration. Open the
     // requested workspace as soon as navigation is wired, even when a large
     // or unhealthy session store leaves loadSessions() pending.
@@ -1324,9 +1344,25 @@ function initializeEventListeners() {
   // click handler in emailInbox, sessionModule's loaded session list) are
   // still being wired up further down in this same function. Stash the
   // opener so it runs from sessionModule.loadSessions().finally() below.
-  if (_opener && urlPath !== '/today' && urlPath !== '/activity') {
+  if (_opener && urlPath !== '/today' && urlPath !== '/activity' && urlPath !== '/inbox') {
     window._odysseusRouteOpener = _opener;
   }
+  window.addEventListener('popstate', () => {
+    const path = window.location.pathname;
+    const wasInboxOpen = inboxModule.isOpen();
+    if (path === '/inbox') {
+      try { _routeOpen['/inbox'](); } catch (error) { console.error('Inbox history open failed:', error); }
+      return;
+    }
+    if (!wasInboxOpen) return;
+    inboxModule.close({ restoreFocus: false });
+    const opener = _routeOpen[path];
+    if (opener) {
+      try { opener(); } catch (error) { console.error('History route open failed:', error); }
+    } else {
+      void activateNavigationItem('chat');
+    }
+  });
 
   // Archive browser tool button
   const toolLibraryBtn = el('tool-library-btn');
@@ -3682,6 +3718,7 @@ function startRestiaApp() {
   _bumpChatPriority(10000);
   // Set CSS variables
   document.documentElement.style.setProperty('--line-height', '20px');
+  inboxModule.init(API_BASE);
   initV2NavigationShell();
   initRailHoverLabels();
 

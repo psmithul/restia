@@ -90,6 +90,10 @@ def test_failed_remote_delete_leaves_tombstone_and_later_retry_cleans_up(tmp_pat
     dbmod = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, "core.database", dbmod)
     spec.loader.exec_module(dbmod)
+    # Database imports are intentionally side-effect free in V3. This isolated
+    # module/engine therefore needs the same explicit bootstrap as an app or
+    # CLI process before the test can insert calendar rows.
+    dbmod.init_db()
 
     CalendarCal = dbmod.CalendarCal
     CalendarDeletedEvent = dbmod.CalendarDeletedEvent

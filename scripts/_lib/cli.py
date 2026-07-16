@@ -96,7 +96,12 @@ def common_parser(prog: str, description: str = "") -> argparse.ArgumentParser:
     return p
 
 
-def run(parser: argparse.ArgumentParser, argv=None) -> int:
+def run(
+    parser: argparse.ArgumentParser,
+    argv=None,
+    *,
+    initialize_db: bool = False,
+) -> int:
     """Parse args, dispatch to `args.func(args)`, return an exit code.
     Catches KeyboardInterrupt (→ 130) and uncaught exceptions (→ 1)
     with a friendly stderr message.
@@ -111,6 +116,13 @@ def run(parser: argparse.ArgumentParser, argv=None) -> int:
 
     args = parser.parse_args(argv)
     try:
+        if initialize_db:
+            # Database-backed CLIs opt in explicitly. Importing ORM models is
+            # side-effect-free; the schema bootstrap happens only when the
+            # executable actually dispatches a command.
+            from src.database_runtime import initialize_database
+
+            initialize_database()
         args.func(args)
     except KeyboardInterrupt:
         sys.stderr.write("interrupted\n")

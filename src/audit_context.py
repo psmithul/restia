@@ -1,0 +1,128 @@
+"""Structured, privacy-safe actor context for immutable V3 action audits."""
+
+from __future__ import annotations
+
+import hashlib
+import os
+from typing import Any, Mapping
+
+
+SESSION_AUDIT_CONTEXT_KEY = "restia_action_audit_context"
+_INTERFACES = frozenset({
+    "web",
+    "api",
+    "cli",
+    "telegram",
+    "voice",
+    "automation",
+    "home_link",
+    "internal_tool",
+    "domain_service",
+})
+_OUTCOMES = frozenset({"success", "failure", "denied", "cancelled"})
+
+
+def _bounded(value: object, limit: int) -> str | None:
+    text = str(value or "").strip()
+    return text[:limit] if text else None
+
+
+def _protected_reference(value: object) -> str | None:
+    """Return a bounded one-way reference suitable for an immutable audit row."""
+
+    text = _bounded(value, 4096)
+    if not text:
+        return None
+    if text.startswith("sha256:") and len(text) == 71:
+        return text
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def bind_request_audit_context(db, request, account) -> dict[str, Any]:
+    """Bind one admitted request's actor metadata to its SQLAlchemy session.
+
+    Only server-populated request state is consulted. Raw headers, bearer
+    tokens, cookies, usernames, and email addresses are never copied into the
+    audit payload.
+    """
+
+    state = getattr(request, "state", None)
+    api_token = bool(getattr(state, "api_token", False))
+    configured_interface = _bounded(
+        getattr(state, "restia_interface", None), 32
+    )
+    if configured_interface not in _INTERFACES:
+        if api_token:
+            configured_interface = "api"
+        elif os.getenv("AUTH_ENABLED", "true").lower() == "false":
+            configured_interface = "web"
+        else:
+            configured_interface = "web"
+
+    context = {
+        "actor_type": "api_token" if api_token else "account",
+        "actor_id": str(account.id),
+        "interface": configured_interface,
+        "credential_type": "api_token" if api_token else (
+            "local" if os.getenv("AUTH_ENABLED", "true").lower() == "false"
+            else "session"
+        ),
+        "credential_id": (
+            _bounded(getattr(state, "api_token_id", None), 255)
+            if api_token else None
+        ),
+        "workflow_id": _bounded(
+            getattr(state, "workflow_id", None)
+            or getattr(state, "automation_run_id", None),
+            255,
+        ),
+    }
+    db.info[SESSION_AUDIT_CONTEXT_KEY] = context
+    return dict(context)
+
+
+def build_action_audit_details(
+    db,
+    *,
+    owner_id: str,
+    reason: str,
+    outcome: str = "success",
+    idempotency_ref: object | None = None,
+    reversible: bool = False,
+    undo_ref: object | None = None,
+    domain_details: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Merge domain metadata with the required cross-interface audit shape."""
+
+    raw_context = db.info.get(SESSION_AUDIT_CONTEXT_KEY) or {}
+    actor_id = _bounded(raw_context.get("actor_id"), 255) or str(owner_id)
+    interface = _bounded(raw_context.get("interface"), 32)
+    if interface not in _INTERFACES:
+        interface = "domain_service"
+    actor_type = _bounded(raw_context.get("actor_type"), 32) or "service"
+    credential_type = (
+        _bounded(raw_context.get("credential_type"), 32) or "internal"
+    )
+    normalized_outcome = str(outcome or "").strip().lower()
+    if normalized_outcome not in _OUTCOMES:
+        raise ValueError("Unknown action audit outcome")
+
+    audit = {
+        "actor_type": actor_type,
+        "actor_id": actor_id,
+        "interface": interface,
+        "credential_type": credential_type,
+        "credential_id": _bounded(raw_context.get("credential_id"), 255),
+        "workflow_id": _bounded(raw_context.get("workflow_id"), 255),
+        "reason": _bounded(reason, 500) or "unspecified",
+        "outcome": normalized_outcome,
+        "idempotency_ref": _protected_reference(idempotency_ref),
+        "reversible": bool(reversible),
+        # Undo references are server-issued opaque IDs, not credentials. Keep
+        # them usable by the future reversal endpoint; raw idempotency keys are
+        # protected separately above.
+        "undo_ref": _bounded(undo_ref, 255),
+    }
+    details = dict(domain_details or {})
+    details["audit"] = audit
+    return details

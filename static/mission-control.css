@@ -227,6 +227,94 @@ button.mission-item:hover { background: color-mix(in srgb, var(--fg) 6%, transpa
   white-space: nowrap;
 }
 
+.mission-inbox-attention .mission-panel-body { max-height: 380px; }
+.mission-inbox-breakdown {
+  display: flex;
+  margin: 0;
+  padding: 8px 9px;
+  flex-wrap: wrap;
+  gap: 6px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 58%, transparent);
+}
+.mission-inbox-breakdown > div {
+  display: inline-flex;
+  min-height: 26px;
+  padding: 4px 8px;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid color-mix(in srgb, var(--border) 82%, transparent);
+  border-radius: 999px;
+  color: color-mix(in srgb, var(--fg) 64%, transparent);
+  background: color-mix(in srgb, var(--fg) 4%, transparent);
+  font-size: 11px;
+}
+.mission-inbox-breakdown dt { font-weight: 600; }
+.mission-inbox-breakdown dd {
+  margin: 0;
+  color: var(--fg);
+  font-variant-numeric: tabular-nums;
+  font-weight: 750;
+}
+.mission-inbox-breakdown-empty,
+.mission-inbox-age {
+  margin: 0;
+  padding: 9px 10px;
+  color: color-mix(in srgb, var(--fg) 50%, transparent);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.mission-inbox-breakdown-empty {
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 58%, transparent);
+  text-align: center;
+}
+.mission-inbox-previews {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.mission-inbox-preview {
+  min-width: 0;
+  padding: 9px 10px;
+}
+.mission-inbox-preview + .mission-inbox-preview {
+  border-top: 1px solid color-mix(in srgb, var(--border) 58%, transparent);
+}
+.mission-inbox-preview-heading {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+.mission-inbox-preview-heading strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--fg);
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.35;
+}
+.mission-inbox-preview-heading span {
+  flex: 0 0 auto;
+  color: color-mix(in srgb, var(--red) 74%, var(--fg));
+  font-size: 11px;
+  font-weight: 650;
+}
+.mission-inbox-preview-meta,
+.mission-inbox-preview-reason {
+  margin: 3px 0 0;
+  color: color-mix(in srgb, var(--fg) 51%, transparent);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.mission-inbox-preview-reason { color: color-mix(in srgb, var(--fg) 62%, transparent); }
+.mission-inbox-age {
+  border-top: 1px solid color-mix(in srgb, var(--border) 58%, transparent);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
 .mission-empty,
 .mission-source-error { margin: 0; padding: 20px 12px; color: color-mix(in srgb, var(--fg) 48%, transparent); font-size: 11px; text-align: center; }
 .mission-source-error { display: flex; flex-direction: column; gap: 4px; color: var(--color-error, #ef6b73); }
@@ -400,6 +488,9 @@ button.mission-item:hover { background: color-mix(in srgb, var(--fg) 6%, transpa
   .mission-panel { margin-bottom: 12px; }
   .mission-panel-body { max-height: none; }
   .mission-item { min-height: 56px; }
+  .mission-inbox-attention .mission-panel-body { max-height: none; }
+  .mission-inbox-preview { padding-block: 11px; }
+  .mission-inbox-age { text-align: left; }
   .mission-plan-form { grid-template-columns: 1fr auto; }
   .mission-plan-form input[type="text"] { grid-column: 1 / -1; }
   .mission-plan-form input,

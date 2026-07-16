@@ -3,7 +3,7 @@
 // workspace that remains useful when any individual source is unavailable.
 
 const SOURCE_KEYS = Object.freeze([
-  'calendar', 'project_work', 'goals', 'tasks', 'study_reviews', 'health',
+  'calendar', 'project_work', 'inbox', 'goals', 'tasks', 'study_reviews', 'health',
   'important_mail', 'notes_today', 'daily_brief', 'planning', 'progression',
 ]);
 
@@ -124,6 +124,58 @@ function source(name) {
   return value && typeof value === 'object'
     ? { ...value, status: text(value.status, 'ok'), items: rows(value.items) }
     : { status: 'empty', items: [], count: 0, truncated: false };
+}
+
+function inboxKindLabel(value) {
+  const normalized = text(value, 'Unclassified')
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .slice(0, 80);
+  return normalized.replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function normalizeInboxAttention(value) {
+  const safeValue = value && typeof value === 'object' ? value : {};
+  const unprocessedCount = Math.max(0, Math.floor(number(
+    safeValue.unprocessed_count ?? safeValue.count,
+  )));
+  const rawKinds = safeValue.kinds && typeof safeValue.kinds === 'object' && !Array.isArray(safeValue.kinds)
+    ? safeValue.kinds
+    : {};
+  const kinds = Object.entries(rawKinds)
+    .map(([kind, count]) => ({
+      kind: text(kind, 'unclassified').slice(0, 80),
+      label: inboxKindLabel(kind),
+      count: Math.max(0, Math.floor(number(count))),
+    }))
+    .filter((item) => item.count > 0)
+    .sort((left, right) => right.count - left.count || left.label.localeCompare(right.label))
+    .slice(0, 12);
+  const items = rows(safeValue.items).slice(0, 5).map((item) => {
+    const rawConfidence = item?.confidence;
+    const confidence = rawConfidence === null
+      || rawConfidence === undefined
+      || String(rawConfidence).trim() === ''
+      ? Number.NaN
+      : Number(rawConfidence);
+    return {
+      title: text(item?.title, 'Untitled capture').slice(0, 180),
+      kind: text(item?.kind, 'unclassified').slice(0, 80),
+      kindLabel: inboxKindLabel(item?.kind),
+      confidence: Number.isFinite(confidence)
+        ? Math.max(0, Math.min(100, Math.round(confidence)))
+        : null,
+      reason: text(item?.reason, 'Classification reason not available.').slice(0, 240),
+    };
+  });
+  return {
+    unavailable: sourceUnavailable(safeValue),
+    unprocessedCount,
+    kinds,
+    items,
+    oldestAt: text(safeValue.oldest_at),
+    truncated: Boolean(safeValue.truncated || unprocessedCount > items.length),
+  };
 }
 
 function sourceMessage(value) {
@@ -307,6 +359,86 @@ function renderImportantMail() {
       detail: text(message.reason),
     }));
   });
+  return section;
+}
+
+function renderInboxAttention() {
+  const value = source('inbox');
+  const inbox = normalizeInboxAttention(value);
+  const section = make('section', {
+    className: 'mission-panel mission-inbox-attention',
+    attrs: { 'aria-labelledby': 'mission-inbox-title' },
+  });
+  const headingStatus = inbox.unavailable
+    ? sourceMessage(value)
+    : inbox.unprocessedCount
+      ? `${inbox.unprocessedCount} unprocessed capture${inbox.unprocessedCount === 1 ? '' : 's'}`
+      : 'Inbox is clear';
+  const heading = make('header', { className: 'mission-panel-heading' }, [
+    make('div', {}, [
+      make('h2', { id: 'mission-inbox-title', text: 'Inbox attention' }),
+      make('p', { text: headingStatus }),
+    ]),
+    button('Open Inbox', 'open-target', {
+      className: 'mission-text-btn', target: 'inbox', title: 'Open Universal Inbox',
+    }),
+  ]);
+  const body = make('div', { className: 'mission-panel-body' });
+
+  if (inbox.unavailable) {
+    body.appendChild(sourceError(value));
+  } else if (!inbox.unprocessedCount) {
+    body.appendChild(emptyState('Nothing needs classification or processing.'));
+  } else {
+    if (inbox.kinds.length) {
+      const breakdown = make('dl', {
+        className: 'mission-inbox-breakdown',
+        attrs: { 'aria-label': 'Inbox classification breakdown' },
+      });
+      inbox.kinds.forEach((kind) => breakdown.appendChild(make('div', {}, [
+        make('dt', { text: kind.label }),
+        make('dd', { text: kind.count }),
+      ])));
+      body.appendChild(breakdown);
+    } else {
+      body.appendChild(make('p', {
+        className: 'mission-inbox-breakdown-empty',
+        text: 'Classification breakdown unavailable.',
+      }));
+    }
+
+    if (inbox.items.length) {
+      const previews = make('ol', {
+        className: 'mission-inbox-previews',
+        attrs: { 'aria-label': 'Oldest Inbox captures awaiting attention' },
+      });
+      inbox.items.forEach((item) => previews.appendChild(make('li', {
+        className: 'mission-inbox-preview',
+      }, [
+        make('div', { className: 'mission-inbox-preview-heading' }, [
+          make('strong', { text: item.title }),
+          make('span', { text: item.kindLabel }),
+        ]),
+        make('p', {
+          className: 'mission-inbox-preview-meta',
+          text: item.confidence === null ? 'Confidence unavailable' : `${item.confidence}% confidence`,
+        }),
+        make('p', { className: 'mission-inbox-preview-reason', text: `Reason: ${item.reason}` }),
+      ])));
+      body.appendChild(previews);
+    } else {
+      body.appendChild(emptyState('Previews are unavailable. Open Inbox to review the captures.'));
+    }
+
+    body.appendChild(make('p', {
+      className: 'mission-inbox-age',
+      text: inbox.oldestAt
+        ? `Oldest capture ${formatDate(inbox.oldestAt, { time: true })}${inbox.truncated ? ' · showing up to 5' : ''}`
+        : `Oldest capture time unavailable${inbox.truncated ? ' · showing up to 5' : ''}`,
+    }));
+  }
+
+  section.append(heading, body);
   return section;
 }
 
@@ -580,13 +712,31 @@ function render() {
   }
   renderSummary();
   refs.grid.append(
-    renderFocus(), renderPlanning(), renderProgression(), renderCalendar(),
+    renderFocus(), renderInboxAttention(), renderPlanning(), renderProgression(), renderCalendar(),
     renderProjectWork(), renderNotesToday(), renderImportantMail(), renderDailyBrief(),
     renderTasks(), renderGoals(), renderReviews(), renderHealth(),
   );
 }
 
+async function activateInboxNavigation(activate = null) {
+  const handler = activate || (typeof window !== 'undefined' ? window.activateNavigationItem : null);
+  if (typeof handler !== 'function') return false;
+  return (await handler('inbox')) !== false;
+}
+
 function triggerTarget(target) {
+  if (target === 'inbox') {
+    if (typeof window.activateNavigationItem !== 'function') {
+      notify('Inbox navigation is unavailable', true);
+      return false;
+    }
+    void activateInboxNavigation(window.activateNavigationItem).then((opened) => {
+      if (!opened) notify('Inbox could not be opened', true);
+    }).catch((error) => {
+      notify(text(error?.message, 'Inbox could not be opened'), true);
+    });
+    return true;
+  }
   const ids = {
     'new-chat': ['sidebar-new-chat-btn', 'rail-new-session'],
     projects: ['tool-projects-btn', 'rail-projects'],
@@ -944,6 +1094,7 @@ export function refresh() {
 export const __test = Object.freeze({
   localOffsetMinutes, focusCandidates, mapBackendActions,
   sourceMessage, sourceUnavailable, healthUnavailable,
+  normalizeInboxAttention, activateInboxNavigation,
 });
 
 const missionControlModule = { init, open, close, toggle, isOpen, refresh, __test };
