@@ -990,6 +990,17 @@ app.include_router(setup_notification_center_routes(task_scheduler))
 from routes.planner_routes import setup_planner_routes
 app.include_router(setup_planner_routes())
 
+# Restia V3 Life OS planning spine. These APIs all resolve the same immutable
+# principal used by browser sessions and scoped API tokens; no interface owns a
+# parallel life database.
+from routes.life_routes import setup_life_routes
+from routes.action_policy_routes import setup_action_policy_routes
+from routes.focus_routes import setup_focus_routes
+
+app.include_router(setup_life_routes())
+app.include_router(setup_action_policy_routes())
+app.include_router(setup_focus_routes())
+
 # Email
 from routes.email_routes import setup_email_routes
 email_router = setup_email_routes()
@@ -1059,6 +1070,10 @@ async def serve_today(request: Request):
 
 @app.get("/activity")
 async def serve_activity(request: Request):
+    return await serve_index(request)
+
+@app.get("/life")
+async def serve_life(request: Request):
     return await serve_index(request)
 
 # Per-tool deep-link routes — all serve the same SPA, the JS auto-opens

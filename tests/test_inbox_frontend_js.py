@@ -210,10 +210,13 @@ def test_list_pagination_sends_cursor_and_merges_pages_without_duplicates():
     ]
 
 
-def test_unsupported_processing_is_disabled_and_409_is_not_reported_as_success():
+def test_life_record_processing_is_enabled_and_409_is_not_reported_as_success():
     result = _node_eval(
         """
-        const availability = Object.fromEntries(['task', 'archive', 'note', 'project_information'].map(kind => {
+        const availability = Object.fromEntries([
+          'task', 'event', 'note', 'person_update', 'decision', 'reference_material',
+          'expense', 'goal', 'habit', 'someday_idea', 'archive', 'project_information',
+        ].map(kind => {
           const item = inbox.normalizeInboxItem({ id: kind, content: kind, kind, status: 'inbox' });
           return [kind, inbox.__test.processAvailability(item)];
         }));
@@ -233,8 +236,13 @@ def test_unsupported_processing_is_disabled_and_409_is_not_reported_as_success()
     assert result["availability"]["task"]["enabled"] is True
     assert result["availability"]["archive"]["enabled"] is False
     assert "Use Archive below" in result["availability"]["archive"]["message"]
-    assert result["availability"]["note"]["enabled"] is False
-    assert "No safe automatic processor" in result["availability"]["note"]["message"]
+    for kind in (
+        "task", "event", "note", "person_update", "decision",
+        "reference_material", "expense", "goal", "habit", "someday_idea",
+    ):
+        assert result["availability"][kind]["enabled"] is True
+    assert "To Do authority" in result["availability"]["task"]["message"]
+    assert "source-backed Note Life record" in result["availability"]["note"]["message"]
     assert result["availability"]["project_information"]["enabled"] is False
     assert "project destination" in result["availability"]["project_information"]["message"]
     assert result["error"] == {"message": "No safe adapter yet (Email)", "status": 409}

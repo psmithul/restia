@@ -606,6 +606,79 @@ async def test_today_snapshot_is_owner_scoped_deterministic_and_redacted(mission
         "important_mail:account-a:42",
     ]
     assert len(body["next_actions"]) == mission.NEXT_ACTION_LIMIT
+
+    section_keys = {
+        "primary_outcome",
+        "top_three_actions",
+        "events",
+        "must_do_tasks",
+        "people_awaiting_responses",
+        "health_routine_commitments",
+        "risks_conflicts",
+        "suggested_schedule",
+        "restia_owned_work",
+    }
+    assert section_keys <= set(body)
+    assert body["primary_outcome"] == body["top_three_actions"][0]
+    assert [row["id"] for row in body["top_three_actions"]] == [
+        "failed_task:run-failed",
+        "overdue_project_work:item-overdue",
+        "important_mail:account-a:42",
+    ]
+    assert body["top_three_actions"][1]["supported_project"] == {
+        "id": "project-alice",
+        "title": "Applications",
+    }
+    assert [row["id"] for row in body["events"]] == [
+        "event-utc-boundary",
+        "event-local",
+    ]
+    assert [row["id"] for row in body["must_do_tasks"]] == [
+        "project_work:item-overdue",
+        "study_review:study-alice",
+    ]
+    assert [row["person"] for row in body["people_awaiting_responses"]] == [
+        "Admissions Office <admissions@example.test>"
+    ]
+    assert body["health_routine_commitments"] == []
+    assert {
+        "failed_task:run-failed",
+        "overdue_project:item-overdue",
+        "service_health:providers",
+        "mail_risk:account-a:42",
+    } <= {row["id"] for row in body["risks_conflicts"]}
+    assert [
+        (row["start"], row["end"])
+        for row in body["suggested_schedule"]
+    ] == [
+        ("2026-07-15T12:00:00", "2026-07-15T12:30:00"),
+        ("2026-07-15T12:30:00", "2026-07-15T13:15:00"),
+        ("2026-07-15T13:15:00", "2026-07-15T13:30:00"),
+    ]
+    assert [row["kind"] for row in body["restia_owned_work"]] == [
+        "failed_run", "running_run", "scheduled"
+    ]
+
+    recommendation_fields = {
+        "why_now",
+        "estimated_minutes",
+        "delay_cost",
+        "supported_goal",
+        "supported_project",
+        "source_evidence",
+        "what_restia_can_handle",
+    }
+    recommendation_rows = [body["primary_outcome"]]
+    for key in section_keys - {"primary_outcome"}:
+        recommendation_rows.extend(body[key])
+    for row in recommendation_rows:
+        assert recommendation_fields <= set(row)
+        assert isinstance(row["estimated_minutes"], int)
+        assert row["why_now"]
+        assert row["delay_cost"]
+        assert row["source_evidence"]
+        assert row["what_restia_can_handle"]
+
     assert sources["health"] == {
         "status": "degraded",
         "overall": "degraded",
@@ -624,6 +697,114 @@ async def test_today_snapshot_is_owner_scoped_deterministic_and_redacted(mission
     assert "SENSITIVE_EMAIL_BODY_MUST_NOT_LEAK" not in rendered
     assert "SENSITIVE_ARBITRARY_LLM_RESULT" not in rendered
     assert "private long-form note body" not in rendered
+
+
+def test_v3_today_sections_are_hard_bounded_deterministic_and_non_mutating():
+    def source(items):
+        return {
+            "status": "ok",
+            "items": items,
+            "count": len(items),
+            "truncated": False,
+        }
+
+    calendar = [
+        {
+            "id": f"event-{index:02d}",
+            "title": f"Overlapping event {index:02d}",
+            "start": "2026-07-15T01:00:00",
+            "end": "2026-07-15T02:00:00",
+            "all_day": False,
+            "importance": "normal",
+        }
+        for index in range(mission.TODAY_EVENT_LIMIT + 5)
+    ]
+    planning = [
+        {
+            "id": f"routine-{index:02d}",
+            "title": f"Morning workout {index:02d}",
+            "details": "Daily exercise habit",
+            "status": "open",
+            "priority": "normal",
+            "due_date": "2026-07-15",
+            "due_today": True,
+            "overdue": False,
+        }
+        for index in range(mission.TODAY_MUST_DO_LIMIT + 5)
+    ]
+    tasks = [
+        {
+            "kind": "failed_run",
+            "run_id": f"run-{index:02d}",
+            "task_id": f"task-{index:02d}",
+            "task_name": f"Automation {index:02d}",
+            "status": "error",
+            "started_at": "2026-07-15T03:00:00Z",
+            "scheduled_for": None,
+            "finished_at": None,
+        }
+        for index in range(mission.TODAY_RESTIA_WORK_LIMIT + 5)
+    ]
+    mail = [
+        {
+            "id": f"account:{index:02d}",
+            "subject": f"Please reply {index:02d}",
+            "sender": f"Person {index:02d} <person{index:02d}@example.test>",
+            "score": 3,
+            "reason": "Reply needed today",
+        }
+        for index in range(mission.TODAY_PEOPLE_LIMIT + 5)
+    ]
+    sources = {
+        "calendar": source(calendar),
+        "project_work": source([]),
+        "planning": source(planning),
+        "goals": source([]),
+        "tasks": source(tasks),
+        "study_reviews": source([]),
+        "important_mail": source(mail),
+        "notes_today": source([]),
+        "health": {
+            "status": "ok",
+            "overall": "ok",
+            "services": [],
+            "truncated": False,
+        },
+    }
+    original = json.loads(json.dumps(sources))
+    next_actions = mission._build_next_actions(sources)
+
+    first = mission._build_today_sections(
+        sources,
+        next_actions=next_actions,
+        local_date=_NOW.date(),
+        local_now=datetime(2026, 7, 15, 12, 0),
+        utc_offset_minutes=330,
+    )
+    second = mission._build_today_sections(
+        sources,
+        next_actions=next_actions,
+        local_date=_NOW.date(),
+        local_now=datetime(2026, 7, 15, 12, 0),
+        utc_offset_minutes=330,
+    )
+
+    assert first == second
+    assert sources == original
+    assert first["primary_outcome"] == first["top_three_actions"][0]
+    assert len(first["top_three_actions"]) == mission.NEXT_ACTION_LIMIT
+    assert len(first["events"]) == mission.TODAY_EVENT_LIMIT
+    assert len(first["must_do_tasks"]) == mission.TODAY_MUST_DO_LIMIT
+    assert len(first["people_awaiting_responses"]) == mission.TODAY_PEOPLE_LIMIT
+    assert len(first["health_routine_commitments"]) == mission.TODAY_ROUTINE_LIMIT
+    assert len(first["risks_conflicts"]) == mission.TODAY_RISK_LIMIT
+    assert len(first["suggested_schedule"]) == mission.TODAY_SCHEDULE_LIMIT
+    assert len(first["restia_owned_work"]) == mission.TODAY_RESTIA_WORK_LIMIT
+    assert all(
+        row["kind"] == "calendar_conflict" for row in first["risks_conflicts"]
+    )
+    assert first["suggested_schedule"][0]["start"] == "2026-07-15T12:00:00"
+    assert first["suggested_schedule"][-1]["end"] == "2026-07-15T13:30:00"
 
 
 @pytest.mark.anyio

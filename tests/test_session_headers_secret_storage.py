@@ -113,7 +113,7 @@ def test_session_header_migration_failure_log_never_contains_bound_secret(
     monkeypatch.setattr(database, "engine", engine)
     monkeypatch.setattr(
         secret_storage,
-        "encrypt",
+        "encrypt_plaintext",
         lambda _value: (_ for _ in ()).throw(RuntimeError(f"failed for {secret}")),
     )
     caplog.set_level("WARNING", logger="core.database")

@@ -182,6 +182,23 @@ def test_create_token_accepts_cookbook_read_scope(monkeypatch, token_routes_mod)
     assert resp["scopes"] == ["cookbook:read"]
 
 
+def test_life_profile_grants_read_before_write(monkeypatch, token_routes_mod):
+    monkeypatch.setenv("AUTH_ENABLED", "true")
+    mod = token_routes_mod
+    monkeypatch.setattr(mod, "get_current_user", lambda req: req.state.current_user)
+
+    req = _req("alice", is_admin=True)
+    create_token = _get_handler(mod, "POST", "/tokens")
+    resp = create_token(request=req, name="life-client", profile="life_os")
+
+    assert resp["scopes"] == ["life:read", "life:write"]
+    req.app.state.auth_manager.issue_api_token.assert_called_once_with(
+        "alice",
+        name="life-client",
+        scopes=["life:read", "life:write"],
+    )
+
+
 def test_cookbook_launch_scope_implies_read(monkeypatch, token_routes_mod):
     monkeypatch.setenv("AUTH_ENABLED", "true")
     mod = token_routes_mod

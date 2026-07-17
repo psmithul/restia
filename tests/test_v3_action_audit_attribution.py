@@ -345,7 +345,10 @@ def test_every_inbox_transition_audit_has_required_reason_outcome_and_undo_shape
         assert isinstance(audit["reason"], str) and audit["reason"]
         assert audit["outcome"] == "success"
         assert isinstance(audit["reversible"], bool)
-        assert audit["undo_ref"] is None
+        if audit["reversible"]:
+            assert isinstance(audit["undo_ref"], str) and audit["undo_ref"]
+        else:
+            assert audit["undo_ref"] is None
 
 
 def test_invalid_action_audit_outcome_fails_closed_without_persisting(audit_env):

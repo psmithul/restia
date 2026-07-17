@@ -11,13 +11,17 @@ backup, leaked container layer, sibling-tenant read). Does **not**
 protect against a process compromise — anyone who can read this
 module's memory or the key file has plaintext.
 
-Encrypted values carry an `enc:` prefix so the migration is
-idempotent: passing an already-encrypted value to `encrypt()` is a
-no-op; passing a plaintext value to `decrypt()` returns it
-unchanged. That lets legacy rows coexist with new ones until a
-single migration pass rewrites them.
+Encrypted values carry an `enc:` prefix. Credential/secret paths reserve that
+prefix and :func:`encrypt` preserves it byte-for-byte, including malformed or
+wrong-key envelopes, so recovery with the original key remains possible and
+corruption continues to fail closed. Arbitrary content uses
+:func:`encrypt_plaintext` instead; it wraps the exact text even when it begins
+with ``enc:`` or is itself a complete Fernet-looking token. Legacy plaintext
+still passes through :func:`decrypt` unchanged until a migration rewrites it.
 """
 
+import base64
+import binascii
 import os
 import logging
 import stat
@@ -32,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 _KEY_PATH = Path(APP_KEY_FILE)
 _PREFIX = "enc:"
+_CONTENT_PREFIX = "enc:c1:"
 _fernet: Fernet | None = None
 
 
@@ -150,9 +155,64 @@ def _get_fernet() -> Fernet:
     return _fernet
 
 
+def _envelope_token(value: str) -> str | None:
+    if value.startswith(_CONTENT_PREFIX):
+        return value[len(_CONTENT_PREFIX):]
+    if value.startswith(_PREFIX):
+        return value[len(_PREFIX):]
+    return None
+
+
+def _has_fernet_envelope_shape(value: str) -> bool:
+    """Recognize a Fernet envelope without consulting the active key.
+
+    Key-based recognition is destructive during rotation: a perfectly valid
+    token from the previous key would look like plaintext and get wrapped a
+    second time.  Fernet has a stable binary frame (version, timestamp, IV,
+    block-aligned ciphertext, HMAC), which is enough to distinguish stored
+    envelopes from ordinary text such as ``enc:private note`` while preserving
+    wrong-key ciphertext byte-for-byte.
+    """
+    if not value:
+        return False
+    token = _envelope_token(value)
+    if token is None:
+        return False
+    try:
+        raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
+    except (binascii.Error, ValueError, UnicodeEncodeError):
+        return False
+    # 1 version + 8 timestamp + 16 IV + >=16 ciphertext + 32 HMAC.
+    return (
+        len(raw) >= 73
+        and raw[0] == 0x80
+        and (len(raw) - 57) % 16 == 0
+    )
+
+
+def encrypt_plaintext(plaintext: str) -> str:
+    """Encrypt an application plaintext value even when it resembles a token.
+
+    Arbitrary content columns use this function because a user may paste a
+    literal Fernet-looking string. Secret/credential migrations use
+    :func:`encrypt` instead so existing envelopes remain idempotent across key
+    rotation.
+    """
+    if not plaintext:
+        return plaintext or ""
+    token = _get_fernet().encrypt(plaintext.encode("utf-8")).decode("ascii")
+    return _CONTENT_PREFIX + token
+
+
 def encrypt(plaintext: str) -> str:
-    """Encrypt a string. Empty input passes through. Already-encrypted
-    values pass through unchanged so re-encrypting is a no-op."""
+    """Encrypt a credential/secret string with fail-closed idempotency.
+
+    Any reserved ``enc:`` value passes through unchanged. This conservative
+    rule is essential for a wrong-key or frame-damaged token: wrapping the bad
+    envelope as plaintext would turn a safe empty read into token text and can
+    permanently destroy recovery. User-authored content must use
+    :func:`encrypt_plaintext` (normally through ``EncryptedContentText``).
+    """
     if not plaintext:
         return plaintext or ""
     if plaintext.startswith(_PREFIX):
@@ -169,8 +229,11 @@ def decrypt(value: str) -> str:
         return value or ""
     if not value.startswith(_PREFIX):
         return value
+    token = _envelope_token(value)
+    if token is None:
+        return value
     try:
-        return _get_fernet().decrypt(value[len(_PREFIX):].encode("ascii")).decode("utf-8")
+        return _get_fernet().decrypt(token.encode("ascii")).decode("utf-8")
     except InvalidToken:
         logger.error("Failed to decrypt stored secret — wrong key or corrupt token")
         return ""
@@ -180,4 +243,30 @@ def decrypt(value: str) -> str:
 
 
 def is_encrypted(value: str) -> bool:
-    return bool(value) and value.startswith(_PREFIX)
+    """Return whether ``value`` has a structurally valid Fernet envelope.
+
+    Prefix-only checks are unsafe for user-authored encrypted text columns:
+    ``enc:hello`` is plaintext. Key-based checks are also unsafe because they
+    would rewrite ciphertext from a previous key. Callers that need to prove
+    the active key can decrypt a token must use :func:`is_decryptable`.
+    """
+    return _has_fernet_envelope_shape(value)
+
+
+def is_content_encrypted(value: str) -> bool:
+    """Return whether ``value`` is a V3 content envelope."""
+    return bool(value) and value.startswith(_CONTENT_PREFIX) and is_encrypted(value)
+
+
+def is_decryptable(value: str) -> bool:
+    """Return whether a structured envelope authenticates with the active key."""
+    if not is_encrypted(value):
+        return False
+    token = _envelope_token(value)
+    if token is None:
+        return False
+    try:
+        _get_fernet().decrypt(token.encode("ascii"))
+        return True
+    except (InvalidToken, ValueError, UnicodeError):
+        return False

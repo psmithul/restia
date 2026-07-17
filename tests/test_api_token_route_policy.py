@@ -23,6 +23,9 @@ ROOT = Path(__file__).resolve().parent.parent
         ("POST", "/api/v1/chat", ["chat"]),
         ("GET", "/api/inbox", ["todos:read"]),
         ("POST", "/api/inbox", ["todos:write"]),
+        ("GET", "/api/life/entities", ["life:read"]),
+        ("POST", "/api/life/entities", ["life:write"]),
+        ("GET", "/api/life/focus/current", ["life:write"]),
         ("GET", "/api/codex/todos", ["todos:write"]),
         ("GET", "/api/claude/plugin.zip", ["todos:read"]),
         ("GET", "/api/codex/emails/42", ["email:draft"]),
@@ -53,6 +56,8 @@ def test_explicit_api_token_routes_accept_their_scopes(method, path, scopes):
         ("DELETE", "/api/codex/todos", ["todos:write"]),
         ("GET", "/api/codex/todos/extra", ["todos:read"]),
         ("GET", "/api/inbox//", ["todos:read"]),
+        ("GET", "/api/life/entities", ["todos:read"]),
+        ("POST", "/api/life/entities", ["life:read"]),
     ],
 )
 def test_unknown_or_wrong_scope_api_token_routes_fail_closed(method, path, scopes):
@@ -146,12 +151,38 @@ denied = [
     todos.get("/api/cookbook/state"),
     todos.get("/api/codex/emails"),
     todos.get("/api/codex/cookbook/tasks"),
+    todos.get("/api/life/entities"),
     todos.get("/api/tokens"),
     # Auth-exempt paths must not bypass policy when an ody_ credential is sent.
     todos.get("/api/auth/status"),
 ]
 for response in denied:
     assert response.status_code == 403, response.text
+
+# A Life write credential resolves to the same principal as the browser and
+# carries the domain-local read implication needed for optimistic workflows.
+life_token = issue("life-os", "life:write")
+life = TestClient(
+    app_module.app,
+    headers={"Authorization": f"Bearer {life_token}"},
+)
+life_created = life.post(
+    "/api/life/entities",
+    json={
+        "entity_type": "task",
+        "title": "Cross-interface task",
+        "properties": {"next_action": "Verify the shared principal"},
+        "idempotency_key": "real-app-life-task",
+    },
+)
+assert life_created.status_code == 201, life_created.text
+life_entity_id = life_created.json()["entity"]["id"]
+life_list = life.get("/api/life/entities")
+assert life_list.status_code == 200, life_list.text
+assert [row["id"] for row in life_list.json()["items"]] == [life_entity_id]
+browser_life = admin.get("/api/life/entities")
+assert browser_life.status_code == 200, browser_life.text
+assert [row["id"] for row in browser_life.json()["items"]] == [life_entity_id]
 
 chat_token = issue("paired-chat", "chat")
 chat = TestClient(

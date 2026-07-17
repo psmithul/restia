@@ -150,9 +150,11 @@ export function initSidebarLayout(Storage, opts) {
     [hamburgerBtn, sidebarToggleBtn].forEach((btn) => {
       if (!btn) return;
       btn.setAttribute('aria-expanded', sidebarHidden ? 'false' : 'true');
-      const action = !sidebarHidden
-        ? 'Collapse sidebar to navigation rail'
-        : (railHidden ? 'Show sidebar' : 'Hide navigation rail');
+      const action = _isMobileViewport()
+        ? (sidebarHidden ? 'Open more tools' : 'Close more tools')
+        : (!sidebarHidden
+          ? 'Collapse sidebar to navigation rail'
+          : (railHidden ? 'Show sidebar' : 'Hide navigation rail'));
       btn.setAttribute('aria-label', action);
       btn.title = action;
     });

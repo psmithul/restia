@@ -7,6 +7,38 @@
   padding: 4px 0 10px;
 }
 
+.v3-primary-navigation {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 1px;
+  padding: 2px 0 5px;
+}
+
+.v3-primary-navigation > .list-item,
+.v3-primary-navigation > button.list-item {
+  width: 100%;
+  min-height: 38px;
+  height: auto;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  font-family: inherit;
+}
+
+.v3-primary-navigation > .list-item:focus-visible,
+.v3-primary-navigation > button.list-item:focus-visible {
+  outline: 2px solid var(--accent, var(--red));
+  outline-offset: -2px;
+}
+
+.v3-primary-navigation > .list-item.is-active,
+.v3-primary-navigation > .list-item[aria-current="page"] {
+  color: var(--fg);
+  background: color-mix(in srgb, var(--accent, var(--red)) 13%, transparent);
+  box-shadow: inset 2px 0 0 var(--accent, var(--red));
+}
+
 #sidebar[data-navigation-version="2"] > .sidebar-inner > button.list-item {
   width: 100%;
   min-height: 34px;
@@ -137,6 +169,11 @@ body.v2-navigation-ready .settings-appearance-panel .vis-row:has(input[data-ui-k
   display: none !important;
 }
 
+#icon-rail > .rail-separator,
+#icon-rail > div[style*="flex:1"] {
+  display: none !important;
+}
+
 #icon-rail .icon-rail-btn.is-active,
 #icon-rail .icon-rail-btn[aria-current="page"] {
   color: var(--accent, var(--red));
@@ -146,11 +183,17 @@ body.v2-navigation-ready .settings-appearance-panel .vis-row:has(input[data-ui-k
 .v2-mobile-nav { display: none; }
 
 @media (max-width: 768px) {
-  /* The five-item mobile bar owns navigation in V2. Keeping the legacy
-     floating hamburger as well creates a duplicate target and can cover
-     workspace header actions such as Mission Control's Close button. */
+  /* The five canonical destinations stay in the bottom bar. The hamburger is
+     the single contextual entry to More tools and the specialist drawer. */
   body.v2-navigation-ready .hamburger-btn {
-    display: none !important;
+    display: flex !important;
+    width: 44px;
+    height: 44px;
+    top: 6px;
+    right: 4px;
+    left: auto;
+    border-radius: 12px;
+    background: color-mix(in srgb, var(--panel) 88%, transparent);
   }
 
   body.v2-navigation-ready .chat-container {
@@ -205,7 +248,8 @@ body.v2-navigation-ready .settings-appearance-panel .vis-row:has(input[data-ui-k
   body.call-active .v2-mobile-nav { display: none; }
 
   body.mission-control-view .mission-workspace,
-  body.projects-view #projects-workspace {
+  body.projects-view #projects-workspace,
+  body.life-view .life-workspace {
     padding-bottom: calc(72px + env(safe-area-inset-bottom, 0px));
   }
 
@@ -214,7 +258,9 @@ body.v2-navigation-ready .settings-appearance-panel .vis-row:has(input[data-ui-k
   }
 
   #sidebar[data-navigation-version="2"] > .sidebar-inner > button.list-item,
-  .v2-nav-group-heading { min-height: 44px; height: 44px; }
+  .v2-nav-group-heading,
+  .v3-primary-navigation > .list-item,
+  .v3-primary-navigation > button.list-item { min-height: 44px; height: 44px; }
   .v2-nav-group-panel > .list-item,
   .v2-nav-group-panel > button.list-item { min-height: 44px; }
 }

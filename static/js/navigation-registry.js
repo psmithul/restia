@@ -76,12 +76,19 @@ export const NAVIGATION_GROUPS = deepFreeze([
   { id: 'quick-actions', label: 'Quick actions', order: 80, hidden: true },
 ]);
 
+// V3 has one stable primary hierarchy on every adaptive surface. Canonical
+// ids intentionally retain the V2/public route owners so existing commands,
+// persisted recents, and deep links keep resolving while labels simplify.
+export const PRIMARY_NAVIGATION_IDS = deepFreeze([
+  'chat', 'home', 'inbox', 'life', 'search',
+]);
+
 export const NAVIGATION_ITEMS = deepFreeze([
   // Home and shell actions.
   navigationItem({
     id: 'home',
     aliases: ['today', 'mission-control'],
-    label: 'Home',
+    label: 'Today',
     shortLabel: 'Today',
     description: 'Open the personal Mission Control overview.',
     icon: 'home',
@@ -92,28 +99,29 @@ export const NAVIGATION_ITEMS = deepFreeze([
     legacyIds: { rail: ['rail-home'], sidebar: ['v2-home-nav'] },
     containerId: 'mission-control-workspace',
     command: {
-      id: 'home', title: 'Home', hint: 'Open Mission Control', icon: '🏠',
+      id: 'home', title: 'Today', hint: 'Open Mission Control', icon: '🏠',
       keywords: ['home', 'today', 'mission', 'control', 'overview'],
       triggerIds: ['v2-home-nav', 'rail-home'], afterTriggerId: null, handler: null,
     },
   }),
   navigationItem({
     id: 'chat',
-    aliases: ['chats'],
-    label: 'Chat',
+    aliases: ['chats', 'restia', 'assistant'],
+    label: 'Restia',
+    shortLabel: 'Restia',
     description: 'Return to a chat or open a completed background chat.',
     icon: 'chat',
     group: 'home',
     order: 10,
-    kind: 'contextual',
     route: '/',
-    surfaces: ['rail', 'mobile', 'route'],
-    legacyIds: { rail: ['rail-chats'], auxiliary: ['session-list'] },
+    surfaces: ['rail', 'sidebar', 'mobile', 'route'],
+    legacyIds: {
+      rail: ['rail-restia', 'rail-chats'],
+      sidebar: ['v3-restia-nav'],
+      auxiliary: ['session-list'],
+    },
     containerId: 'chat-container',
     visibility: {
-      defaultVisible: false,
-      contextual: true,
-      contextKey: 'background-chat-ready',
       preferences: { sidebar: 'sessions-section' },
     },
     slash: {
@@ -159,7 +167,7 @@ export const NAVIGATION_ITEMS = deepFreeze([
     group: 'home',
     order: 30,
     kind: 'action',
-    surfaces: ['rail', 'sidebar', 'command-palette'],
+    surfaces: ['rail', 'sidebar', 'mobile', 'command-palette'],
     legacyIds: { rail: ['rail-search-btn'], sidebar: ['sidebar-search-btn'] },
     visibility: { preferences: { sidebar: 'sidebar-search' } },
     command: {
@@ -231,6 +239,24 @@ export const NAVIGATION_ITEMS = deepFreeze([
     },
   }),
   navigationItem({
+    id: 'life',
+    aliases: ['life-os', 'life-workspace'],
+    label: 'Life',
+    description: 'Review the owner-scoped goals, projects, tasks, habits, people, and decisions that make up your life map.',
+    icon: 'life',
+    group: 'work',
+    order: 7,
+    route: '/life',
+    surfaces: ['rail', 'sidebar', 'mobile', 'command-palette', 'route'],
+    legacyIds: { rail: ['rail-life'], sidebar: ['v3-life-nav'] },
+    containerId: 'life-workspace',
+    command: {
+      id: 'life', title: 'Life', hint: 'Open your life map', icon: '◇',
+      keywords: ['life', 'goals', 'projects', 'habits', 'decisions', 'people'],
+      triggerIds: ['v3-life-nav', 'rail-life'], afterTriggerId: null, handler: null,
+    },
+  }),
+  navigationItem({
     id: 'projects',
     label: 'Projects',
     description: 'Open the full project and workflow workspace.',
@@ -238,7 +264,7 @@ export const NAVIGATION_ITEMS = deepFreeze([
     group: 'work',
     order: 10,
     route: '/projects',
-    surfaces: ['rail', 'sidebar', 'mobile', 'command-palette', 'route'],
+    surfaces: ['rail', 'sidebar', 'command-palette', 'route'],
     legacyIds: { rail: ['rail-projects'], sidebar: ['tool-projects-btn'] },
     containerId: 'projects-workspace',
     visibility: { preferences: { rail: 'tool-projects', sidebar: 'tool-projects' } },
@@ -257,7 +283,7 @@ export const NAVIGATION_ITEMS = deepFreeze([
     order: 20,
     route: '/tasks',
     deepLinks: ['#task-{id}'],
-    surfaces: ['rail', 'sidebar', 'mobile', 'command-palette', 'route', 'deep-link'],
+    surfaces: ['rail', 'sidebar', 'command-palette', 'route', 'deep-link'],
     legacyIds: { rail: ['rail-tasks'], sidebar: ['tool-tasks-btn'] },
     modal: { ids: ['tasks-modal'], manager: 'auto', kind: 'modal' },
     visibility: { preferences: { sidebar: 'tool-tasks' } },
@@ -278,7 +304,7 @@ export const NAVIGATION_ITEMS = deepFreeze([
     order: 30,
     route: '/calendar',
     deepLinks: ['#event-{uid}'],
-    surfaces: ['rail', 'sidebar', 'mobile', 'command-palette', 'route', 'deep-link'],
+    surfaces: ['rail', 'sidebar', 'command-palette', 'route', 'deep-link'],
     legacyIds: { rail: ['rail-calendar'], sidebar: ['tool-calendar-btn'] },
     modal: { ids: ['calendar-modal'], manager: 'registered', kind: 'modal' },
     visibility: { preferences: { sidebar: 'tool-calendar' } },
@@ -628,12 +654,28 @@ export const NAVIGATION_ITEMS = deepFreeze([
     group: 'system',
     order: 25,
     route: '/activity',
-    surfaces: ['rail', 'sidebar', 'mobile', 'command-palette', 'route'],
+    surfaces: ['rail', 'sidebar', 'command-palette', 'route'],
     legacyIds: { rail: ['rail-activity'], sidebar: ['v2-activity-nav'] },
     command: {
       id: 'activity', title: 'Activity', hint: 'Open Activity Center', icon: '📊',
       keywords: ['activity', 'maintainer', 'health', 'status', 'jobs', 'runs'],
       triggerIds: ['v2-activity-nav', 'rail-activity'], afterTriggerId: null, handler: null,
+    },
+  }),
+  navigationItem({
+    id: 'notifications',
+    label: 'Notifications',
+    description: 'Review communication, calendar, task, and background-work attention.',
+    icon: 'bell',
+    group: 'system',
+    order: 24,
+    kind: 'action',
+    surfaces: ['sidebar', 'command-palette'],
+    legacyIds: { sidebar: ['rail-notif-center'] },
+    command: {
+      id: 'notifications', title: 'Notifications', hint: 'Open attention center', icon: '🔔',
+      keywords: ['notifications', 'attention', 'unread', 'alerts'],
+      triggerIds: ['rail-notif-center'], afterTriggerId: null, handler: null,
     },
   }),
   navigationItem({

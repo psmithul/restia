@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from cryptography.fernet import Fernet
 from fastapi import FastAPI
 from sqlalchemy import create_engine
 from sqlalchemy.exc import IntegrityError
@@ -23,12 +24,19 @@ from core.database import (
     Base,
     EntityLink,
     InboxItem,
+    LifeEntity,
+    LifeSource,
     PlanningItem,
     Project,
 )
 from routes.inbox_routes import setup_inbox_routes
 from src.identity import ensure_account, rename_local_identity, resolve_request_account
-from src.life_core import INBOX_KINDS, classify_inbox_text, create_inbox_item
+from src.life_core import (
+    INBOX_KINDS,
+    LifeCoreConflict,
+    classify_inbox_text,
+    create_inbox_item,
+)
 
 
 class _IdentityAuthority:
@@ -168,7 +176,6 @@ def test_identity_mapping_is_stable_and_cookie_api_owner_share_account(life_env)
         assert db.query(AuthIdentity).count() == 1
     finally:
         db.close()
-
 
 def test_local_rename_preserves_account_and_external_subjects(life_env):
     db = life_env.Session()
@@ -657,7 +664,7 @@ def test_concurrent_idempotency_conflict_selects_capture_winner(life_env):
         raced, created = create_inbox_item(
             _StaleFirstSession(db, InboxItem),
             account=account,
-            title="Concurrent duplicate",
+            title="First capture",
             kind="note",
             idempotency_key="same-request",
         )
@@ -666,6 +673,14 @@ def test_concurrent_idempotency_conflict_selects_capture_winner(life_env):
         assert raced.id == winner.id
         assert db.query(InboxItem).count() == 1
         assert db.query(ActionAudit).filter_by(action="inbox.created").count() == 1
+        with pytest.raises(LifeCoreConflict, match="different capture"):
+            create_inbox_item(
+                db,
+                account=account,
+                title="Mismatched retry",
+                kind="note",
+                idempotency_key="same-request",
+            )
     finally:
         db.close()
 
@@ -709,7 +724,7 @@ async def test_api_owner_matches_cookie_owner_and_scopes_are_enforced(life_env):
 
 
 @pytest.mark.asyncio
-async def test_classify_and_unsupported_processing_are_explicit(life_env):
+async def test_classify_and_life_graph_processing_are_explicit(life_env):
     created = await _call(
         life_env,
         "POST",
@@ -726,17 +741,90 @@ async def test_classify_and_unsupported_processing_are_explicit(life_env):
     assert classified.status_code == 200
     item = classified.json()["item"]
     assert item["kind"] == "expense"
-    unsupported = await _call(
+    processed = await _call(
         life_env,
         "POST",
         f"/api/inbox/{item['id']}/process",
         json={"version": item["version"]},
     )
-    assert unsupported.status_code == 409
-    assert unsupported.json()["detail"]["status"] == "unsupported"
+    assert processed.status_code == 200, processed.text
+    result = processed.json()["item"]
+    assert result["status"] == "processed"
+    assert result["processed_target_type"] == "life_entity"
     current = (await _call(life_env, "GET", f"/api/inbox/{item['id']}")).json()["item"]
-    assert current["status"] == "inbox"
-    assert current["version"] == item["version"]
+    assert current["status"] == "processed"
+    assert current["version"] == item["version"] + 1
+
+    db = life_env.Session()
+    try:
+        entity = db.query(LifeEntity).one()
+        assert entity.id == result["processed_target_id"]
+        assert entity.entity_type == "transaction"
+        assert entity.owner_id == db.query(Account).filter_by(username="alice").one().id
+        assert db.query(LifeSource).count() == 1
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("kind", "entity_type", "entity_status"),
+    [
+        ("event", "event", "active"),
+        ("note", "note", "active"),
+        ("person_update", "interaction", "active"),
+        ("decision", "decision", "active"),
+        ("reference_material", "source", "active"),
+        ("expense", "transaction", "active"),
+        ("goal", "goal", "active"),
+        ("habit", "habit", "active"),
+        ("someday_idea", "note", "someday"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_every_non_project_inbox_kind_has_a_source_backed_adapter(
+    life_env, kind, entity_type, entity_status
+):
+    created = await _call(
+        life_env,
+        "POST",
+        "/api/inbox",
+        json={
+            "title": f"Capture {kind}",
+            "content": f"Private content for {kind}",
+            "kind": kind,
+            "metadata": {"origin": "test"},
+        },
+    )
+    assert created.status_code == 201, created.text
+    item = created.json()["item"]
+    processed = await _call(
+        life_env,
+        "POST",
+        f"/api/inbox/{item['id']}/process",
+        json={"version": item["version"]},
+    )
+    assert processed.status_code == 200, processed.text
+    result = processed.json()["item"]
+    assert result["processed_target_type"] == "life_entity"
+
+    db = life_env.Session()
+    try:
+        entity = db.query(LifeEntity).filter_by(id=result["processed_target_id"]).one()
+        source = db.query(LifeSource).one()
+        assert entity.entity_type == entity_type
+        assert entity.status == entity_status
+        assert entity.provenance == {"source_id": source.id}
+        assert entity.properties["inbox_item_id"] == item["id"]
+        assert entity.properties["origin"] == "test"
+        assert db.query(EntityLink).filter_by(
+            source_type="inbox_item",
+            source_id=item["id"],
+            relation="represents",
+            target_type="life_entity",
+            target_id=entity.id,
+        ).count() == 1
+    finally:
+        db.close()
 
 
 @pytest.mark.asyncio
@@ -775,12 +863,70 @@ async def test_task_processing_reuses_planning_and_is_retry_idempotent(life_env)
         assert planning.id == result["processed_target_id"]
         assert planning.owner == "alice"
         assert planning.source == "inbox"
-        assert db.query(EntityLink).count() == 1
+        task_entity = db.query(LifeEntity).filter_by(entity_type="task").one()
+        assert task_entity.domain_ref_type == "planning_item"
+        assert task_entity.domain_ref_id == planning.id
+        assert {
+            "definition_of_done", "priority", "deadline", "effort_minutes",
+            "energy", "context", "project_id", "people_ids", "dependency_ids",
+            "document_ids", "source", "next_action",
+            "completion_evidence",
+        } <= set(task_entity.properties)
+        assert task_entity.status == "open"
+        assert db.query(PlanningItem).count() == 1
+        assert db.query(LifeSource).count() == 1
+        assert db.query(EntityLink).count() == 2
         actions = [row.action for row in db.query(ActionAudit).all()]
         assert actions.count("inbox.processed") == 1
-        assert actions.count("entity.linked") == 1
+        assert actions.count("entity.linked") == 2
     finally:
         db.close()
+
+    with sqlite3.connect(life_env.db_path) as raw_db:
+        raw_title, raw_details = raw_db.execute(
+            "SELECT title, details FROM planning_items"
+        ).fetchone()
+    assert raw_title.startswith("enc:")
+    assert raw_details.startswith("enc:")
+    assert "Finish controller" not in raw_title
+    assert "Implement the heading controller" not in raw_details
+
+
+@pytest.mark.asyncio
+async def test_planning_item_round_trips_literal_encryption_prefix(life_env):
+    foreign_fernet = Fernet(Fernet.generate_key())
+    literal = "enc:" + foreign_fernet.encrypt(
+        b"literal token-looking planning title"
+    ).decode("ascii")
+    created = await _call(
+        life_env,
+        "POST",
+        "/api/inbox",
+        json={"title": literal, "kind": "task", "content": "Keep the prefix"},
+    )
+    item = created.json()["item"]
+    processed = await _call(
+        life_env,
+        "POST",
+        f"/api/inbox/{item['id']}/process",
+        json={"version": 1},
+    )
+    assert processed.status_code == 200, processed.text
+
+    db = life_env.Session()
+    try:
+        planning = db.query(PlanningItem).one()
+        assert planning.title == literal
+    finally:
+        db.close()
+
+    with sqlite3.connect(life_env.db_path) as raw_db:
+        raw_title = raw_db.execute(
+            "SELECT title FROM planning_items"
+        ).fetchone()[0]
+    assert raw_title.startswith("enc:")
+    assert raw_title != literal
+    assert literal not in raw_title
 
 
 @pytest.mark.asyncio
@@ -828,6 +974,22 @@ async def test_archive_and_project_link_processing(life_env):
     )
     assert linked.status_code == 200, linked.text
     assert linked.json()["item"]["processed_target_type"] == "project"
+    db = life_env.Session()
+    try:
+        project_entity = db.query(LifeEntity).filter_by(
+            entity_type="project", domain_ref_type="project", domain_ref_id="project-1"
+        ).one()
+        information = db.query(LifeEntity).filter_by(entity_type="note").one()
+        assert db.query(LifeSource).count() == 1
+        assert db.query(EntityLink).filter_by(
+            source_type="life_entity",
+            source_id=information.id,
+            relation="about",
+            target_type="life_entity",
+            target_id=project_entity.id,
+        ).count() == 1
+    finally:
+        db.close()
 
 
 @pytest.mark.asyncio

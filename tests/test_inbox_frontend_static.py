@@ -64,7 +64,12 @@ def test_inbox_client_uses_versioned_mutations_and_never_claims_unsupported_succ
     assert "body: { version:" in source
     for action in ("classify", "process", "archive"):
         assert f"'{action}'" in source
-    assert "const DIRECT_PROCESS_KINDS = new Set(['task']);" in source
+    assert "const DIRECT_PROCESS_KINDS = new Set([" in source
+    for kind in (
+        "task", "event", "note", "person_update", "decision",
+        "reference_material", "expense", "goal", "habit", "someday_idea",
+    ):
+        assert f"'{kind}'" in source
     assert "Use Archive below." in source
     assert "Processing project information needs a project destination" in source
     assert "No safe automatic processor is available" in source
@@ -102,4 +107,4 @@ def test_inbox_assets_are_preloaded_and_precached_with_cache_bump():
     assert '<link rel="modulepreload" href="/static/js/inbox.js">' in html
     assert "'/static/inbox.css'" in sw
     assert "'/static/js/inbox.js'" in sw
-    assert "const CACHE_NAME = 'restia-v367'" in sw
+    assert "const CACHE_NAME = 'restia-v371'" in sw

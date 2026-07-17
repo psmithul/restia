@@ -22,6 +22,8 @@ ALLOWED_SCOPES = {
     "calendar:write",
     "memory:read",
     "memory:write",
+    "life:read",
+    "life:write",
     "cookbook:read",
     "cookbook:launch",
 }
@@ -30,6 +32,7 @@ TOKEN_PROFILES = {
     "codex_todos": ["todos:read", "todos:write"],
     "codex_documents": ["documents:read", "documents:write"],
     "codex_email_drafts": ["email:read", "email:draft", "documents:read", "documents:write"],
+    "life_os": ["life:read", "life:write"],
 }
 
 
@@ -64,6 +67,7 @@ def _normalize_scopes(scopes: str | list[str] | None = None, profile: str | None
     ensure_before("documents:write", "documents:read")
     ensure_before("calendar:write", "calendar:read")
     ensure_before("memory:write", "memory:read")
+    ensure_before("life:write", "life:read")
     ensure_before("email:draft", "email:read")
     ensure_before("cookbook:launch", "cookbook:read")
 

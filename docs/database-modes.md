@@ -65,10 +65,17 @@ scripts/odysseus-db status --pretty
 
 Fresh databases are created automatically by recording the immutable,
 stamp-only `20260716_0001` foundation and then executing the explicit
-`20260717_0002` schema. For an existing installation, normal application
+`20260717_0002` schema followed by the additive `20260718_0003` Life OS
+planning spine. For an existing installation, normal application
 startup first creates a private SQLite backup, runs the compatibility repair,
-and verifies the frozen 0002 contract. Operators may inspect or explicitly
-record an already-repaired schema with:
+encrypts legacy planning-item text plus private edge metadata and provenance
+with the configured Fernet key, and verifies the frozen baseline plus every
+reviewed head contract. Keep that same key available for rollback: the 0003
+downgrade preflights every encrypted value and aborts before destructive DDL if
+it cannot restore the V2 plaintext contract. Revision 0003 is deliberately
+online-only; Alembic `--sql` generation fails rather than producing SQL that could stamp
+plaintext data as migrated. Operators may inspect or explicitly record
+an already-repaired schema with:
 
 ```bash
 scripts/odysseus-db stamp-legacy --pretty

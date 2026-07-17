@@ -55,6 +55,8 @@ EMAIL_DRAFT = frozenset({"email:draft", "email:send"})
 EMAIL_SEND = frozenset({"email:send"})
 MEMORY_READ = frozenset({"memory:read", "memory:write"})
 MEMORY_WRITE = frozenset({"memory:write"})
+LIFE_READ = frozenset({"life:read", "life:write"})
+LIFE_WRITE = frozenset({"life:write"})
 CALENDAR_READ = frozenset({"calendar:read", "calendar:write"})
 CALENDAR_WRITE = frozenset({"calendar:write"})
 DOCUMENT_READ = frozenset({"documents:read", "documents:write"})
@@ -99,6 +101,12 @@ _API_TOKEN_ROUTE_RULES: tuple[_RouteRule, ...] = (
     _rule("GET", r"/api/inbox/[^/]+", INBOX_READ),
     _rule("PATCH", r"/api/inbox/[^/]+", TODO_WRITE),
     _rule("POST", r"/api/inbox/[^/]+/(?:classify|process|archive)", TODO_WRITE),
+
+    # Principal-scoped Life OS graph, focus, and action-policy APIs.  The
+    # request transaction inside each handler narrows ownership and versions;
+    # this boundary prevents a chat/todo token from reaching the life graph.
+    _rule("GET", r"/api/life(?:/.*)?", LIFE_READ),
+    _rule(("POST", "PUT", "PATCH", "DELETE"), r"/api/life(?:/.*)?", LIFE_WRITE),
 
     # Codex discovery/bundle routes intentionally expose no owner data.  Every
     # owner-data route below has an explicit method/path scope rule.

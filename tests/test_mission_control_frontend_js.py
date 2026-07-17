@@ -70,6 +70,48 @@ def test_health_loaded_states_are_not_rendered_as_source_failures():
     }
 
 
+def test_degraded_today_sources_never_render_as_confirmed_zeroes():
+    result = _node_eval(
+        """
+        const sources = {
+          calendar: { status: 'error' },
+          planning: { status: 'empty' },
+          tasks: { status: 'unavailable' },
+          health: { status: 'degraded' },
+          progression: { status: 'error' },
+        };
+        console.log(JSON.stringify({
+          unavailable: mission.__test.unavailableSourceNames(
+            sources,
+            ['calendar', 'planning', 'tasks', 'health', 'progression'],
+          ),
+          failedCalendar: mission.__test.summaryMetricValue(0, 'calendar', sources.calendar),
+          emptyPlan: mission.__test.summaryMetricValue(0, 'planning', sources.planning),
+          degradedHealth: mission.__test.sourceValueUnavailable('health', sources.health),
+        }));
+        """
+    )
+
+    assert result == {
+        "unavailable": ["calendar", "tasks", "progression"],
+        "failedCalendar": "Unavailable",
+        "emptyPlan": 0,
+        "degradedHealth": False,
+    }
+
+
+def test_today_degraded_sections_suppress_affirmative_empty_claims():
+    source = MODULE.read_text(encoding="utf-8")
+
+    assert "function degradedSourceState(sourceNames)" in source
+    assert "Unavailable sources: ${labels.join(', ')}." in source
+    assert "Retry before treating this section as clear." in source
+    assert "if (unavailableSources.length) body.appendChild(degradedSourceState(unavailableSources));" in source
+    assert "if (!items.length && !unavailableSources.length) body.appendChild(emptyState(emptyMessage));" in source
+    assert "currentUnavailableSourceNames(PRIORITY_SOURCE_NAMES)" in source
+    assert "currentUnavailableSourceNames(sourceNames)" in source
+
+
 def test_mission_control_renders_new_v2_sources_without_html_injection():
     source = MODULE.read_text(encoding="utf-8")
     css = (ROOT / "static" / "mission-control.css").read_text(encoding="utf-8")
@@ -90,6 +132,70 @@ def test_mission_control_bounds_long_item_metadata_in_narrow_cards():
     assert "text-overflow: ellipsis" in css
     assert "white-space: nowrap" in css
     assert "attrs: { title: meta }" in source
+
+
+def test_today_renders_the_v3_execution_contract_without_repeating_legacy_panels():
+    source = MODULE.read_text(encoding="utf-8")
+    css = (ROOT / "static" / "mission-control.css").read_text(encoding="utf-8")
+
+    for key in (
+        "primary_outcome",
+        "top_three_actions",
+        "events",
+        "must_do_tasks",
+        "people_awaiting_responses",
+        "health_routine_commitments",
+        "risks_conflicts",
+        "suggested_schedule",
+        "restia_owned_work",
+    ):
+        assert key in source
+    for label in ("Why now", "If delayed", "Restia can", "Supports", "Sources"):
+        assert label in source
+    assert "function renderTodayExecution()" in source
+    home_render = source[source.index("  renderSummary();"):source.index("async function activateInboxNavigation")]
+    assert "...renderTodayExecution(), renderInboxAttention()" in home_render
+    for repeated_panel in (
+        "renderPlanning()",
+        "renderCalendar()",
+        "renderProjectWork()",
+        "renderImportantMail()",
+        "renderTasks()",
+    ):
+        assert repeated_panel not in home_render
+    for selector in (
+        ".mission-recommendation",
+        ".mission-primary-panel",
+        ".mission-recommendation-details",
+    ):
+        assert selector in css
+
+
+def test_today_settings_target_uses_a_real_trigger_and_missing_targets_fail():
+    result = _node_eval(
+        """
+        const calls = [];
+        globalThis.document = {
+          getElementById(id) {
+            return id === 'rail-settings' ? { click() { calls.push(id); } } : null;
+          },
+        };
+        console.log(JSON.stringify({
+          opened: mission.__test.triggerTarget('settings'),
+          missing: mission.__test.triggerTarget('missing-target'),
+          calls,
+        }));
+        """
+    )
+
+    assert result == {
+        "opened": True,
+        "missing": False,
+        "calls": ["rail-settings"],
+    }
+    source = MODULE.read_text(encoding="utf-8")
+    assert "settings: ['user-bar-settings', 'rail-settings']" in source
+    assert "notify(`Could not open ${target.replace(/[-_]+/g, ' ')}`, true);" in source
 
 
 def test_inbox_attention_normalization_is_bounded_and_content_free():
@@ -176,7 +282,7 @@ def test_today_renders_accessible_inbox_attention_via_canonical_navigation():
     assert "Inbox classification breakdown" in source
     assert "Oldest Inbox captures awaiting attention" in source
     assert "Oldest capture ${formatDate(inbox.oldestAt, { time: true })}" in source
-    assert "renderFocus(), renderInboxAttention(), renderPlanning()" in source
+    assert "...renderTodayExecution(), renderInboxAttention()" in source
     assert "activateInboxNavigation(window.activateNavigationItem)" in source
     assert "return (await handler('inbox')) !== false;" in source
     assert "target: 'inbox', title: 'Open Universal Inbox'" in source

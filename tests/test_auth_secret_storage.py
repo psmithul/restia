@@ -95,6 +95,28 @@ def test_wrong_key_does_not_destroy_totp_seed_and_original_key_recovers(tmp_path
     assert recovered.totp_verify("alice", pyotp.TOTP(secret).now()) is True
 
 
+def test_frame_damaged_totp_seed_stays_fail_closed_and_unchanged(
+    tmp_path, monkeypatch
+):
+    manager = _manager(tmp_path, monkeypatch)
+    assert manager.setup("alice", "correct horse battery staple")
+    secret = manager.totp_generate_secret("alice")
+    assert manager.totp_confirm_enable(
+        "alice", pyotp.TOTP(secret).now(), "correct horse battery staple"
+    )
+    auth_path = tmp_path / "auth.json"
+    stored = json.loads(auth_path.read_text(encoding="utf-8"))
+    damaged = stored["users"]["alice"]["totp_secret"][:-4]
+    stored["users"]["alice"]["totp_secret"] = damaged
+    auth_path.write_text(json.dumps(stored), encoding="utf-8")
+
+    reloaded = AuthManager(str(auth_path))
+
+    assert reloaded.totp_verify("alice", pyotp.TOTP(secret).now()) is False
+    persisted = json.loads(auth_path.read_text(encoding="utf-8"))
+    assert persisted["users"]["alice"]["totp_secret"] == damaged
+
+
 def test_session_file_contains_only_token_digest_and_survives_reload(tmp_path, monkeypatch):
     manager = _manager(tmp_path, monkeypatch)
     assert manager.setup("alice", "correct horse battery staple")

@@ -66,7 +66,7 @@ def test_email_tags_task_invalidates_stale_classification_caches():
 def test_email_tag_taxonomy_is_available_offline_after_release():
     source = _SERVICE_WORKER.read_text(encoding="utf-8")
 
-    assert "const CACHE_NAME = 'restia-v367'" in source
+    assert "const CACHE_NAME = 'restia-v371'" in source
     assert "'/static/js/emailLibrary.js'" in source
     assert "'/static/js/emailTagTaxonomy.js'" in source
 

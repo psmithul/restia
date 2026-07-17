@@ -174,6 +174,9 @@ body.hamburger-right .mission-workspace {
 .mission-panel:nth-child(2),
 .mission-panel:nth-child(3) { grid-column: span 4; }
 .mission-focus { grid-column: span 4; }
+.mission-panel.mission-execution-panel { grid-column: span 6; }
+.mission-panel.mission-primary-panel,
+.mission-panel.mission-inbox-attention { grid-column: span 12; }
 
 .mission-panel-heading {
   display: flex;
@@ -192,6 +195,74 @@ body.hamburger-right .mission-workspace {
   line-height: 1.35;
 }
 .mission-panel-body { display: flex; max-height: 330px; padding: 6px; flex-direction: column; overflow: auto; scrollbar-width: thin; }
+.mission-execution-body { max-height: 560px; gap: 7px; padding: 8px; }
+
+.mission-recommendation {
+  min-width: 0;
+  padding: 11px;
+  border: 1px solid color-mix(in srgb, var(--border) 74%, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--panel) 74%, var(--bg));
+}
+.mission-recommendation.is-primary {
+  border-color: color-mix(in srgb, var(--red) 48%, var(--border));
+  background: color-mix(in srgb, var(--red) 7%, var(--panel));
+}
+.mission-recommendation-heading {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.mission-recommendation-heading > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+.mission-recommendation-heading strong {
+  color: var(--fg);
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.mission-recommendation-heading small {
+  color: color-mix(in srgb, var(--fg) 52%, transparent);
+  font-size: 9px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.mission-primary-label {
+  width: fit-content;
+  color: color-mix(in srgb, var(--red) 80%, var(--fg));
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.mission-recommendation-details {
+  display: grid;
+  margin: 9px 0 0;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px 12px;
+}
+.mission-recommendation-details > div { min-width: 0; }
+.mission-recommendation-details dt {
+  margin-bottom: 2px;
+  color: color-mix(in srgb, var(--fg) 45%, transparent);
+  font-size: 8px;
+  font-weight: 750;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.mission-recommendation-details dd {
+  margin: 0;
+  color: color-mix(in srgb, var(--fg) 74%, transparent);
+  font-size: 9px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
 
 .mission-item {
   display: flex;
@@ -443,6 +514,8 @@ button.mission-item:hover { background: color-mix(in srgb, var(--fg) 6%, transpa
   .mission-panel:nth-child(2),
   .mission-panel:nth-child(3),
   .mission-focus { grid-column: span 6; }
+  .mission-primary-panel,
+  .mission-inbox-attention { grid-column: span 12; }
   .mission-plan-panel,
   .mission-system-panel,
   .mission-activity-feed { grid-column: span 6; }
@@ -487,6 +560,7 @@ button.mission-item:hover { background: color-mix(in srgb, var(--fg) 6%, transpa
   .mission-grid { display: block; }
   .mission-panel { margin-bottom: 12px; }
   .mission-panel-body { max-height: none; }
+  .mission-recommendation-details { grid-template-columns: 1fr; }
   .mission-item { min-height: 56px; }
   .mission-inbox-attention .mission-panel-body { max-height: none; }
   .mission-inbox-preview { padding-block: 11px; }

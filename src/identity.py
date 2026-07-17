@@ -286,6 +286,11 @@ def _require_api_scopes(request: Request, required_scopes: Iterable[str]) -> Non
     if isinstance(raw, str):
         raw = raw.split(",")
     granted = {str(scope).strip() for scope in raw if str(scope).strip()}
+    # Life OS write credentials operate on versioned resources and need to read
+    # the resulting state. Keep this implication explicit and domain-local;
+    # legacy scope families retain their established independent contracts.
+    if "life:write" in granted:
+        granted.add("life:read")
     missing = sorted(required - granted)
     if missing:
         raise HTTPException(403, f"API token requires scope: {', '.join(missing)}")

@@ -1258,6 +1258,7 @@ function initializeEventListeners() {
       _collapseSidebarToRail();
       void inboxModule.open({ historyMode: 'none' });
     },
+    '/life':     () => activateNavigationItem('life'),
     '/study':    () => document.getElementById('tool-study-btn')?.click(),
     '/projects': () => {
       if (!projectsModule) return;
@@ -1326,7 +1327,7 @@ function initializeEventListeners() {
     '/library':  () => sessionModule && sessionModule.openLibrary && sessionModule.openLibrary(),
   };
   const _opener = _routeOpen[urlPath];
-  if (_opener && (urlPath === '/today' || urlPath === '/activity' || urlPath === '/inbox')) {
+  if (_opener && ['/today', '/activity', '/inbox', '/life'].includes(urlPath)) {
     // Home and Activity do not depend on chat-session restoration. Open the
     // requested workspace as soon as navigation is wired, even when a large
     // or unhealthy session store leaves loadSessions() pending.
@@ -1344,18 +1345,24 @@ function initializeEventListeners() {
   // click handler in emailInbox, sessionModule's loaded session list) are
   // still being wired up further down in this same function. Stash the
   // opener so it runs from sessionModule.loadSessions().finally() below.
-  if (_opener && urlPath !== '/today' && urlPath !== '/activity' && urlPath !== '/inbox') {
+  if (_opener && !['/today', '/activity', '/inbox', '/life'].includes(urlPath)) {
     window._odysseusRouteOpener = _opener;
   }
   window.addEventListener('popstate', () => {
     const path = window.location.pathname;
     const wasInboxOpen = inboxModule.isOpen();
+    const wasLifeOpen = window.lifeWorkspaceModule?.isOpen?.() || false;
     if (path === '/inbox') {
       try { _routeOpen['/inbox'](); } catch (error) { console.error('Inbox history open failed:', error); }
       return;
     }
-    if (!wasInboxOpen) return;
+    if (path === '/life') {
+      try { _routeOpen['/life'](); } catch (error) { console.error('Life history open failed:', error); }
+      return;
+    }
+    if (!wasInboxOpen && !wasLifeOpen) return;
     inboxModule.close({ restoreFocus: false });
+    window.lifeWorkspaceModule?.close?.({ restoreFocus: false });
     const opener = _routeOpen[path];
     if (opener) {
       try { opener(); } catch (error) { console.error('History route open failed:', error); }

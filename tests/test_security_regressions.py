@@ -18,6 +18,7 @@ import importlib
 from pathlib import Path
 
 import pytest
+from cryptography.fernet import Fernet
 
 
 # ── prompt-injection context wrapper ────────────────────────────
@@ -73,6 +74,54 @@ def test_secret_storage_idempotent_encrypt(tmp_path, monkeypatch):
     ss = _import_secret_storage(tmp_path, monkeypatch)
     enc = ss.encrypt("hunter2")
     assert ss.encrypt(enc) == enc
+
+
+def test_secret_storage_content_api_encrypts_literal_enc_prefix(tmp_path, monkeypatch):
+    """Content can contain the credential marker without ambiguity."""
+    ss = _import_secret_storage(tmp_path, monkeypatch)
+    literal = "enc:private planning title"
+
+    stored = ss.encrypt_plaintext(literal)
+
+    assert stored != literal
+    assert stored.startswith("enc:")
+    assert ss.is_encrypted(stored) is True
+    assert ss.is_encrypted(literal) is False
+    assert ss.decrypt(stored) == literal
+    # Credential paths reserve the marker so corrupt/wrong-key values are not
+    # laundered into readable token text.
+    assert ss.encrypt(literal) == literal
+
+
+def test_secret_storage_preserves_wrong_key_envelope_without_double_wrapping(
+    tmp_path, monkeypatch,
+):
+    ss = _import_secret_storage(tmp_path, monkeypatch)
+    original = ss.encrypt("recoverable secret")
+    original_key = ss._KEY_PATH.read_bytes()
+    rotated_key = Fernet.generate_key()
+    ss._KEY_PATH.write_bytes(rotated_key)
+    monkeypatch.setattr(ss, "_fernet", None)
+
+    assert ss.is_encrypted(original) is True
+    assert ss.is_decryptable(original) is False
+    assert ss.encrypt(original) == original
+    assert ss.decrypt(original) == ""
+
+    ss._KEY_PATH.write_bytes(original_key)
+    monkeypatch.setattr(ss, "_fernet", None)
+    assert ss.decrypt(original) == "recoverable secret"
+
+
+def test_secret_storage_preserves_frame_damaged_envelope_fail_closed(
+    tmp_path, monkeypatch,
+):
+    ss = _import_secret_storage(tmp_path, monkeypatch)
+    damaged = ss.encrypt("recoverable secret")[:-4]
+
+    assert ss.is_encrypted(damaged) is False
+    assert ss.encrypt(damaged) == damaged
+    assert ss.decrypt(damaged) == ""
 
 
 def test_secret_storage_legacy_plaintext_passes_through(tmp_path, monkeypatch):

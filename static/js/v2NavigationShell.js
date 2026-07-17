@@ -6,10 +6,11 @@
 // while giving desktop, rail, mobile, and command surfaces one registry.
 
 import missionControlModule from './missionControl.js';
+import lifeWorkspaceModule from './lifeWorkspace.js';
 import { closeSidebar, SIDEBAR_STATES } from './sidebar-layout.js';
 import {
-  NAVIGATION_GROUPS,
   NAVIGATION_ITEMS,
+  PRIMARY_NAVIGATION_IDS,
   findNavigationItemByLegacyId,
   findNavigationItemByModalId,
   findNavigationItemByRoute,
@@ -26,9 +27,7 @@ const SEMANTIC_BUTTON_IDS = Object.freeze([
 ]);
 
 const RAIL_PRIMARY = new Set([
-  'rail-home', 'rail-search-btn', 'rail-new-session', 'rail-chats',
-  'rail-documents', 'rail-inbox', 'rail-projects', 'rail-tasks', 'rail-calendar',
-  'rail-messages', 'rail-study', 'rail-activity', 'rail-settings',
+  'rail-restia', 'rail-home', 'rail-inbox', 'rail-life', 'rail-search-btn',
 ]);
 
 let initialized = false;
@@ -117,16 +116,32 @@ function railButton(id, label, iconNodes) {
 }
 
 function ensureNewDestinations(container) {
+  const restiaItem = getNavigationItem('chat');
+  let restia = document.getElementById('v3-restia-nav');
+  if (!restia) {
+    restia = destinationButton('v3-restia-nav', restiaItem?.label || 'Restia', icon([
+      { d: 'M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z' },
+    ]));
+    container.appendChild(restia);
+  }
   const homeItem = getNavigationItem('home');
   let home = document.getElementById('v2-home-nav');
   if (!home) {
-    // The group heading already says "Home". Use the registry's compact
-    // "Today" label for the destination so the expanded sidebar does not
-    // repeat the same visible word on adjacent controls.
-    home = destinationButton('v2-home-nav', homeItem?.shortLabel || homeItem?.label || 'Today', icon([
+    home = destinationButton('v2-home-nav', homeItem?.label || 'Today', icon([
       { d: 'M3 11.5 12 4l9 7.5' }, { d: 'M5.5 10v10h13V10' }, { d: 'M9.5 20v-6h5v6' },
     ]));
     container.appendChild(home);
+  }
+  const lifeItem = getNavigationItem('life');
+  let life = document.getElementById('v3-life-nav');
+  if (!life) {
+    life = destinationButton('v3-life-nav', lifeItem?.label || 'Life', icon([
+      { tag: 'circle', cx: '12', cy: '5', r: '2' },
+      { tag: 'circle', cx: '6', cy: '17', r: '2' },
+      { tag: 'circle', cx: '18', cy: '17', r: '2' },
+      { d: 'M12 7v4M12 11 6 15M12 11l6 4' },
+    ]));
+    container.appendChild(life);
   }
   let activity = document.getElementById('v2-activity-nav');
   if (!activity) {
@@ -136,7 +151,7 @@ function ensureNewDestinations(container) {
     ]));
     container.appendChild(activity);
   }
-  return { home, activity };
+  return { restia, home, life, activity };
 }
 
 function moveThemeToSettings() {
@@ -191,24 +206,48 @@ function groupElement(group, nodes, savedState) {
   return wrapper;
 }
 
-function nodesForGroup(groupId) {
-  if (groupId === 'home') {
-    return ['v2-home-nav', 'sessions-section'].map((id) => document.getElementById(id)).filter(Boolean);
-  }
-  if (groupId === 'system') {
-    return [document.getElementById('v2-activity-nav')].filter(Boolean);
-  }
-  const nodes = NAVIGATION_ITEMS
-    .filter((item) => item.group === groupId && item.surfaces.includes('sidebar'))
-    .filter((item) => !['new-chat', 'search', 'toggle-sidebar', 'theme', 'settings', 'profile'].includes(item.id))
-    .map((item) => {
-      if (item.id === 'email') return document.getElementById('email-section');
-      if (item.id === 'library') return document.getElementById('tool-library-row');
-      return item.legacyIds.sidebar.map((id) => document.getElementById(id)).find(Boolean);
-    })
+function sidebarNodeForItem(item) {
+  if (item.id === 'email') return document.getElementById('email-section');
+  if (item.id === 'library') return document.getElementById('tool-library-row');
+  return item.legacyIds.sidebar.map((id) => document.getElementById(id)).find(Boolean) || null;
+}
+
+function primaryNavigationNodes() {
+  return PRIMARY_NAVIGATION_IDS
+    .map((id) => getNavigationItem(id))
+    .map((item) => item && sidebarNodeForItem(item))
     .filter(Boolean);
-  if (groupId === 'ai-lab') nodes.unshift(document.getElementById('models-section'));
-  return Array.from(new Set(nodes.filter(Boolean)));
+}
+
+function secondaryNavigationNodes() {
+  const excluded = new Set([
+    ...PRIMARY_NAVIGATION_IDS,
+    'new-chat', 'toggle-sidebar', 'theme', 'settings', 'profile',
+  ]);
+  const specialistNodes = NAVIGATION_ITEMS
+    .filter((item) => item.surfaces.includes('sidebar'))
+    .filter((item) => item.group !== 'quick-actions' && !excluded.has(item.id))
+    .map(sidebarNodeForItem)
+    .filter(Boolean);
+  return Array.from(new Set([
+    document.getElementById('sessions-section'),
+    document.getElementById('models-section'),
+    ...specialistNodes,
+    document.getElementById('v2-activity-nav'),
+  ].filter(Boolean)));
+}
+
+function primaryNavigationElement(nodes) {
+  const primary = document.createElement('div');
+  primary.className = 'v3-primary-navigation';
+  primary.setAttribute('role', 'group');
+  primary.setAttribute('aria-label', 'Primary navigation');
+  nodes.forEach((node) => {
+    node.dataset.primaryNavigation = 'true';
+    node.setAttribute('draggable', 'false');
+    primary.appendChild(node);
+  });
+  return primary;
 }
 
 function existingSidebarNavigationRoots(sidebar) {
@@ -235,11 +274,24 @@ function annotateRegistryControls() {
 function prepareRail() {
   const rail = document.getElementById('icon-rail');
   if (!rail) return;
-  const search = document.getElementById('rail-search-btn');
+  rail.setAttribute('aria-label', 'Primary navigation');
+  if (!document.getElementById('rail-restia')) {
+    rail.appendChild(railButton('rail-restia', 'Restia', icon([
+      { d: 'M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z' },
+    ])));
+  }
   if (!document.getElementById('rail-home')) {
-    rail.insertBefore(railButton('rail-home', 'Home', icon([
+    rail.appendChild(railButton('rail-home', 'Today', icon([
       { d: 'M3 11.5 12 4l9 7.5' }, { d: 'M5.5 10v10h13V10' },
-    ])), search || rail.firstChild);
+    ])));
+  }
+  if (!document.getElementById('rail-life')) {
+    rail.appendChild(railButton('rail-life', 'Life', icon([
+      { tag: 'circle', cx: '12', cy: '5', r: '2' },
+      { tag: 'circle', cx: '6', cy: '17', r: '2' },
+      { tag: 'circle', cx: '18', cy: '17', r: '2' },
+      { d: 'M12 7v4M12 11 6 15M12 11l6 4' },
+    ])));
   }
   if (!document.getElementById('rail-activity')) {
     const activity = railButton('rail-activity', 'Activity', icon([
@@ -248,6 +300,15 @@ function prepareRail() {
     const spacer = Array.from(rail.children).find((node) => node instanceof HTMLElement && node.style.flex === '1');
     rail.insertBefore(activity, spacer || document.getElementById('rail-settings'));
   }
+  const resizeHandle = rail.querySelector('.rail-resize-handle');
+  let previous = resizeHandle;
+  ['rail-restia', 'rail-home', 'rail-inbox', 'rail-life', 'rail-search-btn']
+    .map((id) => document.getElementById(id))
+    .filter(Boolean)
+    .forEach((button) => {
+      rail.insertBefore(button, previous?.nextSibling || rail.firstChild);
+      previous = button;
+    });
   rail.querySelectorAll('.icon-rail-btn').forEach((button) => {
     button.classList.toggle('v2-rail-secondary', !RAIL_PRIMARY.has(button.id));
   });
@@ -269,15 +330,17 @@ function prepareMobileNav() {
   nav.className = 'v2-mobile-nav';
   nav.setAttribute('aria-label', 'Primary navigation');
   nav.append(
-    mobileButton('home', 'Home', icon([{ d: 'M3 11.5 12 4l9 7.5' }, { d: 'M5.5 10v10h13V10' }])),
-    mobileButton('chat', 'Chat', icon([{ d: 'M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z' }])),
-    mobileButton('projects', 'Projects', icon([{ tag: 'rect', x: '3', y: '4', width: '18', height: '16', rx: '2' }, { d: 'M9 4v16M15 4v16' }])),
-    mobileButton('calendar', 'Calendar', icon([{ tag: 'rect', x: '3', y: '4', width: '18', height: '17', rx: '2' }, { d: 'M8 2v4M16 2v4M3 10h18' }])),
-    mobileButton('more', 'More', icon([{ tag: 'circle', cx: '5', cy: '12', r: '1' }, { tag: 'circle', cx: '12', cy: '12', r: '1' }, { tag: 'circle', cx: '19', cy: '12', r: '1' }])),
+    mobileButton('chat', 'Restia', icon([{ d: 'M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z' }])),
+    mobileButton('home', 'Today', icon([{ d: 'M3 11.5 12 4l9 7.5' }, { d: 'M5.5 10v10h13V10' }])),
+    mobileButton('inbox', 'Inbox', icon([{ d: 'M4 4h16l2 9v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-6z' }, { d: 'M2 13h5l2 3h6l2-3h5' }])),
+    mobileButton('life', 'Life', icon([
+      { tag: 'circle', cx: '12', cy: '5', r: '2' },
+      { tag: 'circle', cx: '6', cy: '17', r: '2' },
+      { tag: 'circle', cx: '18', cy: '17', r: '2' },
+      { d: 'M12 7v4M12 11 6 15M12 11l6 4' },
+    ])),
+    mobileButton('search', 'Search', icon([{ tag: 'circle', cx: '10', cy: '10', r: '7' }, { d: 'M21 21l-4.35-4.35' }])),
   );
-  const more = nav.querySelector('[data-mobile-nav="more"]');
-  more?.setAttribute('aria-controls', 'sidebar');
-  more?.setAttribute('aria-expanded', 'false');
   document.body.appendChild(nav);
 }
 
@@ -306,14 +369,27 @@ export function setActiveNavigationItem(id) {
 function leaveInboxFor(id) {
   if (id === 'inbox' || !window.inboxModule?.isOpen?.()) return false;
   const item = getNavigationItem(id);
-  if (item?.kind === 'action' && id !== 'new-chat') return false;
-  const route = item?.route || (['chat', 'new-chat'].includes(id) ? '/' : null);
+  if (item?.kind === 'action' && !['new-chat', 'search'].includes(id)) return false;
+  const route = item?.route || (['chat', 'new-chat', 'search'].includes(id) ? '/' : null);
   const wasInboxRoute = window.location.pathname === '/inbox';
   window.inboxModule.close({ restoreFocus: false });
   if (wasInboxRoute && route && window.location.pathname !== route) {
     window.history.pushState({ restiaNavigation: item?.id || 'chat' }, '', route);
     document.title = item?.label ? `${item.label} — Restia` : 'Restia';
   }
+  return true;
+}
+
+function commitPrimaryRoute(id, { fallbackRoute = null } = {}) {
+  const item = getNavigationItem(id);
+  const route = item?.route || fallbackRoute;
+  if (!route || typeof window === 'undefined') return false;
+  if (window.location.pathname !== route) {
+    window.history.pushState({ restiaNavigation: id }, '', route);
+  }
+  document.title = route === '/'
+    ? 'Restia'
+    : `${item?.label || 'Restia'} — Restia`;
   return true;
 }
 
@@ -336,8 +412,17 @@ function asModalRows(item, excludedModalId = '') {
 }
 
 function syncActiveNavigationFromVisibleSurface(excludedModalId = '') {
+  const searchOverlay = document.getElementById('search-overlay');
+  if (searchOverlay && !searchOverlay.classList.contains('hidden')) {
+    setActiveNavigationItem('search');
+    return;
+  }
   if (window.inboxModule?.isOpen?.()) {
     setActiveNavigationItem('inbox');
+    return;
+  }
+  if (lifeWorkspaceModule.isOpen()) {
+    setActiveNavigationItem('life');
     return;
   }
   if (missionControlModule.isOpen()) {
@@ -428,6 +513,13 @@ export async function activateNavigationItem(id, options = {}) {
     window.notesModule.closePanel?.();
   }
 
+  // More is a contextual drawer, not a destination. Keep the current Life
+  // workspace (and its valid /life route) open behind it. Every real primary
+  // switch closes Life and commits its own route only after opening succeeds.
+  if (!['life', 'more'].includes(id) && lifeWorkspaceModule.isOpen()) {
+    lifeWorkspaceModule.close({ restoreFocus: false });
+  }
+
   if (id === 'more') {
     if (typeof window._odyOpenSidebar === 'function') window._odyOpenSidebar();
     else document.getElementById('mobile-menu-btn')?.click();
@@ -441,6 +533,17 @@ export async function activateNavigationItem(id, options = {}) {
     return true;
   }
   leaveInboxFor(id);
+  if (id === 'life') {
+    setActiveNavigationItem('life');
+    const opened = await lifeWorkspaceModule.open();
+    if (opened === false) {
+      syncActiveNavigationFromVisibleSurface();
+      return false;
+    }
+    setActiveNavigationItem('life');
+    hideMobileSidebar();
+    return true;
+  }
   if (id === 'home' || id === 'activity') {
     // Reflect the requested destination immediately while the bounded Today
     // aggregation loads. If a dirty Projects close is cancelled, reconcile
@@ -452,6 +555,7 @@ export async function activateNavigationItem(id, options = {}) {
       return false;
     }
     setActiveNavigationItem(id);
+    commitPrimaryRoute(id);
     hideMobileSidebar();
     return true;
   }
@@ -481,6 +585,7 @@ export async function activateNavigationItem(id, options = {}) {
       document.getElementById('sidebar-new-chat-btn')?.click();
     }
     setActiveNavigationItem('chat');
+    commitPrimaryRoute('chat');
     hideMobileSidebar();
     return true;
   }
@@ -505,6 +610,10 @@ export async function activateNavigationItem(id, options = {}) {
     : ['sidebar', 'rail', 'auxiliary'];
   const trigger = visibleOrExisting(getLegacyTriggerIds(item, preferred));
   if (!trigger) return false;
+  // Search is an overlay on the Restia surface. Commit the underlying route
+  // before invoking legacy search handlers so a synchronous focus/modal error
+  // cannot leave a closed Life workspace paired with a stale `/life` URL.
+  if (item.id === 'search') commitPrimaryRoute('search', { fallbackRoute: '/' });
   trigger.click();
   setActiveNavigationItem(item.id);
   hideMobileSidebar();
@@ -526,9 +635,9 @@ export function prepareV2NavigationShell() {
 
   ensureStylesheet();
   SEMANTIC_BUTTON_IDS.forEach(replaceWithButton);
-  // Attach new V2-only destinations before resolving groups. Detached nodes
-  // are intentionally absent from document.getElementById(), which otherwise
-  // leaves Home and Activity out of the expanded sidebar on a fresh load.
+  // Attach shell-owned destinations before resolving the hierarchy. Detached
+  // nodes are intentionally absent from document.getElementById(), which
+  // would otherwise leave them out on a fresh load.
   ensureNewDestinations(inner);
   moveThemeToSettings();
   prepareRail();
@@ -540,21 +649,30 @@ export function prepareV2NavigationShell() {
   root.id = 'v2-sidebar-navigation';
   root.className = 'v2-sidebar-navigation';
   const savedState = readGroupState();
-  const groups = [];
   const claimedNodes = new Set();
-  NAVIGATION_GROUPS.filter((group) => !group.hidden).forEach((group) => {
-    // A legacy control has exactly one registry owner. Keep the first group
-    // claim if malformed extension metadata ever points two groups at the
-    // same DOM node, rather than moving it back and forth during rendering.
-    const nodes = nodesForGroup(group.id).filter((node) => {
-      if (claimedNodes.has(node)) return false;
-      claimedNodes.add(node);
-      return true;
-    });
-    if (nodes.length) groups.push(groupElement(group, nodes, savedState));
+  const primaryNodes = primaryNavigationNodes().filter((node) => {
+    if (claimedNodes.has(node)) return false;
+    claimedNodes.add(node);
+    return true;
   });
-  root.replaceChildren(...groups);
-  document.getElementById('sidebar-search-btn')?.after(root);
+  const secondaryNodes = secondaryNavigationNodes().filter((node) => {
+    // A legacy control has exactly one registry owner. Keep the first claim
+    // if malformed extension metadata points two destinations at one node.
+    if (claimedNodes.has(node)) return false;
+    claimedNodes.add(node);
+    return true;
+  });
+  const moreState = Object.prototype.hasOwnProperty.call(savedState, 'more')
+    ? savedState
+    : { ...savedState, more: false };
+  const moreGroup = secondaryNodes.length
+    ? groupElement({ id: 'more', label: 'More' }, secondaryNodes, moreState)
+    : null;
+  root.replaceChildren(
+    primaryNavigationElement(primaryNodes),
+    ...(moreGroup ? [moreGroup] : []),
+  );
+  document.getElementById('sidebar-new-chat-btn')?.after(root);
   existingRoots.forEach((duplicate) => duplicate.remove());
   document.getElementById('tools-section')?.remove();
 
@@ -573,10 +691,15 @@ export function initV2NavigationShell() {
   if (initialized) return true;
   initialized = true;
   missionControlModule.init(window.location.origin);
+  lifeWorkspaceModule.init(window.location.origin);
   initNavigationModalObserver();
 
+  document.getElementById('v3-restia-nav')?.addEventListener('click', () => activateNavigationItem('chat'));
+  document.getElementById('rail-restia')?.addEventListener('click', () => activateNavigationItem('chat'));
   document.getElementById('v2-home-nav')?.addEventListener('click', () => activateNavigationItem('home'));
   document.getElementById('rail-home')?.addEventListener('click', () => activateNavigationItem('home'));
+  document.getElementById('v3-life-nav')?.addEventListener('click', () => activateNavigationItem('life'));
+  document.getElementById('rail-life')?.addEventListener('click', () => activateNavigationItem('life'));
   document.getElementById('v2-activity-nav')?.addEventListener('click', () => activateNavigationItem('activity'));
   document.getElementById('rail-activity')?.addEventListener('click', () => activateNavigationItem('activity'));
   document.getElementById('v2-mobile-nav')?.addEventListener('click', (event) => {
@@ -584,7 +707,13 @@ export function initV2NavigationShell() {
     if (control) activateNavigationItem(control.dataset.mobileNav, { surface: 'mobile' });
   });
   document.addEventListener('restia:mission-control-closed', () => {
-    setActiveNavigationItem('chat');
+    scheduleNavigationSurfaceSync();
+  });
+  document.addEventListener('restia:search-opened', () => {
+    setActiveNavigationItem('search');
+  });
+  document.addEventListener('restia:search-closed', () => {
+    scheduleNavigationSurfaceSync();
   });
   document.addEventListener('restia:projects-closed', () => {
     scheduleNavigationSurfaceSync();
@@ -593,6 +722,12 @@ export function initV2NavigationShell() {
     setActiveNavigationItem('inbox');
   });
   document.addEventListener('restia:inbox-closed', () => {
+    scheduleNavigationSurfaceSync();
+  });
+  document.addEventListener('restia:life-opened', () => {
+    setActiveNavigationItem('life');
+  });
+  document.addEventListener('restia:life-closed', () => {
     scheduleNavigationSurfaceSync();
   });
   document.addEventListener('restia:study-opened', () => {
@@ -618,6 +753,12 @@ export function initV2NavigationShell() {
     if (item && !['home', 'activity'].includes(item.id)) {
       if (SHELL_ONLY_ACTIONS.has(item.id)) return;
       if (item.id !== 'inbox') leaveInboxFor(item.id);
+      if (item.id !== 'life' && lifeWorkspaceModule.isOpen()) {
+        lifeWorkspaceModule.close({ restoreFocus: false });
+      }
+      if (item.id === 'search') {
+        commitPrimaryRoute('search', { fallbackRoute: '/' });
+      }
       if (
         item.id !== 'projects' &&
         window.projectsModule?.isOpen?.() &&
@@ -644,6 +785,6 @@ export function initV2NavigationShell() {
   return true;
 }
 
-export const __test = Object.freeze({ RAIL_PRIMARY });
+export const __test = Object.freeze({ RAIL_PRIMARY, PRIMARY_NAVIGATION_IDS });
 
 export default { prepareV2NavigationShell, initV2NavigationShell, activateNavigationItem, setActiveNavigationItem };

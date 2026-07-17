@@ -32,7 +32,7 @@ SUPPORTED_DATABASE_MODES = frozenset({LOCAL_SINGLE_MODE, SHARED_MODE})
 # This must only become True in the same change that removes every remaining
 # SQLite/local-file runtime authority from the shared startup path.
 SHARED_SCHEMA_AUTHORITY_READY = False
-SCHEMA_AUTHORITY = "alembic-20260717"
+SCHEMA_AUTHORITY = "alembic-20260718"
 
 _initialization_lock = threading.Lock()
 _initialized_binding: tuple[int, str] | None = None
@@ -264,6 +264,13 @@ def initialize_database() -> DatabaseRuntimeConfig:
                 elif not application_tables:
                     # Alembic's immutable 0001 is stamp-only. Empty databases
                     # record it without executing code, then run explicit 0002.
+                    upgrade_schema(engine)
+                elif status.current_revisions == ("20260717_0002",):
+                    # 0002 is a real executable Alembic baseline.  Later
+                    # revisions may upgrade it normally, but private SQLite
+                    # installs still receive a consistent recovery copy first.
+                    if config.mode == LOCAL_SINGLE_MODE:
+                        backup_legacy_sqlite_database(engine)
                     upgrade_schema(engine)
                 elif config.mode == LOCAL_SINGLE_MODE:
                     if status.state == "unstamped":

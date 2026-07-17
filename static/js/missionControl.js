@@ -194,6 +194,23 @@ function healthUnavailable(value) {
   );
 }
 
+function sourceValueUnavailable(name, value) {
+  return name === 'health' ? healthUnavailable(value) : sourceUnavailable(value);
+}
+
+function unavailableSourceNames(sourceValues, names) {
+  const values = sourceValues && typeof sourceValues === 'object' ? sourceValues : {};
+  return rows(names).filter((name) => sourceValueUnavailable(name, values[name]));
+}
+
+function currentUnavailableSourceNames(names) {
+  return unavailableSourceNames(state.data?.sources, names);
+}
+
+function summaryMetricValue(value, sourceName, sourceValue) {
+  return sourceValueUnavailable(sourceName, sourceValue) ? 'Unavailable' : number(value);
+}
+
 function summaryCard(label, value, hint = '', tone = '') {
   return make('article', {
     className: `mission-summary-card${tone ? ` mission-tone-${tone}` : ''}`,
@@ -210,15 +227,37 @@ function renderSummary() {
   const health = source('health');
   const progression = source('progression');
   const profile = progression.profile || {};
-  const overall = text(health.overall, healthUnavailable(health) ? 'Unavailable' : 'Ready');
+  const progressionIsUnavailable = sourceValueUnavailable('progression', progression);
+  const healthIsUnavailable = sourceValueUnavailable('health', health);
+  const overall = healthIsUnavailable ? 'Unavailable' : text(health.overall, 'Ready');
+  const sourceSummaryCard = (label, summaryKey, sourceName, hint) => {
+    const value = source(sourceName);
+    const unavailable = sourceValueUnavailable(sourceName, value);
+    return summaryCard(
+      label,
+      summaryMetricValue(summary[summaryKey], sourceName, value),
+      unavailable ? `${label} source` : hint,
+      unavailable ? 'attention' : '',
+    );
+  };
   refs.summary.append(
-    summaryCard('Calendar', number(summary.calendar), 'today'),
-    summaryCard('Project work', number(summary.project_work), 'open or due'),
-    summaryCard('Plan', number(summary.planning), 'open commitments'),
-    summaryCard('To Do', number(summary.notes_today), 'next steps'),
-    summaryCard('Rank', text(profile.rank_name, 'E-Rank'), `Level ${number(profile.level) || 1}`),
-    summaryCard('Automations', number(summary.tasks), 'scheduled or running'),
-    summaryCard('System', overall, `${rows(health.services).length} services`, ['ok', 'healthy'].includes(overall.toLowerCase()) ? 'good' : 'attention'),
+    sourceSummaryCard('Calendar', 'calendar', 'calendar', 'today'),
+    sourceSummaryCard('Project work', 'project_work', 'project_work', 'open or due'),
+    sourceSummaryCard('Plan', 'planning', 'planning', 'open commitments'),
+    sourceSummaryCard('To Do', 'notes_today', 'notes_today', 'next steps'),
+    summaryCard(
+      'Rank',
+      progressionIsUnavailable ? 'Unavailable' : text(profile.rank_name, 'E-Rank'),
+      progressionIsUnavailable ? 'Progression source' : `Level ${number(profile.level) || 1}`,
+      progressionIsUnavailable ? 'attention' : '',
+    ),
+    sourceSummaryCard('Automations', 'tasks', 'tasks', 'scheduled or running'),
+    summaryCard(
+      'System',
+      overall,
+      healthIsUnavailable ? 'Health source' : `${rows(health.services).length} services`,
+      ['ok', 'healthy'].includes(overall.toLowerCase()) ? 'good' : 'attention',
+    ),
   );
 }
 
@@ -673,6 +712,152 @@ function renderFocus() {
   return section;
 }
 
+const SOURCE_LABELS = Object.freeze({
+  calendar: 'Calendar',
+  project_work: 'Project work',
+  planning: 'Plan',
+  study_reviews: 'Study reviews',
+  notes_today: 'To Do',
+  important_mail: 'Important mail',
+  tasks: 'Automations',
+  goals: 'Study goals',
+  health: 'System health',
+});
+
+const PRIORITY_SOURCE_NAMES = Object.freeze([
+  'tasks', 'project_work', 'important_mail', 'study_reviews', 'planning', 'notes_today', 'goals',
+]);
+
+const SCHEDULE_SOURCE_NAMES = Object.freeze(['calendar', ...PRIORITY_SOURCE_NAMES]);
+
+const TODAY_EXECUTION_SECTIONS = Object.freeze([
+  ['events', 'What is happening today?', 'Known calendar commitments.', 'No calendar commitments today.', ['calendar']],
+  ['must_do_tasks', 'What must be completed?', 'Due, overdue, and review work.', 'No must-do work is due today.', ['project_work', 'planning', 'study_reviews', 'notes_today']],
+  ['people_awaiting_responses', 'Who needs a response?', 'People and threads awaiting attention.', 'No source-backed responses are waiting.', ['important_mail']],
+  ['health_routine_commitments', 'Health and routines', 'Commitments worth protecting today.', 'No health or routine commitment is due.', ['planning', 'notes_today', 'calendar']],
+  ['risks_conflicts', 'Risks and conflicts', 'Overlaps, failures, overdue work, and degraded services.', 'No current conflict or overdue risk was found.', ['calendar', 'tasks', 'project_work', 'planning', 'health', 'important_mail']],
+  ['suggested_schedule', 'Suggested schedule', 'Free blocks for the highest-priority actions.', 'No additional focus block fits the known schedule.', SCHEDULE_SOURCE_NAMES],
+  ['restia_owned_work', 'What Restia is handling', 'Scheduled, running, and supervised automated work.', 'Restia has no owned work scheduled today.', ['tasks']],
+]);
+
+function recommendationSupport(item) {
+  const values = [];
+  if (item?.supported_goal?.title) values.push(`Goal: ${text(item.supported_goal.title)}`);
+  if (item?.supported_project?.title) values.push(`Project: ${text(item.supported_project.title)}`);
+  return values.join(' · ');
+}
+
+function recommendationEvidence(item) {
+  return rows(item?.source_evidence)
+    .slice(0, 2)
+    .map((evidence) => text(evidence?.label, text(evidence?.source)))
+    .filter(Boolean)
+    .join(' · ');
+}
+
+function recommendationCard(item, { primary = false } = {}) {
+  const duration = Math.max(0, Math.round(number(item?.estimated_minutes)));
+  const timing = item?.start && item?.end
+    ? `${formatClock(item.start)}–${formatClock(item.end)}`
+    : duration ? `${duration} min` : 'Restia-owned';
+  const tone = item?.urgency === 'critical'
+    ? ' mission-tone-danger'
+    : item?.urgency === 'attention' ? ' mission-tone-attention' : '';
+  const support = recommendationSupport(item);
+  const evidence = recommendationEvidence(item);
+  const card = make('article', {
+    className: `mission-recommendation${primary ? ' is-primary' : ''}${tone}`,
+  }, [
+    make('header', { className: 'mission-recommendation-heading' }, [
+      make('div', {}, [
+        ...(primary ? [make('span', { className: 'mission-primary-label', text: 'Primary outcome' })] : []),
+        make('strong', { text: text(item?.title, 'Untitled recommendation') }),
+        make('small', { text: [timing, text(item?.detail)].filter(Boolean).join(' · ') }),
+      ]),
+      ...(text(item?.target) ? [button('Open', 'open-target', {
+        className: 'mission-text-btn', target: text(item.target),
+        title: `Open ${text(item.title, 'recommendation')}`,
+      })] : []),
+    ]),
+    make('dl', { className: 'mission-recommendation-details' }, [
+      make('div', {}, [make('dt', { text: 'Why now' }), make('dd', { text: text(item?.why_now, 'Reason unavailable.') })]),
+      make('div', {}, [make('dt', { text: 'If delayed' }), make('dd', { text: text(item?.delay_cost, 'Delay impact unavailable.') })]),
+      make('div', {}, [make('dt', { text: 'Restia can' }), make('dd', { text: text(item?.what_restia_can_handle, 'Open the source context.') })]),
+      ...(support ? [make('div', {}, [make('dt', { text: 'Supports' }), make('dd', { text: support })])] : []),
+      ...(evidence ? [make('div', {}, [make('dt', { text: 'Sources' }), make('dd', { text: evidence })])] : []),
+    ]),
+  ]);
+  return card;
+}
+
+function degradedSourceState(sourceNames) {
+  const labels = rows(sourceNames).map((name) => SOURCE_LABELS[name] || name);
+  return make('div', { className: 'mission-source-error', attrs: { role: 'status' } }, [
+    make('strong', { text: 'Incomplete data' }),
+    make('span', {
+      text: `Unavailable sources: ${labels.join(', ')}. Retry before treating this section as clear.`,
+    }),
+  ]);
+}
+
+function executionSection(
+  title,
+  subtitle,
+  items,
+  emptyMessage,
+  { primaryId = '', unavailableSources = [] } = {},
+) {
+  const section = make('section', {
+    className: `mission-panel mission-execution-panel${primaryId ? ' mission-primary-panel' : ''}`,
+    attrs: { 'aria-labelledby': `mission-execution-${title.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` },
+  });
+  const headingId = section.getAttribute('aria-labelledby');
+  const heading = make('header', { className: 'mission-panel-heading' }, [
+    make('div', {}, [
+      make('h2', { id: headingId, text: title }),
+      make('p', { text: subtitle }),
+    ]),
+  ]);
+  const body = make('div', { className: 'mission-panel-body mission-execution-body' });
+  if (unavailableSources.length) body.appendChild(degradedSourceState(unavailableSources));
+  if (!items.length && !unavailableSources.length) body.appendChild(emptyState(emptyMessage));
+  items.forEach((item) => body.appendChild(recommendationCard(item, {
+    primary: Boolean(primaryId && text(item?.id) === primaryId),
+  })));
+  section.append(heading, body);
+  return section;
+}
+
+function renderTodayExecution() {
+  const primary = state.data?.primary_outcome;
+  const primaryId = text(primary?.id);
+  const seen = new Set();
+  const topActions = rows(state.data?.top_three_actions).filter((item) => {
+    const id = text(item?.id);
+    if (!id || seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  }).slice(0, 3);
+  if (primaryId && !seen.has(primaryId)) topActions.unshift(primary);
+  const sections = [executionSection(
+    'What matters now?',
+    'Primary outcome and the three highest-priority actions.',
+    topActions.slice(0, 3),
+    'No urgent action is currently recommended.',
+    {
+      primaryId: primaryId || text(topActions[0]?.id),
+      unavailableSources: currentUnavailableSourceNames(PRIORITY_SOURCE_NAMES),
+    },
+  )];
+  TODAY_EXECUTION_SECTIONS.forEach(([key, title, subtitle, emptyMessage, sourceNames]) => {
+    sections.push(executionSection(
+      title, subtitle, rows(state.data?.[key]), emptyMessage,
+      { unavailableSources: currentUnavailableSourceNames(sourceNames) },
+    ));
+  });
+  return sections;
+}
+
 function renderQuickActions() {
   clear(refs.quickActions);
   const actions = state.view === 'activity'
@@ -712,9 +897,7 @@ function render() {
   }
   renderSummary();
   refs.grid.append(
-    renderFocus(), renderInboxAttention(), renderPlanning(), renderProgression(), renderCalendar(),
-    renderProjectWork(), renderNotesToday(), renderImportantMail(), renderDailyBrief(),
-    renderTasks(), renderGoals(), renderReviews(), renderHealth(),
+    ...renderTodayExecution(), renderInboxAttention(),
   );
 }
 
@@ -746,6 +929,7 @@ function triggerTarget(target) {
     email: ['email-section-title', 'rail-email'],
     notes: ['tool-notes-btn', 'rail-notes'],
     todos: ['tool-todos-btn', 'rail-todos'],
+    settings: ['user-bar-settings', 'rail-settings'],
     home: ['v2-home-nav', 'rail-home'],
     activity: ['v2-activity-nav', 'rail-activity'],
   }[target] || [];
@@ -1004,7 +1188,12 @@ function buildWorkspace() {
     if (control.dataset.action === 'close') close();
     else if (control.dataset.action === 'refresh') loadCurrentView();
     else if (control.dataset.action === 'activity-more') void loadMoreActivity();
-    else if (control.dataset.action === 'open-target') triggerTarget(control.dataset.target);
+    else if (control.dataset.action === 'open-target') {
+      const target = text(control.dataset.target, 'destination');
+      if (!triggerTarget(target)) {
+        notify(`Could not open ${target.replace(/[-_]+/g, ' ')}`, true);
+      }
+    }
     else if (control.dataset.action.startsWith('planning-')) void mutatePlanningItem(control);
   });
   root.addEventListener('submit', (event) => {
@@ -1093,8 +1282,9 @@ export function refresh() {
 
 export const __test = Object.freeze({
   localOffsetMinutes, focusCandidates, mapBackendActions,
-  sourceMessage, sourceUnavailable, healthUnavailable,
-  normalizeInboxAttention, activateInboxNavigation,
+  sourceMessage, sourceUnavailable, healthUnavailable, sourceValueUnavailable,
+  unavailableSourceNames, summaryMetricValue,
+  normalizeInboxAttention, activateInboxNavigation, triggerTarget,
 });
 
 const missionControlModule = { init, open, close, toggle, isOpen, refresh, __test };

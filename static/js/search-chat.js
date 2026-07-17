@@ -13,6 +13,7 @@ function el(id) { return document.getElementById(id); }
 export function openSearch() {
   const overlay = el('search-overlay');
   if (!overlay) return;
+  const wasOpen = !overlay.classList.contains('hidden');
   overlay.classList.remove('hidden');
   const input = el('search-input');
   if (input) {
@@ -22,15 +23,18 @@ export function openSearch() {
   selectedIndex = -1;
   results = [];
   el('search-results').innerHTML = '';
+  if (!wasOpen) document.dispatchEvent(new CustomEvent('restia:search-opened'));
 }
 
 export function closeSearch() {
   const overlay = el('search-overlay');
   if (!overlay) return;
+  const wasOpen = !overlay.classList.contains('hidden');
   overlay.classList.add('hidden');
   el('search-results').innerHTML = '';
   selectedIndex = -1;
   results = [];
+  if (wasOpen) document.dispatchEvent(new CustomEvent('restia:search-closed'));
 }
 
 export function isOpen() {

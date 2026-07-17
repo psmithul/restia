@@ -263,4 +263,4 @@ def test_chats_collapse_control_stays_visible_beside_header_actions():
     assert "/static/projects.css?v=20260716v21" in html
     assert "/static/v2-shell.css?v=20260716v21" in html
     assert "/static/mission-control.css?v=20260716v21" in html
-    assert "const CACHE_NAME = 'restia-v367'" in service_worker
+    assert "const CACHE_NAME = 'restia-v371'" in service_worker

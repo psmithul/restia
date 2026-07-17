@@ -1,4 +1,4 @@
-// Notification command center — a bell in the icon rail with a dropdown
+// Notification command center — one contextual entry with a dropdown
 // aggregating everything that used to hide behind scattered red dots:
 // emails needing reply, direct messages, due to-dos, calendar events, AI
 // suggestions, and finished long-running jobs. Data comes from
@@ -205,14 +205,25 @@ function _injectBellButton() {
   if (document.getElementById('rail-notif-center')) return;
   const rail = document.getElementById('rail-search-btn')?.parentElement;
   if (!rail) return;
+  const morePanel = document.querySelector(
+    '#sidebar[data-navigation-version="2"] [data-nav-group="more"] .v2-nav-group-panel',
+  );
   const btn = document.createElement('button');
-  btn.className = 'icon-rail-btn';
+  btn.type = 'button';
+  btn.className = morePanel ? 'list-item v2-destination' : 'icon-rail-btn';
   btn.id = 'rail-notif-center';
   btn.title = 'Notifications';
+  btn.setAttribute('aria-label', 'Notifications');
   btn.style.position = 'relative';
-  btn.innerHTML = _ICONS.bell;
-  const anchor = document.getElementById('rail-search-btn');
-  rail.insertBefore(btn, anchor);
+  btn.innerHTML = morePanel
+    ? `${_ICONS.bell}<span class="grow">Notifications</span>`
+    : _ICONS.bell;
+  if (morePanel) {
+    morePanel.appendChild(btn);
+  } else {
+    const anchor = document.getElementById('rail-search-btn');
+    rail.insertBefore(btn, anchor);
+  }
   btn.addEventListener('click', (e) => {
     e.stopPropagation();
     _openPanel(btn);

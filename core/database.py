@@ -15,6 +15,7 @@ from sqlalchemy import (
     DateTime,
     Integer,
     ForeignKey,
+    ForeignKeyConstraint,
     JSON,
     Index,
     UniqueConstraint,
@@ -142,6 +143,23 @@ class EncryptedText(TypeDecorator):
         return decrypt(value)
 
 
+class EncryptedContentText(EncryptedText):
+    """Encrypted text whose input is always application/user plaintext.
+
+    Credential columns use :class:`EncryptedText` so importing an existing
+    envelope is idempotent across key rotation. Content columns cannot reserve
+    any plaintext prefix—including a complete Fernet-looking string—so they
+    deliberately wrap every non-empty value.
+    """
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        from src.secret_storage import encrypt_plaintext
+        return encrypt_plaintext(value)
+
+
 class EncryptedJSON(TypeDecorator):
     """JSON-compatible values encrypted through the app's secret envelope.
 
@@ -162,9 +180,9 @@ class EncryptedJSON(TypeDecorator):
             return None
         if not isinstance(value, dict):
             raise ValueError("encrypted JSON value must be an object")
-        from src.secret_storage import encrypt
+        from src.secret_storage import encrypt_plaintext
         serialized = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-        return encrypt(serialized)
+        return encrypt_plaintext(serialized)
 
     def process_result_value(self, value, dialect):
         if value is None:
@@ -459,12 +477,12 @@ class InboxItem(TimestampMixin, Base):
     # Universal Inbox can contain health, finance, and private message data.
     # Keep only routing/classification fields queryable; user content is
     # encrypted with the same local envelope used by other sensitive domains.
-    title = Column(EncryptedText, nullable=False, default="")
-    content = Column(EncryptedText, nullable=False, default="")
+    title = Column(EncryptedContentText, nullable=False, default="")
+    content = Column(EncryptedContentText, nullable=False, default="")
     kind = Column(String(32), nullable=False, default="note", index=True)
     status = Column(String(24), nullable=False, default="inbox", index=True)
     source_type = Column(String(48), nullable=False, default="user")
-    source_ref = Column(EncryptedText, nullable=True)
+    source_ref = Column(EncryptedContentText, nullable=True)
     meta_data = Column("metadata", EncryptedJSON, nullable=False, default=dict)
     classification_confidence = Column(Integer, nullable=False, default=0)
     classification_reason = Column(String(500), nullable=False, default="")
@@ -499,8 +517,19 @@ class EntityLink(Base):
     relation = Column(String(64), nullable=False)
     target_type = Column(String(48), nullable=False)
     target_id = Column(String(255), nullable=False)
-    meta_data = Column("metadata", JSON, nullable=False, default=dict)
+    # Relationship metadata can reveal private people, health, finance, or
+    # project context.  Legacy plaintext JSON remains readable through the
+    # encrypted type and is rewritten on the next mutation.
+    meta_data = Column("metadata", EncryptedJSON, nullable=False, default=dict)
+    provenance = Column(EncryptedJSON, nullable=False, default=dict)
+    confidence = Column(Integer, nullable=False, default=100)
+    sensitivity = Column(String(24), nullable=False, default="private")
+    version = Column(Integer, nullable=False, default=1)
+    deleted_at = Column(DateTime, nullable=True, index=True)
     created_at = Column(DateTime, nullable=False, default=utcnow_naive)
+    updated_at = Column(
+        DateTime, nullable=False, default=utcnow_naive, onupdate=utcnow_naive,
+    )
 
     __table_args__ = (
         UniqueConstraint(
@@ -509,6 +538,11 @@ class EntityLink(Base):
         ),
         Index("ix_entity_links_source", "owner_id", "source_type", "source_id"),
         Index("ix_entity_links_target", "owner_id", "target_type", "target_id"),
+        CheckConstraint(
+            "confidence >= 0 AND confidence <= 100",
+            name="ck_entity_links_confidence",
+        ),
+        CheckConstraint("version >= 1", name="ck_entity_links_version"),
     )
 
 
@@ -567,6 +601,296 @@ event.listen(
         END
     """).execute_if(dialect="sqlite"),
 )
+
+
+LIFE_ENTITY_TYPES = (
+    "person", "area", "goal", "project", "milestone", "task", "action",
+    "event", "communication_thread", "message", "note", "file",
+    "decision", "habit", "metric", "transaction", "health_record",
+    "place", "asset", "reminder", "automation", "source",
+    "journal_entry", "workspace", "trip", "interaction", "commitment",
+    "period_review", "learning_record", "career_item", "home_record",
+)
+
+
+class LifeSource(TimestampMixin, Base):
+    """Immutable-principal provenance for captured or imported information."""
+
+    __tablename__ = "life_sources"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    source_type = Column(String(48), nullable=False, index=True)
+    title = Column(EncryptedContentText, nullable=False, default="")
+    source_ref = Column(EncryptedContentText, nullable=True)
+    safe_excerpt = Column(EncryptedContentText, nullable=False, default="")
+    content_sha256 = Column(String(64), nullable=True, index=True)
+    observed_at = Column(DateTime, nullable=True, index=True)
+    captured_at = Column(DateTime, nullable=False, default=utcnow_naive, index=True)
+    sensitivity = Column(String(24), nullable=False, default="private")
+    meta_data = Column("metadata", EncryptedJSON, nullable=False, default=dict)
+    idempotency_key = Column(String(128), nullable=True)
+    version = Column(Integer, nullable=False, default=1)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_id", "idempotency_key", name="uq_life_sources_owner_idempotency",
+        ),
+        Index("ix_life_sources_owner_type_captured", "owner_id", "source_type", "captured_at"),
+        CheckConstraint("version >= 1", name="ck_life_sources_version"),
+    )
+
+
+class LifeEntity(TimestampMixin, Base):
+    """Principal-scoped node in Restia's cross-domain life graph.
+
+    Mature domain tables remain authoritative.  ``domain_ref_*`` points to
+    those rows; domains that do not yet have a dedicated table can use the
+    validated encrypted ``properties`` object as their authority without
+    creating a second disconnected dashboard store.
+    """
+
+    __tablename__ = "life_entities"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    entity_type = Column(String(48), nullable=False, index=True)
+    title = Column(EncryptedContentText, nullable=False, default="")
+    summary = Column(EncryptedContentText, nullable=False, default="")
+    status = Column(String(32), nullable=False, default="active", index=True)
+    properties = Column(EncryptedJSON, nullable=False, default=dict)
+    provenance = Column(EncryptedJSON, nullable=False, default=dict)
+    confidence = Column(Integer, nullable=False, default=100)
+    sensitivity = Column(String(24), nullable=False, default="private")
+    domain_ref_type = Column(String(48), nullable=True)
+    domain_ref_id = Column(String(255), nullable=True)
+    occurred_at = Column(DateTime, nullable=True, index=True)
+    due_at = Column(DateTime, nullable=True, index=True)
+    review_at = Column(DateTime, nullable=True, index=True)
+    idempotency_key = Column(String(128), nullable=True)
+    version = Column(Integer, nullable=False, default=1)
+    deleted_at = Column(DateTime, nullable=True, index=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "id", "owner_id", name="uq_life_entities_id_owner",
+        ),
+        UniqueConstraint(
+            "owner_id", "idempotency_key", name="uq_life_entities_owner_idempotency",
+        ),
+        UniqueConstraint(
+            "owner_id", "entity_type", "domain_ref_type", "domain_ref_id",
+            name="uq_life_entities_domain_ref",
+        ),
+        Index("ix_life_entities_owner_type_status", "owner_id", "entity_type", "status"),
+        Index("ix_life_entities_owner_updated", "owner_id", "updated_at"),
+        CheckConstraint(
+            "entity_type IN (" + ", ".join(repr(value) for value in LIFE_ENTITY_TYPES) + ")",
+            name="ck_life_entities_type",
+        ),
+        CheckConstraint(
+            "confidence >= 0 AND confidence <= 100",
+            name="ck_life_entities_confidence",
+        ),
+        CheckConstraint("version >= 1", name="ck_life_entities_version"),
+    )
+
+
+class LifeEntityVersion(Base):
+    """Append-only snapshot supporting inspection and safe reversal."""
+
+    __tablename__ = "life_entity_versions"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    entity_id = Column(String(36), nullable=False, index=True)
+    version = Column(Integer, nullable=False)
+    snapshot = Column(EncryptedJSON, nullable=False, default=dict)
+    reason = Column(EncryptedContentText, nullable=False, default="")
+    created_at = Column(DateTime, nullable=False, default=utcnow_naive, index=True)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ("entity_id", "owner_id"),
+            ("life_entities.id", "life_entities.owner_id"),
+            ondelete="CASCADE",
+            name="fk_life_entity_versions_entity_owner",
+        ),
+        UniqueConstraint(
+            "entity_id", "version", name="uq_life_entity_versions_entity_version",
+        ),
+        Index("ix_life_entity_versions_owner_created", "owner_id", "created_at"),
+        CheckConstraint("version >= 1", name="ck_life_entity_versions_version"),
+    )
+
+
+@event.listens_for(LifeEntityVersion, "before_update")
+@event.listens_for(LifeEntityVersion, "before_delete")
+def _protect_append_only_life_entity_version(*_args, **_kwargs):
+    raise RuntimeError("LifeEntityVersion rows are append-only")
+
+
+event.listen(
+    LifeEntityVersion.__table__,
+    "after_create",
+    DDL("""
+        CREATE TRIGGER IF NOT EXISTS life_entity_versions_no_update
+        BEFORE UPDATE ON life_entity_versions
+        BEGIN
+            SELECT RAISE(ABORT, 'LifeEntityVersion rows are append-only');
+        END
+    """).execute_if(dialect="sqlite"),
+)
+event.listen(
+    LifeEntityVersion.__table__,
+    "after_create",
+    DDL("""
+        CREATE TRIGGER IF NOT EXISTS life_entity_versions_no_delete
+        BEFORE DELETE ON life_entity_versions
+        BEGIN
+            SELECT RAISE(ABORT, 'LifeEntityVersion rows are append-only');
+        END
+    """).execute_if(dialect="sqlite"),
+)
+
+
+class ActionPolicy(TimestampMixin, Base):
+    """Per-principal autonomy ceiling for one life domain."""
+
+    __tablename__ = "action_policies"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    domain = Column(String(48), nullable=False)
+    max_autonomy = Column(Integer, nullable=False, default=3)
+    external_requires_confirmation = Column(Boolean, nullable=False, default=True)
+    enabled = Column(Boolean, nullable=False, default=True)
+    rules = Column(EncryptedJSON, nullable=False, default=dict)
+    version = Column(Integer, nullable=False, default=1)
+
+    __table_args__ = (
+        UniqueConstraint("owner_id", "domain", name="uq_action_policies_owner_domain"),
+        CheckConstraint(
+            "max_autonomy >= 1 AND max_autonomy <= 6",
+            name="ck_action_policies_autonomy",
+        ),
+        CheckConstraint("version >= 1", name="ck_action_policies_version"),
+    )
+
+
+class ActionProposal(TimestampMixin, Base):
+    """Durable proposed/executed action with explicit approval semantics."""
+
+    __tablename__ = "action_proposals"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    domain = Column(String(48), nullable=False, index=True)
+    action = Column(String(80), nullable=False, index=True)
+    autonomy_level = Column(Integer, nullable=False)
+    state = Column(String(24), nullable=False, default="prepared", index=True)
+    target_type = Column(String(48), nullable=False)
+    target_id = Column(String(255), nullable=True)
+    payload = Column(EncryptedJSON, nullable=False, default=dict)
+    reason = Column(EncryptedContentText, nullable=False, default="")
+    sources = Column(EncryptedJSON, nullable=False, default=dict)
+    external = Column(Boolean, nullable=False, default=False)
+    requires_confirmation = Column(Boolean, nullable=False, default=False)
+    confirmation_digest = Column(String(64), nullable=True, unique=True)
+    expires_at = Column(DateTime, nullable=True, index=True)
+    approved_at = Column(DateTime, nullable=True)
+    approved_by_account_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="SET NULL"), nullable=True,
+    )
+    executed_at = Column(DateTime, nullable=True)
+    result = Column(EncryptedJSON, nullable=False, default=dict)
+    undo_ref = Column(EncryptedContentText, nullable=True)
+    idempotency_key = Column(String(128), nullable=True)
+    version = Column(Integer, nullable=False, default=1)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_id", "idempotency_key", name="uq_action_proposals_owner_idempotency",
+        ),
+        Index("ix_action_proposals_owner_state_created", "owner_id", "state", "created_at"),
+        CheckConstraint(
+            "autonomy_level >= 1 AND autonomy_level <= 6",
+            name="ck_action_proposals_autonomy",
+        ),
+        CheckConstraint(
+            "state IN ('prepared', 'approved', 'executing', 'completed', "
+            "'rejected', 'failed', 'reversed', 'expired')",
+            name="ck_action_proposals_state",
+        ),
+        CheckConstraint(
+            "approved_by_account_id IS NULL OR approved_by_account_id = owner_id",
+            name="ck_action_proposals_approver_owner",
+        ),
+        CheckConstraint("version >= 1", name="ck_action_proposals_version"),
+    )
+
+
+class FocusSession(TimestampMixin, Base):
+    """Recoverable focus lease over one principal-owned life entity."""
+
+    __tablename__ = "focus_sessions"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    entity_id = Column(String(36), nullable=False, index=True)
+    state = Column(String(24), nullable=False, default="active", index=True)
+    definition_of_done = Column(EncryptedContentText, nullable=False, default="")
+    started_at = Column(DateTime, nullable=False, default=utcnow_naive)
+    active_since = Column(DateTime, nullable=True)
+    paused_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    elapsed_seconds = Column(Integer, nullable=False, default=0)
+    interruptions = Column(EncryptedJSON, nullable=False, default=dict)
+    progress = Column(EncryptedJSON, nullable=False, default=dict)
+    evidence = Column(EncryptedJSON, nullable=False, default=dict)
+    follow_up_entity_ids = Column(EncryptedJSON, nullable=False, default=dict)
+    version = Column(Integer, nullable=False, default=1)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ("entity_id", "owner_id"),
+            ("life_entities.id", "life_entities.owner_id"),
+            ondelete="CASCADE",
+            name="fk_focus_sessions_entity_owner",
+        ),
+        Index("ix_focus_sessions_owner_state", "owner_id", "state"),
+        Index(
+            "uq_focus_sessions_owner_live",
+            "owner_id",
+            unique=True,
+            sqlite_where=text("state IN ('active', 'paused')"),
+            postgresql_where=text("state IN ('active', 'paused')"),
+        ),
+        CheckConstraint(
+            "state IN ('active', 'paused', 'completed', 'abandoned')",
+            name="ck_focus_sessions_state",
+        ),
+        CheckConstraint("elapsed_seconds >= 0", name="ck_focus_sessions_elapsed"),
+        CheckConstraint("version >= 1", name="ck_focus_sessions_version"),
+    )
 
 
 class Session(TimestampMixin, Base):
@@ -1094,8 +1418,8 @@ class PlanningItem(TimestampMixin, Base):
 
     id = Column(String(36), primary_key=True)
     owner = Column(String, nullable=False, index=True)
-    title = Column(String(240), nullable=False)
-    details = Column(Text, nullable=False, default="")
+    title = Column(EncryptedContentText, nullable=False)
+    details = Column(EncryptedContentText, nullable=False, default="")
     status = Column(String(16), nullable=False, default="open", index=True)
     priority = Column(String(16), nullable=False, default="normal")
     due_date = Column(String(10), nullable=True, index=True)
@@ -1376,10 +1700,10 @@ class Signature(TimestampMixin, Base):
     id = Column(String, primary_key=True, index=True)
     owner = Column(String, nullable=True, index=True)
     name = Column(String, nullable=False, default="Signature")
-    data_png = Column(EncryptedText, nullable=False)   # base64 PNG, encrypted at rest
+    data_png = Column(EncryptedContentText, nullable=False)   # base64 PNG, encrypted at rest
     width = Column(Integer, nullable=True)
     height = Column(Integer, nullable=True)
-    svg = Column(EncryptedText, nullable=True)         # vector signature, encrypted at rest
+    svg = Column(EncryptedContentText, nullable=True)         # vector signature, encrypted at rest
 
 
 class ApiToken(TimestampMixin, Base):
@@ -1476,7 +1800,7 @@ class DirectMessage(Base):
     id          = Column(Integer, primary_key=True, autoincrement=True)
     sender      = Column(String, nullable=False, index=True)   # username who sent it
     recipient   = Column(String, nullable=False, index=True)   # username it's addressed to
-    body        = Column(EncryptedText, nullable=False)
+    body        = Column(EncryptedContentText, nullable=False)
     created_at  = Column(DateTime, default=utcnow_naive, nullable=False, index=True)
     read_at     = Column(DateTime, nullable=True)              # NULL = unread by recipient
     edited_at   = Column(DateTime, nullable=True)              # NULL = never edited
@@ -1511,13 +1835,13 @@ class DirectMessageAttachment(Base):
         nullable=False,
         index=True,
     )
-    filename   = Column(EncryptedText, nullable=False)
+    filename   = Column(EncryptedContentText, nullable=False)
     mime       = Column(String(32), nullable=False)
     size       = Column(Integer, nullable=False)
     width      = Column(Integer, nullable=False)
     height     = Column(Integer, nullable=False)
     sha256     = Column(String(64), nullable=False)
-    data_b64   = Column(EncryptedText, nullable=False)
+    data_b64   = Column(EncryptedContentText, nullable=False)
     created_at = Column(DateTime, default=utcnow_naive, nullable=False)
 
     __table_args__ = (
@@ -1694,8 +2018,8 @@ class StatusPost(Base):
 
     id         = Column(Integer, primary_key=True, autoincrement=True)
     author     = Column(String, nullable=False, index=True)
-    image      = Column(EncryptedText, nullable=False)     # base64 data URL, encrypted at rest
-    caption    = Column(EncryptedText, nullable=True)
+    image      = Column(EncryptedContentText, nullable=False)     # base64 data URL, encrypted at rest
+    caption    = Column(EncryptedContentText, nullable=True)
     created_at = Column(DateTime, default=utcnow_naive, nullable=False, index=True)
     expires_at = Column(DateTime, nullable=False, index=True)
 
@@ -3996,6 +4320,7 @@ def init_db():
     _migrate_model_endpoints()
     Base.metadata.create_all(bind=engine)
     _migrate_add_unified_auth_columns()
+    _migrate_life_planning_spine()
     _migrate_action_audit_guards()
     harden_database_permissions()
     _migrate_add_study_review_columns()
@@ -4064,6 +4389,191 @@ def _migrate_action_audit_guards():
             BEFORE UPDATE ON action_audit
             BEGIN
                 SELECT RAISE(ABORT, 'ActionAudit rows are append-only');
+            END
+        """))
+
+
+def _migrate_life_planning_spine():
+    """Complete the additive 0003 shape during pre-Alembic adoption.
+
+    ``create_all`` creates the new Life OS tables but cannot add columns to an
+    existing ``entity_links`` table.  This compatibility step exists only for
+    the guarded, backed-up legacy SQLite adoption path; databases already at
+    0002 execute the reviewed Alembic revision instead.
+    """
+
+    if engine.dialect.name != "sqlite":
+        return
+    with engine.begin() as conn:
+        columns = {
+            str(row[1])
+            for row in conn.execute(text("PRAGMA table_info(entity_links)"))
+        }
+        additions = (
+            ("provenance", "JSON NOT NULL DEFAULT '{}'"),
+            ("confidence", "INTEGER NOT NULL DEFAULT 100"),
+            ("sensitivity", "VARCHAR(24) NOT NULL DEFAULT 'private'"),
+            ("version", "INTEGER NOT NULL DEFAULT 1"),
+            ("deleted_at", "DATETIME"),
+            (
+                "updated_at",
+                "DATETIME NOT NULL DEFAULT '1970-01-01 00:00:00'",
+            ),
+        )
+        for name, definition in additions:
+            if name not in columns:
+                conn.execute(text(
+                    f'ALTER TABLE entity_links ADD COLUMN "{name}" {definition}'
+                ))
+        conn.execute(text(
+            "UPDATE entity_links SET updated_at = CURRENT_TIMESTAMP "
+            "WHERE updated_at = '1970-01-01 00:00:00'"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_entity_links_deleted_at "
+            "ON entity_links (deleted_at)"
+        ))
+        # SQLite cannot add CHECK constraints without rebuilding the legacy
+        # table. Equivalent triggers keep the additive adoption path aligned
+        # with EntityLink's model invariants.
+        conn.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS entity_links_validate_insert
+            BEFORE INSERT ON entity_links
+            WHEN NEW.confidence < 0 OR NEW.confidence > 100 OR NEW.version < 1
+            BEGIN
+                SELECT RAISE(ABORT, 'EntityLink confidence/version is invalid');
+            END
+        """))
+        conn.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS entity_links_validate_update
+            BEFORE UPDATE ON entity_links
+            WHEN NEW.confidence < 0 OR NEW.confidence > 100 OR NEW.version < 1
+            BEGIN
+                SELECT RAISE(ABORT, 'EntityLink confidence/version is invalid');
+            END
+        """))
+        # ADD COLUMN needs a constant default on populated SQLite tables. This
+        # trigger gives future non-ORM inserts the runtime timestamp expected
+        # by the model instead of permanently retaining the migration sentinel.
+        conn.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS entity_links_fill_updated_at
+            AFTER INSERT ON entity_links
+            WHEN NEW.updated_at = '1970-01-01 00:00:00'
+            BEGIN
+                UPDATE entity_links
+                SET updated_at = CURRENT_TIMESTAMP
+                WHERE id = NEW.id;
+            END
+        """))
+        # EntityLink.metadata and provenance use EncryptedJSON in V3. The
+        # guarded pre-Alembic adoption path stamps directly at head, so it must
+        # perform the same online data rewrite as migration 0003.
+        from src.secret_storage import (
+            encrypt_plaintext,
+            is_content_encrypted,
+            is_decryptable,
+            is_encrypted,
+        )
+
+        private_json_rows = conn.execute(text(
+            'SELECT id, metadata, provenance FROM entity_links'
+        )).all()
+        for link_id, raw_metadata, raw_provenance in private_json_rows:
+            updates: dict[str, str] = {}
+            for field, raw_value in (
+                ("metadata", raw_metadata),
+                ("provenance", raw_provenance),
+            ):
+                if isinstance(raw_value, dict):
+                    decoded_value = raw_value
+                elif isinstance(raw_value, str):
+                    try:
+                        decoded_value = json.loads(raw_value)
+                    except (TypeError, json.JSONDecodeError) as exc:
+                        raise RuntimeError(
+                            f"EntityLink {field} must be valid JSON before encryption"
+                        ) from exc
+                    if isinstance(decoded_value, str):
+                        if is_encrypted(decoded_value):
+                            if not is_decryptable(decoded_value):
+                                raise RuntimeError(
+                                    f"EntityLink {field} could not be decrypted with the active key"
+                                )
+                            continue
+                        raise RuntimeError(
+                            f"EntityLink {field} must be a JSON object before encryption"
+                        )
+                else:
+                    raise RuntimeError(
+                        f"EntityLink {field} must be a JSON object before encryption"
+                    )
+                if not isinstance(decoded_value, dict):
+                    raise RuntimeError(
+                        f"EntityLink {field} must be a JSON object before encryption"
+                    )
+                serialized = json.dumps(
+                    decoded_value, ensure_ascii=False, separators=(",", ":")
+                )
+                updates[field] = json.dumps(encrypt_plaintext(serialized))
+            if updates:
+                assignments = ", ".join(
+                    f'"{field}" = :{field}' for field in updates
+                )
+                conn.execute(
+                    text(f'UPDATE entity_links SET {assignments} WHERE id = :id'),
+                    {**updates, "id": link_id},
+                )
+
+        # PlanningItem.title/details changed from V2 plaintext to V3 content
+        # envelopes. The distinct `enc:c1:` marker makes this exact-text
+        # rewrite retry-safe without mistaking a user's literal legacy
+        # `enc:<fernet>` string for ciphertext.
+        planning_rows = conn.execute(text(
+            "SELECT id, title, details FROM planning_items"
+        )).all()
+        for planning_id, raw_title, raw_details in planning_rows:
+            title_value = "" if raw_title is None else str(raw_title)
+            details_value = "" if raw_details is None else str(raw_details)
+            for field, stored in (
+                ("title", title_value), ("details", details_value)
+            ):
+                if is_content_encrypted(stored) and not is_decryptable(stored):
+                    raise RuntimeError(
+                        f"PlanningItem {field} could not be decrypted with the active key"
+                    )
+            encrypted_title = (
+                title_value
+                if is_content_encrypted(title_value)
+                else encrypt_plaintext(title_value)
+            )
+            encrypted_details = (
+                details_value
+                if is_content_encrypted(details_value)
+                else encrypt_plaintext(details_value)
+            )
+            if (encrypted_title, encrypted_details) != (
+                title_value, details_value
+            ):
+                conn.execute(text(
+                    "UPDATE planning_items SET title = :title, details = :details "
+                    "WHERE id = :id"
+                ), {
+                    "title": encrypted_title,
+                    "details": encrypted_details,
+                    "id": planning_id,
+                })
+        conn.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS life_entity_versions_no_update
+            BEFORE UPDATE ON life_entity_versions
+            BEGIN
+                SELECT RAISE(ABORT, 'LifeEntityVersion rows are append-only');
+            END
+        """))
+        conn.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS life_entity_versions_no_delete
+            BEFORE DELETE ON life_entity_versions
+            BEGIN
+                SELECT RAISE(ABORT, 'LifeEntityVersion rows are append-only');
             END
         """))
         conn.execute(text("""

@@ -36,9 +36,9 @@ def test_registry_is_valid_immutable_and_covers_current_destinations():
         """
         const required = [
           'home', 'chat', 'new-chat', 'search', 'delete-session', 'toggle-sidebar',
-          'inbox', 'projects', 'tasks', 'calendar', 'todos', 'library', 'documents',
+          'inbox', 'life', 'projects', 'tasks', 'calendar', 'todos', 'library', 'documents',
           'notes', 'memory', 'study', 'research', 'messages', 'email',
-          'compare', 'cookbook', 'gallery', 'theme', 'settings', 'activity', 'profile',
+          'compare', 'cookbook', 'gallery', 'theme', 'settings', 'activity', 'notifications', 'profile',
           'quick-note', 'quick-todo', 'new-message', 'share-moment',
           'compose-email', 'new-document', 'manage-chats', 'new-model-chat',
         ];
@@ -65,10 +65,25 @@ def test_registry_is_valid_immutable_and_covers_current_destinations():
     assert result["mutationBlocked"] is True
 
 
+def test_v3_primary_hierarchy_is_exact_and_specialists_do_not_own_mobile_tabs():
+    result = _node_eval(
+        """
+        const mobile = nav.NAVIGATION_ITEMS
+          .filter(item => item.surfaces.includes('mobile') && item.id !== 'toggle-sidebar')
+          .map(item => item.id);
+        console.log(JSON.stringify({ primary: nav.PRIMARY_NAVIGATION_IDS, mobile }));
+        """
+    )
+
+    assert result["primary"] == ["chat", "home", "inbox", "life", "search"]
+    assert set(result["mobile"]) == set(result["primary"])
+
+
 def test_every_current_icon_rail_control_has_one_stable_owner():
     result = _node_eval(
         """
         const railIds = [
+          'rail-restia', 'rail-home', 'rail-life', 'rail-activity',
           'rail-search-btn', 'rail-new-session', 'rail-delete-session',
           'rail-chats', 'rail-documents', 'rail-messages', 'rail-calendar',
           'rail-compare', 'rail-cookbook', 'rail-research', 'rail-email',
@@ -83,6 +98,10 @@ def test_every_current_icon_rail_control_has_one_stable_owner():
     )
 
     assert result == {
+        "rail-restia": "chat",
+        "rail-home": "home",
+        "rail-life": "life",
+        "rail-activity": "activity",
         "rail-search-btn": "search",
         "rail-new-session": "new-chat",
         "rail-delete-session": "delete-session",
@@ -120,9 +139,9 @@ def test_command_palette_metadata_preserves_existing_public_ids():
 
     by_id = {entry["id"]: entry for entry in result}
     assert set(by_id) == {
-        "inbox", "projects", "study", "messages", "notes", "tasks", "todos", "calendar", "documents",
+        "inbox", "life", "projects", "study", "messages", "notes", "tasks", "todos", "calendar", "documents",
         "gallery", "research", "compare", "cookbook", "memory", "email",
-        "settings", "search", "quick-note", "quick-todo", "new-chat",
+        "settings", "notifications", "search", "quick-note", "quick-todo", "new-chat",
         "new-message", "share-moment", "theme", "home", "activity",
     }
     # The old palette calls the Library command "documents". Keeping that id
@@ -139,10 +158,13 @@ def test_lookup_helpers_resolve_aliases_routes_modals_and_trigger_order():
         console.log(JSON.stringify({
           brain: nav.getNavigationItem('brain')?.id,
           today: nav.getNavigationItem('today')?.id,
+          restia: nav.getNavigationItem('restia')?.id,
+          life: nav.getNavigationItem('life-os')?.id,
           maintainer: nav.getNavigationItem('maintainer-center')?.id,
           route: nav.findNavigationItemByRoute('https://restia.local/tasks/?tab=runs#task-1')?.id,
           homeRoute: nav.findNavigationItemByRoute('/today/')?.id,
           activityRoute: nav.findNavigationItemByRoute('/activity')?.id,
+          lifeRoute: nav.findNavigationItemByRoute('/life/')?.id,
           root: nav.findNavigationItemByRoute('/')?.id,
           unknownRoute: nav.findNavigationItemByRoute('/missing')?.id || null,
           registeredModal: nav.findNavigationItemByModalId('#calendar-modal')?.id,
@@ -156,10 +178,13 @@ def test_lookup_helpers_resolve_aliases_routes_modals_and_trigger_order():
     assert result == {
         "brain": "memory",
         "today": "home",
+        "restia": "chat",
+        "life": "life",
         "maintainer": "activity",
         "route": "tasks",
         "homeRoute": "home",
         "activityRoute": "activity",
+        "lifeRoute": "life",
         "root": "chat",
         "unknownRoute": None,
         "registeredModal": "calendar",
@@ -256,16 +281,16 @@ def test_list_helper_keeps_group_order_and_exposes_hidden_commands_by_surface():
     )
 
     assert "quick-note" not in result["defaultIds"]
-    assert result["work"] == ["inbox", "projects", "tasks", "calendar", "todos"]
+    assert result["work"] == ["inbox", "life", "projects", "tasks", "calendar", "todos"]
     assert result["quick"] == [
         "quick-note", "quick-todo", "new-message", "share-moment",
         "compose-email", "new-document", "manage-chats", "new-model-chat",
     ]
     assert "research" not in result["sidebarWithResearchHidden"]
     assert set(result["commands"]) == {
-        "inbox", "projects", "study", "messages", "notes", "tasks", "todos", "calendar", "documents",
+        "inbox", "life", "projects", "study", "messages", "notes", "tasks", "todos", "calendar", "documents",
         "gallery", "research", "compare", "cookbook", "memory", "email",
-        "settings", "search", "quick-note", "quick-todo", "new-chat",
+        "settings", "notifications", "search", "quick-note", "quick-todo", "new-chat",
         "new-message", "share-moment", "theme", "home", "activity",
     }
 
@@ -300,7 +325,7 @@ def test_v2_home_and_activity_contracts_are_ready_for_shell_integration():
         "containerId": "mission-control-workspace",
         "command": {
             "id": "home",
-            "title": "Home",
+            "title": "Today",
             "hint": "Open Mission Control",
             "icon": "🏠",
             "keywords": ["home", "today", "mission", "control", "overview"],
@@ -314,7 +339,7 @@ def test_v2_home_and_activity_contracts_are_ready_for_shell_integration():
         "aliases": ["maintainer-center"],
         "group": "system",
         "route": "/activity",
-        "surfaces": ["rail", "sidebar", "mobile", "command-palette", "route"],
+        "surfaces": ["rail", "sidebar", "command-palette", "route"],
         "legacyIds": {"rail": ["rail-activity"], "sidebar": ["v2-activity-nav"], "auxiliary": []},
         "containerId": None,
         "command": {

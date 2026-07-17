@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import json
 import os
 import secrets
 import sqlite3
@@ -17,11 +18,20 @@ from migrations.versions.restia_schema_baseline_20260717_0002 import (
     BASELINE_REQUIRED_COLUMNS,
     BASELINE_REQUIRED_TABLES,
 )
+from migrations.versions.life_planning_spine_20260718_0003 import (
+    V3_REQUIRED_COLUMNS,
+    V3_REQUIRED_TABLES,
+)
 from src.database_runtime import validate_database_mode
 
 
 LEGACY_BASELINE_REVISION = "20260716_0001"
-SCHEMA_HEAD_REVISION = "20260717_0002"
+EXPLICIT_BASELINE_REVISION = "20260717_0002"
+SCHEMA_HEAD_REVISION = "20260718_0003"
+KNOWN_BEHIND_REVISIONS = frozenset({
+    LEGACY_BASELINE_REVISION,
+    EXPLICIT_BASELINE_REVISION,
+})
 # Compatibility export retained for existing tooling.  This is now the full
 # frozen baseline manifest, not a small sentinel subset.
 LEGACY_BASELINE_REQUIRED_TABLES = BASELINE_REQUIRED_TABLES
@@ -116,7 +126,7 @@ def schema_revision_status(engine: Engine) -> SchemaRevisionStatus:
     matches = revisions == (SCHEMA_HEAD_REVISION,)
     if matches:
         state = "current"
-    elif revisions == (LEGACY_BASELINE_REVISION,):
+    elif len(revisions) == 1 and revisions[0] in KNOWN_BEHIND_REVISIONS:
         state = "behind"
     elif not revisions:
         # Alembic intentionally leaves an empty version table after an online
@@ -159,7 +169,7 @@ def database_status() -> dict[str, Any]:
         mode_error = str(exc)
         mode = "invalid"
         dialect = engine.dialect.name
-        schema_authority = "alembic-20260717"
+        schema_authority = "alembic-20260718"
 
     revision_error = None
     try:
@@ -330,19 +340,151 @@ def _identity_unique_sets(inspector) -> set[tuple[str, ...]]:
     return values
 
 
+def _table_unique_sets(inspector, table_name: str) -> set[tuple[str, ...]]:
+    values = {
+        tuple(str(name) for name in constraint.get("column_names") or ())
+        for constraint in inspector.get_unique_constraints(table_name)
+    }
+    values.update({
+        tuple(str(name) for name in index.get("column_names") or ())
+        for index in inspector.get_indexes(table_name)
+        if bool(index.get("unique"))
+    })
+    if inspector.bind.dialect.name == "sqlite":
+        # SQLite's SQLAlchemy parser can miss a multiline named UNIQUE
+        # constraint on an adopted legacy table even though PRAGMA exposes its
+        # authoritative auto-index. Include those auto-index column sets.
+        with inspector.bind.connect() as connection:
+            index_rows = connection.exec_driver_sql(
+                f'PRAGMA index_list("{table_name}")'
+            ).fetchall()
+            for index_row in index_rows:
+                if not bool(index_row[2]):
+                    continue
+                index_name = str(index_row[1]).replace('"', '""')
+                columns = tuple(
+                    str(column_row[2])
+                    for column_row in connection.exec_driver_sql(
+                        f'PRAGMA index_info("{index_name}")'
+                    ).fetchall()
+                    if column_row[2] is not None
+                )
+                if columns:
+                    values.add(columns)
+    return values
+
+
+def _has_foreign_key(
+    inspector,
+    table_name: str,
+    *,
+    constrained: tuple[str, ...],
+    referred_table: str,
+    referred: tuple[str, ...],
+    ondelete: str,
+) -> bool:
+    return any(
+        tuple(str(name) for name in foreign_key.get("constrained_columns") or ())
+        == constrained
+        and str(foreign_key.get("referred_table") or "") == referred_table
+        and tuple(str(name) for name in foreign_key.get("referred_columns") or ())
+        == referred
+        and str(
+            (foreign_key.get("options") or {}).get("ondelete") or ""
+        ).upper() == ondelete.upper()
+        for foreign_key in inspector.get_foreign_keys(table_name)
+    )
+
+
+def _stored_encrypted_json_envelope(value: object, *, dialect: str) -> str | None:
+    """Return the JSON string stored for an ``EncryptedJSON`` column.
+
+    SQLite exposes the raw JSON document, so an encrypted string arrives as a
+    quoted JSON string. PostgreSQL drivers normally decode the JSON value first
+    and return the envelope directly. Accept both supported representations,
+    while refusing SQLite text that is not valid JSON because the ORM's JSON
+    result processor could not read it either.
+    """
+
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        try:
+            value = bytes(value).decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    if not isinstance(value, str):
+        return None
+    if dialect == "sqlite":
+        try:
+            decoded = json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return None
+        return decoded if isinstance(decoded, str) else None
+    if value.startswith("enc:"):
+        return value
+    try:
+        decoded = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        decoded = value
+    return decoded if isinstance(decoded, str) else None
+
+
+def _validate_entity_link_private_json_encryption(engine: Engine) -> None:
+    """Verify every head edge contains readable encrypted private JSON."""
+
+    from src.secret_storage import (
+        decrypt,
+        is_content_encrypted,
+        is_decryptable,
+    )
+
+    with engine.connect() as connection:
+        rows = connection.execute(text(
+            "SELECT metadata, provenance FROM entity_links"
+        )).all()
+    for stored_metadata, stored_provenance in rows:
+        for field, stored_value in (
+            ("metadata", stored_metadata),
+            ("provenance", stored_provenance),
+        ):
+            envelope = _stored_encrypted_json_envelope(
+                stored_value, dialect=engine.dialect.name
+            )
+            if envelope is None or not is_content_encrypted(envelope):
+                raise SchemaRevisionError(
+                    f"entity_links contains plaintext or invalid {field} at the "
+                    "current revision"
+                )
+            if not is_decryptable(envelope):
+                raise SchemaRevisionError(
+                    f"entity_links {field} could not be decrypted with the active key"
+                )
+            try:
+                decoded = json.loads(decrypt(envelope))
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise SchemaRevisionError(
+                    f"entity_links {field} does not contain an encrypted JSON object"
+                ) from exc
+            if not isinstance(decoded, dict):
+                raise SchemaRevisionError(
+                    f"entity_links {field} does not contain an encrypted JSON object"
+                )
+
+
 def validate_head_schema(engine: Engine) -> None:
-    """Verify frozen 0002 structure and security invariants before trust/stamp."""
+    """Verify frozen baseline plus every reviewed post-baseline contract."""
 
     inspector = inspect(engine)
     existing = set(inspector.get_table_names())
-    missing = sorted(BASELINE_REQUIRED_TABLES - existing)
+    required_tables = BASELINE_REQUIRED_TABLES | V3_REQUIRED_TABLES
+    required_columns = {**BASELINE_REQUIRED_COLUMNS, **V3_REQUIRED_COLUMNS}
+    missing = sorted(required_tables - existing)
     if missing:
         raise SchemaRevisionError(
             "Database claims the current revision but is missing baseline "
             f"tables: {', '.join(missing)}"
         )
     missing_columns: list[str] = []
-    for table_name, required in sorted(BASELINE_REQUIRED_COLUMNS.items()):
+    for table_name, required in sorted(required_columns.items()):
         present = {
             str(column["name"]) for column in inspector.get_columns(table_name)
         }
@@ -354,6 +496,23 @@ def validate_head_schema(engine: Engine) -> None:
             "Database is missing frozen baseline columns: "
             + "; ".join(missing_columns)
         )
+
+    # The head revision is also a data-bound privacy contract. A version row
+    # must not be able to legitimize plaintext PlanningItem content after an
+    # offline/manual stamp or an incomplete legacy repair. Empty details carry
+    # no private value; every non-empty content value uses the distinct V3
+    # content envelope so credential-looking literal text remains exact.
+    with engine.connect() as connection:
+        plaintext_planning_count = int(connection.execute(text(
+            "SELECT COUNT(*) FROM planning_items "
+            "WHERE title NOT LIKE 'enc:c1:%' "
+            "OR (details <> '' AND details NOT LIKE 'enc:c1:%')"
+        )).scalar_one())
+    if plaintext_planning_count:
+        raise SchemaRevisionError(
+            "planning_items contains plaintext content at the current revision"
+        )
+    _validate_entity_link_private_json_encryption(engine)
 
     identity_unique_sets = _identity_unique_sets(inspector)
     expected_identity_key = ("provider", "issuer", "subject")
@@ -406,6 +565,173 @@ def validate_head_schema(engine: Engine) -> None:
             "api_tokens lacks the account ownership cascade constraint"
         )
 
+    life_entity_unique_sets = {
+        tuple(str(name) for name in constraint.get("column_names") or ())
+        for constraint in inspector.get_unique_constraints("life_entities")
+    }
+    if ("id", "owner_id") not in life_entity_unique_sets:
+        raise SchemaRevisionError(
+            "life_entities lacks composite id/owner uniqueness"
+        )
+
+    for child_table in ("life_entity_versions", "focus_sessions"):
+        composite_owner_fk = any(
+            tuple(foreign_key.get("constrained_columns") or ())
+            == ("entity_id", "owner_id")
+            and str(foreign_key.get("referred_table") or "") == "life_entities"
+            and tuple(foreign_key.get("referred_columns") or ())
+            == ("id", "owner_id")
+            and str(
+                (foreign_key.get("options") or {}).get("ondelete") or ""
+            ).upper() == "CASCADE"
+            for foreign_key in inspector.get_foreign_keys(child_table)
+        )
+        if not composite_owner_fk:
+            raise SchemaRevisionError(
+                f"{child_table} lacks owner-matching life-entity ownership"
+            )
+
+    focus_checks = {
+        str(constraint.get("name") or "")
+        for constraint in inspector.get_check_constraints("focus_sessions")
+    }
+    required_focus_checks = {
+        "ck_focus_sessions_state",
+        "ck_focus_sessions_elapsed",
+        "ck_focus_sessions_version",
+    }
+    if not required_focus_checks.issubset(focus_checks):
+        raise SchemaRevisionError(
+            "focus_sessions lacks required state/elapsed/version checks"
+        )
+
+    principal_tables = (
+        "life_sources",
+        "life_entities",
+        "life_entity_versions",
+        "entity_links",
+        "action_policies",
+        "action_proposals",
+        "focus_sessions",
+    )
+    for table_name in principal_tables:
+        if not _has_foreign_key(
+            inspector,
+            table_name,
+            constrained=("owner_id",),
+            referred_table="accounts",
+            referred=("id",),
+            ondelete="CASCADE",
+        ):
+            raise SchemaRevisionError(
+                f"{table_name} lacks the account ownership cascade constraint"
+            )
+
+    if not _has_foreign_key(
+        inspector,
+        "action_proposals",
+        constrained=("approved_by_account_id",),
+        referred_table="accounts",
+        referred=("id",),
+        ondelete="SET NULL",
+    ):
+        raise SchemaRevisionError(
+            "action_proposals lacks the approver account constraint"
+        )
+
+    required_uniques: dict[str, set[tuple[str, ...]]] = {
+        "life_sources": {("owner_id", "idempotency_key")},
+        "life_entities": {
+            ("id", "owner_id"),
+            ("owner_id", "idempotency_key"),
+            (
+                "owner_id",
+                "entity_type",
+                "domain_ref_type",
+                "domain_ref_id",
+            ),
+        },
+        "life_entity_versions": {("entity_id", "version")},
+        "entity_links": {
+            (
+                "owner_id",
+                "source_type",
+                "source_id",
+                "relation",
+                "target_type",
+                "target_id",
+            )
+        },
+        "action_policies": {("owner_id", "domain")},
+        "action_proposals": {
+            ("owner_id", "idempotency_key"),
+            ("confirmation_digest",),
+        },
+    }
+    for table_name, expected in required_uniques.items():
+        present = _table_unique_sets(inspector, table_name)
+        missing_unique = expected - present
+        if missing_unique:
+            rendered = ", ".join("/".join(value) for value in sorted(missing_unique))
+            raise SchemaRevisionError(
+                f"{table_name} lacks required uniqueness: {rendered}"
+            )
+
+    required_v3_checks: dict[str, set[str]] = {
+        "life_sources": {"ck_life_sources_version"},
+        "life_entities": {
+            "ck_life_entities_type",
+            "ck_life_entities_confidence",
+            "ck_life_entities_version",
+        },
+        "life_entity_versions": {"ck_life_entity_versions_version"},
+        "action_policies": {
+            "ck_action_policies_autonomy",
+            "ck_action_policies_version",
+        },
+        "action_proposals": {
+            "ck_action_proposals_autonomy",
+            "ck_action_proposals_state",
+            "ck_action_proposals_approver_owner",
+            "ck_action_proposals_version",
+        },
+    }
+    for table_name, expected in required_v3_checks.items():
+        present = {
+            str(constraint.get("name") or "")
+            for constraint in inspector.get_check_constraints(table_name)
+        }
+        if not expected.issubset(present):
+            raise SchemaRevisionError(
+                f"{table_name} lacks required database checks"
+            )
+
+    focus_indexes = {
+        str(index.get("name") or ""): index
+        for index in inspector.get_indexes("focus_sessions")
+    }
+    live_index = focus_indexes.get("uq_focus_sessions_owner_live")
+    live_predicate = ""
+    if live_index is not None:
+        dialect_options = live_index.get("dialect_options") or {}
+        predicate_value = dialect_options.get(
+            f"{engine.dialect.name}_where"
+        )
+        live_predicate = (
+            "" if predicate_value is None else str(predicate_value).upper()
+        )
+    if (
+        live_index is None
+        or not bool(live_index.get("unique"))
+        or tuple(live_index.get("column_names") or ()) != ("owner_id",)
+        or "STATE" not in live_predicate
+        or "ACTIVE" not in live_predicate
+        or "PAUSED" not in live_predicate
+    ):
+        raise SchemaRevisionError(
+            "focus_sessions lacks the one-live-session partial unique index"
+        )
+
     if engine.dialect.name == "sqlite":
         with engine.connect() as connection:
             trigger_rows = connection.execute(text(
@@ -436,6 +762,136 @@ def validate_head_schema(engine: Engine) -> None:
         if "RESTIA_REJECT_ACTION_AUDIT_MUTATION" not in definition:
             raise SchemaRevisionError("action_audit PostgreSQL guard is missing")
 
+    if engine.dialect.name == "sqlite":
+        with engine.connect() as connection:
+            version_trigger_rows = connection.execute(text(
+                "SELECT name, sql FROM sqlite_master "
+                "WHERE type='trigger' AND tbl_name='life_entity_versions'"
+            )).all()
+        version_trigger_sql = {
+            str(row[0]): " ".join(str(row[1] or "").upper().split())
+            for row in version_trigger_rows
+        }
+        update_guard = version_trigger_sql.get("life_entity_versions_no_update", "")
+        delete_guard = version_trigger_sql.get("life_entity_versions_no_delete", "")
+        if (
+            "BEFORE UPDATE ON LIFE_ENTITY_VERSIONS" not in update_guard
+            or "RAISE(ABORT" not in update_guard
+        ):
+            raise SchemaRevisionError(
+                "life_entity_versions update guard is missing or invalid"
+            )
+        if (
+            "BEFORE DELETE ON LIFE_ENTITY_VERSIONS" not in delete_guard
+            or "RAISE(ABORT" not in delete_guard
+        ):
+            raise SchemaRevisionError(
+                "life_entity_versions delete guard is missing or invalid"
+            )
+    elif engine.dialect.name == "postgresql":
+        with engine.connect() as connection:
+            version_definitions = {
+                str(row[0]): str(row[1]).upper()
+                for row in connection.execute(text("""
+                    SELECT trigger_name, action_statement
+                    FROM information_schema.triggers
+                    WHERE event_object_table = 'life_entity_versions'
+                """)).all()
+            }
+        version_definition = version_definitions.get(
+            "life_entity_versions_no_update_or_delete", ""
+        )
+        if "RESTIA_REJECT_LIFE_ENTITY_VERSION_MUTATION" not in version_definition:
+            raise SchemaRevisionError(
+                "life_entity_versions PostgreSQL guard is missing"
+            )
+
+    if engine.dialect.name == "sqlite":
+        with engine.connect() as connection:
+            edge_trigger_rows = connection.execute(text(
+                "SELECT name, sql FROM sqlite_master "
+                "WHERE type='trigger' AND tbl_name='entity_links'"
+            )).all()
+        edge_trigger_sql = {
+            str(row[0]): " ".join(str(row[1] or "").upper().split())
+            for row in edge_trigger_rows
+        }
+        edge_checks = {
+            str(constraint.get("name") or "")
+            for constraint in inspector.get_check_constraints("entity_links")
+        }
+        required_edge_checks = {
+            "ck_entity_links_confidence",
+            "ck_entity_links_version",
+        }
+        validation_fragments = {
+            "entity_links_validate_insert": (
+                "BEFORE INSERT ON ENTITY_LINKS",
+                "NEW.CONFIDENCE < 0",
+                "NEW.VERSION < 1",
+                "RAISE(ABORT",
+            ),
+            "entity_links_validate_update": (
+                "BEFORE UPDATE ON ENTITY_LINKS",
+                "NEW.CONFIDENCE < 0",
+                "NEW.VERSION < 1",
+                "RAISE(ABORT",
+            ),
+        }
+        # A fresh ORM-created SQLite table has native CHECK constraints. The
+        # additive 0003/legacy path uses equivalent triggers because SQLite
+        # cannot add those constraints without rebuilding the whole table.
+        if not required_edge_checks.issubset(edge_checks):
+            for trigger_name, fragments in validation_fragments.items():
+                definition = edge_trigger_sql.get(trigger_name, "")
+                if any(fragment not in definition for fragment in fragments):
+                    raise SchemaRevisionError(
+                        "entity_links confidence/version guard is missing or "
+                        f"invalid: {trigger_name}"
+                    )
+        updated_at = next(
+            column
+            for column in inspector.get_columns("entity_links")
+            if str(column.get("name")) == "updated_at"
+        )
+        default = str(updated_at.get("default") or "").upper()
+        if "1970-01-01 00:00:00" in default:
+            definition = edge_trigger_sql.get(
+                "entity_links_fill_updated_at", ""
+            )
+            required = (
+                "AFTER INSERT ON ENTITY_LINKS",
+                "NEW.UPDATED_AT = '1970-01-01 00:00:00'",
+                "SET UPDATED_AT = CURRENT_TIMESTAMP",
+            )
+            if any(fragment not in definition for fragment in required):
+                raise SchemaRevisionError(
+                    "entity_links updated_at sentinel guard is missing or invalid"
+                )
+    elif engine.dialect.name == "postgresql":
+        edge_checks = {
+            str(constraint.get("name") or "")
+            for constraint in inspector.get_check_constraints("entity_links")
+        }
+        required_edge_checks = {
+            "ck_entity_links_confidence",
+            "ck_entity_links_version",
+        }
+        if not required_edge_checks.issubset(edge_checks):
+            raise SchemaRevisionError(
+                "entity_links lacks confidence/version database checks"
+            )
+        updated_at = next(
+            column
+            for column in inspector.get_columns("entity_links")
+            if str(column.get("name")) == "updated_at"
+        )
+        default = str(updated_at.get("default") or "").upper()
+        if "CURRENT_TIMESTAMP" not in default and "NOW()" not in default:
+            raise SchemaRevisionError(
+                "entity_links.updated_at lacks a current-time server default"
+            )
+
 
 def _stamp_revision(engine: Engine, revision: str) -> None:
     try:
@@ -451,7 +907,7 @@ def _stamp_revision(engine: Engine, revision: str) -> None:
 
 
 def upgrade_schema(engine: Engine) -> SchemaRevisionStatus:
-    """Upgrade an empty/known-behind engine to immutable schema head 0002."""
+    """Upgrade an empty or executable known-behind engine to schema head."""
 
     status = schema_revision_status(engine)
     application_tables = application_table_names(engine)
@@ -461,7 +917,8 @@ def upgrade_schema(engine: Engine) -> SchemaRevisionStatus:
     if status.matches_expected:
         validate_head_schema(engine)
         return status
-    if application_tables:
+    executable_upgrade = status.current_revisions == (EXPLICIT_BASELINE_REVISION,)
+    if application_tables and not executable_upgrade:
         raise SchemaRevisionError(
             "A non-empty legacy database must use the verified adoption path"
         )

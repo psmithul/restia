@@ -76,6 +76,13 @@ NOTES_TODAY_ITEM_LIMIT = 10
 PLANNING_ITEM_LIMIT = 20
 DAILY_BRIEF_ITEM_LIMIT = 1
 NEXT_ACTION_LIMIT = 3
+TODAY_EVENT_LIMIT = CALENDAR_ITEM_LIMIT
+TODAY_MUST_DO_LIMIT = 10
+TODAY_PEOPLE_LIMIT = 10
+TODAY_ROUTINE_LIMIT = 10
+TODAY_RISK_LIMIT = 10
+TODAY_SCHEDULE_LIMIT = NEXT_ACTION_LIMIT
+TODAY_RESTIA_WORK_LIMIT = 10
 ACTIVITY_ITEM_LIMIT = 50
 INBOX_PREVIEW_LIMIT = 5
 
@@ -93,6 +100,27 @@ _HEALTH_CACHE_TTL_SECONDS = 30.0
 _ACTIVITY_SOURCE_SCAN_LIMIT = 100
 _HIGH_PRIORITIES = ("high", "highest", "critical")
 _HEALTH_STATUSES = {"ok", "degraded", "down", "disabled"}
+_REPLY_MARKERS = ("reply", "respond", "response", "answer", "follow up", "follow-up")
+_ROUTINE_MARKERS = (
+    "exercise",
+    "workout",
+    "gym",
+    "walk",
+    "meditat",
+    "yoga",
+    "sleep",
+    "medicine",
+    "medication",
+    "doctor",
+    "therapy",
+    "meal",
+    "nutrition",
+    "hydrate",
+    "water",
+    "health",
+    "routine",
+    "habit",
+)
 
 
 @dataclass(frozen=True)
@@ -1260,6 +1288,885 @@ def _build_next_actions(sources: dict[str, dict[str, Any]]) -> list[dict[str, An
     return actions
 
 
+def _bounded_text(value: Any, limit: int = 240) -> str:
+    return " ".join(str(value or "").split())[:limit]
+
+
+def _supported_ref(source_id: Any, title: Any) -> dict[str, str] | None:
+    label = _bounded_text(title, 180)
+    if not label:
+        return None
+    return {
+        "id": _bounded_text(source_id, 240),
+        "title": label,
+    }
+
+
+def _source_evidence(source: str, source_id: Any, label: Any) -> dict[str, str]:
+    return {
+        "source": _bounded_text(source, 48),
+        "source_id": _bounded_text(source_id, 240),
+        "label": _bounded_text(label, 180) or "Source record",
+    }
+
+
+def _recommendation(
+    *,
+    item_id: Any,
+    kind: str,
+    title: Any,
+    detail: Any,
+    target: str,
+    urgency: str,
+    why_now: str,
+    estimated_minutes: int,
+    delay_cost: str,
+    supported_goal: dict[str, str] | None = None,
+    supported_project: dict[str, str] | None = None,
+    source_evidence: list[dict[str, str]] | None = None,
+    what_restia_can_handle: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the uniform, bounded V3 recommendation contract.
+
+    ``payload`` may retain safe source-specific fields, but the common fields
+    below always win.  This prevents a source row from overriding provenance
+    or recommendation rationale.
+    """
+
+    result = dict(payload or {})
+    result.update({
+        "id": _bounded_text(item_id, 300),
+        "kind": _bounded_text(kind, 80),
+        "title": _bounded_text(title, 180) or "Untitled",
+        "detail": _bounded_text(detail, 300),
+        "target": _bounded_text(target, 48),
+        "urgency": _bounded_text(urgency, 32),
+        "why_now": _bounded_text(why_now, 300),
+        "estimated_minutes": max(0, min(1440, int(estimated_minutes))),
+        "delay_cost": _bounded_text(delay_cost, 300),
+        "supported_goal": supported_goal,
+        "supported_project": supported_project,
+        "source_evidence": list(source_evidence or [])[:2],
+        "what_restia_can_handle": _bounded_text(what_restia_can_handle, 360),
+    })
+    return result
+
+
+def _row_label(row: dict[str, Any]) -> str:
+    for key in ("title", "task_name", "subject", "goal", "workspace_name", "id"):
+        label = _bounded_text(row.get(key), 180)
+        if label:
+            return label
+    return "Source record"
+
+
+def _find_action_source(
+    action: dict[str, Any], sources: dict[str, dict[str, Any]]
+) -> tuple[str, dict[str, Any]]:
+    kind = str(action.get("kind") or "")
+    source_id = str(action.get("source_id") or "")
+    if kind in {"failed_task", "scheduled_task"}:
+        source_name, keys = "tasks", ("run_id", "task_id")
+    elif kind in {
+        "overdue_project_work",
+        "project_work_due_today",
+        "high_priority_project_work",
+    }:
+        source_name, keys = "project_work", ("id",)
+    elif kind == "important_mail":
+        source_name, keys = "important_mail", ("id",)
+    elif kind == "study_review":
+        source_name, keys = "study_reviews", ("session_id",)
+    elif kind == "planning_item":
+        source_name, keys = "planning", ("id",)
+    elif kind == "goal_step":
+        source_name, keys = "notes_today", ("id",)
+    elif kind == "study_goal":
+        source_name, keys = "goals", ("session_id",)
+    else:
+        return "unknown", {}
+    for row in _source_items(sources.get(source_name, {})):
+        if any(str(row.get(key) or "") == source_id for key in keys):
+            return source_name, row
+    return source_name, {}
+
+
+def _enrich_next_action(
+    action: dict[str, Any], sources: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    source_name, row = _find_action_source(action, sources)
+    kind = str(action.get("kind") or "")
+    guidance: dict[str, tuple[int, str, str, str]] = {
+        "failed_task": (
+            20,
+            "The latest automation run failed and is blocking work Restia was meant to handle.",
+            "The intended automation stays incomplete and dependent work may age.",
+            "Inspect the recorded failure, prepare a safe retry, and report the "
+            "diagnosis; execution still follows the action policy.",
+        ),
+        "overdue_project_work": (
+            45,
+            "Its due date has passed, so it has the highest user-work urgency.",
+            "The supported project remains late and downstream work may slip.",
+            "Open the linked project and prepare a concrete recovery checklist.",
+        ),
+        "important_mail": (
+            15,
+            "It is unread and the email urgency state marks it as needing attention.",
+            "A time-sensitive decision or relationship may wait longer for a response.",
+            "Open the thread and draft a reply; sending always requires the applicable approval.",
+        ),
+        "study_review": (
+            25,
+            "The spaced review is due now, when recall evidence is most useful.",
+            "Delaying the review weakens retention and leaves mastery evidence stale.",
+            "Open the due Study review, restore its context, and start the Study timer.",
+        ),
+        "planning_item": (
+            30,
+            "This open planning commitment is overdue or due today.",
+            "The commitment will roll forward and compete with tomorrow's work.",
+            "Open the item and prepare a realistic calendar block for it.",
+        ),
+        "project_work_due_today": (
+            45,
+            "The linked project work is due before the end of today.",
+            "Missing today's deadline puts the project behind plan.",
+            "Open the linked project and prepare the next executable steps.",
+        ),
+        "goal_step": (
+            25,
+            "It is the first incomplete step in an active goal or checklist.",
+            "The linked commitment makes no measurable progress today.",
+            "Open the source note and start a focused timer on this step.",
+        ),
+        "high_priority_project_work": (
+            45,
+            "It is marked high priority in an active project.",
+            "High-priority project work remains exposed as deadlines approach.",
+            "Open the project item and prepare a bounded execution plan.",
+        ),
+        "study_goal": (
+            25,
+            "It is the next evidence-producing step for an active Study goal.",
+            "Goal progress and mastery evidence remain unchanged.",
+            "Open Study Mode with the goal context and start a focused session.",
+        ),
+        "scheduled_task": (
+            0,
+            "Restia has an automation scheduled to run today.",
+            "No user action is needed unless its timing or policy must change.",
+            "Run it under its current policy and report the result.",
+        ),
+    }
+    estimated, why_now, delay_cost, restia = guidance.get(
+        kind,
+        (
+            30,
+            "It is the highest-ranked evidence-backed item available now.",
+            "The underlying commitment remains unresolved.",
+            "Open the source and prepare its next step.",
+        ),
+    )
+    project = None
+    goal = None
+    if source_name == "project_work":
+        project = _supported_ref(row.get("project_id"), row.get("project_name"))
+    elif source_name in {"study_reviews", "goals"}:
+        goal = _supported_ref(row.get("session_id"), row.get("goal"))
+    elif source_name == "notes_today" and row.get("kind") == "goal":
+        goal = _supported_ref(row.get("id"), row.get("title"))
+    evidence_id = action.get("source_id")
+    evidence = [
+        _source_evidence(source_name, evidence_id, _row_label(row) or action.get("title"))
+    ] if source_name != "unknown" else []
+    return _recommendation(
+        item_id=action.get("id"),
+        kind=kind,
+        title=action.get("title"),
+        detail=action.get("detail"),
+        target=str(action.get("target") or "home"),
+        urgency=str(action.get("urgency") or "normal"),
+        why_now=why_now,
+        estimated_minutes=estimated,
+        delay_cost=delay_cost,
+        supported_goal=goal,
+        supported_project=project,
+        source_evidence=evidence,
+        what_restia_can_handle=restia,
+        payload={"source_id": _bounded_text(action.get("source_id"), 240)},
+    )
+
+
+def _parse_local_datetime(value: Any, utc_offset_minutes: int) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed
+    utc_naive = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return utc_naive + timedelta(minutes=utc_offset_minutes)
+
+
+def _event_interval(
+    row: dict[str, Any], utc_offset_minutes: int
+) -> tuple[datetime, datetime] | None:
+    start = _parse_local_datetime(row.get("start"), utc_offset_minutes)
+    end = _parse_local_datetime(row.get("end"), utc_offset_minutes)
+    if start is None or end is None or end <= start:
+        return None
+    return start, end
+
+
+def _event_minutes(row: dict[str, Any], utc_offset_minutes: int) -> int:
+    interval = _event_interval(row, utc_offset_minutes)
+    if interval is None:
+        return 30
+    return max(1, min(1440, int((interval[1] - interval[0]).total_seconds() // 60)))
+
+
+def _build_today_events(
+    sources: dict[str, dict[str, Any]],
+    *,
+    local_now: datetime,
+    utc_offset_minutes: int,
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for row in _source_items(sources.get("calendar", {}))[:TODAY_EVENT_LIMIT]:
+        interval = _event_interval(row, utc_offset_minutes)
+        if row.get("all_day"):
+            why_now = "It is an all-day commitment on today's calendar."
+        elif interval is not None and interval[0] > local_now:
+            why_now = f"It starts at {interval[0].strftime('%H:%M')} local time today."
+        elif interval is not None and interval[1] > local_now:
+            why_now = "It is in progress now."
+        else:
+            why_now = "It occurred earlier today and may need follow-up."
+        source_id = row.get("id")
+        items.append(_recommendation(
+            item_id=source_id,
+            kind="calendar_event",
+            title=row.get("title"),
+            detail=row.get("location") or row.get("calendar") or "Calendar commitment",
+            target="calendar",
+            urgency="attention" if row.get("importance") in _HIGH_PRIORITIES else "normal",
+            why_now=why_now,
+            estimated_minutes=_event_minutes(row, utc_offset_minutes),
+            delay_cost="Missing it risks a calendar conflict, missed commitment, or follow-up gap.",
+            source_evidence=[_source_evidence("calendar", source_id, row.get("title"))],
+            what_restia_can_handle=(
+                "Open the event and prepare reminders, context, or follow-up "
+                "notes without changing the calendar."
+            ),
+            payload={
+                key: row.get(key)
+                for key in (
+                    "start", "end", "all_day", "calendar", "importance",
+                    "event_type", "location",
+                )
+            },
+        ))
+    return items
+
+
+def _build_must_do_tasks(
+    sources: dict[str, dict[str, Any]], *, local_date: date
+) -> list[dict[str, Any]]:
+    candidates: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    for row in _source_items(sources.get("project_work", {}))[:PROJECT_WORK_ITEM_LIMIT]:
+        if not (row.get("overdue") or row.get("due_today")):
+            continue
+        overdue = bool(row.get("overdue"))
+        source_id = row.get("id")
+        candidates.append(((0 if overdue else 1, str(row.get("due_date") or ""), str(source_id)), _recommendation(
+            item_id=f"project_work:{source_id}",
+            kind="project_work",
+            title=row.get("title"),
+            detail=(
+                f"{row.get('key') or row.get('project_name') or 'Project work'} "
+                f"is {'overdue' if overdue else 'due today'}."
+            ),
+            target="projects",
+            urgency="critical" if overdue else "attention",
+            why_now="Its deadline has passed." if overdue else "Its deadline is today.",
+            estimated_minutes=45,
+            delay_cost="The linked project remains late and downstream work may slip.",
+            supported_project=_supported_ref(row.get("project_id"), row.get("project_name")),
+            source_evidence=[_source_evidence("project_work", source_id, row.get("title"))],
+            what_restia_can_handle="Open the project item, gather its context, and prepare a bounded completion plan.",
+            payload={
+                "source_id": _bounded_text(source_id, 240),
+                "due_date": row.get("due_date"),
+                "overdue": overdue,
+                "due_today": bool(row.get("due_today")),
+                "priority": row.get("priority") or "medium",
+            },
+        )))
+
+    for row in _source_items(sources.get("planning", {}))[:PLANNING_ITEM_LIMIT]:
+        if row.get("status") != "open" or not (
+            row.get("overdue") or row.get("due_today")
+        ):
+            continue
+        overdue = bool(row.get("overdue"))
+        source_id = row.get("id")
+        candidates.append(((0 if overdue else 1, str(row.get("due_date") or ""), str(source_id)), _recommendation(
+            item_id=f"planning:{source_id}",
+            kind="planning_item",
+            title=row.get("title"),
+            detail="Open planning commitment",
+            target="home",
+            urgency="critical" if overdue else "attention",
+            why_now="It is overdue." if overdue else "It is due today.",
+            estimated_minutes=30,
+            delay_cost="The commitment rolls forward and competes with tomorrow's work.",
+            source_evidence=[_source_evidence("planning", source_id, row.get("title"))],
+            what_restia_can_handle="Open the planning item and prepare a realistic focus block.",
+            payload={
+                "source_id": _bounded_text(source_id, 240),
+                "due_date": row.get("due_date"),
+                "overdue": overdue,
+                "due_today": bool(row.get("due_today")),
+                "priority": row.get("priority") or "normal",
+            },
+        )))
+
+    for row in _source_items(sources.get("study_reviews", {}))[:STUDY_REVIEW_ITEM_LIMIT]:
+        source_id = row.get("session_id")
+        candidates.append(((2, str(row.get("due_at") or ""), str(source_id)), _recommendation(
+            item_id=f"study_review:{source_id}",
+            kind="study_review",
+            title=f"Review {row.get('goal') or row.get('workspace_name') or 'study goal'}",
+            detail=row.get("next_step") or "Complete the due review.",
+            target="study",
+            urgency="attention",
+            why_now="The spaced review is due now.",
+            estimated_minutes=25,
+            delay_cost="Recall and mastery evidence become less reliable as the review slips.",
+            supported_goal=_supported_ref(source_id, row.get("goal")),
+            source_evidence=[_source_evidence("study_reviews", source_id, _row_label(row))],
+            what_restia_can_handle="Open the review with its Study context and start the timer.",
+            payload={
+                "source_id": _bounded_text(source_id, 240),
+                "due_at": row.get("due_at"),
+            },
+        )))
+
+    today_text = local_date.isoformat()
+    for row in _source_items(sources.get("notes_today", {}))[:NOTES_TODAY_ITEM_LIMIT]:
+        due_date = str(row.get("due_date") or "")
+        if not due_date or due_date > today_text:
+            continue
+        overdue = due_date < today_text
+        source_id = row.get("id")
+        candidates.append(((2 if overdue else 3, due_date, str(source_id)), _recommendation(
+            item_id=f"note_step:{source_id}",
+            kind="goal_step" if row.get("kind") == "goal" else "todo_step",
+            title=row.get("next_step"),
+            detail=f"Next incomplete step for {row.get('title') or 'active note'}.",
+            target="notes" if row.get("kind") == "goal" else "todos",
+            urgency="critical" if overdue else "attention",
+            why_now="Its note deadline has passed." if overdue else "Its note deadline is today.",
+            estimated_minutes=25,
+            delay_cost="The linked goal or checklist remains incomplete past its target date.",
+            supported_goal=(
+                _supported_ref(source_id, row.get("title"))
+                if row.get("kind") == "goal" else None
+            ),
+            source_evidence=[_source_evidence("notes_today", source_id, row.get("title"))],
+            what_restia_can_handle="Open the exact incomplete step and start a focused timer.",
+            payload={
+                "source_id": _bounded_text(source_id, 240),
+                "due_date": due_date,
+                "overdue": overdue,
+                "due_today": not overdue,
+            },
+        )))
+
+    candidates.sort(key=lambda candidate: candidate[0])
+    return [item for _, item in candidates[:TODAY_MUST_DO_LIMIT]]
+
+
+def _build_people_awaiting_responses(
+    sources: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for row in _source_items(sources.get("important_mail", {}))[:IMPORTANT_MAIL_ITEM_LIMIT]:
+        score = int(row.get("score") or 0)
+        searchable = f"{row.get('reason') or ''} {row.get('subject') or ''}".lower()
+        if score < 3 and not any(marker in searchable for marker in _REPLY_MARKERS):
+            continue
+        source_id = row.get("id")
+        sender = _bounded_text(row.get("sender"), 120) or "Email sender"
+        items.append(_recommendation(
+            item_id=f"mail_response:{source_id}",
+            kind="email_response",
+            title=f"Reply to {sender}",
+            detail=row.get("subject") or row.get("reason") or "Important unread email",
+            target="email",
+            urgency="critical" if score >= 3 else "attention",
+            why_now="The unread message is marked important and has reply-related evidence.",
+            estimated_minutes=15,
+            delay_cost="A time-sensitive decision or relationship may wait longer for your response.",
+            source_evidence=[_source_evidence("important_mail", source_id, row.get("subject"))],
+            what_restia_can_handle=(
+                "Open the thread and draft a response; sending always requires "
+                "the applicable approval."
+            ),
+            payload={
+                "source_id": _bounded_text(source_id, 240),
+                "person": sender,
+                "subject": _bounded_text(row.get("subject"), 160),
+                "score": score,
+                "reason": _bounded_text(row.get("reason"), 160),
+            },
+        ))
+        if len(items) == TODAY_PEOPLE_LIMIT:
+            break
+    return items
+
+
+def _looks_like_routine(*values: Any) -> bool:
+    searchable = " ".join(str(value or "") for value in values).lower()
+    return any(marker in searchable for marker in _ROUTINE_MARKERS)
+
+
+def _build_health_routine_commitments(
+    sources: dict[str, dict[str, Any]], *, utc_offset_minutes: int
+) -> list[dict[str, Any]]:
+    candidates: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    for row in _source_items(sources.get("planning", {}))[:PLANNING_ITEM_LIMIT]:
+        if row.get("status") != "open" or not _looks_like_routine(
+            row.get("title"), row.get("details")
+        ):
+            continue
+        source_id = row.get("id")
+        due_now = bool(row.get("overdue") or row.get("due_today"))
+        candidates.append(((0 if due_now else 2, str(row.get("due_date") or ""), str(source_id)), _recommendation(
+            item_id=f"routine:planning:{source_id}",
+            kind="routine_planning_item",
+            title=row.get("title"),
+            detail="Open health or routine planning commitment.",
+            target="home",
+            urgency="attention" if due_now else "normal",
+            why_now=(
+                "It is due or overdue today."
+                if due_now
+                else "It is an open routine commitment worth protecting today."
+            ),
+            estimated_minutes=30,
+            delay_cost="Skipping the commitment breaks routine continuity and pushes it into another day.",
+            source_evidence=[_source_evidence("planning", source_id, row.get("title"))],
+            what_restia_can_handle="Open the commitment, prepare a reminder, and suggest a calendar block.",
+            payload={
+                "source_id": _bounded_text(source_id, 240),
+                "due_date": row.get("due_date"),
+            },
+        )))
+
+    for row in _source_items(sources.get("notes_today", {}))[:NOTES_TODAY_ITEM_LIMIT]:
+        if not _looks_like_routine(row.get("title"), row.get("next_step")):
+            continue
+        source_id = row.get("id")
+        candidates.append(((1, str(row.get("due_date") or ""), str(source_id)), _recommendation(
+            item_id=f"routine:note:{source_id}",
+            kind="routine_note_step",
+            title=row.get("next_step") or row.get("title"),
+            detail=f"Next routine step in {row.get('title') or 'active note'}.",
+            target="notes" if row.get("kind") == "goal" else "todos",
+            urgency="attention" if row.get("due_date") else "normal",
+            why_now="It is the next incomplete step in an active health or routine note.",
+            estimated_minutes=20,
+            delay_cost="The routine loses continuity and the linked note remains incomplete.",
+            supported_goal=(
+                _supported_ref(source_id, row.get("title"))
+                if row.get("kind") == "goal" else None
+            ),
+            source_evidence=[_source_evidence("notes_today", source_id, row.get("title"))],
+            what_restia_can_handle="Open the exact step and prepare a reminder or focus timer.",
+            payload={
+                "source_id": _bounded_text(source_id, 240),
+                "due_date": row.get("due_date"),
+            },
+        )))
+
+    for row in _source_items(sources.get("calendar", {}))[:TODAY_EVENT_LIMIT]:
+        if not _looks_like_routine(row.get("title"), row.get("event_type")):
+            continue
+        source_id = row.get("id")
+        candidates.append(((1, str(row.get("start") or ""), str(source_id)), _recommendation(
+            item_id=f"routine:event:{source_id}",
+            kind="routine_calendar_event",
+            title=row.get("title"),
+            detail=row.get("location") or "Calendar routine",
+            target="calendar",
+            urgency="attention",
+            why_now="It is scheduled on today's calendar as a health or routine commitment.",
+            estimated_minutes=_event_minutes(row, utc_offset_minutes),
+            delay_cost="Missing the scheduled block breaks routine continuity.",
+            source_evidence=[_source_evidence("calendar", source_id, row.get("title"))],
+            what_restia_can_handle="Open the event and prepare reminders or post-routine notes.",
+            payload={
+                "source_id": _bounded_text(source_id, 240),
+                "start": row.get("start"),
+                "end": row.get("end"),
+            },
+        )))
+
+    candidates.sort(key=lambda candidate: candidate[0])
+    seen: set[str] = set()
+    items: list[dict[str, Any]] = []
+    for _, item in candidates:
+        if item["id"] in seen:
+            continue
+        seen.add(item["id"])
+        items.append(item)
+        if len(items) == TODAY_ROUTINE_LIMIT:
+            break
+    return items
+
+
+def _build_risks_conflicts(
+    sources: dict[str, dict[str, Any]], *, utc_offset_minutes: int
+) -> list[dict[str, Any]]:
+    candidates: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    calendar_rows = _source_items(sources.get("calendar", {}))[:TODAY_EVENT_LIMIT]
+    event_intervals: list[tuple[datetime, datetime, dict[str, Any]]] = []
+    for row in calendar_rows:
+        if row.get("all_day"):
+            continue
+        interval = _event_interval(row, utc_offset_minutes)
+        if interval is not None:
+            event_intervals.append((interval[0], interval[1], row))
+    event_intervals.sort(key=lambda value: (value[0], value[1], str(value[2].get("id") or "")))
+    for index, (start, end, left) in enumerate(event_intervals):
+        for other_start, other_end, right in event_intervals[index + 1:]:
+            if other_start >= end:
+                break
+            if start >= other_end:
+                continue
+            left_id = left.get("id")
+            right_id = right.get("id")
+            stable_pair = f"{left_id}:{right_id}"
+            candidates.append(((0, start.isoformat(), stable_pair), _recommendation(
+                item_id=f"calendar_conflict:{stable_pair}",
+                kind="calendar_conflict",
+                title=f"Calendar conflict: {left.get('title') or 'Event'} and {right.get('title') or 'Event'}",
+                detail=(
+                    f"The events overlap from {other_start.strftime('%H:%M')} "
+                    f"to {min(end, other_end).strftime('%H:%M')} local time."
+                ),
+                target="calendar",
+                urgency="critical",
+                why_now="Both commitments occupy the same time today.",
+                estimated_minutes=5,
+                delay_cost="Leaving the overlap unresolved risks missing one or both commitments.",
+                source_evidence=[
+                    _source_evidence("calendar", left_id, left.get("title")),
+                    _source_evidence("calendar", right_id, right.get("title")),
+                ],
+                what_restia_can_handle=(
+                    "Prepare rescheduling options and the affected context; "
+                    "calendar changes follow the action policy."
+                ),
+                payload={
+                    "starts_at": start.isoformat(timespec="seconds"),
+                    "overlap_starts_at": other_start.isoformat(timespec="seconds"),
+                },
+            )))
+
+    for row in _source_items(sources.get("tasks", {}))[:TASK_ITEM_LIMIT]:
+        if row.get("kind") != "failed_run":
+            continue
+        source_id = row.get("run_id") or row.get("task_id")
+        candidates.append(((0, str(row.get("started_at") or ""), str(source_id)), _recommendation(
+            item_id=f"failed_task:{source_id}",
+            kind="failed_automation",
+            title=f"Failed automation: {row.get('task_name') or 'Untitled task'}",
+            detail="The latest run ended in error.",
+            target="tasks",
+            urgency="critical",
+            why_now="Restia-owned work failed and has not been recovered by a newer run.",
+            estimated_minutes=20,
+            delay_cost="The intended automation remains incomplete and dependent work may age.",
+            source_evidence=[_source_evidence("tasks", source_id, row.get("task_name"))],
+            what_restia_can_handle="Inspect the recorded failure and prepare a safe retry under the action policy.",
+            payload={"source_id": _bounded_text(source_id, 240)},
+        )))
+
+    for row in _source_items(sources.get("project_work", {}))[:PROJECT_WORK_ITEM_LIMIT]:
+        if not row.get("overdue"):
+            continue
+        source_id = row.get("id")
+        candidates.append(((1, str(row.get("due_date") or ""), str(source_id)), _recommendation(
+            item_id=f"overdue_project:{source_id}",
+            kind="overdue_project_work",
+            title=row.get("title"),
+            detail=f"{row.get('key') or 'Project work'} was due {row.get('due_date') or 'earlier'}.",
+            target="projects",
+            urgency="critical",
+            why_now="Its project deadline has already passed.",
+            estimated_minutes=45,
+            delay_cost="The project remains late and downstream milestones may slip.",
+            supported_project=_supported_ref(row.get("project_id"), row.get("project_name")),
+            source_evidence=[_source_evidence("project_work", source_id, row.get("title"))],
+            what_restia_can_handle="Open the item, gather context, and prepare a recovery sequence.",
+            payload={"source_id": _bounded_text(source_id, 240)},
+        )))
+
+    for row in _source_items(sources.get("planning", {}))[:PLANNING_ITEM_LIMIT]:
+        if row.get("status") != "open" or not row.get("overdue"):
+            continue
+        source_id = row.get("id")
+        candidates.append(((1, str(row.get("due_date") or ""), str(source_id)), _recommendation(
+            item_id=f"overdue_planning:{source_id}",
+            kind="overdue_planning_item",
+            title=row.get("title"),
+            detail="This open planning item is overdue.",
+            target="home",
+            urgency="critical",
+            why_now="Its due date has passed without completion.",
+            estimated_minutes=30,
+            delay_cost="The commitment rolls forward and consumes future capacity.",
+            source_evidence=[_source_evidence("planning", source_id, row.get("title"))],
+            what_restia_can_handle="Open the item and prepare recovery or rescheduling options.",
+            payload={"source_id": _bounded_text(source_id, 240)},
+        )))
+
+    health = sources.get("health", {})
+    raw_services = health.get("services") if isinstance(health, dict) else None
+    services = raw_services if isinstance(raw_services, list) else []
+    for row in services[:_HEALTH_SERVICE_LIMIT]:
+        if not isinstance(row, dict) or row.get("status") not in {"degraded", "down"}:
+            continue
+        name = _bounded_text(row.get("name"), 80) or "service"
+        status = str(row.get("status") or "degraded")
+        candidates.append(((0 if status == "down" else 2, name.lower(), name), _recommendation(
+            item_id=f"service_health:{name}",
+            kind="service_health_risk",
+            title=f"{name} is {status}",
+            detail="A Restia service needed by today's workflows is not fully healthy.",
+            target="settings",
+            urgency="critical" if status == "down" else "attention",
+            why_now="The current service-health probe reports reduced availability.",
+            estimated_minutes=10,
+            delay_cost="Features that depend on this service may fail or produce incomplete work.",
+            source_evidence=[_source_evidence("health", name, f"{name}: {status}")],
+            what_restia_can_handle=(
+                "Show the affected service and prepare diagnostic steps without "
+                "exposing internal health details."
+            ),
+            payload={"service": name, "status": status},
+        )))
+
+    for row in _source_items(sources.get("important_mail", {}))[:IMPORTANT_MAIL_ITEM_LIMIT]:
+        if int(row.get("score") or 0) < 3:
+            continue
+        source_id = row.get("id")
+        candidates.append(((2, str(row.get("subject") or "").lower(), str(source_id)), _recommendation(
+            item_id=f"mail_risk:{source_id}",
+            kind="important_mail_risk",
+            title=row.get("subject"),
+            detail=row.get("reason") or "Critical unread email",
+            target="email",
+            urgency="critical",
+            why_now="The unread message has the highest email urgency score.",
+            estimated_minutes=15,
+            delay_cost="A time-sensitive request or deadline may be missed.",
+            source_evidence=[_source_evidence("important_mail", source_id, row.get("subject"))],
+            what_restia_can_handle="Open the thread and draft a response; sending requires the applicable approval.",
+            payload={"source_id": _bounded_text(source_id, 240)},
+        )))
+
+    candidates.sort(key=lambda candidate: candidate[0])
+    return [item for _, item in candidates[:TODAY_RISK_LIMIT]]
+
+
+def _ceil_quarter_hour(value: datetime) -> datetime:
+    base = value.replace(second=0, microsecond=0)
+    remainder = base.minute % 15
+    if remainder:
+        base += timedelta(minutes=15 - remainder)
+    return base
+
+
+def _build_suggested_schedule(
+    sources: dict[str, dict[str, Any]],
+    top_actions: list[dict[str, Any]],
+    *,
+    local_date: date,
+    local_now: datetime,
+    utc_offset_minutes: int,
+) -> list[dict[str, Any]]:
+    day_start = datetime.combine(local_date, time(hour=8))
+    day_end = datetime.combine(local_date, time(hour=21))
+    cursor = max(day_start, _ceil_quarter_hour(local_now))
+    if cursor >= day_end:
+        return []
+
+    occupied: list[tuple[datetime, datetime]] = []
+    for row in _source_items(sources.get("calendar", {}))[:TODAY_EVENT_LIMIT]:
+        if row.get("all_day"):
+            continue
+        interval = _event_interval(row, utc_offset_minutes)
+        if interval is None or interval[1] <= cursor or interval[0] >= day_end:
+            continue
+        occupied.append((max(interval[0], day_start), min(interval[1], day_end)))
+    occupied.sort()
+
+    items: list[dict[str, Any]] = []
+    for action in top_actions[:TODAY_SCHEDULE_LIMIT]:
+        if action.get("kind") == "scheduled_task":
+            continue
+        raw_duration = max(15, min(120, int(action.get("estimated_minutes") or 30)))
+        duration = ((raw_duration + 14) // 15) * 15
+        start = cursor
+        while start + timedelta(minutes=duration) <= day_end:
+            candidate_end = start + timedelta(minutes=duration)
+            conflict = next(
+                (
+                    interval for interval in occupied
+                    if interval[0] < candidate_end and interval[1] > start
+                ),
+                None,
+            )
+            if conflict is None:
+                break
+            start = _ceil_quarter_hour(conflict[1])
+        end = start + timedelta(minutes=duration)
+        if end > day_end:
+            continue
+        occupied.append((start, end))
+        occupied.sort()
+        cursor = end
+        action_id = str(action.get("id") or "")
+        items.append(_recommendation(
+            item_id=f"schedule:{action_id}",
+            kind="focus_block",
+            title=action.get("title"),
+            detail=f"Suggested {duration}-minute block for a top action.",
+            target="calendar",
+            urgency=str(action.get("urgency") or "normal"),
+            why_now="This is the earliest free block today that does not overlap a known event.",
+            estimated_minutes=duration,
+            delay_cost=str(action.get("delay_cost") or "The linked commitment remains unresolved."),
+            supported_goal=action.get("supported_goal"),
+            supported_project=action.get("supported_project"),
+            source_evidence=list(action.get("source_evidence") or []),
+            what_restia_can_handle=(
+                "Prepare this focus block for Calendar; saving or moving events "
+                "follows the action policy."
+            ),
+            payload={
+                "action_id": action_id,
+                "start": start.isoformat(timespec="seconds"),
+                "end": end.isoformat(timespec="seconds"),
+                "utc_offset_minutes": utc_offset_minutes,
+            },
+        ))
+        if len(items) == TODAY_SCHEDULE_LIMIT:
+            break
+    return items
+
+
+def _build_restia_owned_work(
+    sources: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for row in _source_items(sources.get("tasks", {}))[:TODAY_RESTIA_WORK_LIMIT]:
+        task_kind = str(row.get("kind") or "scheduled")
+        source_id = row.get("run_id") or row.get("task_id")
+        if task_kind == "failed_run":
+            why_now = "The latest Restia-owned run failed and needs supervised recovery."
+            delay_cost = "The automation's intended work remains incomplete."
+            restia = "Inspect the failure and prepare a safe retry under the action policy."
+            urgency = "critical"
+            estimated = 5
+        elif task_kind == "running_run":
+            why_now = "Restia is currently handling this work."
+            delay_cost = "No user action is needed unless the run stalls or its priority changes."
+            restia = "Continue the run and report its terminal result."
+            urgency = "normal"
+            estimated = 0
+        else:
+            why_now = "Restia is scheduled to handle this work today."
+            delay_cost = "No user action is needed unless its timing or policy should change."
+            restia = "Run the task at its scheduled time under the current action policy and report the result."
+            urgency = "normal"
+            estimated = 0
+        items.append(_recommendation(
+            item_id=f"restia_work:{task_kind}:{source_id}",
+            kind=task_kind,
+            title=row.get("task_name"),
+            detail=f"Status: {row.get('status') or task_kind}",
+            target="tasks",
+            urgency=urgency,
+            why_now=why_now,
+            estimated_minutes=estimated,
+            delay_cost=delay_cost,
+            source_evidence=[_source_evidence("tasks", source_id, row.get("task_name"))],
+            what_restia_can_handle=restia,
+            payload={
+                key: row.get(key)
+                for key in (
+                    "run_id", "task_id", "status", "scheduled_for",
+                    "started_at", "finished_at",
+                )
+            },
+        ))
+    return items
+
+
+def _build_today_sections(
+    sources: dict[str, dict[str, Any]],
+    *,
+    next_actions: list[dict[str, Any]],
+    local_date: date,
+    local_now: datetime,
+    utc_offset_minutes: int,
+) -> dict[str, Any]:
+    """Project already-bounded owner-safe sources into the V3 Today contract."""
+
+    local_wall_now = local_now.replace(tzinfo=None) if local_now.tzinfo else local_now
+    top_actions = [
+        _enrich_next_action(action, sources)
+        for action in next_actions[:NEXT_ACTION_LIMIT]
+    ]
+    events = _build_today_events(
+        sources,
+        local_now=local_wall_now,
+        utc_offset_minutes=utc_offset_minutes,
+    )
+    return {
+        "primary_outcome": dict(top_actions[0]) if top_actions else None,
+        "top_three_actions": top_actions,
+        "events": events,
+        "must_do_tasks": _build_must_do_tasks(sources, local_date=local_date),
+        "people_awaiting_responses": _build_people_awaiting_responses(sources),
+        "health_routine_commitments": _build_health_routine_commitments(
+            sources, utc_offset_minutes=utc_offset_minutes
+        ),
+        "risks_conflicts": _build_risks_conflicts(
+            sources, utc_offset_minutes=utc_offset_minutes
+        ),
+        "suggested_schedule": _build_suggested_schedule(
+            sources,
+            top_actions,
+            local_date=local_date,
+            local_now=local_wall_now,
+            utc_offset_minutes=utc_offset_minutes,
+        ),
+        "restia_owned_work": _build_restia_owned_work(sources),
+    }
+
+
 async def _load_health(
     collector: Callable[..., Any],
     rag_manager: Any,
@@ -1714,6 +2621,13 @@ def setup_mission_control_routes(
             "health": health,
         }
         next_actions = _build_next_actions(sources)
+        today_sections = _build_today_sections(
+            sources,
+            next_actions=next_actions,
+            local_date=local_date,
+            local_now=local_now,
+            utc_offset_minutes=utc_offset_minutes,
+        )
         return {
             "date": local_date.isoformat(),
             "as_of": _iso_utc(now_utc),
@@ -1738,6 +2652,7 @@ def setup_mission_control_routes(
                 "health": health["overall"],
             },
             "next_actions": next_actions,
+            **today_sections,
             "sources": sources,
         }
 

@@ -4,7 +4,10 @@
 // are explicit review actions backed by the owner-scoped /api/inbox contract.
 
 const STATUS_FILTERS = new Set(['all', 'inbox', 'processed', 'archived']);
-const DIRECT_PROCESS_KINDS = new Set(['task']);
+const DIRECT_PROCESS_KINDS = new Set([
+  'task', 'event', 'note', 'person_update', 'decision', 'reference_material',
+  'expense', 'goal', 'habit', 'someday_idea',
+]);
 
 let API_BASE = typeof window !== 'undefined' ? window.location.origin : '';
 let refs = {};
@@ -308,7 +311,12 @@ function processAvailability(item) {
       message: `No safe automatic processor is available for ${humanize(item.kind)}; keep it classified or archive it.`,
     };
   }
-  return { enabled: true, message: 'Process will create a To Do item.' };
+  return {
+    enabled: true,
+    message: item.kind === 'task'
+      ? 'Process will create one To Do authority and its linked Life record.'
+      : `Process will create a source-backed ${humanize(item.kind)} Life record.`,
+  };
 }
 
 function metaRow(label, value, { time = '' } = {}) {
