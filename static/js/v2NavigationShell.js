@@ -211,6 +211,14 @@ function nodesForGroup(groupId) {
   return Array.from(new Set(nodes.filter(Boolean)));
 }
 
+function existingSidebarNavigationRoots(sidebar) {
+  if (!sidebar) return [];
+  // Attribute matching intentionally returns every duplicate id. Using
+  // getElementById() here would hide the exact partial-reinitialization fault
+  // this reconciliation protects against.
+  return Array.from(sidebar.querySelectorAll('[id="v2-sidebar-navigation"]'));
+}
+
 function annotateRegistryControls() {
   NAVIGATION_ITEMS.forEach((item) => {
     getLegacyTriggerIds(item).forEach((id) => {
@@ -507,7 +515,14 @@ export function prepareV2NavigationShell() {
   const sidebar = document.getElementById('sidebar');
   const inner = sidebar?.querySelector('.sidebar-inner');
   if (!sidebar || !inner) return false;
-  if (sidebar.dataset.navigationVersion === '2') return true;
+  const existingRoots = existingSidebarNavigationRoots(sidebar);
+  if (sidebar.dataset.navigationVersion === '2') {
+    if (existingRoots.length === 1) return true;
+    // The legacy controls were moved into the root during the first build.
+    // If that root vanished, silently constructing a partial shell would
+    // create unbound Home/Activity clones. Fail loudly to the caller instead.
+    if (existingRoots.length === 0) return false;
+  }
 
   ensureStylesheet();
   SEMANTIC_BUTTON_IDS.forEach(replaceWithButton);
@@ -518,15 +533,29 @@ export function prepareV2NavigationShell() {
   moveThemeToSettings();
   prepareRail();
 
-  const root = document.createElement('div');
+  // Reuse one canonical root when a partial re-init left shell markup behind.
+  // Build the replacement groups before clearing it: the registry-owned
+  // controls may currently live inside that root and must be moved, not cloned.
+  const root = existingRoots.shift() || document.createElement('div');
   root.id = 'v2-sidebar-navigation';
   root.className = 'v2-sidebar-navigation';
   const savedState = readGroupState();
+  const groups = [];
+  const claimedNodes = new Set();
   NAVIGATION_GROUPS.filter((group) => !group.hidden).forEach((group) => {
-    const nodes = nodesForGroup(group.id);
-    if (nodes.length) root.appendChild(groupElement(group, nodes, savedState));
+    // A legacy control has exactly one registry owner. Keep the first group
+    // claim if malformed extension metadata ever points two groups at the
+    // same DOM node, rather than moving it back and forth during rendering.
+    const nodes = nodesForGroup(group.id).filter((node) => {
+      if (claimedNodes.has(node)) return false;
+      claimedNodes.add(node);
+      return true;
+    });
+    if (nodes.length) groups.push(groupElement(group, nodes, savedState));
   });
+  root.replaceChildren(...groups);
   document.getElementById('sidebar-search-btn')?.after(root);
+  existingRoots.forEach((duplicate) => duplicate.remove());
   document.getElementById('tools-section')?.remove();
 
   sidebar.dataset.navigationVersion = '2';
@@ -537,7 +566,10 @@ export function prepareV2NavigationShell() {
 }
 
 export function initV2NavigationShell() {
-  prepareV2NavigationShell();
+  if (!prepareV2NavigationShell()) {
+    console.error('V2 navigation shell could not be prepared; initialization deferred.');
+    return false;
+  }
   if (initialized) return true;
   initialized = true;
   missionControlModule.init(window.location.origin);

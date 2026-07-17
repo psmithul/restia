@@ -31,10 +31,10 @@ def owner_has_admin_task_privileges(owner: str | None) -> bool:
             pass
 
     try:
-        from core.auth import AuthManager
-        auth = AuthManager()
+        from src.auth_runtime import get_auth_manager
+        auth = get_auth_manager()
         if not auth.is_configured:
-            return True
+            return False
         if not owner:
             return False
         return bool(auth.is_admin(owner))

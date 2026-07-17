@@ -18,6 +18,7 @@ clear_fake_database_modules()
 import core.auth as core_auth
 import core.database as cdb
 import routes.task_routes as task_routes
+import src.auth_runtime as auth_runtime
 from core.database import ScheduledTask
 from core.database import TaskRun
 from src.task_scheduler import TaskScheduler
@@ -69,6 +70,11 @@ def configured_auth(monkeypatch):
             return user == "admin"
 
     monkeypatch.setattr(core_auth, "AuthManager", FakeAuthManager)
+    monkeypatch.setattr(
+        auth_runtime,
+        "get_auth_manager",
+        lambda: FakeAuthManager(),
+    )
 
 
 @pytest.fixture()

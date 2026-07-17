@@ -1,12 +1,9 @@
 """API Token management routes — /api/tokens/*."""
 
-import secrets
-import uuid
-
-import bcrypt
+import os
 from fastapi import APIRouter, HTTPException, Request, Form
 
-from core.database import get_db_session, ApiToken
+from core.database import get_db_session, ApiToken, utcnow_naive
 from core.middleware import require_admin
 from src.auth_helpers import get_current_user
 
@@ -95,14 +92,28 @@ def setup_api_token_routes() -> APIRouter:
                 for t in tokens
             ]
 
-    def _invalidate_cache(request: Request):
-        """Tell the auth middleware its cached token map is stale."""
-        try:
-            invalidator = getattr(request.app.state, "invalidate_token_cache", None)
-            if invalidator:
-                invalidator()
-        except Exception:
-            pass
+    def _auth_manager(request: Request):
+        manager = getattr(request.app.state, "auth_manager", None)
+        if manager is None:
+            raise HTTPException(503, "Database authentication is unavailable")
+        return manager
+
+    def _current_account_id(request: Request) -> str | None:
+        value = getattr(request.state, "current_account_id", None)
+        if value:
+            return str(value)
+        manager = _auth_manager(request)
+        resolver = getattr(manager, "account_id_for_username", None)
+        if not callable(resolver):
+            raise HTTPException(503, "Database authentication is unavailable")
+        return resolver(get_current_user(request))
+
+    def _require_token_owner(request: Request, token: ApiToken) -> None:
+        if os.getenv("AUTH_ENABLED", "true").lower() == "false":
+            return
+        account_id = _current_account_id(request)
+        if not account_id or str(getattr(token, "account_id", "") or "") != account_id:
+            raise HTTPException(403, "Not your token")
 
     @router.get("/tokens/profiles")
     def token_profiles(request: Request):
@@ -125,31 +136,24 @@ def setup_api_token_routes() -> APIRouter:
             raise HTTPException(400, "Token name is required")
         owner = get_current_user(request)
         scope_list = _normalize_scopes(scopes, profile)
-        scopes_value = ",".join(scope_list)
-
-        raw_token = "ody_" + secrets.token_urlsafe(32)
-        token_hash = bcrypt.hashpw(raw_token.encode(), bcrypt.gensalt()).decode()
-        token_id = str(uuid.uuid4())[:8]
-
-        with get_db_session() as db:
-            db.add(ApiToken(
-                id=token_id,
-                owner=owner,
-                name=name,
-                token_hash=token_hash,
-                token_prefix=raw_token[:8],
-                scopes=scopes_value,
-                is_active=True,
-            ))
-        _invalidate_cache(request)
+        issue = getattr(_auth_manager(request), "issue_api_token", None)
+        if not callable(issue):
+            raise HTTPException(503, "Database authentication is unavailable")
+        issued = issue(
+            owner,
+            name=name,
+            scopes=scope_list,
+        )
+        if issued is None:
+            raise HTTPException(503, "Could not issue an account-bound API token")
 
         return {
-            "id": token_id,
+            "id": issued["id"],
             "name": name,
-            "owner": owner,
-            "token": raw_token,
-            "token_prefix": raw_token[:8],
-            "scopes": scope_list,
+            "owner": issued["owner"],
+            "token": issued["token"],
+            "token_prefix": issued["token_prefix"],
+            "scopes": issued["scopes"],
         }
 
     @router.patch("/tokens/{token_id}")
@@ -166,8 +170,8 @@ def setup_api_token_routes() -> APIRouter:
             token = db.query(ApiToken).filter(ApiToken.id == token_id).first()
             if not token:
                 raise HTTPException(404, "Token not found")
-            if current_user and token.owner != current_user:
-                raise HTTPException(403, "Not your token")
+            if current_user:
+                _require_token_owner(request, token)
             if isinstance(payload.get("name"), str) and payload["name"].strip():
                 token.name = payload["name"].strip()[:MAX_NAME_LEN]
             # Only touch scopes when the caller actually sent them. A partial
@@ -189,7 +193,6 @@ def setup_api_token_routes() -> APIRouter:
                 "token_prefix": getattr(token, "token_prefix", ""),
                 "scopes": current_scopes,
             }
-        _invalidate_cache(request)
         return response
 
     @router.delete("/tokens/{token_id}")
@@ -200,10 +203,11 @@ def setup_api_token_routes() -> APIRouter:
             token = db.query(ApiToken).filter(ApiToken.id == token_id).first()
             if not token:
                 raise HTTPException(404, "Token not found")
-            if current_user and token.owner != current_user:
-                raise HTTPException(403, "Not your token")
-            db.delete(token)
-        _invalidate_cache(request)
-        return {"status": "deleted"}
+            if current_user:
+                _require_token_owner(request, token)
+            token.is_active = False
+            token.revoked_at = utcnow_naive()
+            db.add(token)
+        return {"status": "revoked"}
 
     return router

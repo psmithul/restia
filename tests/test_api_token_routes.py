@@ -8,10 +8,8 @@ fake objects only — no real DB, no network, no external services.
 import asyncio
 import contextlib
 import datetime
-import secrets as _secrets_mod
 import sys
 import types
-import uuid as _uuid_mod
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -71,7 +69,21 @@ def token_routes_mod(monkeypatch):
 
 
 def _admin_mgr(is_admin: bool):
-    return SimpleNamespace(is_admin=lambda u: is_admin, is_configured=True)
+    def issue_api_token(owner, *, name, scopes):
+        return {
+            "id": "database-token-id",
+            "owner": owner,
+            "token": "ody_database-issued-secret",
+            "token_prefix": "ody_data",
+            "scopes": list(scopes),
+        }
+
+    return SimpleNamespace(
+        is_admin=lambda u: is_admin,
+        is_configured=True,
+        issue_api_token=MagicMock(side_effect=issue_api_token),
+        account_id_for_username=lambda username: f"account:{username}",
+    )
 
 
 def _req(current_user: str, *, is_admin: bool = False, invalidator=None):
@@ -79,7 +91,10 @@ def _req(current_user: str, *, is_admin: bool = False, invalidator=None):
     if invalidator is not None:
         app_state.invalidate_token_cache = invalidator
     return SimpleNamespace(
-        state=SimpleNamespace(current_user=current_user),
+        state=SimpleNamespace(
+            current_user=current_user,
+            current_account_id=f"account:{current_user}" if current_user else None,
+        ),
         headers={},
         app=SimpleNamespace(state=app_state),
     )
@@ -135,61 +150,21 @@ def test_create_token_attributes_owner_hashes_secret_and_returns_raw_once(monkey
     monkeypatch.setenv("AUTH_ENABLED", "true")
     mod = token_routes_mod
 
-    fake_suffix = "FAKESUFFIX_XXXXXXXXXXXXXXXXXXXXXXXXXX"
-    fake_uuid_str = "abcd1234-0000-0000-0000-000000000000"
-    fake_hash = b"$2b$12$FAKEHASHVALUE"
-
-    monkeypatch.setattr(_secrets_mod, "token_urlsafe", lambda n: fake_suffix)
-
-    class _FakeUUID:
-        def __str__(self):
-            return fake_uuid_str
-
-    monkeypatch.setattr(_uuid_mod, "uuid4", _FakeUUID)
-
-    fake_bcrypt = SimpleNamespace(
-        hashpw=lambda pw, salt: fake_hash,
-        gensalt=lambda: b"fakesalt",
-    )
-    monkeypatch.setattr(mod, "bcrypt", fake_bcrypt)
-
-    captured = {}
-
-    class _FakeApiToken:
-        def __init__(self, **kw):
-            captured.clear()
-            captured.update(kw)
-            self.__dict__.update(kw)
-
-    fake_session = MagicMock()
-    monkeypatch.setattr(mod, "ApiToken", _FakeApiToken)
-    monkeypatch.setattr(mod, "get_db_session", lambda: _db_ctx(fake_session))
     monkeypatch.setattr(mod, "get_current_user", lambda req: req.state.current_user)
 
-    invalidator = MagicMock()
-    req = _req("alice", is_admin=True, invalidator=invalidator)
+    req = _req("alice", is_admin=True)
     create_token = _get_handler(mod, "POST", "/tokens")
     resp = create_token(request=req, name="my-token")
 
-    expected_raw = "ody_" + fake_suffix
-    expected_prefix = expected_raw[:8]
-    expected_id = fake_uuid_str[:8]
-
-    assert resp["token"] == expected_raw
+    assert resp["token"] == "ody_database-issued-secret"
     assert resp["token"].startswith("ody_")
-    assert resp["token_prefix"] == expected_prefix
-    assert resp["id"] == expected_id
+    assert resp["token_prefix"] == "ody_data"
+    assert resp["id"] == "database-token-id"
     assert resp["owner"] == "alice"
     assert resp["scopes"] == ["chat"]
-
-    assert captured["owner"] == "alice"
-    assert captured["scopes"] == "chat"
-    assert captured["is_active"] is True
-    assert captured["token_hash"] == fake_hash.decode()
-    assert captured["token_hash"] != expected_raw
-    assert captured["token_prefix"] == expected_prefix
-
-    invalidator.assert_called_once()
+    req.app.state.auth_manager.issue_api_token.assert_called_once_with(
+        "alice", name="my-token", scopes=["chat"]
+    )
 
 
 def test_create_token_accepts_cookbook_read_scope(monkeypatch, token_routes_mod):
@@ -277,33 +252,41 @@ def test_list_tokens_returns_safe_display_fields_only(monkeypatch, token_routes_
 
 
 # ---------------------------------------------------------------------------
-# 4. DELETE /api/tokens/{id} — found → deleted + cache invalidated
+# 4. DELETE /api/tokens/{id} — found → durably revoked
 # ---------------------------------------------------------------------------
 
 
-def test_delete_token_deletes_and_invalidates_cache(monkeypatch, token_routes_mod):
+def test_delete_token_revokes_without_deleting_audit_row(monkeypatch, token_routes_mod):
     monkeypatch.setenv("AUTH_ENABLED", "true")
     mod = token_routes_mod
     monkeypatch.setattr(mod, "get_current_user", lambda req: req.state.current_user)
     monkeypatch.setattr(mod, "ApiToken", MagicMock())
 
-    fake_token = SimpleNamespace(id="abcd1234", owner="alice", name="test")
+    fake_token = SimpleNamespace(
+        id="abcd1234",
+        owner="alice",
+        account_id="account:alice",
+        name="test",
+        is_active=True,
+        revoked_at=None,
+    )
     fake_session = MagicMock()
     fake_session.query.return_value.filter.return_value.first.return_value = fake_token
     monkeypatch.setattr(mod, "get_db_session", lambda: _db_ctx(fake_session))
 
-    invalidator = MagicMock()
-    req = _req("alice", is_admin=True, invalidator=invalidator)
+    req = _req("alice", is_admin=True)
     delete_token = _get_handler(mod, "DELETE", "/tokens/{token_id}")
     resp = delete_token(request=req, token_id="abcd1234")
 
-    assert resp == {"status": "deleted"}
-    fake_session.delete.assert_called_once_with(fake_token)
-    invalidator.assert_called_once()
+    assert resp == {"status": "revoked"}
+    assert fake_token.is_active is False
+    assert fake_token.revoked_at is not None
+    fake_session.add.assert_called_once_with(fake_token)
+    fake_session.delete.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
-# 5. DELETE /api/tokens/{id} — not found → 404, cache NOT invalidated
+# 5. DELETE /api/tokens/{id} — not found → 404
 # ---------------------------------------------------------------------------
 
 
@@ -317,14 +300,12 @@ def test_delete_missing_token_returns_404_without_invalidating_cache(monkeypatch
     fake_session.query.return_value.filter.return_value.first.return_value = None
     monkeypatch.setattr(mod, "get_db_session", lambda: _db_ctx(fake_session))
 
-    invalidator = MagicMock()
-    req = _req("alice", is_admin=True, invalidator=invalidator)
+    req = _req("alice", is_admin=True)
     delete_token = _get_handler(mod, "DELETE", "/tokens/{token_id}")
 
     with pytest.raises(HTTPException) as exc:
         delete_token(request=req, token_id="missing99")
     assert exc.value.status_code == 404
-    invalidator.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +335,7 @@ def test_update_token_rename_preserves_scopes(monkeypatch, token_routes_mod):
     mod = token_routes_mod
 
     token = SimpleNamespace(
-        id="tok123", name="original", owner="alice",
+        id="tok123", name="original", owner="alice", account_id="account:alice",
         token_prefix="ody_orig", scopes="email:read,email:draft", is_active=True,
     )
     fake_session = MagicMock()
@@ -369,7 +350,6 @@ def test_update_token_rename_preserves_scopes(monkeypatch, token_routes_mod):
     assert token.scopes == "email:read,email:draft"  # untouched
     assert resp["scopes"] == ["email:read", "email:draft"]
     assert token.name == "renamed"
-    invalidator.assert_called_once()
 
 
 def test_update_token_applies_explicit_scopes(monkeypatch, token_routes_mod):
@@ -378,7 +358,7 @@ def test_update_token_applies_explicit_scopes(monkeypatch, token_routes_mod):
     mod = token_routes_mod
 
     token = SimpleNamespace(
-        id="tok123", name="original", owner="alice",
+        id="tok123", name="original", owner="alice", account_id="account:alice",
         token_prefix="ody_orig", scopes="email:read,email:draft", is_active=True,
     )
     fake_session = MagicMock()
@@ -430,7 +410,7 @@ def test_update_token_rejects_non_owner(monkeypatch, token_routes_mod):
     monkeypatch.setattr(mod, "get_current_user", lambda req: req.state.current_user)
 
     token = SimpleNamespace(
-        id="tok123", name="alice-token", owner="alice",
+        id="tok123", name="alice-token", owner="alice", account_id="account:alice",
         token_prefix="ody_alic", scopes="chat", is_active=True,
     )
     fake_session = MagicMock()
@@ -451,7 +431,10 @@ def test_delete_token_rejects_non_owner(monkeypatch, token_routes_mod):
     monkeypatch.setattr(mod, "get_current_user", lambda req: req.state.current_user)
     monkeypatch.setattr(mod, "ApiToken", MagicMock())
 
-    fake_token = SimpleNamespace(id="tok123", owner="alice", name="alice-token")
+    fake_token = SimpleNamespace(
+        id="tok123", owner="alice", account_id="account:alice",
+        name="alice-token", is_active=True, revoked_at=None,
+    )
     fake_session = MagicMock()
     fake_session.query.return_value.filter.return_value.first.return_value = fake_token
     monkeypatch.setattr(mod, "get_db_session", lambda: _db_ctx(fake_session))
@@ -462,8 +445,7 @@ def test_delete_token_rejects_non_owner(monkeypatch, token_routes_mod):
     with pytest.raises(HTTPException) as exc:
         delete_token(request=req, token_id="tok123")
     assert exc.value.status_code == 403
-    fake_session.delete.assert_not_called()
-    invalidator.assert_not_called()
+    fake_session.add.assert_not_called()
 
 
 def test_update_token_owner_check_skipped_when_auth_disabled(monkeypatch, token_routes_mod):
@@ -472,7 +454,7 @@ def test_update_token_owner_check_skipped_when_auth_disabled(monkeypatch, token_
     monkeypatch.setattr(mod, "get_current_user", lambda req: None)
 
     token = SimpleNamespace(
-        id="tok123", name="original", owner="alice",
+        id="tok123", name="original", owner="alice", account_id="account:alice",
         token_prefix="ody_alic", scopes="chat", is_active=True,
     )
     fake_session = MagicMock()
@@ -491,7 +473,10 @@ def test_delete_token_owner_check_skipped_when_auth_disabled(monkeypatch, token_
     monkeypatch.setattr(mod, "get_current_user", lambda req: None)
     monkeypatch.setattr(mod, "ApiToken", MagicMock())
 
-    fake_token = SimpleNamespace(id="tok123", owner="alice", name="alice-token")
+    fake_token = SimpleNamespace(
+        id="tok123", owner="alice", account_id="account:alice",
+        name="alice-token", is_active=True, revoked_at=None,
+    )
     fake_session = MagicMock()
     fake_session.query.return_value.filter.return_value.first.return_value = fake_token
     monkeypatch.setattr(mod, "get_db_session", lambda: _db_ctx(fake_session))
@@ -500,8 +485,9 @@ def test_delete_token_owner_check_skipped_when_auth_disabled(monkeypatch, token_
     req = _req("", is_admin=True, invalidator=invalidator)
     delete_token = _get_handler(mod, "DELETE", "/tokens/{token_id}")
     resp = delete_token(request=req, token_id="tok123")
-    assert resp == {"status": "deleted"}
-    fake_session.delete.assert_called_once_with(fake_token)
+    assert resp == {"status": "revoked"}
+    assert fake_token.is_active is False
+    fake_session.add.assert_called_once_with(fake_token)
 
 
 # ---------------------------------------------------------------------------
@@ -515,7 +501,7 @@ def test_update_token_with_array_body_does_not_500(monkeypatch, token_routes_mod
     mod = token_routes_mod
 
     token = SimpleNamespace(
-        id="tok123", name="original", owner="alice",
+        id="tok123", name="original", owner="alice", account_id="account:alice",
         token_prefix="ody_orig", scopes="email:read", is_active=True,
     )
     fake_session = MagicMock()
@@ -539,7 +525,7 @@ def test_update_token_with_null_body_does_not_500(monkeypatch, token_routes_mod)
     mod = token_routes_mod
 
     token = SimpleNamespace(
-        id="tok123", name="original", owner="alice",
+        id="tok123", name="original", owner="alice", account_id="account:alice",
         token_prefix="ody_orig", scopes="chat", is_active=True,
     )
     fake_session = MagicMock()
@@ -561,7 +547,7 @@ def test_update_token_normal_object_still_works(monkeypatch, token_routes_mod):
     mod = token_routes_mod
 
     token = SimpleNamespace(
-        id="tok123", name="original", owner="alice",
+        id="tok123", name="original", owner="alice", account_id="account:alice",
         token_prefix="ody_orig", scopes="email:read", is_active=True,
     )
     fake_session = MagicMock()
@@ -575,4 +561,3 @@ def test_update_token_normal_object_still_works(monkeypatch, token_routes_mod):
 
     assert token.name == "updated"
     assert resp["name"] == "updated"
-    invalidator.assert_called_once()

@@ -1,16 +1,15 @@
-"""Stable V3 account resolution over Restia's existing authentication.
+"""Stable V3 account resolution over Restia's unified database authority.
 
-This module deliberately does not replace ``auth.json`` or ``sessions.json``.
-The current AuthManager remains the credential/session authority; this is the
-compatibility seam that maps its authenticated username (including the real
-owner behind an API token) to a durable SQL ``Account.id`` for new domains.
-Credential migration and remote identity-provider validation are separate
-release gates.
+Credentials, identities and sessions resolve to immutable ``Account.id``
+values. Normalized usernames remain compatibility aliases for older owner
+columns; externally verified provider subjects stay exact and require explicit
+account linking before this module will resolve them.
 """
 
 from __future__ import annotations
 
 import os
+import unicodedata
 import uuid
 from collections.abc import Iterable
 from contextlib import contextmanager
@@ -25,6 +24,7 @@ from src.auth_helpers import effective_user, require_user, resolved_request_owne
 
 
 LOCAL_IDENTITY_PROVIDER = "local"
+LOCAL_IDENTITY_ISSUER = "restia-local"
 _IDENTITY_CHANGED = "Profile identity changed; refresh and sign in again"
 
 
@@ -37,6 +37,7 @@ def ensure_account(
     username: str,
     *,
     provider: str = LOCAL_IDENTITY_PROVIDER,
+    issuer: str | None = None,
     subject: str | None = None,
 ) -> Account:
     """Return the stable account for one already-authenticated principal.
@@ -48,20 +49,48 @@ def ensure_account(
 
     normalized_username = normalize_identity(username)
     normalized_provider = normalize_identity(provider)
-    normalized_subject = normalize_identity(subject or normalized_username)
-    if not normalized_username or not normalized_provider or not normalized_subject:
+    if normalized_provider == LOCAL_IDENTITY_PROVIDER:
+        normalized_issuer = LOCAL_IDENTITY_ISSUER
+        normalized_subject = normalize_identity(subject or normalized_username)
+    else:
+        # Externally verified subjects are opaque and case-sensitive. Never
+        # trim/lower/canonicalize them: doing so can collapse two provider
+        # identities onto one Restia account. The verifier supplies an exact
+        # issuer and subject; explicit linking creates the row first.
+        normalized_issuer = str(issuer or "")
+        normalized_subject = str(subject or "")
+        if (
+            not normalized_issuer
+            or normalized_issuer != normalized_issuer.strip()
+            or len(normalized_issuer) > 500
+            or not normalized_subject
+            or len(normalized_subject) > 255
+            or any(unicodedata.category(char) == "Cc" for char in normalized_subject)
+        ):
+            raise ValueError("External identities require explicit account linking")
+    if (
+        not normalized_username
+        or not normalized_provider
+        or not normalized_issuer
+        or not normalized_subject
+    ):
         raise ValueError("A concrete authenticated identity is required")
 
     identity = (
         db.query(AuthIdentity)
         .filter(
             AuthIdentity.provider == normalized_provider,
+            AuthIdentity.issuer == normalized_issuer,
             AuthIdentity.subject == normalized_subject,
+            AuthIdentity.state == "active",
         )
         .first()
     )
     if identity is not None:
-        account = db.query(Account).filter(Account.id == identity.account_id).first()
+        account = db.query(Account).filter(
+            Account.id == identity.account_id,
+            Account.status == "active",
+        ).first()
         if account is None:
             raise RuntimeError("Authenticated identity points to a missing account")
         return account
@@ -78,6 +107,8 @@ def ensure_account(
         .filter(Account.username == normalized_username)
         .first()
     )
+    if account is not None and account.status != "active":
+        raise ValueError("Local account is not active")
     try:
         # The savepoint turns a concurrent first-touch unique conflict into a
         # recoverable lookup without rolling back the caller's whole request.
@@ -90,7 +121,9 @@ def ensure_account(
                 id=str(uuid.uuid4()),
                 account_id=account.id,
                 provider=normalized_provider,
+                issuer=normalized_issuer,
                 subject=normalized_subject,
+                state="active",
             ))
             db.flush()
     except IntegrityError:
@@ -98,13 +131,18 @@ def ensure_account(
             db.query(AuthIdentity)
             .filter(
                 AuthIdentity.provider == normalized_provider,
+                AuthIdentity.issuer == normalized_issuer,
                 AuthIdentity.subject == normalized_subject,
+                AuthIdentity.state == "active",
             )
             .first()
         )
         if identity is None:
             raise
-        account = db.query(Account).filter(Account.id == identity.account_id).first()
+        account = db.query(Account).filter(
+            Account.id == identity.account_id,
+            Account.status == "active",
+        ).first()
         if account is None:
             raise RuntimeError("Authenticated identity points to a missing account")
     return account
@@ -120,19 +158,27 @@ def find_account(db, username: str) -> Account | None:
         db.query(AuthIdentity)
         .filter(
             AuthIdentity.provider == LOCAL_IDENTITY_PROVIDER,
+            AuthIdentity.issuer == LOCAL_IDENTITY_ISSUER,
             AuthIdentity.subject == subject,
+            AuthIdentity.state == "active",
         )
         .first()
     )
     if identity is not None:
-        account = db.query(Account).filter(Account.id == identity.account_id).first()
+        account = db.query(Account).filter(
+            Account.id == identity.account_id,
+            Account.status == "active",
+        ).first()
         if account is None:
             raise RuntimeError("Authenticated identity points to a missing account")
         return account
     # Account.username is itself a local alias. Older/manual V3 data can have
     # that row before the AuthIdentity backfill; reads may use it, but must not
     # repair it implicitly.
-    return db.query(Account).filter(Account.username == subject).first()
+    return db.query(Account).filter(
+        Account.username == subject,
+        Account.status == "active",
+    ).first()
 
 
 def rename_local_identity(db, old_username: str, new_username: str) -> Account | None:
@@ -153,7 +199,9 @@ def rename_local_identity(db, old_username: str, new_username: str) -> Account |
             db.query(AuthIdentity)
             .filter(
                 AuthIdentity.provider == LOCAL_IDENTITY_PROVIDER,
+                AuthIdentity.issuer == LOCAL_IDENTITY_ISSUER,
                 AuthIdentity.subject == old_subject,
+                AuthIdentity.state == "active",
             )
             .first()
         )
@@ -167,7 +215,9 @@ def rename_local_identity(db, old_username: str, new_username: str) -> Account |
         db.query(AuthIdentity)
         .filter(
             AuthIdentity.provider == LOCAL_IDENTITY_PROVIDER,
+            AuthIdentity.issuer == LOCAL_IDENTITY_ISSUER,
             AuthIdentity.subject == old_subject,
+            AuthIdentity.state == "active",
         )
         .first()
     )
@@ -176,8 +226,12 @@ def rename_local_identity(db, old_username: str, new_username: str) -> Account |
         account = db.query(Account).filter(Account.id == old_identity.account_id).first()
         if account is None:
             raise RuntimeError("Local identity points to a missing account")
+        if account.status != "active":
+            raise ValueError("Local account is not active")
     if account is None:
         account = db.query(Account).filter(Account.username == old_subject).first()
+        if account is not None and account.status != "active":
+            raise ValueError("Local account is not active")
     # Accounts are created lazily.  A profile that never used a V3 owner-scoped
     # domain has no identity row to migrate and will be created under its new
     # authenticated username on first use.
@@ -193,7 +247,9 @@ def rename_local_identity(db, old_username: str, new_username: str) -> Account |
         db.query(AuthIdentity)
         .filter(
             AuthIdentity.provider == LOCAL_IDENTITY_PROVIDER,
+            AuthIdentity.issuer == LOCAL_IDENTITY_ISSUER,
             AuthIdentity.subject == new_subject,
+            AuthIdentity.state == "active",
         )
         .first()
     )
@@ -214,7 +270,9 @@ def rename_local_identity(db, old_username: str, new_username: str) -> Account |
             id=str(uuid.uuid4()),
             account_id=account.id,
             provider=LOCAL_IDENTITY_PROVIDER,
+            issuer=LOCAL_IDENTITY_ISSUER,
             subject=new_subject,
+            state="active",
         ))
     db.flush()
     return account

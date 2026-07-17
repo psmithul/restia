@@ -65,15 +65,18 @@ def require_models_scope(request: Request) -> None:
         raise HTTPException(403, "API token requires chat scope")
 
 
-def mint_pairing_token(owner: str, invalidate=None) -> tuple[str, str]:
-    """Mint a pairing token AND invalidate the auth middleware's in-memory token
-    cache, so the new token is accepted on the very next request without a server
-    restart. Returns (token_id, raw_token); the raw token is shown once.
+def mint_pairing_token(
+    owner: str,
+    invalidate=None,
+    *,
+    auth_manager=None,
+) -> tuple[str, str]:
+    """Mint a database-backed pairing token and reveal it once."""
 
-    `invalidate` is the app's request.app.state.invalidate_token_cache callable
-    (passed in so this stays a pure, testable unit).
-    """
-    token_id, raw_token = _pairing.mint_token(owner)
+    token_id, raw_token = _pairing.mint_token(
+        owner,
+        auth_manager=auth_manager,
+    )
     if callable(invalidate):
         invalidate()
     return token_id, raw_token
@@ -195,8 +198,10 @@ def setup_companion_routes() -> APIRouter:
         payload for an in-app pairing screen."""
         require_admin(request)
         owner = get_current_user(request)
-        invalidate = getattr(request.app.state, "invalidate_token_cache", None)
-        token_id, raw_token = mint_pairing_token(owner, invalidate)
+        token_id, raw_token = mint_pairing_token(
+            owner,
+            auth_manager=request.app.state.auth_manager,
+        )
 
         hosts = _pairing.lan_ip_candidates()
         host = hosts[0] if hosts else "127.0.0.1"

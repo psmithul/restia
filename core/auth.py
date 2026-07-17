@@ -13,6 +13,7 @@ import secrets
 import threading
 import time
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -150,6 +151,14 @@ class SetAdminResult(enum.Enum):
     USER_NOT_FOUND = "user_not_found"
     NOT_AUTHORIZED = "not_authorized"   # requester is not an admin
     LAST_ADMIN = "last_admin"           # would remove the last remaining admin
+
+
+@dataclass(frozen=True)
+class AuthLoginResult:
+    token: Optional[str] = None
+    username: Optional[str] = None
+    account_id: Optional[str] = None
+    requires_totp: bool = False
 
 
 class AuthManager:
@@ -450,7 +459,13 @@ class AuthManager:
                 return False
             return self.create_user(username, password, is_admin=True)
 
-    def create_user(self, username: str, password: str, is_admin: bool = False) -> bool:
+    def create_user(
+        self,
+        username: str,
+        password: str,
+        is_admin: bool = False,
+        requesting_user: Optional[str] = None,
+    ) -> bool:
         """Create a new user account."""
         if self._auth_load_failed:
             logger.error("Refused to create profile while auth store is unavailable")
@@ -470,6 +485,10 @@ class AuthManager:
                 or username in self.retired_usernames
                 or username in self.users
             ):
+                return False
+            if requesting_user and not self.users.get(
+                requesting_user.strip().lower(), {}
+            ).get("is_admin"):
                 return False
             if "users" not in self._config:
                 self._config["users"] = {}
@@ -680,13 +699,22 @@ class AuthManager:
         stored = user.get("privileges", {})
         return {**DEFAULT_PRIVILEGES, **stored}
 
-    def set_privileges(self, username: str, privileges: Dict[str, Any]) -> bool:
+    def set_privileges(
+        self,
+        username: str,
+        privileges: Dict[str, Any],
+        requesting_user: Optional[str] = None,
+    ) -> bool:
         """Update privileges for a user. Can't modify admin privileges."""
         if self._auth_load_failed:
             logger.error("Refused to change privileges while auth store is unavailable")
             return False
         username = username.strip().lower()
         with self._config_lock:
+            if requesting_user and not self.users.get(
+                requesting_user.strip().lower(), {}
+            ).get("is_admin"):
+                return False
             if username not in self.users:
                 return False
             if self.users[username].get("is_admin"):
@@ -699,6 +727,14 @@ class AuthManager:
             self._config["users"][username]["privileges"] = current
             self._save()
         logger.info(f"Updated privileges for '{username}': {current}")
+        return True
+
+    def set_signup_enabled(self, value: bool, requesting_user: str) -> bool:
+        if self._auth_load_failed or not self.is_admin(
+            (requesting_user or "").strip().lower()
+        ):
+            return False
+        self.signup_enabled = value
         return True
 
     def set_admin(self, username: str, is_admin: bool,
@@ -767,7 +803,13 @@ class AuthManager:
         logger.info("Set is_admin=%s for '%s' (by '%s')", is_admin, username, requesting_user)
         return SetAdminResult.OK
 
-    def change_password(self, username: str, current_password: str, new_password: str) -> bool:
+    def change_password(
+        self,
+        username: str,
+        current_password: str,
+        new_password: str,
+        preserve_token: Optional[str] = None,
+    ) -> bool:
         if self._auth_load_failed:
             logger.error("Refused to change password while auth store is unavailable")
             return False
@@ -779,6 +821,7 @@ class AuthManager:
         with self._config_lock:
             self._config["users"][username]["password_hash"] = _hash_password(new_password)
             self._save()
+        self.revoke_user_sessions(username, preserve_token)
         return True
 
     # ------------------------------------------------------------------
@@ -812,13 +855,21 @@ class AuthManager:
         totp = pyotp.TOTP(secret)
         return totp.provisioning_uri(name=username, issuer_name="Restia")
 
-    def totp_confirm_enable(self, username: str, code: str) -> Optional[List[str]]:
+    def totp_confirm_enable(
+        self,
+        username: str,
+        code: str,
+        password: str,
+        preserve_token: Optional[str] = None,
+    ) -> Optional[List[str]]:
         """Enable 2FA and return one-time plaintext backup codes."""
         if self._auth_load_failed:
             logger.error("Refused to enable 2FA while auth store is unavailable")
             return None
         username = username.strip().lower()
         user = self.users.get(username, {})
+        if not self.verify_password(username, password):
+            return None
         from src.secret_storage import decrypt, encrypt
         secret = decrypt(user.get("totp_secret_pending") or "")
         if not secret:
@@ -837,6 +888,7 @@ class AuthManager:
                 _hash_backup_code(value) for value in backup
             ]
             self._save()
+        self.revoke_user_sessions(username, preserve_token)
         logger.info(f"2FA enabled for '{username}'")
         return backup
 
@@ -878,7 +930,12 @@ class AuthManager:
         logger.info(f"Backup code used for '{username}' ({remaining} remaining)")
         return True
 
-    def totp_disable(self, username: str, password: str) -> bool:
+    def totp_disable(
+        self,
+        username: str,
+        password: str,
+        preserve_token: Optional[str] = None,
+    ) -> bool:
         """Disable 2FA for a user. Requires password confirmation."""
         if self._auth_load_failed:
             logger.error("Refused to disable 2FA while auth store is unavailable")
@@ -892,6 +949,7 @@ class AuthManager:
             self._config["users"][username].pop("totp_backup_codes", None)
             self._config["users"][username]["totp_enabled"] = False
             self._save()
+        self.revoke_user_sessions(username, preserve_token)
         logger.info(f"2FA disabled for '{username}'")
         return True
 
@@ -909,10 +967,31 @@ class AuthManager:
 
     def create_session(self, username: str, password: str) -> Optional[str]:
         """Verify credentials and return a session token, or None."""
+        return self.authenticate_session(username, password).token
+
+    def authenticate_session(
+        self,
+        username: str,
+        password: str,
+        *,
+        totp_code: Optional[str] = None,
+        interface: str = "web",
+    ) -> AuthLoginResult:
+        """Compatibility login contract for explicit legacy rollback tools."""
+
         username = username.strip().lower()
         if not self.verify_password(username, password):
-            return None
-        return self.create_session_trusted(username)
+            return AuthLoginResult()
+        if self.totp_enabled(username):
+            if not totp_code:
+                return AuthLoginResult(
+                    username=username,
+                    requires_totp=True,
+                )
+            if not self.totp_verify(username, totp_code):
+                return AuthLoginResult()
+        token = self.create_session_trusted(username)
+        return AuthLoginResult(token=token, username=username if token else None)
 
     def create_session_trusted(self, username: str) -> Optional[str]:
         """Issue a session token for an already-verified user.

@@ -1,16 +1,18 @@
 # Database modes and migration status
 
-Restia V3 has one application/API policy boundary and one account identity
-model, but it does **not** yet claim that the legacy schema is PostgreSQL-ready.
-The runtime makes that distinction explicit with `RESTIA_DATABASE_MODE`.
+Restia V3 has one application/API policy boundary, one account identity model,
+and a deterministic Alembic schema baseline. The runtime separately gates the
+remaining local-only worker and sidecar state with `RESTIA_DATABASE_MODE`.
 
 ## `local-single` (default)
 
 - Requires a SQLite `DATABASE_URL`.
 - Keeps Restia's private, local-first deployment behavior.
-- Runs the existing idempotent schema bootstrap explicitly from each
-  database-backed production entrypoint. Importing `core.database` alone does
-  not create tables or run migrations.
+- Runs Alembic on an empty database. A pre-Alembic Restia database receives one
+  final compatibility bootstrap and is stamped only after the frozen baseline
+  manifest verifies every table, security-critical columns, external-identity
+  uniqueness, and append-only audit guards.
+- Importing `core.database` alone does not create tables or run migrations.
 - May use the auto-generated `data/.app_key`, or an explicitly supplied key.
 
 ## `shared` (guarded, not available yet)
@@ -26,13 +28,32 @@ authority gate:
   `RESTIA_ENCRYPTION_KEY` or `RESTIA_ENCRYPTION_KEY_FILE`.
 
 Even with those requirements present, this release refuses shared-mode startup.
-The current bootstrap still contains SQLite-specific `PRAGMA` and hand-written
-migrations. Enabling PostgreSQL before deterministic Alembic revisions exist
-would create partial or divergent schemas.
+The schema itself now compiles for PostgreSQL, but email tags/schedules,
+Telegram offsets/link state, reminder outboxes, some preferences, worker
+leadership, and attachment storage still have local SQLite/file authorities.
+Enabling multiple replicas before those are leased and fenced in PostgreSQL
+could duplicate sends or diverge state.
 
-Supabase can later provide managed PostgreSQL and OIDC, but clients must still
-go through Restia's FastAPI authorization/audit boundary. This foundation does
-not enable direct browser access to Supabase tables.
+Supabase can provide managed PostgreSQL and optional JWT identity. Set the
+public project origin in `RESTIA_SUPABASE_PROJECT_URL` (and, only when needed,
+`RESTIA_SUPABASE_AUDIENCE`; default `authenticated`). Restia derives and pins
+the issuer/JWKS URLs, accepts asymmetric RS256/ES256 access tokens only, and
+requires an authenticated user to explicitly link the exact opaque subject to
+an immutable Restia account. Browser/mobile clients still go through Restia's
+FastAPI authorization and audit boundary; they never receive a service-role key
+or query Restia tables directly.
+
+The exchange endpoints accept the Supabase access token in a bounded JSON body:
+
+- `POST /api/auth/external/supabase/link` requires an existing Restia session
+  plus the current local password and, when enabled, a fresh Restia TOTP or
+  recovery code. It links that exact verified subject to the session's account.
+- `POST /api/auth/external/supabase/login` accepts only an already-linked
+  subject, enforces the account's current Restia MFA policy, and returns the
+  normal HttpOnly Restia session cookie. A password change disables existing
+  external links until the user explicitly performs the step-up link again.
+
+Neither endpoint auto-links by email, username, or token metadata.
 
 ## Migration status and legacy baseline
 
@@ -42,19 +63,23 @@ Install the core requirements, then inspect schema state without mutating it:
 scripts/odysseus-db status --pretty
 ```
 
-The first Alembic revision is deliberately stamp-only. After the current local
-bootstrap has successfully created every V3 foundation table, record the
-baseline with:
+Fresh databases are created automatically by recording the immutable,
+stamp-only `20260716_0001` foundation and then executing the explicit
+`20260717_0002` schema. For an existing installation, normal application
+startup first creates a private SQLite backup, runs the compatibility repair,
+and verifies the frozen 0002 contract. Operators may inspect or explicitly
+record an already-repaired schema with:
 
 ```bash
 scripts/odysseus-db stamp-legacy --pretty
 ```
 
-The stamp command verifies a frozen list of sentinel tables and refuses empty,
-partial, or already-mismatched schemas. Do not run `alembic upgrade head` on an
-empty database; the baseline cannot create one. PostgreSQL stays blocked until
-the legacy migrations are replaced and the schema-readiness constant is changed
-in the same reviewed release.
+The stamp command verifies the frozen baseline manifest and security constraints
+and refuses empty, partial, pre-unified-auth, or unknown-revision schemas. Use
+normal Restia startup for an empty database; raw Alembic must begin from the
+recorded 0001 boundary (`alembic upgrade 20260716_0001:head`). PostgreSQL
+application startup stays blocked until the runtime-readiness constant is changed
+together with the remaining distributed-state ports and contract tests.
 
 Generate a Fernet key directly into an owner-only secret file, rather than
 displaying it in the terminal or committing it to repository files:

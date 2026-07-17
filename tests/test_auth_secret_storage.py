@@ -33,7 +33,9 @@ def test_totp_seed_is_encrypted_and_backup_codes_are_one_way(tmp_path, monkeypat
     assert secret not in on_disk
     assert "enc:" in on_disk
 
-    backup = manager.totp_confirm_enable("alice", pyotp.TOTP(secret).now())
+    backup = manager.totp_confirm_enable(
+        "alice", pyotp.TOTP(secret).now(), "correct horse battery staple"
+    )
     assert backup and len(backup) == 8
     on_disk = (tmp_path / "auth.json").read_text(encoding="utf-8")
     assert all(code not in on_disk for code in backup)
@@ -45,7 +47,9 @@ def test_backup_code_is_single_use_under_concurrent_login(tmp_path, monkeypatch)
     manager = _manager(tmp_path, monkeypatch)
     assert manager.setup("alice", "correct horse battery staple")
     secret = manager.totp_generate_secret("alice")
-    backup = manager.totp_confirm_enable("alice", pyotp.TOTP(secret).now())
+    backup = manager.totp_confirm_enable(
+        "alice", pyotp.TOTP(secret).now(), "correct horse battery staple"
+    )
     code = backup[0]
 
     # Stretch a successful comparison so the historical verify-before-lock
@@ -72,7 +76,9 @@ def test_wrong_key_does_not_destroy_totp_seed_and_original_key_recovers(tmp_path
     manager = _manager(tmp_path, monkeypatch)
     assert manager.setup("alice", "correct horse battery staple")
     secret = manager.totp_generate_secret("alice")
-    assert manager.totp_confirm_enable("alice", pyotp.TOTP(secret).now())
+    assert manager.totp_confirm_enable(
+        "alice", pyotp.TOTP(secret).now(), "correct horse battery staple"
+    )
     key_path = tmp_path / ".app_key"
     original_key = key_path.read_bytes()
     encrypted_seed = json.loads((tmp_path / "auth.json").read_text())["users"]["alice"]["totp_secret"]

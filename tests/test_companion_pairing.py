@@ -2,8 +2,7 @@
 
 Covers what the review asked for:
   - a non-admin / bearer caller cannot call /api/companion/pair (admin-only)
-  - the pairing token is minted once (hashed at rest) and the mint invalidates
-    the auth cache so it works immediately, no restart
+  - the pairing token is minted once by the database auth authority
   - minting is a POST, never a GET (CSRF: a SameSite=Lax cookie rides a
     top-level GET, so GET-minting would be triggerable by a link / <img>)
 """
@@ -18,17 +17,6 @@ from unittest.mock import MagicMock
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-# Capture what mint_token would persist, via a stubbed core.database.
-_CAPTURED = {}
-
-
-class _ApiToken:
-    def __init__(self, **kw):
-        _CAPTURED.clear()
-        _CAPTURED.update(kw)
-        self.__dict__.update(kw)
-
 
 @contextlib.contextmanager
 def _get_db_session():
@@ -50,7 +38,7 @@ class _DBStub(types.ModuleType):
 
 _db = _DBStub("core.database")
 _db.get_db_session = _get_db_session
-_db.ApiToken = _ApiToken
+_db.ApiToken = MagicMock()
 
 
 @pytest.fixture(autouse=True)
@@ -76,29 +64,30 @@ from companion.routes import mint_pairing_token, setup_companion_routes  # noqa:
 from core.middleware import require_admin  # noqa: E402
 
 
-# --- token minting: shown once, hashed at rest -----------------------------
+# --- token minting: shown once, account-bound ------------------------------
 
-def test_mint_token_returns_raw_once_and_stores_only_a_hash(monkeypatch):
-    monkeypatch.setitem(sys.modules, "core.database", _db)
-    parent = sys.modules.get("core")
-    if parent is not None:
-        monkeypatch.setattr(parent, "database", _db, raising=False)
+def test_mint_token_delegates_to_database_auth_and_returns_raw_once():
+    manager = SimpleNamespace(issue_api_token=MagicMock(return_value={
+        "id": "id1",
+        "token": "ody_database-secret",
+    }))
 
-    token_id, raw = P.mint_token("alice")
-    assert raw.startswith("ody_")
-    # The persisted row stores a bcrypt hash + prefix, never the plaintext.
-    assert _CAPTURED["token_hash"] != raw
-    assert _CAPTURED["token_hash"].startswith("$2")  # bcrypt
-    assert _CAPTURED["token_prefix"] == raw[:8]
-    assert _CAPTURED["owner"] == "alice"
-    assert _CAPTURED["scopes"] == "chat"
-    assert _CAPTURED["is_active"] is True
+    token_id, raw = P.mint_token("alice", auth_manager=manager)
+
+    assert (token_id, raw) == ("id1", "ody_database-secret")
+    manager.issue_api_token.assert_called_once_with(
+        "alice", name="companion", scopes=["chat"]
+    )
 
 
 def test_mint_pairing_token_invalidates_cache(monkeypatch):
     # The mint must flip the auth middleware's cache so the token works on the
     # very next request, with no restart.
-    monkeypatch.setattr(P, "mint_token", lambda owner, name="companion": ("id1", "ody_demo"))
+    monkeypatch.setattr(
+        P,
+        "mint_token",
+        lambda owner, name="companion", auth_manager=None: ("id1", "ody_demo"),
+    )
     invalidate = MagicMock()
     token_id, raw = mint_pairing_token("alice", invalidate)
     assert (token_id, raw) == ("id1", "ody_demo")
@@ -106,7 +95,11 @@ def test_mint_pairing_token_invalidates_cache(monkeypatch):
 
 
 def test_mint_pairing_token_tolerates_no_invalidator(monkeypatch):
-    monkeypatch.setattr(P, "mint_token", lambda owner, name="companion": ("id1", "ody_demo"))
+    monkeypatch.setattr(
+        P,
+        "mint_token",
+        lambda owner, name="companion", auth_manager=None: ("id1", "ody_demo"),
+    )
     # Must not blow up if the app didn't expose an invalidator.
     assert mint_pairing_token("alice", None) == ("id1", "ody_demo")
 
@@ -116,15 +109,17 @@ def test_pairing_payload_shape():
     assert p == {"v": 1, "host": "192.168.1.9", "port": 7000, "token": "ody_x"}
 
 
-@pytest.mark.parametrize("payload", ["[]", '{"users": []}'])
-def test_find_admin_user_ignores_invalid_auth_shape(tmp_path, monkeypatch, payload):
-    auth_file = tmp_path / "auth.json"
-    auth_file.write_text(payload)
-    # find_admin_user reads the import-time AUTH_FILE constant, so redirect that
-    # rather than relying on cwd.
-    monkeypatch.setattr(P, "AUTH_FILE", str(auth_file))
+@pytest.mark.parametrize("users", [[], None, "invalid"])
+def test_find_admin_user_ignores_invalid_database_auth_shape(users):
+    assert P.find_admin_user(SimpleNamespace(users=users)) is None
 
-    assert P.find_admin_user() is None
+
+def test_find_admin_user_prefers_database_role():
+    manager = SimpleNamespace(users={
+        "alice": {"is_admin": False},
+        "admin": {"is_admin": True},
+    })
+    assert P.find_admin_user(manager) == "admin"
 
 
 # --- admin-only gate: a bearer/non-admin caller is rejected ----------------
@@ -239,7 +234,9 @@ def test_pair_post_json_returns_pairing_payload(monkeypatch):
     request = _fake_pair_request(format="json", port=7000)
     response = _pair_route("POST")(request)
 
-    mint.assert_called_once_with("alice", request.app.state.invalidate_token_cache)
+    mint.assert_called_once_with(
+        "alice", auth_manager=request.app.state.auth_manager
+    )
     assert response["host"] == "192.168.1.50"
     assert response["port"] == 7000
     assert response["token"] == "ody_raw"
@@ -258,7 +255,11 @@ def test_pair_post_json_returns_pairing_payload(monkeypatch):
 def test_pair_post_json_qr_failure_returns_null_qr(monkeypatch):
     monkeypatch.setattr(R, "require_admin", lambda request: None, raising=False)
     monkeypatch.setattr(R, "get_current_user", lambda request: "alice")
-    monkeypatch.setattr(R, "mint_pairing_token", lambda owner, invalidate: ("tok123", "ody_raw"))
+    monkeypatch.setattr(
+        R,
+        "mint_pairing_token",
+        lambda owner, **kwargs: ("tok123", "ody_raw"),
+    )
     monkeypatch.setattr(R._pairing, "lan_ip_candidates", lambda: ["192.168.1.50"])
     monkeypatch.setattr(R._pairing, "pairing_qr_png_data_uri", lambda payload: None)
 
@@ -279,7 +280,11 @@ def test_pair_post_json_qr_failure_returns_null_qr(monkeypatch):
 def test_pair_post_html_escapes_pairing_values(monkeypatch):
     monkeypatch.setattr(R, "require_admin", lambda request: None, raising=False)
     monkeypatch.setattr(R, "get_current_user", lambda request: "alice")
-    monkeypatch.setattr(R, "mint_pairing_token", lambda owner, invalidate: ("tok<123>", "ody_<raw>&"))
+    monkeypatch.setattr(
+        R,
+        "mint_pairing_token",
+        lambda owner, **kwargs: ("tok<123>", "ody_<raw>&"),
+    )
     monkeypatch.setattr(R._pairing, "lan_ip_candidates", lambda: ["host<one>&"])
     monkeypatch.setattr(R._pairing, "pairing_qr_png_data_uri", lambda payload: None)
 

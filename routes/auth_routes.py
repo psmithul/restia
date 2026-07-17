@@ -1,7 +1,7 @@
 """Authentication routes — login, logout, signup, status, user management."""
 
 from fastapi import APIRouter, Request, Response, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 import asyncio
 import logging
@@ -84,6 +84,18 @@ class SetAdminRequest(BaseModel):
 class SetOpenRegistrationRequest(BaseModel):
     enabled: bool
 
+
+class SupabaseSessionRequest(BaseModel):
+    access_token: str = Field(min_length=1, max_length=32 * 1024)
+    remember: bool = True
+    totp_code: Optional[str] = Field(default=None, max_length=128)
+
+
+class SupabaseLinkRequest(BaseModel):
+    access_token: str = Field(min_length=1, max_length=32 * 1024)
+    current_password: str = Field(min_length=1, max_length=4096)
+    totp_code: Optional[str] = Field(default=None, max_length=128)
+
 SESSION_COOKIE = "odysseus_session"
 
 
@@ -96,7 +108,12 @@ def username_reserved(name: str) -> bool:
     return username_is_reserved(key) or key.endswith(GUEST_SUFFIX)
 
 
-def setup_auth_routes(auth_manager: AuthManager, *, identity_renamer=None) -> APIRouter:
+def setup_auth_routes(
+    auth_manager: AuthManager,
+    *,
+    identity_renamer=None,
+    supabase_verifier=None,
+) -> APIRouter:
     # Keep V3 identity migration independently testable from the route's many
     # legacy owner stores. Production always resolves the real fail-closed
     # migrator; only focused tests that replace SQLAlchemy inject a test double.
@@ -192,10 +209,30 @@ def setup_auth_routes(auth_manager: AuthManager, *, identity_renamer=None) -> AP
     _login_limiter = RateLimiter(max_requests=15, window_seconds=60)
     _signup_limiter = RateLimiter(max_requests=3, window_seconds=300)
     _setup_limiter = RateLimiter(max_requests=3, window_seconds=300)
+    _external_login_limiter = RateLimiter(max_requests=15, window_seconds=60)
+    _external_link_limiter = RateLimiter(max_requests=5, window_seconds=300)
 
     def _get_current_user(request: Request) -> Optional[str]:
         token = request.cookies.get(SESSION_COOKIE)
         return auth_manager.get_username_for_token(token)
+
+    def _set_session_cookie(
+        response: Response,
+        token: str,
+        *,
+        remember: bool,
+    ) -> None:
+        cookie_kwargs = dict(
+            key=SESSION_COOKIE,
+            value=token,
+            httponly=True,
+            samesite="lax",
+            secure=os.getenv("SECURE_COOKIES", "false").lower() == "true",
+            path="/",
+        )
+        if remember:
+            cookie_kwargs["max_age"] = TOKEN_TTL
+        response.set_cookie(**cookie_kwargs)
 
     @router.post("/setup")
     async def first_run_setup(body: SetupRequest, request: Request):
@@ -272,39 +309,111 @@ def setup_auth_routes(auth_manager: AuthManager, *, identity_renamer=None) -> AP
     async def login(body: LoginRequest, request: Request, response: Response):
         if not _login_limiter.check(request.client.host):
             raise HTTPException(429, "Too many requests — try again later")
-        # Verify password first
         username = body.username.strip().lower()
-        if not await asyncio.to_thread(auth_manager.verify_password, username, body.password):
-            raise HTTPException(401, "Invalid credentials")
-        # Check 2FA if enabled
-        if auth_manager.totp_enabled(username):
-            if not body.totp_code:
-                # Password OK but need TOTP — tell client to show code input
-                return {"ok": False, "requires_totp": True, "username": username}
-            # Legacy backup codes use bcrypt. Keep that CPU-bound verification
-            # off the event loop so one login cannot stall every other request.
-            if not await asyncio.to_thread(
-                auth_manager.totp_verify,
-                username,
-                body.totp_code,
-            ):
-                raise HTTPException(401, "Invalid 2FA code")
-        # All checks passed — create session (password already verified above)
-        token = await asyncio.to_thread(auth_manager.create_session_trusted, username)
+        authenticate = getattr(auth_manager, "authenticate_session", None)
+        if not callable(authenticate):
+            raise HTTPException(503, "Database authentication is unavailable")
+        result = await asyncio.to_thread(
+            authenticate,
+            username,
+            body.password,
+            totp_code=body.totp_code,
+            interface="web",
+        )
+        if result.requires_totp:
+            return {
+                "ok": False,
+                "requires_totp": True,
+                "username": result.username or username,
+            }
+        token = result.token
         if not token:
             raise HTTPException(401, "Invalid credentials")
-        cookie_kwargs = dict(
-            key=SESSION_COOKIE,
-            value=token,
-            httponly=True,
-            samesite="lax",
-            secure=os.getenv("SECURE_COOKIES", "false").lower() == "true",
-            path="/",
+        _set_session_cookie(response, token, remember=body.remember)
+        return {"ok": True, "username": result.username or username}
+
+    @router.post("/external/supabase/login")
+    async def supabase_login(
+        body: SupabaseSessionRequest,
+        request: Request,
+        response: Response,
+    ):
+        """Exchange a verified, already-linked Supabase subject for a session."""
+
+        if supabase_verifier is None:
+            raise HTTPException(503, "Supabase login is not configured")
+        if not _external_login_limiter.check(request.client.host):
+            raise HTTPException(429, "Too many requests — try again later")
+        try:
+            from src.supabase_auth import SupabaseJWTVerificationError
+
+            identity = await asyncio.to_thread(
+                supabase_verifier.verify, body.access_token
+            )
+        except SupabaseJWTVerificationError:
+            # Do not expose signature/key/claim distinctions as an identity
+            # oracle to unauthenticated clients.
+            raise HTTPException(401, "Invalid external credentials") from None
+        authenticate = getattr(
+            auth_manager, "authenticate_external_identity", None
         )
-        if body.remember:
-            cookie_kwargs["max_age"] = TOKEN_TTL
-        response.set_cookie(**cookie_kwargs)
-        return {"ok": True, "username": username}
+        if not callable(authenticate):
+            raise HTTPException(503, "Database authentication is unavailable")
+        result = await asyncio.to_thread(
+            authenticate,
+            provider=identity.auth_provider,
+            issuer=identity.issuer,
+            subject=identity.subject,
+            totp_code=body.totp_code,
+            interface="web",
+        )
+        if result.requires_totp:
+            return {"ok": False, "requires_totp": True}
+        if not result.token:
+            raise HTTPException(401, "Invalid external credentials")
+        _set_session_cookie(response, result.token, remember=body.remember)
+        return {
+            "ok": True,
+            "username": result.username,
+            "account_id": result.account_id,
+            "provider": "supabase",
+        }
+
+    @router.post("/external/supabase/link")
+    async def supabase_link(body: SupabaseLinkRequest, request: Request):
+        """Explicitly link a verified Supabase subject to this signed-in account."""
+
+        if supabase_verifier is None:
+            raise HTTPException(503, "Supabase login is not configured")
+        if not _external_link_limiter.check(request.client.host):
+            raise HTTPException(429, "Too many requests — try again later")
+        session_token = request.cookies.get(SESSION_COOKIE)
+        principal = auth_manager.resolve_session(session_token)
+        if principal is None:
+            raise HTTPException(401, "Not authenticated")
+        try:
+            from src.supabase_auth import SupabaseJWTVerificationError
+
+            identity = await asyncio.to_thread(
+                supabase_verifier.verify, body.access_token
+            )
+        except SupabaseJWTVerificationError:
+            raise HTTPException(401, "Invalid external credentials") from None
+        linker = getattr(auth_manager, "link_external_identity", None)
+        if not callable(linker):
+            raise HTTPException(503, "Database authentication is unavailable")
+        linked = await asyncio.to_thread(
+            linker,
+            session_token,
+            current_password=body.current_password,
+            totp_code=body.totp_code,
+            provider=identity.auth_provider,
+            issuer=identity.issuer,
+            subject=identity.subject,
+        )
+        if not linked:
+            raise HTTPException(403, "External identity link authorization failed")
+        return {"ok": True, "provider": "supabase"}
 
     @router.post("/logout")
     async def logout(request: Request, response: Response):
@@ -344,10 +453,15 @@ def setup_auth_routes(auth_manager: AuthManager, *, identity_renamer=None) -> AP
         if len(body.new_password) < PASSWORD_MIN_LENGTH:
             raise HTTPException(400, f"Password must be at least {PASSWORD_MIN_LENGTH} characters")
         current_token = request.cookies.get(SESSION_COOKIE)
-        ok = await asyncio.to_thread(auth_manager.change_password, user, body.current_password, body.new_password)
+        ok = await asyncio.to_thread(
+            auth_manager.change_password,
+            user,
+            body.current_password,
+            body.new_password,
+            current_token,
+        )
         if not ok:
             raise HTTPException(400, "Current password is incorrect")
-        await asyncio.to_thread(auth_manager.revoke_user_sessions, user, current_token)
         return {"ok": True}
 
     # ------------------------------------------------------------------
@@ -376,6 +490,7 @@ def setup_auth_routes(auth_manager: AuthManager, *, identity_renamer=None) -> AP
 
     class TotpVerifyRequest(BaseModel):
         code: str
+        password: str = Field(min_length=1, max_length=4096)
 
     @router.post("/2fa/confirm")
     async def totp_confirm(body: TotpVerifyRequest, request: Request):
@@ -383,7 +498,12 @@ def setup_auth_routes(auth_manager: AuthManager, *, identity_renamer=None) -> AP
         user = _get_current_user(request)
         if not user:
             raise HTTPException(401, "Not authenticated")
-        backup = auth_manager.totp_confirm_enable(user, body.code)
+        backup = auth_manager.totp_confirm_enable(
+            user,
+            body.code,
+            body.password,
+            request.cookies.get(SESSION_COOKIE),
+        )
         if not backup:
             raise HTTPException(400, "Invalid code — try again")
         return {"ok": True, "backup_codes": backup}
@@ -397,7 +517,11 @@ def setup_auth_routes(auth_manager: AuthManager, *, identity_renamer=None) -> AP
         user = _get_current_user(request)
         if not user:
             raise HTTPException(401, "Not authenticated")
-        if not auth_manager.totp_disable(user, body.password):
+        if not auth_manager.totp_disable(
+            user,
+            body.password,
+            request.cookies.get(SESSION_COOKIE),
+        ):
             raise HTTPException(400, "Invalid password")
         return {"ok": True}
 
@@ -432,7 +556,12 @@ def setup_auth_routes(auth_manager: AuthManager, *, identity_renamer=None) -> AP
             raise HTTPException(400, "Username is required")
         if username_reserved(body.username):
             raise HTTPException(403, "Username is reserved")
-        ok = auth_manager.create_user(body.username, body.password, body.is_admin)
+        ok = auth_manager.create_user(
+            body.username,
+            body.password,
+            body.is_admin,
+            requesting_user=user,
+        )
         if not ok:
             raise HTTPException(409, "Username already taken")
         return {"ok": True}
@@ -444,7 +573,11 @@ def setup_auth_routes(auth_manager: AuthManager, *, identity_renamer=None) -> AP
         if not user or not auth_manager.is_admin(user):
             raise HTTPException(403, "Admin only")
         body = await request.json()
-        ok = auth_manager.set_privileges(username, body)
+        ok = auth_manager.set_privileges(
+            username,
+            body,
+            requesting_user=user,
+        )
         if not ok:
             raise HTTPException(404, "User not found or is admin")
         return {"ok": True, "privileges": auth_manager.get_privileges(username)}
@@ -470,7 +603,7 @@ def setup_auth_routes(auth_manager: AuthManager, *, identity_renamer=None) -> AP
             raise HTTPException(403, "Username is reserved")
 
         # TODO(project-identity-journal): persist an idempotent pending rename
-        # before auth.json changes and resume it during startup. The in-process
+        # before database identity changes and resume it during startup. The in-process
         # coordinator below closes request races, but process death between the
         # auth save and SQL owner migration still requires durable recovery.
         # Gate on auth first. Every mutation below is contingent on this
@@ -793,7 +926,13 @@ def setup_auth_routes(auth_manager: AuthManager, *, identity_renamer=None) -> AP
         user = _get_current_user(request)
         if not user or not auth_manager.is_admin(user):
             raise HTTPException(403, "Admin only")
-        auth_manager.signup_enabled = not auth_manager.signup_enabled
+        enabled = not auth_manager.signup_enabled
+        setter = getattr(auth_manager, "set_signup_enabled", None)
+        if callable(setter):
+            if not setter(enabled, user):
+                raise HTTPException(403, "Admin only")
+        else:
+            auth_manager.signup_enabled = enabled
         return {"ok": True, "signup_enabled": auth_manager.signup_enabled}
 
     @router.put("/open-signup")
@@ -802,7 +941,12 @@ def setup_auth_routes(auth_manager: AuthManager, *, identity_renamer=None) -> AP
         user = _get_current_user(request)
         if not user or not auth_manager.is_admin(user):
             raise HTTPException(403, "Admin only")
-        auth_manager.signup_enabled = body.enabled
+        setter = getattr(auth_manager, "set_signup_enabled", None)
+        if callable(setter):
+            if not setter(body.enabled, user):
+                raise HTTPException(403, "Admin only")
+        else:
+            auth_manager.signup_enabled = body.enabled
         return {"ok": True,"signup_enabled": auth_manager.signup_enabled}
 
     @router.delete("/profiles")

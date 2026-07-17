@@ -1,3 +1,4 @@
+import importlib
 import json
 import os
 import sys
@@ -5,6 +6,8 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+
+from tests.helpers.import_state import clear_module
 
 
 def _import_contacts(tmp_path, monkeypatch):
@@ -23,14 +26,17 @@ def _import_contacts(tmp_path, monkeypatch):
         tmp_path / "contacts.json",
     )
 
-    sys.modules.pop("src.secret_storage", None)
-    from src import secret_storage
+    # Keep one process-wide module identity. Replacing this module in every
+    # test leaves already-collected importers bound to the old object while
+    # their dynamic imports resolve the new one, so encrypted test data can be
+    # produced and consumed with different temporary keys. Resetting _fernet
+    # below is sufficient to isolate the key for this test.
+    secret_storage = importlib.import_module("src.secret_storage")
     monkeypatch.setattr(secret_storage, "_KEY_PATH", tmp_path / ".app_key")
     monkeypatch.setattr(secret_storage, "_fernet", None)
 
-    sys.modules.pop("routes.contacts_routes", None)
-    from routes import contacts_routes
-    return contacts_routes
+    clear_module("routes.contacts_routes")
+    return importlib.import_module("routes.contacts_routes")
 
 
 def test_carddav_password_encrypted_at_rest(tmp_path, monkeypatch):

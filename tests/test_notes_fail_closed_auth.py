@@ -83,7 +83,17 @@ def _temp_db(tmp_path):
 
 def _build_app(factory, *, configured=True):
     app = FastAPI()
-    app.state.auth_manager = SimpleNamespace(is_configured=configured)
+    # Keep the route's single-user owner resolution local to this test app.
+    # An incomplete auth-manager double (``is_configured`` only) makes
+    # ``configured_single_user_owner`` fall through to the process-global
+    # auth runtime, so an earlier test that initialized that singleton can
+    # change this module's behaviour.  Model the one local profile that this
+    # isolated app owns instead.
+    app.state.auth_manager = SimpleNamespace(
+        is_configured=configured,
+        users={"owner@localhost": {"is_admin": True}} if configured else {},
+        is_admin=lambda username: username == "owner@localhost",
+    )
     app.include_router(nr.setup_note_routes())
     return _Identity(app)
 

@@ -12,6 +12,7 @@ from starlette.requests import Request
 from core.database import Account, ActionAudit, Base
 from src.audit_context import (
     bind_request_audit_context,
+    bind_service_audit_context,
     build_action_audit_details,
 )
 from src.life_core import (
@@ -193,6 +194,86 @@ def test_raw_inbox_idempotency_key_is_stored_only_as_one_way_reference(audit_env
     assert _audit_payload(row)["idempotency_ref"] == expected_ref
     assert raw_key not in item.idempotency_key
     assert raw_key not in json.dumps(row.details, sort_keys=True)
+
+
+def test_fake_sha256_prefix_is_hashed_instead_of_trusted(audit_env):
+    db, account = audit_env
+    attacker_value = "sha256:" + ("not-hex!" * 8)
+
+    audit = build_action_audit_details(
+        db,
+        owner_id=account.id,
+        reason="Reject attacker-controlled digest labels",
+        idempotency_ref=attacker_value,
+    )["audit"]
+
+    assert audit["idempotency_ref"] == (
+        "sha256:" + hashlib.sha256(attacker_value.encode("utf-8")).hexdigest()
+    )
+
+
+@pytest.mark.parametrize(
+    ("interface", "actor_type", "credential_type"),
+    [
+        ("cli", "account", "local_cli"),
+        ("telegram", "account", "telegram_link"),
+        ("voice", "account", "voice_session"),
+        ("automation", "automation", "scheduled_task"),
+        ("home_link", "linked_instance", "home_link_grant"),
+        ("internal_tool", "service", "internal_tool"),
+    ],
+)
+def test_trusted_non_http_interfaces_bind_explicit_audit_attribution(
+    audit_env,
+    interface,
+    actor_type,
+    credential_type,
+):
+    db, account = audit_env
+    credential_id = f"{interface}-credential-row"
+    workflow_id = f"{interface}-workflow-run"
+
+    bound = bind_service_audit_context(
+        db,
+        account_id=account.id,
+        interface=interface,
+        actor_type=actor_type,
+        credential_type=credential_type,
+        credential_id=credential_id,
+        workflow_id=workflow_id,
+    )
+    details = build_action_audit_details(
+        db,
+        owner_id=account.id,
+        reason="Trusted adapter attribution test",
+    )
+
+    assert bound == {
+        "actor_type": actor_type,
+        "actor_id": account.id,
+        "interface": interface,
+        "credential_type": credential_type,
+        "credential_id": credential_id,
+        "workflow_id": workflow_id,
+    }
+    audit = details["audit"]
+    assert audit["actor_id"] == account.id
+    assert audit["actor_type"] == actor_type
+    assert audit["interface"] == interface
+    assert audit["credential_type"] == credential_type
+    assert audit["credential_id"] == credential_id
+    assert audit["workflow_id"] == workflow_id
+
+
+def test_service_audit_binding_rejects_untrusted_interface(audit_env):
+    db, account = audit_env
+
+    with pytest.raises(ValueError, match="Unknown action audit interface"):
+        bind_service_audit_context(
+            db,
+            account_id=account.id,
+            interface="arbitrary-client-header",
+        )
 
 
 def test_every_inbox_transition_audit_has_required_reason_outcome_and_undo_shape(

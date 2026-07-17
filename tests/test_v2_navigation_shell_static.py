@@ -68,6 +68,24 @@ def test_expanded_sidebar_deduplicates_home_and_new_chat_controls():
     assert "document.getElementById('sidebar-new-chat-btn')?.click();" in shell
 
 
+def test_sidebar_shell_reconciliation_is_repeat_safe():
+    shell = _read("static/js/v2NavigationShell.js")
+
+    # A normal second init is a no-op. If a partial lifecycle reset leaves
+    # duplicate shell roots behind, preparation reuses one root, moves the
+    # registry-owned nodes once, and removes the extras before listeners bind.
+    assert "existingSidebarNavigationRoots(sidebar)" in shell
+    assert "existingRoots.length === 1" in shell
+    assert "if (existingRoots.length === 0) return false;" in shell
+    assert "const root = existingRoots.shift() || document.createElement('div');" in shell
+    assert "const claimedNodes = new Set();" in shell
+    assert "if (claimedNodes.has(node)) return false;" in shell
+    assert "root.replaceChildren(...groups);" in shell
+    assert "existingRoots.forEach((duplicate) => duplicate.remove());" in shell
+    assert "if (!prepareV2NavigationShell())" in shell
+    assert "return false;" in shell
+
+
 def test_rail_hover_label_replaces_native_tooltip_accessibly():
     app = _read("static/app.js")
 

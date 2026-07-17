@@ -166,24 +166,75 @@ def _default_document_owner() -> str | None:
     if owner:
         return owner
     try:
-        auth_path = DATA_DIR / "auth.json"
-        if not auth_path.exists():
+        from src.auth_runtime import get_auth_manager
+
+        profiles = get_auth_manager().list_users()
+        if not profiles:
             return None
-        users = (json.loads(auth_path.read_text(encoding="utf-8")).get("users") or {})
-        if not isinstance(users, dict) or not users:
-            return None
-        admins = [name for name, data in users.items() if isinstance(data, dict) and data.get("is_admin")]
+        admins = [
+            str(profile.get("username") or "")
+            for profile in profiles
+            if bool(profile.get("is_admin"))
+        ]
         if len(admins) == 1:
             return admins[0]
-        if len(users) == 1:
-            return next(iter(users))
-        return admins[0] if admins else next(iter(users))
+        if len(profiles) == 1:
+            return str(profiles[0].get("username") or "") or None
+        # Preserve the legacy deterministic fallback for multi-admin local
+        # installs, but source it from the unified database authority.
+        if admins:
+            return admins[0]
+        return str(profiles[0].get("username") or "") or None
     except Exception:
         return None
 
 
 def _read_accounts_from_db() -> list:
     """Return all enabled email account rows. Empty list if missing. Never raises."""
+    database_url = str(os.environ.get("DATABASE_URL") or "").strip().lower()
+    if database_url and not database_url.startswith("sqlite"):
+        # Shared deployments do not have a local ``app.db`` file for this MCP
+        # subprocess to open.  Go through the application's SQLAlchemy binding
+        # so the same account rows are visible when DATABASE_URL is PostgreSQL
+        # (including managed Supabase Postgres).  Keep the direct SQLite path
+        # below for standalone/local MCP compatibility and existing installs.
+        try:
+            from core.database import EmailAccount, SessionLocal
+
+            db = SessionLocal()
+            try:
+                rows = (
+                    db.query(EmailAccount)
+                    .filter(EmailAccount.enabled.is_(True))
+                    .order_by(EmailAccount.is_default.desc(), EmailAccount.created_at.asc())
+                    .all()
+                )
+                return [
+                    {
+                        "id": row.id,
+                        "owner": row.owner,
+                        "name": row.name,
+                        "is_default": row.is_default,
+                        "enabled": row.enabled,
+                        "imap_host": row.imap_host,
+                        "imap_port": row.imap_port,
+                        "imap_user": row.imap_user,
+                        "imap_password": row.imap_password,
+                        "imap_starttls": row.imap_starttls,
+                        "smtp_host": row.smtp_host,
+                        "smtp_port": row.smtp_port,
+                        "smtp_security": row.smtp_security,
+                        "smtp_user": row.smtp_user,
+                        "smtp_password": row.smtp_password,
+                        "from_address": row.from_address,
+                    }
+                    for row in rows
+                ]
+            finally:
+                db.close()
+        except Exception:
+            return []
+
     path = _db_path()
     if not path.exists():
         return []

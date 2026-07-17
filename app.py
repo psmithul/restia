@@ -77,23 +77,21 @@ from starlette.middleware.gzip import GZipMiddleware
 # Core imports
 from core.constants import (
     BASE_DIR, STATIC_DIR, SESSIONS_FILE,
-    REQUEST_TIMEOUT, OPENAI_API_KEY, AUTH_FILE,
+    REQUEST_TIMEOUT, OPENAI_API_KEY,
 )
-from core.database import SessionLocal, ApiToken
+from core.database import SessionLocal
 from core.middleware import SecurityHeadersMiddleware, is_cors_preflight
 from core.project_upload_limit import (
     ProjectAttachmentBodyLimitMiddleware,
     is_project_attachment_upload,
 )
-from core.auth import AuthManager, normalize_known_username
 from core.exceptions import (
     SessionNotFoundError, InvalidFileUploadError,
     LLMServiceError, WebSearchError,
 )
 
-import bcrypt as _bcrypt
-
 from src.app_helpers import abs_join, serve_html_with_nonce
+from src.api_token_policy import api_token_route_error
 from src.generated_images import GENERATED_IMAGE_HEADERS, resolve_generated_image_path
 from starlette.responses import RedirectResponse
 
@@ -280,8 +278,13 @@ app.add_middleware(_SlowRequestLogMiddleware)
 # ========= AUTH =========
 from routes.auth_routes import setup_auth_routes, SESSION_COOKIE
 
-auth_manager = AuthManager()
+from src.auth_runtime import get_auth_manager
+from src.supabase_auth_runtime import get_supabase_verifier
+
+auth_manager = get_auth_manager()
+supabase_auth_verifier = get_supabase_verifier()
 app.state.auth_manager = auth_manager
+app.state.supabase_auth_verifier = supabase_auth_verifier
 AUTH_ENABLED = os.getenv("AUTH_ENABLED", "true").lower() != "false"
 LOCALHOST_BYPASS = os.getenv("LOCALHOST_BYPASS", "false").lower() == "true"
 if LOCALHOST_BYPASS:
@@ -292,6 +295,7 @@ if AUTH_ENABLED:
         "/api/auth/setup",
         "/api/auth/signup",
         "/api/auth/login",
+        "/api/auth/external/supabase/login",
         "/api/auth/logout",
         "/api/auth/status",
         "/api/auth/features",
@@ -340,51 +344,13 @@ if AUTH_ENABLED:
             return True
         return any(p.match(path) for p in AUTH_EXEMPT_PATTERNS)
 
-    # In-memory token cache: prefix → list[(token_id, token_hash, owner, scopes)]. The DB
-    # query was running on every API-bearer request and scanning bcrypt
-    # checks linearly. With this cache, we hit the DB only when the cache
-    # version bumps (token created/revoked) — see _token_cache_invalidate
-    # in app.state, called by routes/api_token_routes.
-    _token_cache: dict = {}
-    _token_cache_lock = _asyncio.Lock()
-    _token_cache_dirty = True
-
+    # Compatibility hook for route/tests written before API tokens moved to
+    # indexed database HMAC lookups. There is deliberately no process-local
+    # credential cache to invalidate: revocation, scope, role, and account
+    # status changes are authoritative on the next request across all replicas.
     def _token_cache_invalidate():
-        nonlocal_dict = app.state.__dict__
-        nonlocal_dict["_token_cache_dirty"] = True
+        return None
     app.state.invalidate_token_cache = _token_cache_invalidate
-    app.state._token_cache = _token_cache
-    app.state._token_cache_dirty = True
-
-    def _refresh_token_cache():
-        """Rebuild the prefix→[(id,hash)] map from the DB."""
-        from collections import defaultdict
-        if auth_manager.auth_store_error:
-            # A quarantined credential store cannot vouch for any token owner,
-            # including otherwise well-formed rows left in the database.
-            _token_cache.clear()
-            app.state._token_cache_dirty = False
-            return
-        new_map = defaultdict(list)
-        db = SessionLocal()
-        try:
-            rows = db.query(ApiToken).filter(ApiToken.is_active == True).all()
-            for r in rows:
-                owner_key = normalize_known_username(auth_manager.users, getattr(r, "owner", None))
-                if not owner_key:
-                    logger.warning(
-                        "Ignoring active API token '%s' for unknown auth user '%s'",
-                        getattr(r, "id", ""),
-                        getattr(r, "owner", None),
-                    )
-                    continue
-                scopes = [s.strip() for s in (getattr(r, "scopes", "") or "chat").split(",") if s.strip()]
-                new_map[r.token_prefix].append((r.id, r.token_hash, owner_key, scopes))
-        finally:
-            db.close()
-        _token_cache.clear()
-        _token_cache.update(new_map)
-        app.state._token_cache_dirty = False
 
     # Headers that prove a request was forwarded by a proxy/tunnel (cloudflared,
     # nginx, Caddy, Tailscale Funnel, …). cloudflared connects to the app FROM
@@ -414,6 +380,13 @@ if AUTH_ENABLED:
     class AuthMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request: Request, call_next):
             path = request.url.path
+            auth_header = request.headers.get("authorization", "")
+            auth_parts = auth_header.strip().split(None, 1)
+            api_bearer_present = bool(
+                len(auth_parts) == 2
+                and auth_parts[0].lower() == "bearer"
+                and auth_parts[1].startswith("ody_")
+            )
             # A genuine CORS preflight (OPTIONS + Access-Control-Request-Method)
             # carries no credentials by design and must reach CORSMiddleware to be
             # answered. AuthMiddleware is the outermost middleware, so gating the
@@ -423,7 +396,11 @@ if AUTH_ENABLED:
             # header; never a credentialed request).
             if is_cors_preflight(request.method, request.headers):
                 return await call_next(request)
-            if _is_auth_exempt(path):
+            # A caller that presents an ody_ credential has selected API-token
+            # authentication.  Do not let public-route, internal-tool, or
+            # localhost bypasses reinterpret that request and skip the token's
+            # centralized route/scope boundary.
+            if _is_auth_exempt(path) and not api_bearer_present:
                 return await call_next(request)
             # In-process internal-tool token bypass. Used by the agent
             # tool layer when it HTTP-loopbacks to admin-gated routes
@@ -432,7 +409,12 @@ if AUTH_ENABLED:
             try:
                 from core.middleware import INTERNAL_TOOL_HEADER, INTERNAL_TOOL_TOKEN as _ITT, INTERNAL_TOOL_USER
                 _hdr = request.headers.get(INTERNAL_TOOL_HEADER)
-                if _hdr and secrets.compare_digest(_hdr, _ITT) and _is_trusted_loopback(request):
+                if (
+                    not api_bearer_present
+                    and _hdr
+                    and secrets.compare_digest(_hdr, _ITT)
+                    and _is_trusted_loopback(request)
+                ):
                     # Impersonation: when the agent's loopback call sets
                     # X-Restia-Owner, attribute the request to that user only
                     # if they exist. Authorization checks remain separate; this
@@ -445,9 +427,14 @@ if AUTH_ENABLED:
                         and _impersonate in getattr(_auth_mgr, "users", {})
                     ):
                         request.state.current_user = _impersonate
+                        request.state.current_account_id = (
+                            _auth_mgr.account_id_for_username(_impersonate)
+                        )
                     else:
                         request.state.current_user = INTERNAL_TOOL_USER
+                        request.state.current_account_id = None
                     request.state.api_token = False
+                    request.state.restia_interface = "internal_tool"
                     return await call_next(request)
             except Exception as _e:
                 logger.warning("Internal tool auth header check failed", exc_info=_e)
@@ -472,7 +459,9 @@ if AUTH_ENABLED:
             # _is_trusted_loopback so LOCALHOST_BYPASS can't be abused over a
             # Cloudflare tunnel / reverse proxy. Keep LOCALHOST_BYPASS=false for
             # network-exposed deployments regardless.
-            if LOCALHOST_BYPASS and _is_trusted_loopback(request):
+            if LOCALHOST_BYPASS and _is_trusted_loopback(request) and (
+                not api_bearer_present
+            ):
                 # The bypass admits the request, but a logged-in operator still
                 # deserves attribution: without stamping current_user here, a
                 # valid session cookie is IGNORED on loopback, route guards see
@@ -480,9 +469,19 @@ if AUTH_ENABLED:
                 # frontend fetch wrapper escalates into a redirect-to-login
                 # loop even though the user just logged in.
                 _tok = request.cookies.get(SESSION_COOKIE)
-                if _tok and auth_manager.validate_token(_tok):
-                    request.state.current_user = auth_manager.get_username_for_token(_tok)
+                _principal = None
+                if _tok:
+                    try:
+                        _principal = await _asyncio.to_thread(
+                            auth_manager.resolve_session, _tok
+                        )
+                    except Exception:
+                        logger.warning("Session attribution lookup failed", exc_info=True)
+                if _principal is not None:
+                    request.state.current_user = _principal.username
+                    request.state.current_account_id = _principal.account_id
                     request.state.api_token = False
+                    request.state.restia_interface = "web"
                 return await call_next(request)
             if not auth_manager.is_configured:
                 # No users yet — redirect to login for first-time setup
@@ -491,69 +490,79 @@ if AUTH_ENABLED:
                 return JSONResponse(status_code=401, content={"error": "Setup required"})
 
             # --- Bearer token auth (API tokens for external integrations) ---
-            auth_header = request.headers.get("authorization", "")
-            if auth_header.startswith("Bearer ody_"):
-                raw_token = auth_header[7:]
+            if api_bearer_present:
+                raw_token = auth_parts[1]
                 # Sanity check: tokens are "ody_" + 43 chars of base64
                 if len(raw_token) < 12 or len(raw_token) > 100:
                     return JSONResponse(status_code=401, content={"error": "Invalid API token"})
-                prefix = raw_token[:8]
                 try:
-                    if app.state._token_cache_dirty:
-                        async with _token_cache_lock:
-                            if app.state._token_cache_dirty:
-                                await _asyncio.to_thread(_refresh_token_cache)
-                    candidates = list(_token_cache.get(prefix, ()))
-                    matched_id = None
-                    matched_owner = None
-                    matched_scopes = []
-                    for tid, thash, owner, scopes in candidates:
-                        if _bcrypt.checkpw(raw_token.encode(), thash.encode()):
-                            matched_id = tid
-                            matched_owner = owner
-                            matched_scopes = scopes or []
-                            break
-                    if matched_id:
-                        # Update last_used_at off the hot path. Doing it
-                        # inline used to keep the request open across an
-                        # extra commit; do it fire-and-forget instead.
-                        async def _touch_last_used(tid: str):
-                            def _do():
-                                _db = SessionLocal()
-                                try:
-                                    _db.query(ApiToken).filter(ApiToken.id == tid).update(
-                                        {"last_used_at": datetime.utcnow()}
-                                    )
-                                    _db.commit()
-                                finally:
-                                    _db.close()
+                    principal = await _asyncio.to_thread(
+                        auth_manager.resolve_api_token, raw_token
+                    )
+                    if principal is not None:
+                        policy_error = api_token_route_error(
+                            request.method,
+                            path,
+                            principal.scopes,
+                        )
+                        if policy_error is not None:
+                            return JSONResponse(
+                                status_code=403,
+                                content={"error": policy_error},
+                            )
+                        async def _touch_last_used(token_id: str):
                             try:
-                                await _asyncio.to_thread(_do)
+                                await _asyncio.to_thread(
+                                    auth_manager.touch_api_token, token_id
+                                )
                             except Exception as _e:
-                                logger.debug("Failed to update token last_used_at", exc_info=_e)
-                        _asyncio.create_task(_touch_last_used(matched_id))
+                                logger.debug(
+                                    "Failed to update token last_used_at",
+                                    exc_info=_e,
+                                )
+                        _asyncio.create_task(
+                            _touch_last_used(principal.credential_id)
+                        )
                         # Keep bearer-token callers out of normal cookie/user
                         request.state.current_user = "api"
+                        request.state.current_account_id = principal.account_id
                         request.state.api_token = True
-                        request.state.api_token_id = matched_id
-                        request.state.api_token_owner = matched_owner
-                        request.state.api_token_scopes = matched_scopes
+                        request.state.api_token_id = principal.credential_id
+                        request.state.api_token_owner = principal.username
+                        request.state.api_token_scopes = list(principal.scopes)
+                        request.state.restia_interface = "api"
                         return await call_next(request)
                 except Exception:
-                    logger.warning("API token auth error", exc_info=False)
+                    logger.warning("API token database lookup failed", exc_info=True)
+                    return JSONResponse(
+                        status_code=503,
+                        content={"error": "Authentication database unavailable"},
+                    )
                 # Invalid bearer token — reject immediately
                 return JSONResponse(status_code=401, content={"error": "Invalid API token"})
 
             # --- Cookie-based session auth ---
             token = request.cookies.get(SESSION_COOKIE)
-            if not auth_manager.validate_token(token):
+            try:
+                principal = await _asyncio.to_thread(
+                    auth_manager.resolve_session, token
+                )
+            except Exception:
+                logger.warning("Session database lookup failed", exc_info=True)
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": "Authentication database unavailable"},
+                )
+            if principal is None:
                 if path.startswith("/api/"):
                     return JSONResponse(status_code=401, content={"error": "Not authenticated"})
                 return RedirectResponse(url="/login", status_code=302)
 
             # Attach current username to request state for downstream routes
-            request.state.current_user = auth_manager.get_username_for_token(token)
+            request.state.current_user = principal.username
+            request.state.current_account_id = principal.account_id
             request.state.api_token = False
+            request.state.restia_interface = "web"
             return await call_next(request)
 
     app.add_middleware(AuthMiddleware)
@@ -712,7 +721,10 @@ webhook_manager = WebhookManager(api_key_manager=api_key_manager)
 # ========= INCLUDE ROUTERS =========
 
 # Auth
-auth_router = setup_auth_routes(auth_manager)
+auth_router = setup_auth_routes(
+    auth_manager,
+    supabase_verifier=supabase_auth_verifier,
+)
 app.include_router(auth_router)
 
 
@@ -1345,17 +1357,18 @@ async def _startup_event():
     async def _ensure_default_tasks():
         # Create/reconcile default automation tasks + personal assistant for every user.
         owners = set()
+        profiles_loaded = False
         try:
-            import json as _json
-            auth_path = AUTH_FILE
-            with open(auth_path, encoding="utf-8") as f:
-                users = _json.load(f).get("users", {})
-            owners.update(users.keys())
+            from src.auth_runtime import active_auth_usernames
+
+            owners.update(active_auth_usernames())
+            profiles_loaded = True
         except Exception as e:
-            logger.debug(f"Default task auth-owner scan: {e}")
+            logger.warning("Default task database-owner scan failed: %s", e)
 
         # Also reconcile owners already present in scheduled_tasks. This cleans
-        # up stale/demo/deleted-user built-ins that are no longer in auth.json;
+        # up stale/demo/deleted-user built-ins that are no longer in the
+        # database-backed profile authority;
         # otherwise their old scheduled rows can keep firing forever.
         try:
             from core.database import SessionLocal, ScheduledTask
@@ -1366,11 +1379,19 @@ async def _startup_event():
                 builtin_names.extend(defs.get("legacy_names") or [])
             db_seed = SessionLocal()
             try:
-                rows = db_seed.query(ScheduledTask.owner).filter(
+                rows = db_seed.query(ScheduledTask).filter(
                     (ScheduledTask.action.in_(list(HOUSEKEEPING_DEFAULTS.keys())))
                     | (ScheduledTask.name.in_(builtin_names))
-                ).distinct().all()
-                owners.update(row[0] for row in rows if row[0])
+                ).all()
+                if profiles_loaded:
+                    for task in rows:
+                        if (
+                            task.owner
+                            and str(task.owner).strip().lower() not in owners
+                        ):
+                            task.status = "paused"
+                            task.next_run = None
+                    db_seed.commit()
             finally:
                 db_seed.close()
         except Exception as e:
@@ -1399,6 +1420,19 @@ async def _startup_event():
     else:
         logger.info("In-process Telegram polling disabled (RESTIA_INPROCESS_TELEGRAM=0)")
 
+    # Legacy null-owner rows can only be claimed after the one-time credential
+    # import has established the database-backed admin role. Never consult the
+    # retired auth.json source for ownership decisions.
+    try:
+        from core.database import _migrate_assign_legacy_owner
+        from src.auth_runtime import primary_admin_username
+
+        primary_owner = primary_admin_username()
+        if primary_owner:
+            await asyncio.to_thread(_migrate_assign_legacy_owner, primary_owner)
+    except Exception as e:
+        logger.warning("Initial legacy-owner database sweep failed: %s", e)
+
     # Reconcile built-in tasks before the runner starts. Otherwise legacy
     # scheduled built-ins can fire once before being converted to event tasks.
     await _ensure_default_tasks()
@@ -1407,19 +1441,12 @@ async def _startup_event():
     # ownerless or deleted/test-owner SKILL.md files so strict owner filtering
     # does not make an existing library look empty after auth/account changes.
     try:
-        import json as _json
-        auth_path = AUTH_FILE
-        with open(auth_path, encoding="utf-8") as f:
-            users = _json.load(f).get("users", {})
-        primary_owner = None
-        for uname, udata in users.items():
-            if udata.get("is_admin") is True:
-                primary_owner = uname
-                break
-        if not primary_owner and users:
-            primary_owner = next(iter(users))
+        from src.auth_runtime import active_auth_usernames, primary_admin_username
+
+        users = set(active_auth_usernames())
+        primary_owner = primary_admin_username()
         if primary_owner:
-            changed = skills_manager.backfill_owner(primary_owner, set(users.keys()))
+            changed = skills_manager.backfill_owner(primary_owner, users)
             if changed:
                 logger.info("Assigned %s legacy skill file(s) to %s", changed, primary_owner)
     except Exception as e:
@@ -1444,7 +1471,13 @@ async def _startup_event():
             try:
                 await asyncio.sleep(3600)
                 from core.database import _migrate_assign_legacy_owner
-                await asyncio.to_thread(_migrate_assign_legacy_owner)
+                from src.auth_runtime import primary_admin_username
+
+                primary_owner = primary_admin_username()
+                if primary_owner:
+                    await asyncio.to_thread(
+                        _migrate_assign_legacy_owner, primary_owner
+                    )
             except Exception as e:
                 logger.debug(f"Null-owner sweep skipped: {e}")
                 await asyncio.sleep(3600)
@@ -1526,6 +1559,10 @@ async def _shutdown_event():
         await telegram_polling_service.stop()
     except Exception:
         logger.warning("Telegram polling shutdown failed", exc_info=True)
+    # The optional Supabase verifier is a process-wide singleton created at
+    # module import, not a lifespan-owned resource.  Closing it here makes a
+    # second lifespan in the same process reuse a closed HTTP client.  Test
+    # resets close it explicitly; production process exit reclaims the client.
     # Stop every strong-referenced startup task before tearing down the
     # services they can call. In particular, the asynchronous MCP connector
     # must be fully cancelled before disconnect_all(), or a slow registration

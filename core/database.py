@@ -18,6 +18,7 @@ from sqlalchemy import (
     JSON,
     Index,
     UniqueConstraint,
+    CheckConstraint,
     DDL,
     func,
     text,
@@ -59,7 +60,7 @@ class TimestampMixin:
         return Column(DateTime, default=utcnow_naive, onupdate=utcnow_naive, nullable=False)
 
 # Ensure the writable data directory exists before SQLite connects.
-from src.constants import DATA_DIR, AUTH_FILE, MEMORY_FILE, USER_PREFS_FILE, SETTINGS_FILE
+from src.constants import DATA_DIR, MEMORY_FILE, USER_PREFS_FILE, SETTINGS_FILE
 Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
 safe_chmod(DATA_DIR, 0o700)
 
@@ -199,6 +200,19 @@ class Account(TimestampMixin, Base):
     id = Column(String(36), primary_key=True)
     username = Column(String(160), nullable=False, unique=True, index=True)
     display_name = Column(String(160), nullable=True)
+    status = Column(String(24), nullable=False, default="active")
+    auth_epoch = Column(Integer, nullable=False, default=1)
+    last_login_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('active', 'renaming', 'disabled', "
+            "'deletion_pending', 'deleted')",
+            name="ck_accounts_status",
+        ),
+        CheckConstraint("auth_epoch >= 1", name="ck_accounts_auth_epoch"),
+        Index("ix_accounts_status", "status"),
+    )
 
 
 class AuthIdentity(TimestampMixin, Base):
@@ -212,11 +226,223 @@ class AuthIdentity(TimestampMixin, Base):
         nullable=False, index=True,
     )
     provider = Column(String(32), nullable=False, default="local")
+    # Provider namespaces are not globally unique (for example, two Supabase
+    # projects can issue the same opaque ``sub``). Every writer must bind the
+    # exact trusted issuer explicitly; silently defaulting a non-local identity
+    # to the local issuer would create an account-linking ambiguity.
+    issuer = Column(String(500), nullable=False)
     subject = Column(String(255), nullable=False)
+    state = Column(String(24), nullable=False, default="active")
+    linked_at = Column(DateTime, nullable=False, default=utcnow_naive)
+    last_verified_at = Column(DateTime, nullable=True)
 
     __table_args__ = (
-        UniqueConstraint("provider", "subject", name="uq_auth_identity_subject"),
+        UniqueConstraint(
+            "provider", "issuer", "subject",
+            name="uq_auth_identity_provider_issuer_subject",
+        ),
+        CheckConstraint(
+            "state IN ('active', 'disabled', 'unlinked')",
+            name="ck_auth_identities_state",
+        ),
         Index("ix_auth_identity_account_provider", "account_id", "provider"),
+        Index("ix_auth_identity_issuer_subject", "issuer", "subject"),
+    )
+
+
+class AuthPolicy(TimestampMixin, Base):
+    """Singleton policy row used to serialize global auth decisions."""
+
+    __tablename__ = "auth_policy"
+
+    id = Column(String(32), primary_key=True, default="global")
+    signup_enabled = Column(Boolean, nullable=False, default=False)
+    bootstrap_completed = Column(Boolean, nullable=False, default=False)
+    version = Column(Integer, nullable=False, default=1)
+
+    __table_args__ = (
+        CheckConstraint("version >= 1", name="ck_auth_policy_version"),
+    )
+
+
+class LocalCredential(TimestampMixin, Base):
+    """Password credential attached to an immutable account UUID."""
+
+    __tablename__ = "local_credentials"
+
+    id = Column(String(36), primary_key=True)
+    account_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, unique=True, index=True,
+    )
+    password_hash = Column(String(255), nullable=False)
+    algorithm = Column(String(32), nullable=False, default="bcrypt")
+    version = Column(Integer, nullable=False, default=1)
+    password_changed_at = Column(DateTime, nullable=False, default=utcnow_naive)
+
+    __table_args__ = (
+        CheckConstraint("version >= 1", name="ck_local_credentials_version"),
+    )
+
+
+class MfaFactor(TimestampMixin, Base):
+    """One persisted multi-factor credential for an account."""
+
+    __tablename__ = "mfa_factors"
+
+    id = Column(String(36), primary_key=True)
+    account_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    kind = Column(String(32), nullable=False, default="totp")
+    state = Column(String(24), nullable=False, default="pending")
+    secret = Column(EncryptedText, nullable=True)
+    pending_secret = Column(EncryptedText, nullable=True)
+    confirmed_at = Column(DateTime, nullable=True)
+    last_used_step = Column(Integer, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("account_id", "kind", name="uq_mfa_factor_account_kind"),
+        CheckConstraint(
+            "state IN ('pending', 'active', 'disabled')",
+            name="ck_mfa_factors_state",
+        ),
+    )
+
+
+class MfaRecoveryCode(TimestampMixin, Base):
+    """One one-time recovery credential; plaintext is never persisted."""
+
+    __tablename__ = "mfa_recovery_codes"
+
+    id = Column(String(36), primary_key=True)
+    factor_id = Column(
+        String(36), ForeignKey("mfa_factors.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    code_hash = Column(String(255), nullable=False)
+    digest_scheme = Column(String(32), nullable=False, default="hmac_sha256_v1")
+    used_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("factor_id", "code_hash", name="uq_mfa_recovery_code"),
+        Index("ix_mfa_recovery_factor_used", "factor_id", "used_at"),
+    )
+
+
+class AccountRole(Base):
+    """Global Restia role assignment, separate from mutable usernames."""
+
+    __tablename__ = "account_roles"
+
+    id = Column(String(36), primary_key=True)
+    account_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    role = Column(String(64), nullable=False)
+    granted_by_account_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="SET NULL"), nullable=True,
+    )
+    granted_at = Column(DateTime, nullable=False, default=utcnow_naive)
+
+    __table_args__ = (
+        UniqueConstraint("account_id", "role", name="uq_account_role"),
+        CheckConstraint("length(role) > 0", name="ck_account_roles_role"),
+        Index("ix_account_roles_role", "role"),
+    )
+
+
+class AccountCapability(TimestampMixin, Base):
+    """Stored non-admin capability overrides for one account."""
+
+    __tablename__ = "account_capabilities"
+
+    account_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    capabilities = Column(JSON, nullable=False, default=dict)
+
+
+class AuthSession(TimestampMixin, Base):
+    """Database-backed browser/native session with a protected token digest."""
+
+    __tablename__ = "auth_sessions"
+
+    id = Column(String(36), primary_key=True)
+    account_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    token_digest = Column(String(128), nullable=False, unique=True, index=True)
+    digest_scheme = Column(String(32), nullable=False, default="hmac_sha256_v1")
+    auth_epoch = Column(Integer, nullable=False, default=1)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    revoked_at = Column(DateTime, nullable=True, index=True)
+    last_seen_at = Column(DateTime, nullable=True)
+    interface = Column(String(32), nullable=False, default="web")
+    auth_method = Column(String(32), nullable=False, default="local")
+    source_identity_id = Column(
+        String(36), ForeignKey("auth_identities.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    external_session_id = Column(String(255), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("auth_epoch >= 1", name="ck_auth_sessions_auth_epoch"),
+        Index(
+            "ix_auth_sessions_account_revoked_expires",
+            "account_id", "revoked_at", "expires_at",
+        ),
+    )
+
+
+class RetiredAuthSubject(Base):
+    """Permanent reservation for a former authentication subject."""
+
+    __tablename__ = "retired_auth_subjects"
+
+    id = Column(String(36), primary_key=True)
+    provider = Column(String(32), nullable=False)
+    issuer = Column(String(500), nullable=False)
+    subject = Column(String(255), nullable=False)
+    account_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="SET NULL"), nullable=True,
+    )
+    reason = Column(String(64), nullable=False, default="retired")
+    retired_at = Column(DateTime, nullable=False, default=utcnow_naive)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "provider", "issuer", "subject",
+            name="uq_retired_auth_subject",
+        ),
+        Index("ix_retired_auth_subject_account", "account_id"),
+    )
+
+
+class AuthImportRun(TimestampMixin, Base):
+    """Redacted status for one idempotent legacy-auth import source."""
+
+    __tablename__ = "auth_import_runs"
+
+    id = Column(String(36), primary_key=True)
+    source_kind = Column(String(64), nullable=False, unique=True)
+    state = Column(String(24), nullable=False, default="pending")
+    auth_sha256 = Column(String(64), nullable=True)
+    sessions_sha256 = Column(String(64), nullable=True)
+    backup_auth_path = Column(Text, nullable=True)
+    backup_sessions_path = Column(Text, nullable=True)
+    details = Column(JSON, nullable=False, default=dict)
+    completed_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('pending', 'completed', 'failed')",
+            name="ck_auth_import_runs_state",
+        ),
     )
 
 
@@ -1162,12 +1388,19 @@ class ApiToken(TimestampMixin, Base):
 
     id = Column(String, primary_key=True, index=True)
     owner = Column(String, nullable=True, index=True)
+    account_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=True, index=True,
+    )
     name = Column(String, nullable=False)
     token_hash = Column(String, nullable=False)
     token_prefix = Column(String, nullable=False)  # first 8 chars for display
+    digest_scheme = Column(String(32), nullable=False, default="bcrypt_legacy")
     scopes = Column(String, nullable=False, default="chat")
     is_active = Column(Boolean, default=True)
     last_used_at = Column(DateTime, nullable=True)
+    revoked_at = Column(DateTime, nullable=True)
+    expires_at = Column(DateTime, nullable=True)
 
 
 class Webhook(TimestampMixin, Base):
@@ -2462,6 +2695,668 @@ def _migrate_add_api_token_scopes_column():
             pass
 
 
+def _migrate_auth_identities_for_unified_auth(bind):
+    """Upgrade the SQLite identity namespace without losing FK references.
+
+    SQLite implements a table-level ``UNIQUE`` constraint as an auto-index,
+    which cannot be dropped.  Legacy databases therefore need a table rebuild
+    to remove ``UNIQUE(provider, subject)``; merely adding the new three-column
+    index would leave the old, over-broad constraint active.
+
+    The rebuild is one explicit SQLite transaction. Foreign-key enforcement is
+    disabled *before* that transaction so dropping the old parent table cannot
+    fire ``ON DELETE`` actions in referencing tables. The original pragma is
+    restored afterwards, and any new violation aborts the transaction. IDs,
+    account links, timestamps, issuer values, user-created indexes, and
+    triggers are copied or recreated before commit.
+    """
+
+    raw_connection = bind.raw_connection()
+    cursor = None
+    original_foreign_keys = None
+    rebuilt_identity_table = False
+    migration_table = "auth_identities__restia_migration"
+    canonical_columns = (
+        "id",
+        "account_id",
+        "provider",
+        "issuer",
+        "subject",
+        "state",
+        "linked_at",
+        "last_verified_at",
+        "created_at",
+        "updated_at",
+    )
+    required_legacy_columns = {
+        "id",
+        "account_id",
+        "provider",
+        "subject",
+        "created_at",
+        "updated_at",
+    }
+    canonical_indexes = {
+        "ix_auth_identities_account_id": (False, ("account_id",)),
+        "ix_auth_identity_account_provider": (
+            False,
+            ("account_id", "provider"),
+        ),
+        "ix_auth_identity_issuer_subject": (False, ("issuer", "subject")),
+    }
+    desired_unique_columns = ("provider", "issuer", "subject")
+
+    def _quoted_identifier(value):
+        return '"' + str(value).replace('"', '""') + '"'
+
+    def _index_details():
+        details = []
+        for row in cursor.execute(
+            'PRAGMA index_list("auth_identities")'
+        ).fetchall():
+            name = str(row[1])
+            columns = tuple(
+                str(info[2]) if info[2] is not None else ""
+                for info in cursor.execute(
+                    f"PRAGMA index_info({_quoted_identifier(name)})"
+                ).fetchall()
+            )
+            sql_row = cursor.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+                (name,),
+            ).fetchone()
+            details.append({
+                "name": name,
+                "unique": bool(row[2]),
+                "partial": bool(row[4]) if len(row) > 4 else False,
+                "columns": columns,
+                "sql": sql_row[0] if sql_row else None,
+            })
+        return details
+
+    try:
+        # A PRAGMA foreign_keys change is ignored while a transaction is open.
+        raw_connection.rollback()
+        cursor = raw_connection.cursor()
+        original_foreign_keys = int(
+            cursor.execute("PRAGMA foreign_keys").fetchone()[0]
+        )
+        tables = {
+            str(row[0])
+            for row in cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if "auth_identities" not in tables:
+            return
+        if "accounts" not in tables:
+            raise RuntimeError(
+                "Cannot migrate auth_identities without the accounts table"
+            )
+        if migration_table in tables:
+            raise RuntimeError(
+                f"Refusing to overwrite stale migration table {migration_table}"
+            )
+
+        baseline_foreign_key_violations = {
+            tuple(row) for row in cursor.execute("PRAGMA foreign_key_check")
+        }
+        cursor.execute("PRAGMA foreign_keys=OFF")
+        if int(cursor.execute("PRAGMA foreign_keys").fetchone()[0]) != 0:
+            raise RuntimeError(
+                "Could not temporarily disable SQLite foreign-key actions"
+            )
+        cursor.execute("BEGIN IMMEDIATE")
+
+        columns = {
+            str(row[1])
+            for row in cursor.execute(
+                'PRAGMA table_info("auth_identities")'
+            ).fetchall()
+        }
+        missing_required = required_legacy_columns - columns
+        if missing_required:
+            raise RuntimeError(
+                "Cannot migrate auth_identities; missing columns: "
+                + ", ".join(sorted(missing_required))
+            )
+        unexpected_columns = columns - set(canonical_columns)
+        if unexpected_columns:
+            raise RuntimeError(
+                "Cannot safely rebuild auth_identities with unknown columns: "
+                + ", ".join(sorted(unexpected_columns))
+            )
+
+        legacy_identity_shape = "issuer" not in columns
+        if legacy_identity_shape:
+            cursor.execute(
+                "ALTER TABLE auth_identities ADD COLUMN issuer VARCHAR(500) "
+                "NOT NULL DEFAULT 'restia-local'"
+            )
+        if "state" not in columns:
+            cursor.execute(
+                "ALTER TABLE auth_identities ADD COLUMN state VARCHAR(24) "
+                "NOT NULL DEFAULT 'active'"
+            )
+        if "linked_at" not in columns:
+            cursor.execute(
+                "ALTER TABLE auth_identities ADD COLUMN linked_at DATETIME"
+            )
+        if "last_verified_at" not in columns:
+            cursor.execute(
+                "ALTER TABLE auth_identities ADD COLUMN last_verified_at DATETIME"
+            )
+        cursor.execute(
+            "UPDATE auth_identities SET linked_at = "
+            "COALESCE(linked_at, created_at, CURRENT_TIMESTAMP)"
+        )
+        if legacy_identity_shape:
+            # Old non-local rows have no trustworthy external issuer. Keep the
+            # provider namespace explicit without linking them to a new IdP.
+            cursor.execute(
+                "UPDATE auth_identities SET issuer = "
+                "'legacy:' || lower(provider) "
+                "WHERE lower(provider) <> 'local'"
+            )
+
+        indexes = _index_details()
+        legacy_unique_indexes = [
+            item for item in indexes
+            if item["unique"]
+            and len(item["columns"]) == 2
+            and set(item["columns"]) == {"provider", "subject"}
+        ]
+        desired_unique_exists = any(
+            item["unique"]
+            and not item["partial"]
+            and len(item["columns"]) == 3
+            and set(item["columns"]) == set(desired_unique_columns)
+            for item in indexes
+        )
+
+        for item in indexes:
+            expected = canonical_indexes.get(item["name"])
+            if expected and (
+                item["unique"] != expected[0]
+                or item["columns"] != expected[1]
+            ):
+                raise RuntimeError(
+                    f"Index {item['name']} has an unexpected definition"
+                )
+
+        if legacy_unique_indexes:
+            preserved_index_sql = []
+            for item in indexes:
+                is_legacy_unique = item in legacy_unique_indexes
+                is_desired_unique = (
+                    item["unique"]
+                    and len(item["columns"]) == 3
+                    and set(item["columns"]) == set(desired_unique_columns)
+                )
+                if (
+                    is_legacy_unique
+                    or is_desired_unique
+                    or item["name"] in canonical_indexes
+                ):
+                    continue
+                if item["sql"]:
+                    preserved_index_sql.append(str(item["sql"]))
+
+            preserved_trigger_sql = [
+                str(row[0])
+                for row in cursor.execute(
+                    "SELECT sql FROM sqlite_master "
+                    "WHERE type='trigger' AND tbl_name='auth_identities' "
+                    "AND sql IS NOT NULL ORDER BY name"
+                ).fetchall()
+            ]
+            old_row_count = int(
+                cursor.execute(
+                    "SELECT COUNT(*) FROM auth_identities"
+                ).fetchone()[0]
+            )
+
+            cursor.execute(f"""
+                CREATE TABLE {_quoted_identifier(migration_table)} (
+                    id VARCHAR(36) NOT NULL,
+                    account_id VARCHAR(36) NOT NULL,
+                    provider VARCHAR(32) NOT NULL,
+                    issuer VARCHAR(500) NOT NULL,
+                    subject VARCHAR(255) NOT NULL,
+                    state VARCHAR(24) NOT NULL,
+                    linked_at DATETIME NOT NULL,
+                    last_verified_at DATETIME,
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL,
+                    PRIMARY KEY (id),
+                    CONSTRAINT uq_auth_identity_provider_issuer_subject
+                        UNIQUE (provider, issuer, subject),
+                    CONSTRAINT ck_auth_identities_state
+                        CHECK (state IN ('active', 'disabled', 'unlinked')),
+                    FOREIGN KEY(account_id) REFERENCES accounts(id)
+                        ON DELETE CASCADE
+                )
+            """)
+            column_list = ", ".join(
+                _quoted_identifier(column) for column in canonical_columns
+            )
+            cursor.execute(
+                f"INSERT INTO {_quoted_identifier(migration_table)} "
+                f"({column_list}) SELECT {column_list} FROM auth_identities"
+            )
+            new_row_count = int(
+                cursor.execute(
+                    f"SELECT COUNT(*) FROM {_quoted_identifier(migration_table)}"
+                ).fetchone()[0]
+            )
+            if new_row_count != old_row_count:
+                raise RuntimeError(
+                    "auth_identities rebuild did not preserve every row"
+                )
+
+            cursor.execute("DROP TABLE auth_identities")
+            cursor.execute(
+                f"ALTER TABLE {_quoted_identifier(migration_table)} "
+                "RENAME TO auth_identities"
+            )
+            for name, (_, index_columns) in canonical_indexes.items():
+                index_column_list = ", ".join(
+                    _quoted_identifier(column) for column in index_columns
+                )
+                cursor.execute(
+                    f"CREATE INDEX {_quoted_identifier(name)} "
+                    f"ON auth_identities ({index_column_list})"
+                )
+            for statement in preserved_index_sql:
+                cursor.execute(statement)
+            for statement in preserved_trigger_sql:
+                cursor.execute(statement)
+            rebuilt_identity_table = True
+        else:
+            if not desired_unique_exists:
+                cursor.execute(
+                    "CREATE UNIQUE INDEX "
+                    "uq_auth_identity_provider_issuer_subject "
+                    "ON auth_identities(provider, issuer, subject)"
+                )
+            for name, (_, index_columns) in canonical_indexes.items():
+                index_column_list = ", ".join(
+                    _quoted_identifier(column) for column in index_columns
+                )
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS {_quoted_identifier(name)} "
+                    f"ON auth_identities ({index_column_list})"
+                )
+
+        final_foreign_key_violations = {
+            tuple(row) for row in cursor.execute("PRAGMA foreign_key_check")
+        }
+        new_foreign_key_violations = (
+            final_foreign_key_violations - baseline_foreign_key_violations
+        )
+        if new_foreign_key_violations:
+            raise RuntimeError(
+                "auth_identities migration introduced foreign-key violations: "
+                f"{sorted(new_foreign_key_violations, key=repr)!r}"
+            )
+        raw_connection.commit()
+        if rebuilt_identity_table:
+            logger.info(
+                "Migrated auth_identities to issuer-qualified uniqueness"
+            )
+    except Exception:
+        raw_connection.rollback()
+        raise
+    finally:
+        try:
+            # Also closes any implicit transaction left by an early return.
+            raw_connection.rollback()
+            if cursor is not None and original_foreign_keys is not None:
+                desired_setting = "ON" if original_foreign_keys else "OFF"
+                cursor.execute(f"PRAGMA foreign_keys={desired_setting}")
+                restored_setting = int(
+                    cursor.execute("PRAGMA foreign_keys").fetchone()[0]
+                )
+                if restored_setting != original_foreign_keys:
+                    raise RuntimeError(
+                        "Failed to restore SQLite foreign-key enforcement"
+                    )
+        finally:
+            if cursor is not None:
+                cursor.close()
+            raw_connection.close()
+
+
+def _migrate_unified_auth_security_constraints(bind):
+    """Rebuild legacy auth tables whose SQLite constraints cannot be altered.
+
+    The pushed 0001 foundation already had ``accounts`` and ``api_tokens``.
+    Adding columns in place is therefore not enough: a legacy database would
+    otherwise miss the account state/epoch checks and the API-token ownership
+    cascade that fresh Alembic 0002 databases enforce. This repair preserves
+    rows plus non-canonical user indexes/triggers and fails closed on unknown
+    columns or newly introduced foreign-key violations.
+    """
+
+    if bind.dialect.name != "sqlite":
+        return
+
+    raw_connection = bind.raw_connection()
+    cursor = None
+    original_foreign_keys = None
+    account_table = "accounts__restia_security_migration"
+    token_table = "api_tokens__restia_security_migration"
+    account_columns = (
+        "id", "username", "display_name", "status", "auth_epoch",
+        "last_login_at", "created_at", "updated_at",
+    )
+    token_columns = (
+        "id", "owner", "account_id", "name", "token_hash", "token_prefix",
+        "digest_scheme", "scopes", "is_active", "last_used_at", "revoked_at",
+        "expires_at", "created_at", "updated_at",
+    )
+
+    def quoted(value):
+        return '"' + str(value).replace('"', '""') + '"'
+
+    def table_columns(table_name):
+        return tuple(
+            str(row[1])
+            for row in cursor.execute(
+                f"PRAGMA table_info({quoted(table_name)})"
+            ).fetchall()
+        )
+
+    def preserved_objects(table_name, canonical_indexes):
+        statements = []
+        for object_type, name, sql in cursor.execute(
+            "SELECT type, name, sql FROM sqlite_master "
+            "WHERE tbl_name=? AND type IN ('index', 'trigger') "
+            "AND sql IS NOT NULL ORDER BY type, name",
+            (table_name,),
+        ).fetchall():
+            if object_type == "index" and str(name) in canonical_indexes:
+                continue
+            statements.append(str(sql))
+        return statements
+
+    def copy_rows(source, destination, columns):
+        column_sql = ", ".join(quoted(column) for column in columns)
+        old_count = int(
+            cursor.execute(f"SELECT COUNT(*) FROM {quoted(source)}").fetchone()[0]
+        )
+        cursor.execute(
+            f"INSERT INTO {quoted(destination)} ({column_sql}) "
+            f"SELECT {column_sql} FROM {quoted(source)}"
+        )
+        new_count = int(
+            cursor.execute(
+                f"SELECT COUNT(*) FROM {quoted(destination)}"
+            ).fetchone()[0]
+        )
+        if old_count != new_count:
+            raise RuntimeError(f"{source} security rebuild lost rows")
+
+    try:
+        raw_connection.rollback()
+        cursor = raw_connection.cursor()
+        original_foreign_keys = int(
+            cursor.execute("PRAGMA foreign_keys").fetchone()[0]
+        )
+        tables = {
+            str(row[0])
+            for row in cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if not {"accounts", "api_tokens"}.issubset(tables):
+            raise RuntimeError(
+                "Cannot repair unified-auth constraints without accounts/api_tokens"
+            )
+        stale_tables = {account_table, token_table} & tables
+        if stale_tables:
+            raise RuntimeError(
+                "Refusing to overwrite stale auth security migration tables: "
+                + ", ".join(sorted(stale_tables))
+            )
+
+        account_sql_row = cursor.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='accounts'"
+        ).fetchone()
+        normalized_account_sql = " ".join(
+            str(account_sql_row[0] if account_sql_row else "").lower().split()
+        )
+        rebuild_accounts = not (
+            "ck_accounts_status" in normalized_account_sql
+            and "ck_accounts_auth_epoch" in normalized_account_sql
+        )
+        token_foreign_keys = cursor.execute(
+            'PRAGMA foreign_key_list("api_tokens")'
+        ).fetchall()
+        rebuild_tokens = not any(
+            str(row[2]) == "accounts"
+            and str(row[3]) == "account_id"
+            and str(row[4]) == "id"
+            and str(row[6]).upper() == "CASCADE"
+            for row in token_foreign_keys
+        )
+        if not rebuild_accounts and not rebuild_tokens:
+            return
+
+        if set(table_columns("accounts")) != set(account_columns):
+            raise RuntimeError(
+                "Cannot safely rebuild accounts with unknown/missing columns"
+            )
+        if set(table_columns("api_tokens")) != set(token_columns):
+            raise RuntimeError(
+                "Cannot safely rebuild api_tokens with unknown/missing columns"
+            )
+
+        baseline_foreign_key_violations = {
+            tuple(row) for row in cursor.execute("PRAGMA foreign_key_check")
+        }
+        cursor.execute("PRAGMA foreign_keys=OFF")
+        if int(cursor.execute("PRAGMA foreign_keys").fetchone()[0]) != 0:
+            raise RuntimeError(
+                "Could not temporarily disable SQLite foreign-key actions"
+            )
+        cursor.execute("BEGIN IMMEDIATE")
+
+        if rebuild_accounts:
+            preserved = preserved_objects(
+                "accounts", {"ix_accounts_username", "ix_accounts_status"}
+            )
+            cursor.execute(f"""
+                CREATE TABLE {quoted(account_table)} (
+                    id VARCHAR(36) NOT NULL,
+                    username VARCHAR(160) NOT NULL,
+                    display_name VARCHAR(160),
+                    status VARCHAR(24) NOT NULL,
+                    auth_epoch INTEGER NOT NULL,
+                    last_login_at DATETIME,
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL,
+                    PRIMARY KEY (id),
+                    CONSTRAINT ck_accounts_status CHECK (
+                        status IN ('active', 'renaming', 'disabled',
+                                   'deletion_pending', 'deleted')
+                    ),
+                    CONSTRAINT ck_accounts_auth_epoch CHECK (auth_epoch >= 1)
+                )
+            """)
+            copy_rows("accounts", account_table, account_columns)
+            cursor.execute('DROP TABLE "accounts"')
+            cursor.execute(
+                f"ALTER TABLE {quoted(account_table)} RENAME TO accounts"
+            )
+            cursor.execute(
+                "CREATE UNIQUE INDEX ix_accounts_username ON accounts(username)"
+            )
+            cursor.execute(
+                "CREATE INDEX ix_accounts_status ON accounts(status)"
+            )
+            for statement in preserved:
+                cursor.execute(statement)
+
+        if rebuild_tokens:
+            preserved = preserved_objects(
+                "api_tokens",
+                {"ix_api_tokens_id", "ix_api_tokens_owner", "ix_api_tokens_account_id"},
+            )
+            cursor.execute(f"""
+                CREATE TABLE {quoted(token_table)} (
+                    id VARCHAR NOT NULL,
+                    owner VARCHAR,
+                    account_id VARCHAR(36),
+                    name VARCHAR NOT NULL,
+                    token_hash VARCHAR NOT NULL,
+                    token_prefix VARCHAR NOT NULL,
+                    digest_scheme VARCHAR(32) NOT NULL,
+                    scopes VARCHAR NOT NULL,
+                    is_active BOOLEAN,
+                    last_used_at DATETIME,
+                    revoked_at DATETIME,
+                    expires_at DATETIME,
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL,
+                    PRIMARY KEY (id),
+                    FOREIGN KEY(account_id) REFERENCES accounts(id)
+                        ON DELETE CASCADE
+                )
+            """)
+            copy_rows("api_tokens", token_table, token_columns)
+            cursor.execute('DROP TABLE "api_tokens"')
+            cursor.execute(
+                f"ALTER TABLE {quoted(token_table)} RENAME TO api_tokens"
+            )
+            cursor.execute("CREATE INDEX ix_api_tokens_id ON api_tokens(id)")
+            cursor.execute("CREATE INDEX ix_api_tokens_owner ON api_tokens(owner)")
+            cursor.execute(
+                "CREATE INDEX ix_api_tokens_account_id ON api_tokens(account_id)"
+            )
+            for statement in preserved:
+                cursor.execute(statement)
+
+        final_foreign_key_violations = {
+            tuple(row) for row in cursor.execute("PRAGMA foreign_key_check")
+        }
+        new_foreign_key_violations = (
+            final_foreign_key_violations - baseline_foreign_key_violations
+        )
+        if new_foreign_key_violations:
+            raise RuntimeError(
+                "Unified-auth security repair introduced foreign-key violations: "
+                f"{sorted(new_foreign_key_violations, key=repr)!r}"
+            )
+        raw_connection.commit()
+    except Exception:
+        raw_connection.rollback()
+        raise
+    finally:
+        try:
+            raw_connection.rollback()
+            if cursor is not None and original_foreign_keys is not None:
+                desired_setting = "ON" if original_foreign_keys else "OFF"
+                cursor.execute(f"PRAGMA foreign_keys={desired_setting}")
+                if int(cursor.execute("PRAGMA foreign_keys").fetchone()[0]) != original_foreign_keys:
+                    raise RuntimeError(
+                        "Failed to restore SQLite foreign-key enforcement"
+                    )
+        finally:
+            if cursor is not None:
+                cursor.close()
+            raw_connection.close()
+
+
+def _migrate_add_unified_auth_columns(target_engine=None):
+    """Upgrade legacy SQLite rows for database-backed unified authentication.
+
+    ``Base.metadata.create_all`` creates the complete schema for a fresh local
+    install but does not alter existing tables. Until Alembic becomes the
+    authoritative schema path, this bridge adds safe columns and transactionally
+    rebuilds the legacy identity table when its old two-column uniqueness would
+    collapse subjects from different issuers.
+
+    Unlike older best-effort helpers, failures propagate. Starting with only a
+    subset of the security schema would be less safe than refusing startup.
+    """
+
+    bind = target_engine or engine
+    if bind.dialect.name != "sqlite":
+        return
+
+    with bind.begin() as conn:
+        tables = {
+            str(row[0])
+            for row in conn.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+
+        def column_names(table_name: str) -> set[str]:
+            return {
+                str(row[1])
+                for row in conn.exec_driver_sql(
+                    f'PRAGMA table_info("{table_name}")'
+                ).fetchall()
+            }
+
+        if "accounts" in tables:
+            columns = column_names("accounts")
+            if "status" not in columns:
+                conn.exec_driver_sql(
+                    "ALTER TABLE accounts ADD COLUMN status VARCHAR(24) "
+                    "NOT NULL DEFAULT 'active'"
+                )
+            if "auth_epoch" not in columns:
+                conn.exec_driver_sql(
+                    "ALTER TABLE accounts ADD COLUMN auth_epoch INTEGER "
+                    "NOT NULL DEFAULT 1"
+                )
+            if "last_login_at" not in columns:
+                conn.exec_driver_sql(
+                    "ALTER TABLE accounts ADD COLUMN last_login_at DATETIME"
+                )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_accounts_status ON accounts(status)"
+            )
+
+        if "api_tokens" in tables:
+            columns = column_names("api_tokens")
+            if "account_id" not in columns:
+                conn.exec_driver_sql(
+                    "ALTER TABLE api_tokens ADD COLUMN account_id VARCHAR(36)"
+                )
+            if "digest_scheme" not in columns:
+                conn.exec_driver_sql(
+                    "ALTER TABLE api_tokens ADD COLUMN digest_scheme VARCHAR(32) "
+                    "NOT NULL DEFAULT 'bcrypt_legacy'"
+                )
+            if "revoked_at" not in columns:
+                conn.exec_driver_sql(
+                    "ALTER TABLE api_tokens ADD COLUMN revoked_at DATETIME"
+                )
+            if "expires_at" not in columns:
+                conn.exec_driver_sql(
+                    "ALTER TABLE api_tokens ADD COLUMN expires_at DATETIME"
+                )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_api_tokens_account_id "
+                "ON api_tokens(account_id)"
+            )
+
+        if "auth_policy" in tables:
+            columns = column_names("auth_policy")
+            if "bootstrap_completed" not in columns:
+                conn.exec_driver_sql(
+                    "ALTER TABLE auth_policy ADD COLUMN bootstrap_completed "
+                    "BOOLEAN NOT NULL DEFAULT 0"
+                )
+
+    _migrate_auth_identities_for_unified_auth(bind)
+    _migrate_unified_auth_security_constraints(bind)
+
+
 def _migrate_add_project_completion_column():
     """Add the reversible project completion marker to existing installs."""
     import sqlite3
@@ -2498,38 +3393,16 @@ def _migrate_add_project_completion_column():
         except Exception:
             pass
 
-def _migrate_assign_legacy_owner():
+def _migrate_assign_legacy_owner(admin_user: str | None = None):
     """Assign all null-owner data to the first (admin) user.
 
-    Runs at boot AND periodically (sweep_null_owners) so that data created
-    while auth is disabled / middleware is bypassed via localhost doesn't
-    sit in the DB as world-visible. Previously only swept 5 tables; the
-    actual set of owner-bearing tables is much larger.
+    ``admin_user`` must come from the unified database auth authority. The
+    caller runs this after legacy credential import and periodically thereafter
+    so data created while auth is disabled/local-bypassed does not remain
+    world-visible. No credential file is consulted here.
     """
     import sqlite3
-    import json as _json
-
-    # Find admin user from auth.json. The auth schema uses `is_admin: True`,
-    # not `role: "admin"` — old code looked for the wrong field and silently
-    # fell through to "first user" every time.
-    auth_path = os.path.join(os.path.dirname(DATABASE_URL.replace("sqlite:///", "")), "auth.json")
-    if not os.path.isabs(auth_path):
-        auth_path = AUTH_FILE
-    admin_user = None
-    try:
-        with open(auth_path, "r", encoding="utf-8") as f:
-            auth_data = _json.load(f)
-        users = auth_data.get("users", {})
-        if users:
-            for uname, udata in users.items():
-                if udata.get("is_admin") is True:
-                    admin_user = uname
-                    break
-            if not admin_user:
-                admin_user = next(iter(users))
-    except Exception:
-        pass
-
+    admin_user = str(admin_user or "").strip().lower()
     if not admin_user:
         return
 
@@ -3122,6 +3995,7 @@ def init_db():
     harden_database_permissions()
     _migrate_model_endpoints()
     Base.metadata.create_all(bind=engine)
+    _migrate_add_unified_auth_columns()
     _migrate_action_audit_guards()
     harden_database_permissions()
     _migrate_add_study_review_columns()
@@ -3151,7 +4025,6 @@ def init_db():
     _migrate_add_api_token_scopes_column()
     _migrate_add_project_completion_column()
     _migrate_backfill_document_owner_from_session()
-    _migrate_assign_legacy_owner()
     _migrate_add_tidy_verdict()
     _migrate_add_doc_source_email_cols()
     _migrate_add_oauth_config()

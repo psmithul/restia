@@ -41,6 +41,9 @@ python-dateutil
 # the protocol without it.
 caldav
 cryptography
+# Optional Supabase/OIDC adapter verifies configured asymmetric JWT/JWKS
+# locally; no Supabase client SDK or direct client-side data path is used.
+PyJWT[crypto]>=2.10,<3
 bcrypt
 mcp
 pyotp

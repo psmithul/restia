@@ -125,6 +125,9 @@ def test_set_signup_enabled_true_is_idempotent():
 
     request = _fake_auth_request()
     auth.signup_enabled = False
+    auth.set_signup_enabled.side_effect = lambda value, user: (
+        setattr(auth, "signup_enabled", value) or True
+    )
 
     out = asyncio.run(target(body=SetOpenRegistrationRequest(enabled=True),request=request))
 
@@ -145,6 +148,9 @@ def test_set_signup_enabled_false_is_idempotent():
 
     request = _fake_auth_request()
     auth.signup_enabled = True
+    auth.set_signup_enabled.side_effect = lambda value, user: (
+        setattr(auth, "signup_enabled", value) or True
+    )
 
     out = asyncio.run(target(body=SetOpenRegistrationRequest(enabled=False), request=request))
 
@@ -311,14 +317,6 @@ def test_pop_notifications_owner_filtered():
     # Build a minimal scheduler instance that we can hit directly.
     # Reuse the real class so the test catches future regressions of
     # the filter logic.
-    import sys, types
-    from unittest.mock import MagicMock as _MM
-    # `task_scheduler` pulls in lots of helpers — stub the ones it uses.
-    for s in ["src.builtin_actions", "src.ai_interaction",
-              "src.agent_loop", "src.session_manager"]:
-        if s not in sys.modules:
-            mod = types.ModuleType(s)
-            sys.modules[s] = mod
     from src.task_scheduler import TaskScheduler
     sch = TaskScheduler.__new__(TaskScheduler)  # bypass __init__ network etc.
     sch._pending_notifications = []

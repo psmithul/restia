@@ -1383,8 +1383,8 @@ async def action_daily_brief(owner: str, **kwargs) -> Tuple[str, bool]:
         # user's daily brief must not include another user's notes or
         # events that happen to be stored with owner=None.
         try:
-            from core.auth import AuthManager
-            _allow_null = not AuthManager().is_configured
+            from src.auth_runtime import get_auth_manager
+            _allow_null = not get_auth_manager().is_configured
         except Exception:
             _allow_null = False
         db = SessionLocal()
@@ -2756,10 +2756,10 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         AGE_CUTOFF = _dt.utcnow() - _td(days=7)
-        # v12 restores the complete category taxonomy.  v11 cached valid LLM
-        # responses after discarding newsletter/work/notification/etc., so a
-        # version bump is required to repair already-seen messages.
-        TRIAGE_VERSION = 12
+        # v13 keeps the complete category taxonomy and repairs bulk CTA mail
+        # that v12 could still cache as reply-soon when a model over-scored it
+        # or returned a valid response with an empty tag list.
+        TRIAGE_VERSION = 13
         CATEGORY_TAGS = EMAIL_CONTENT_TAGS
         VISIBLE_EMAIL_TAGS = EMAIL_VISIBLE_TAGS
         MANAGED_TAGS = EMAIL_MANAGED_TAGS
@@ -2832,21 +2832,103 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
                 add_type("marketing")
             if _re.search(r"\b(receipt|your order|order (?:confirmation|shipped|placed|#|no\.?|number)|注文|payment confirmation|delivery|shipment|tracking|お届け|購入)\b", blob):
                 add_type("receipt")
-            if _re.search(r"\b(bill|billing|amount due|overdue|pay by|payment due|subscription could not be renewed)\b", blob):
-                add_type("bills")
-            if _re.search(r"\b(court|charge|legal|lawyer|solicitor|claim|judgment|registration fee|debt)\b", blob):
-                add_type("legal")
-            if _re.search(r"\b(flight|hotel|booking|reservation|itinerary|train|ticket|trip|旅|予約)\b", blob):
-                add_type("travel")
-            if _re.search(r"\b(ticket|case|support|helpdesk|request)\b", blob):
-                add_type("support")
-            if _re.search(r"\b(meeting|appointment|calendar|invite|event|schedule|予定|保育園|連絡帳)\b", blob):
-                add_response("calendar")
             if _re.search(
-                r"\b(action required|required action|please reply|please respond|deadline|by \d{1,2} |pay within|submit|sign|confirm|approval|waiting outside|locked out|can't get in|cannot get in|invoice|bill|billing|payment|balance|debt|subscription|renewal|overdue|amount due|court|charge|legal|lawyer|solicitor|claim|judgment)\b",
+                r"\b(bill due|billing statement|amount due|past due|overdue (?:balance|payment|invoice)|"
+                r"pay by|payment due|invoice (?:#|no\.?|number)|subscription could not be renewed)\b",
                 blob,
             ):
+                add_type("bills")
+            if _re.search(
+                r"\b(court|legal|lawyer|solicitor|claim|judgment|registration fee|debt|"
+                r"charges? filed|charged with)\b",
+                blob,
+            ):
+                add_type("legal")
+            if _re.search(
+                r"\b(flight|hotel|booking(?: id| reference| confirmation)?|reservation|"
+                r"itinerary|train|bus (?:ticket|booking)|e-ticket|boarding pass|pnr|trip|旅|予約)\b",
+                blob,
+            ):
+                add_type("travel")
+            if _re.search(
+                r"\b(support (?:ticket|case)|helpdesk|case (?:id|number|#)|"
+                r"service request(?: id| number| #)?)\b",
+                blob,
+            ):
+                add_type("support")
+            if _re.search(
+                r"\b(security alert|sign[ -]?in|login|password|verification code|"
+                r"two[ -]?factor|2fa|one[ -]?time (?:code|password)|otp|suspicious activity)\b",
+                blob,
+            ):
+                add_type("security")
+            if _re.search(
+                r"\b(bank|banking|investment|portfolio|mutual fund|transaction|"
+                r"account balance|dividend|brokerage)\b",
+                blob,
+            ):
+                add_type("finance")
+            if _re.search(r"\b(notification|status update|activity update|has been updated)\b", blob):
+                add_type("notification")
+            if _re.search(
+                r"\b(linkedin|new message|connection request|commented|mentioned you|followed you)\b",
+                blob,
+            ):
+                add_type("social")
+            if _re.search(r"\b(shopping|cart|wishlist|product|store|seller)\b", blob):
+                add_type("shopping")
+            if _re.search(
+                r"\b(client|project|coworker|colleague|interview|hiring|job application|proposal)\b",
+                blob,
+            ):
+                add_type("work")
+            if _re.search(r"\b(family|friend|personal)\b", blob):
+                add_type("personal")
+            if _re.search(r"\b(meeting|appointment|calendar|invite|event|schedule|予定|保育園|連絡帳)\b", blob):
+                add_response("calendar")
+            action_requested = bool(_re.search(
+                r"\b(action required|required action|please reply|please respond|deadline|by \d{1,2} |pay within|submit|sign|confirm|approval|waiting outside|locked out|can't get in|cannot get in|invoice|bill|billing|payment|balance|debt|subscription|renewal|overdue|amount due|court|charge|legal|lawyer|solicitor|claim|judgment|cancelled|canceled|rescheduled|delayed)\b",
+                blob,
+            ))
+            if action_requested:
                 add_response("action-needed")
+
+            # A bulk sender can mention tickets, billing, support, or legal
+            # topics as marketing copy.  Treat it as a personal consequence
+            # only when the message carries concrete account/booking/case
+            # evidence, not merely a category word plus a CTA.
+            bulk_user_consequence = action_requested and bool(_re.search(
+                r"\b(amount due|payment due|past due|overdue (?:balance|payment|invoice)|"
+                r"pay (?:by|within)|invoice (?:#|no\.?|number)|account (?:will be|has been) suspended|"
+                r"security alert|suspicious activity|unrecognized sign[ -]?in|password reset|"
+                r"verification code|one[ -]?time (?:code|password)|otp|court date|summons|"
+                r"legal notice|claim (?:id|number|#)|judgment|charges? filed|debt collection|"
+                r"booking (?:id|reference|confirmation)|pnr|boarding pass|your (?:flight|reservation|booking)|"
+                r"support (?:ticket|case)|case (?:id|number|#)|service request(?: id| number| #)?)\b",
+                blob,
+            ))
+
+            # List-Unsubscribe is also present on transactional service mail.
+            # Drop the broad bulk label only for strong transactional evidence;
+            # a newsletter about billing or tickets must remain a newsletter.
+            if "receipt" in type_candidates or "security" in type_candidates or bulk_user_consequence:
+                type_candidates = [
+                    tag for tag in type_candidates
+                    if tag not in {"newsletter", "marketing"}
+                ]
+
+            urgent_wording = bool(_re.search(
+                r"\b(urgent|immediately|final notice|locked out|waiting outside|can't get in|cannot get in)\b",
+                blob,
+            ))
+            # Bulk senders routinely write "action required", "confirm", or
+            # "urgent" in a promotional CTA.  When the model is unavailable,
+            # that used to turn newsletters into reply reminders (and could
+            # notify the user).  Only keep response urgency for bulk mail when
+            # the content also looks like a real user-specific consequence.
+            suppress_bulk_response = (bulkish or marketingish) and not bulk_user_consequence
+            if suppress_bulk_response:
+                response_tags = [tag for tag in response_tags if tag != "action-needed"]
 
             # Prefer specific transactional categories, then keep the broad
             # categories the heuristic actually detected.  The old three-tag
@@ -2868,10 +2950,10 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
             if "action-needed" in response_tags:
                 score = 2
                 reason = "action likely needed"
-            if _re.search(r"\b(urgent|immediately|final notice|locked out|waiting outside|can't get in|cannot get in)\b", blob):
+            if urgent_wording:
                 score = 3
                 reason = "urgent wording"
-            if (bulkish or marketingish) and score < 2:
+            if suppress_bulk_response:
                 score = 0
                 reason = "bulk marketing/newsletter"
 
@@ -2890,6 +2972,7 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
                 "triage_version": TRIAGE_VERSION,
                 "message_id": (item.get("message_id") or "").strip(),
                 "unread": bool(item.get("unread")),
+                "bulk_user_consequence": bulk_user_consequence,
                 "ts": _time.time(),
             }
 
@@ -2905,7 +2988,7 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
             def _scan_one(account=acc, cache_uids=cache.get("uids", {})):
                 """Sync IMAP work runs in a thread."""
                 results = []
-                conn = _imap_connect(account.id)
+                conn = _imap_connect(account.id, owner=owner)
                 try:
                     conn.select("INBOX", readonly=True)
                     # Tag recent inbox mail, not only unread mail. Urgency
@@ -3107,10 +3190,41 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
                         r"\b(advertisement|sponsored|promo|promotion|sale|discount|offer|limited time|deal|tickets?|tour|merch|stream|purchase|sold out|low tickets|coupon|shop now|buy now)\b",
                         _blob,
                     ))
-                    if (bulkish or marketingish) and score < 2:
+                    # Backfill only high-confidence metadata categories when a
+                    # small/local model returns valid JSON but omits tags. This
+                    # keeps the model authoritative for ambiguous work/personal
+                    # labels while ensuring List-Unsubscribe mail and obvious
+                    # transactional messages still render useful pills.
+                    heuristic = _heuristic_email_verdict(item)
+                    heuristic_tags = set(heuristic.get("tags") or [])
+                    metadata_tags = {
+                        "newsletter", "marketing", "receipt", "bills", "travel",
+                        "security", "finance", "legal", "support", "notification",
+                        "social", "shopping",
+                    }
+                    for inferred_tag in heuristic.get("tags") or []:
+                        if inferred_tag in metadata_tags and inferred_tag not in tags:
+                            tags.append(inferred_tag)
+                        if len(tags) >= 4:
+                            break
+
+                    # Bulk marketing often contains an imperative CTA. A model
+                    # score of 2/3 is not enough evidence by itself; require the
+                    # deterministic pass to also see a user-specific consequence
+                    # before creating reply-soon/urgent state or notifications.
+                    bulk_has_user_consequence = bool(
+                        heuristic.get("bulk_user_consequence")
+                    )
+                    if (bulkish or marketingish) and not bulk_has_user_consequence:
                         score = 0
-                        if not reason or "urgent" in reason.lower():
-                            reason = "bulk mail; no personal reply needed"
+                        tags = [
+                            tag for tag in tags
+                            if tag not in {
+                                "action-needed", "bills", "security", "legal",
+                                "travel", "support",
+                            }
+                        ]
+                        reason = "bulk mail; no personal reply needed"
                     # Strip "Name <addr>" to bare display name for compact summary.
                     _from_raw = item.get("from", "") or ""
                     if "<" in _from_raw:

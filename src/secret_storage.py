@@ -20,6 +20,8 @@ single migration pass rewrites them.
 
 import os
 import logging
+import stat
+import tempfile
 from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -74,6 +76,10 @@ def _load_or_create_key() -> bytes:
 
     key_path, explicitly_configured = _configured_key_path()
     if key_path.exists():
+        if not explicitly_configured:
+            info = key_path.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                raise RuntimeError("Local Restia encryption key is not a regular file")
         return key_path.read_bytes()
     if explicitly_configured:
         raise FileNotFoundError(
@@ -81,12 +87,60 @@ def _load_or_create_key() -> bytes:
         )
     key_path.parent.mkdir(parents=True, exist_ok=True)
     key = Fernet.generate_key()
-    key_path.write_bytes(key)
-    # POSIX: lock the key to 0o600. Windows: no-op (the user-profile data dir is
-    # already ACL-restricted); safe_chmod swallows both cases.
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=key_path.name + ".tmp.",
+        dir=key_path.parent,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            pass
+        written = 0
+        while written < len(key):
+            count = os.write(fd, key[written:])
+            if count <= 0:
+                raise OSError("short write while creating Restia encryption key")
+            written += count
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        try:
+            # Linking a fully-fsynced same-directory temporary file publishes
+            # it atomically and fails if another process already published its
+            # own complete key. No process can ever observe an empty/partial
+            # final key path.
+            os.link(temporary_path, key_path, follow_symlinks=False)
+            won_creation = True
+        except FileExistsError:
+            won_creation = False
+        info = key_path.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise RuntimeError("Local Restia encryption key is not a regular file")
+        winner = key_path.read_bytes()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
     _harden_key_permissions(key_path)
-    logger.info("Generated new app key at %s", key_path)
-    return key
+    if os.name != "nt":
+        try:
+            directory_fd = os.open(key_path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            # The file itself is durable and owner-only. Some network mounts
+            # reject directory fsync; subsequent reads still validate Fernet.
+            pass
+    if won_creation:
+        logger.info("Generated new app key at %s", key_path)
+    return winner
 
 
 def _get_fernet() -> Fernet:

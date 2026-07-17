@@ -179,6 +179,7 @@ def test_local_rename_preserves_account_and_external_subjects(life_env):
             id="external-identity",
             account_id=stable_id,
             provider="oidc",
+            issuer="https://issuer.example.test",
             subject="provider-subject-123",
         ))
         db.commit()
@@ -217,6 +218,64 @@ def test_external_identity_is_never_inferred_from_matching_username(life_env):
         assert db.query(Account).count() == 1
         assert db.query(AuthIdentity).filter_by(provider="oidc").count() == 0
         assert db.query(Account).one().id == local.id
+    finally:
+        db.close()
+
+
+def test_external_identity_resolution_requires_exact_issuer_and_opaque_subject(life_env):
+    db = life_env.Session()
+    try:
+        account = ensure_account(db, "alice")
+        db.add(AuthIdentity(
+            id="supabase-identity",
+            account_id=account.id,
+            provider="supabase",
+            issuer="https://project-a.supabase.co/auth/v1",
+            subject=" CaseSensitiveOpaqueSub ",
+            state="active",
+        ))
+        db.commit()
+
+        resolved = ensure_account(
+            db,
+            "alice",
+            provider="supabase",
+            issuer="https://project-a.supabase.co/auth/v1",
+            subject=" CaseSensitiveOpaqueSub ",
+        )
+        assert resolved.id == account.id
+
+        with pytest.raises(ValueError, match="explicit account linking"):
+            ensure_account(
+                db,
+                "alice",
+                provider="supabase",
+                issuer="https://project-a.supabase.co/auth/v1",
+                subject="CaseSensitiveOpaqueSub",
+            )
+        with pytest.raises(ValueError, match="explicit account linking"):
+            ensure_account(
+                db,
+                "alice",
+                provider="supabase",
+                issuer="https://project-b.supabase.co/auth/v1",
+                subject=" CaseSensitiveOpaqueSub ",
+            )
+    finally:
+        db.close()
+
+
+def test_external_identity_rejects_unicode_control_subject(life_env):
+    db = life_env.Session()
+    try:
+        with pytest.raises(ValueError, match="explicit account linking"):
+            ensure_account(
+                db,
+                "alice",
+                provider="supabase",
+                issuer="https://project-a.supabase.co/auth/v1",
+                subject="opaque\u0085subject",
+            )
     finally:
         db.close()
 

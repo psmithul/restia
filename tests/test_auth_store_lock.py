@@ -91,7 +91,9 @@ def test_locked_store_rejects_every_profile_auth_and_mutation_path(tmp_path):
     assert manager.change_password("alice", "alice-password", "new-password") is False
     assert manager.totp_enabled("alice") is False
     assert manager.totp_generate_secret("alice") is None
-    assert manager.totp_confirm_enable("alice", "123456") is None
+    assert manager.totp_confirm_enable(
+        "alice", "123456", "alice-password"
+    ) is None
     assert manager.totp_verify("alice", "123456") is False
     assert manager.totp_disable("alice", "alice-password") is False
     assert manager.revoke_user_sessions("admin") == 0
@@ -125,7 +127,7 @@ def test_app_lock_gate_precedes_localhost_and_bearer_bypasses():
     ]
     assert '"auth_store_error": True' in source[lock_start:localhost_start]
 
-    cache_start = source.index("def _refresh_token_cache")
-    cache_end = source.index("# Headers that prove", cache_start)
-    assert "if auth_manager.auth_store_error:" in source[cache_start:cache_end]
-    assert "_token_cache.clear()" in source[cache_start:cache_end]
+    assert "def _refresh_token_cache" not in source
+    assert "_token_cache.get(" not in source
+    bearer_end = source.index("# --- Cookie-based session auth", bearer_start)
+    assert "auth_manager.resolve_api_token" in source[bearer_start:bearer_end]

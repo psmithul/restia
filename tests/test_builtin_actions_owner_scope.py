@@ -260,3 +260,141 @@ async def test_check_email_urgency_resolves_llm_candidates_for_task_owner(monkey
 
     assert calls == ["alice"]
     assert db.closed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("llm_output", "subject", "body", "message_id", "expected_tags", "expected_tier"),
+    [
+        (
+            "not-json",
+            "Tomorrow: ask our cofounder Alex anything",
+            "Action required: confirm attendance today. Limited time offer.",
+            "<newsletter-fallback@example.com>",
+            '["newsletter", "marketing"]',
+            "reply-soon 0",
+        ),
+        (
+            '{"score":2,"tags":[],"spam":false,"reason":"confirm attendance"}',
+            "Tomorrow: ask our cofounder Alex anything",
+            "Action required: confirm attendance today. Limited time offer.",
+            "<newsletter-model@example.com>",
+            '["newsletter", "marketing"]',
+            "reply-soon 0",
+        ),
+        (
+            '{"score":3,"tags":["travel","action-needed"],"spam":false,"reason":"tickets require action"}',
+            "Tickets on sale: confirm your seat today",
+            "Action required: buy now for this limited time concert offer.",
+            "<ticket-promo@example.com>",
+            '["newsletter", "marketing"]',
+            "reply-soon 0",
+        ),
+        (
+            "not-json",
+            "Billing benchmarks for founders",
+            "Action required: confirm your place. Limited time offer.",
+            "<billing-newsletter@example.com>",
+            '["newsletter", "marketing"]',
+            "reply-soon 0",
+        ),
+        (
+            '{"score":2,"tags":["bills"],"spam":false,"reason":"payment due tomorrow"}',
+            "Final notice: invoice payment due",
+            "Amount due tomorrow. Pay within 24 hours to avoid a late charge.",
+            "<bill@example.com>",
+            '["reply-soon", "bills"]',
+            "reply-soon 1",
+        ),
+    ],
+)
+async def test_email_tagging_bulk_mail_requires_user_specific_consequence(
+    monkeypatch,
+    tmp_path,
+    llm_output,
+    subject,
+    body,
+    message_id,
+    expected_tags,
+    expected_tier,
+):
+    """Bulk CTAs stay informational while a real bill remains actionable."""
+    from core import database
+    from routes import email_helpers
+    from src import builtin_actions, llm_core, task_endpoint
+
+    class FakeEmailAccount:
+        enabled = _Column()
+        owner = _Column()
+        imap_user = _Column()
+        from_address = _Column()
+        id = _Column()
+
+    account = SimpleNamespace(
+        id="account-1",
+        owner="alice",
+        imap_user="alice@example.com",
+        from_address="alice@example.com",
+        enabled=True,
+    )
+    db = _Db({FakeEmailAccount: [account]})
+    imap_calls = []
+
+    class FakeImap:
+        def select(self, *_args, **_kwargs):
+            return "OK", []
+
+        def uid(self, command, *_args):
+            if command == "SEARCH":
+                return "OK", [b"10"]
+            if command == "FETCH":
+                raw = (
+                    b"From: Littlebird <news@example.com>\r\n"
+                    + f"Subject: {subject}\r\n".encode()
+                    + f"Message-ID: {message_id}\r\n".encode()
+                    + b"List-Unsubscribe: <https://example.com/unsubscribe>\r\n"
+                    + b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
+                    + body.encode()
+                )
+                return "OK", [(b"10 (UID 10 FLAGS ())", raw)]
+            raise AssertionError(command)
+
+        def logout(self):
+            return None
+
+    def fake_imap_connect(account_id=None, owner="", **_kwargs):
+        imap_calls.append((account_id, owner))
+        return FakeImap()
+
+    async def fake_llm(*_args, **_kwargs):
+        return llm_output
+
+    async def no_wait(*_args, **_kwargs):
+        return None
+
+    scheduled_db = tmp_path / "scheduled-emails.db"
+    cache_dir = tmp_path / "email-urgency-cache"
+    monkeypatch.setattr(database, "EmailAccount", FakeEmailAccount)
+    monkeypatch.setattr(database, "SessionLocal", lambda: db)
+    monkeypatch.setattr(email_helpers, "SCHEDULED_DB", scheduled_db)
+    monkeypatch.setattr(email_helpers, "_imap_connect", fake_imap_connect)
+    monkeypatch.setattr(builtin_actions, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(builtin_actions, "EMAIL_URGENCY_CACHE_DIR", str(cache_dir))
+    monkeypatch.setattr(task_endpoint, "resolve_task_candidates", lambda **_kwargs: [("http://llm", "model", {})])
+    monkeypatch.setattr(llm_core, "llm_call_async_with_fallback", fake_llm)
+    monkeypatch.setattr(builtin_actions, "wait_for_interactive_quiet", no_wait)
+
+    result, ok = await builtin_actions.action_check_email_urgency("alice")
+
+    assert ok is True, result
+    assert imap_calls == [("account-1", "alice")]
+    conn = sqlite3.connect(scheduled_db)
+    try:
+        row = conn.execute(
+            "SELECT tags, spam_verdict FROM email_tags WHERE message_id=? AND owner=? AND account_id=?",
+            (message_id, "alice", "account-1"),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row == (expected_tags, 0)
+    assert expected_tier in result

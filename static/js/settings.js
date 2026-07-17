@@ -2268,6 +2268,7 @@ function initAccount() {
                 </div>
                 <div style="font-family:monospace;font-size:12px;text-align:center;padding:6px;background:var(--bg);border:1px solid var(--border);border-radius:4px;margin-bottom:12px;word-break:break-all;user-select:all;cursor:text;">${esc(setup.secret)}</div>
                 <input id="tfa-verify-code" type="text" placeholder="Enter 6-digit code to verify" autocomplete="one-time-code" inputmode="numeric" maxlength="8" style="width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--fg);font-family:inherit;font-size:13px;box-sizing:border-box;text-align:center;letter-spacing:3px;margin-bottom:6px;">
+                <input id="tfa-enable-pw" type="password" placeholder="Confirm your current password" autocomplete="current-password" maxlength="4096" style="width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--fg);font-family:inherit;font-size:13px;box-sizing:border-box;margin-bottom:6px;">
                 <div class="settings-row" style="justify-content:flex-end;">
                   <span id="tfa-msg" style="font-size:11px;margin-right:auto;"></span>
                   <button class="admin-btn-add" id="tfa-cancel-btn" style="opacity:0.5;">Cancel</button>
@@ -2277,13 +2278,15 @@ function initAccount() {
               el('tfa-cancel-btn').addEventListener('click', () => render2FA());
               el('tfa-verify-btn').addEventListener('click', async () => {
                 const code = el('tfa-verify-code').value.trim();
+                const password = el('tfa-enable-pw').value;
                 const vmsg = el('tfa-msg');
                 if (!code) { vmsg.textContent = 'Enter the code'; vmsg.style.color = 'var(--red)'; return; }
+                if (!password) { vmsg.textContent = 'Enter your current password'; vmsg.style.color = 'var(--red)'; return; }
                 try {
                   const vr = await fetch('/api/auth/2fa/confirm', {
                     method: 'POST', credentials: 'same-origin',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ code })
+                    body: JSON.stringify({ code, password })
                   });
                   if (!vr.ok) { const d = await vr.json(); throw new Error(d.detail || 'Invalid code'); }
                   const result = await vr.json();

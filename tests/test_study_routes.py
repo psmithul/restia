@@ -1221,21 +1221,9 @@ def test_startup_owner_migration_assigns_local_study_state_to_admin(
     study_db, monkeypatch, tmp_path
 ):
     _add_legacy_state(study_db, owner=None, goal="Local controls goal")
-    auth_file = tmp_path / "auth.json"
-    auth_file.write_text(
-        json.dumps(
-            {
-                "users": {
-                    "alice": {"is_admin": True},
-                    "bob": {"is_admin": False},
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
     monkeypatch.setattr(cdb, "DATABASE_URL", f"sqlite:///{tmp_path / 'study.db'}")
 
-    cdb._migrate_assign_legacy_owner()
+    cdb._migrate_assign_legacy_owner("alice")
 
     db = study_db()
     row = db.query(StudyState).filter_by(id=study.LOCAL_OWNER_KEY).one()
@@ -1260,13 +1248,9 @@ def test_startup_owner_migration_does_not_duplicate_existing_admin_state(
     )
     db.commit()
     db.close()
-    (tmp_path / "auth.json").write_text(
-        json.dumps({"users": {"alice": {"is_admin": True}}}),
-        encoding="utf-8",
-    )
     monkeypatch.setattr(cdb, "DATABASE_URL", f"sqlite:///{tmp_path / 'study.db'}")
 
-    cdb._migrate_assign_legacy_owner()
+    cdb._migrate_assign_legacy_owner("alice")
 
     db = study_db()
     rows = db.query(StudyState).order_by(StudyState.id).all()

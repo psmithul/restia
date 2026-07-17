@@ -8,11 +8,13 @@ delivery and raises only credential-free errors.
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import json
 import logging
 import os
 import re
+import stat
 import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -28,6 +30,105 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN_RE = re.compile(r"^\d{6,}:[A-Za-z0-9_-]{20,}$")
 TELEGRAM_TRANSPORTS = frozenset({"polling", "webhook"})
 _DISABLED_VALUES = frozenset({"0", "false", "no", "off", ""})
+
+
+class _TelegramPollingProcessLease:
+    """Non-blocking, crash-safe ownership for one local polling process.
+
+    ``TelegramPollingService.start`` prevents duplicate coroutines only inside
+    one interpreter.  Uvicorn can also be launched with multiple workers (or a
+    second Restia process can briefly overlap during restart), and Telegram's
+    ``getUpdates`` API permits only one active poller per bot.  An OS file lock
+    scopes ownership to the shared Restia data directory and is released by
+    the kernel if the owning process exits.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._fd: int | None = None
+
+    @property
+    def owned(self) -> bool:
+        return self._fd is not None
+
+    @staticmethod
+    def _is_busy(exc: OSError) -> bool:
+        return exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}
+
+    def try_acquire(self) -> bool:
+        if self._fd is not None:
+            return True
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_RDWR | os.O_CREAT
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_BINARY", 0)
+        fd = os.open(self.path, flags, 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError("Telegram polling lock is not a regular file")
+            try:
+                os.fchmod(fd, 0o600)
+            except (AttributeError, OSError):
+                # Windows may not expose meaningful POSIX mode bits. The file
+                # contains no credential or message data, so locking remains
+                # safe even when chmod is unavailable.
+                pass
+
+            if os.name == "nt":
+                import msvcrt
+
+                if os.fstat(fd).st_size == 0:
+                    os.write(fd, b"\0")
+                    os.fsync(fd)
+                os.lseek(fd, 0, os.SEEK_SET)
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                except OSError as exc:
+                    if self._is_busy(exc):
+                        os.close(fd)
+                        return False
+                    raise
+            else:
+                import fcntl
+
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError as exc:
+                    if self._is_busy(exc):
+                        os.close(fd)
+                        return False
+                    raise
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+
+        self._fd = fd
+        return True
+
+    def release(self) -> None:
+        fd = self._fd
+        if fd is None:
+            return
+        self._fd = None
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            logger.warning("Telegram polling ownership unlock failed", exc_info=True)
+        finally:
+            os.close(fd)
 
 
 def inprocess_telegram_polling_enabled() -> bool:
@@ -247,14 +348,19 @@ class TelegramPollingService:
     """One long-polling worker for the one bot configured on this instance."""
 
     MAX_UPDATE_ATTEMPTS = 3
+    OWNERSHIP_RETRY_SECONDS = 3.0
 
-    def __init__(self) -> None:
+    def __init__(self, *, process_lock_path: Path | None = None) -> None:
         self._update_handler: Callable[[dict[str, Any]], Awaitable[None]] | None = None
         self._wake = asyncio.Event()
         self._runner_task: asyncio.Task | None = None
+        self._process_lease = _TelegramPollingProcessLease(
+            process_lock_path or (Path(DATA_DIR) / "telegram_polling.lock")
+        )
         self._offset: int | None = None
         self._token_fingerprint = ""
         self._running = False
+        self._standby = False
         self._last_error = ""
         self._last_update_at: float | None = None
         self._update_failures: dict[int, int] = {}
@@ -274,6 +380,7 @@ class TelegramPollingService:
             dead_letter_count = 0
         return {
             "poller_running": self._running,
+            "poller_standby": self._standby,
             "last_error": self._last_error,
             "last_update_at": self._last_update_at,
             "dead_letter_count": dead_letter_count,
@@ -397,6 +504,7 @@ class TelegramPollingService:
         task = self._runner_task
         if task is None:
             self._running = False
+            self._standby = False
             return
         if task is asyncio.current_task():
             task.cancel()
@@ -411,6 +519,7 @@ class TelegramPollingService:
             if self._runner_task is task:
                 self._runner_task = None
             self._running = False
+            self._standby = False
 
     async def run(self) -> None:
         current = asyncio.current_task()
@@ -423,10 +532,36 @@ class TelegramPollingService:
             # still taking ownership and preventing another direct runner.
             self._wake = asyncio.Event()
             self._runner_task = current
-        self._running = True
         backoff = 1.0
         try:
             while True:
+                if not self._process_lease.owned:
+                    try:
+                        owns_process_lease = self._process_lease.try_acquire()
+                    except Exception as exc:
+                        self._running = False
+                        self._standby = False
+                        self._last_error = "Telegram polling ownership unavailable"
+                        logger.error(
+                            "Telegram polling ownership unavailable (%s)",
+                            exc.__class__.__name__,
+                        )
+                        await self._wait(self.OWNERSHIP_RETRY_SECONDS)
+                        continue
+                    if not owns_process_lease:
+                        # Another local worker is healthy enough to hold the
+                        # kernel lease. Stay ready to take over after a crash or
+                        # rolling restart without racing its getUpdates calls.
+                        self._running = False
+                        self._standby = True
+                        self._last_error = ""
+                        await self._wait(self.OWNERSHIP_RETRY_SECONDS)
+                        continue
+                    self._running = True
+                    self._standby = False
+                    self._last_error = ""
+                    logger.info("Telegram polling ownership acquired")
+
                 settings = load_settings()
                 config = load_telegram_config()
                 if (
@@ -475,9 +610,11 @@ class TelegramPollingService:
                     backoff = min(backoff * 2, 30.0)
         finally:
             self._running = False
+            self._standby = False
             self._token_fingerprint = ""
             self._offset = None
             self._update_failures.clear()
+            self._process_lease.release()
             if self._runner_task is current:
                 self._runner_task = None
 

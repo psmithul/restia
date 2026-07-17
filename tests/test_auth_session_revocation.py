@@ -116,9 +116,11 @@ def _login_endpoint(auth_manager):
 
 def test_login_route_does_not_set_cookie_when_trusted_session_rejects_stale_user(monkeypatch):
     auth = MagicMock()
-    auth.verify_password.return_value = True
-    auth.totp_enabled.return_value = False
-    auth.create_session_trusted.return_value = None
+    auth.authenticate_session.return_value = SimpleNamespace(
+        token=None,
+        username=None,
+        requires_totp=False,
+    )
     endpoint, LoginRequest = _login_endpoint(auth)
     monkeypatch.setattr(
         "routes.auth_routes.asyncio.to_thread",
@@ -150,8 +152,13 @@ def test_change_password_route_revokes_other_sessions_after_success(monkeypatch)
     result = asyncio.run(endpoint(body=body, request=request))
 
     assert result == {"ok": True}
-    auth.change_password.assert_called_once_with("alice", "old-password", "new-password")
-    auth.revoke_user_sessions.assert_called_once_with("alice", "current-token")
+    auth.change_password.assert_called_once_with(
+        "alice",
+        "old-password",
+        "new-password",
+        "current-token",
+    )
+    auth.revoke_user_sessions.assert_not_called()
 
 
 def test_change_password_route_wrong_password_does_not_revoke(monkeypatch):

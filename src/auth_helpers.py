@@ -116,9 +116,9 @@ def configured_single_user_owner(request: Request | None = None) -> Optional[str
     auth_mgr = getattr(getattr(getattr(request, "app", None), "state", None), "auth_manager", None)
     managers = [auth_mgr] if auth_mgr is not None else []
     try:
-        from core.auth import AuthManager
+        from src.auth_runtime import get_auth_manager
 
-        managers.append(AuthManager())
+        managers.append(get_auth_manager())
     except Exception:
         pass
 
@@ -291,7 +291,7 @@ def require_user(request: Request) -> str:
 
 
 def require_privilege(request: Request, key: str) -> str:
-    """Reject callers whose `auth.json` privilege flag for `key` is False.
+    """Reject callers whose database-backed privilege for ``key`` is not true.
     Returns the username so the route handler can keep using it.
 
     Admins always have every privilege via `auth_manager.get_privileges`
@@ -307,13 +307,14 @@ def require_privilege(request: Request, key: str) -> str:
         return user
     try:
         privs = auth_mgr.get_privileges(user) or {}
-    except Exception:
-        return user
+    except Exception as exc:
+        raise HTTPException(
+            503,
+            "Authorization policy is temporarily unavailable",
+        ) from exc
     if not isinstance(privs, dict):
-        privs = {}
-    # True = permitted; missing key defaults to permitted (unknown privileges
-    # fail open — the UI gates display-side).
-    if not privs.get(key, True):
+        raise HTTPException(503, "Authorization policy is invalid")
+    if key not in privs or privs.get(key) is not True:
         raise HTTPException(403, f"Your account is not allowed to {key.replace('_', ' ')}.")
     return user
 

@@ -82,6 +82,8 @@ def _install_model_route_import_stubs(monkeypatch):
     db_mod.GalleryImage = MagicMock()
     middleware_mod = types.ModuleType("core.middleware")
     middleware_mod.require_admin = lambda request: None
+    log_safety_mod = types.ModuleType("core.log_safety")
+    log_safety_mod.redact_url = lambda value: value
     multipart_mod = types.ModuleType("python_multipart")
     multipart_mod.__version__ = "0.0.13"
     models_mod = types.ModuleType("core.models")
@@ -97,6 +99,7 @@ def _install_model_route_import_stubs(monkeypatch):
     monkeypatch.setitem(sys.modules, "core", core_mod)
     monkeypatch.setitem(sys.modules, "core.database", db_mod)
     monkeypatch.setitem(sys.modules, "core.middleware", middleware_mod)
+    monkeypatch.setitem(sys.modules, "core.log_safety", log_safety_mod)
     monkeypatch.setitem(sys.modules, "python_multipart", multipart_mod)
     monkeypatch.setitem(sys.modules, "core.models", models_mod)
     monkeypatch.setitem(sys.modules, "core.exceptions", exceptions_mod)
@@ -104,15 +107,11 @@ def _install_model_route_import_stubs(monkeypatch):
 
 
 def _install_core_auth_stub(monkeypatch):
-    """Install the narrow auth surface needed by tool-policy tests."""
-    core_mod = types.ModuleType("core")
-    core_mod.__path__ = []
-    auth_mod = types.ModuleType("core.auth")
-    auth_mod.AuthManager = MagicMock()
-    core_mod.auth = auth_mod
-    monkeypatch.setitem(sys.modules, "core", core_mod)
-    monkeypatch.setitem(sys.modules, "core.auth", auth_mod)
-    return auth_mod
+    """Install the active auth-runtime surface needed by tool-policy tests."""
+    runtime_mod = types.ModuleType("src.auth_runtime")
+    runtime_mod.get_auth_manager = MagicMock()
+    monkeypatch.setitem(sys.modules, "src.auth_runtime", runtime_mod)
+    return runtime_mod
 
 
 def _install_core_middleware_stub(monkeypatch):
@@ -428,7 +427,7 @@ async def test_admin_agent_tools_require_admin(monkeypatch):
         def is_admin(self, username):
             return False
 
-    monkeypatch.setattr(auth_mod, "AuthManager", lambda: FakeAuth())
+    monkeypatch.setattr(auth_mod, "get_auth_manager", lambda: FakeAuth())
 
     for tool_name in ("manage_tokens", "app_api", "serve_preset"):
         desc, result = await execute_tool_block(
@@ -641,7 +640,7 @@ async def test_public_agent_policy_blocks_sensitive_tools(monkeypatch):
         def is_admin(self, username):
             return False
 
-    monkeypatch.setattr(auth_mod, "AuthManager", lambda: FakeAuth())
+    monkeypatch.setattr(auth_mod, "get_auth_manager", lambda: FakeAuth())
 
     # Every bare email tool name is spelled out (not imported from
     # BUILTIN_EMAIL_TOOLS) so accidentally dropping one from that set fails
@@ -783,7 +782,7 @@ def _install_admin_auth_stub(monkeypatch):
         def is_admin(self, username):
             return True
 
-    monkeypatch.setattr(auth_mod, "AuthManager", lambda: FakeAdminAuth())
+    monkeypatch.setattr(auth_mod, "get_auth_manager", lambda: FakeAdminAuth())
 
 
 class _FakeMcpManager:
@@ -1059,7 +1058,7 @@ def test_public_agent_policy_hides_sensitive_tools(monkeypatch):
         def is_admin(self, username):
             return False
 
-    monkeypatch.setattr(auth_mod, "AuthManager", lambda: FakeAuth())
+    monkeypatch.setattr(auth_mod, "get_auth_manager", lambda: FakeAuth())
 
     blocked = blocked_tools_for_owner("regular-user")
 
@@ -1087,7 +1086,7 @@ def test_presetup_does_not_grant_admin_tools_when_auth_enabled(monkeypatch):
         def is_admin(self, username):
             return False
 
-    monkeypatch.setattr(auth_mod, "AuthManager", lambda: FakeAuth())
+    monkeypatch.setattr(auth_mod, "get_auth_manager", lambda: FakeAuth())
 
     from src.tool_security import (
         blocked_tools_for_owner,
@@ -1113,7 +1112,7 @@ def test_single_user_mode_keeps_full_tool_access_when_auth_disabled(monkeypatch)
         def is_admin(self, username):
             return False
 
-    monkeypatch.setattr(auth_mod, "AuthManager", lambda: FakeAuth())
+    monkeypatch.setattr(auth_mod, "get_auth_manager", lambda: FakeAuth())
 
     from src.tool_security import (
         blocked_tools_for_owner,
@@ -1141,7 +1140,7 @@ def test_auth_disabled_configured_mode_keeps_full_tool_access(monkeypatch):
         def is_admin(self, username):
             return False
 
-    monkeypatch.setattr(auth_mod, "AuthManager", lambda: FakeAuth())
+    monkeypatch.setattr(auth_mod, "get_auth_manager", lambda: FakeAuth())
 
     from src.tool_security import (
         blocked_tools_for_owner,

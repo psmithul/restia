@@ -55,10 +55,10 @@ def test_email_tag_normalization_keeps_existing_response_semantics():
     assert normalize_email_tags(tags, limit=0) == []
 
 
-def test_email_tags_task_invalidates_the_narrow_v11_cache():
+def test_email_tags_task_invalidates_stale_classification_caches():
     source = _BUILTIN_ACTIONS.read_text(encoding="utf-8")
 
-    assert "TRIAGE_VERSION = 12" in source
+    assert "TRIAGE_VERSION = 13" in source
     assert "CATEGORY_TAGS = EMAIL_CONTENT_TAGS" in source
     assert "allowed_tags=CATEGORY_TAGS" in source
 

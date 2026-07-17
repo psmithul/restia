@@ -154,12 +154,14 @@ def test_profile_rename_migrates_every_project_identity_column(monkeypatch, tmp_
             id="local-identity",
             account_id="stable-account-id",
             provider="local",
+            issuer="restia-local",
             subject="alice",
         ),
         cdb.AuthIdentity(
             id="external-identity",
             account_id="stable-account-id",
             provider="oidc",
+            issuer="https://issuer.example.test",
             subject="provider-subject-123",
         ),
     ])

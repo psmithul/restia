@@ -57,7 +57,11 @@ from src.constants import DATA_DIR
 from src.study_mode import build_study_tracker, serialize_study_state
 from src.planning import normalize_planning_owner, serialize_planning_item
 from src.progression import build_progression_summary, normalize_progression_owner
-from src.identity import LOCAL_IDENTITY_PROVIDER, normalize_identity
+from src.identity import (
+    LOCAL_IDENTITY_ISSUER,
+    LOCAL_IDENTITY_PROVIDER,
+    normalize_identity,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -508,7 +512,9 @@ def _load_inbox(
             db.query(AuthIdentity.account_id)
             .filter(
                 AuthIdentity.provider == LOCAL_IDENTITY_PROVIDER,
+                AuthIdentity.issuer == LOCAL_IDENTITY_ISSUER,
                 AuthIdentity.subject == owner,
+                AuthIdentity.state == "active",
             )
             .scalar()
         )

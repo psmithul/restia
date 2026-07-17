@@ -8,13 +8,7 @@ from __future__ import annotations
 
 import json
 import os
-import secrets
 import socket
-import uuid
-
-import bcrypt
-
-from src.constants import AUTH_FILE
 
 PAIRING_VERSION = 1
 COMPANION_SCOPE = "chat"
@@ -60,18 +54,19 @@ def lan_ip_candidates() -> list[str]:
     return candidates
 
 
-def find_admin_user() -> str | None:
-    """Resolve an admin username from data/auth.json (schema uses is_admin),
-    falling back to the first user."""
-    auth_path = AUTH_FILE
-    try:
-        with open(auth_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    users = data.get("users") or {}
+def _database_auth_manager(auth_manager=None):
+    if auth_manager is not None:
+        return auth_manager
+    from src.auth_runtime import get_auth_manager
+
+    return get_auth_manager()
+
+
+def find_admin_user(auth_manager=None) -> str | None:
+    """Resolve an admin from the canonical account/role authority."""
+
+    manager = _database_auth_manager(auth_manager)
+    users = getattr(manager, "users", {})
     if not isinstance(users, dict):
         return None
     for uname, udata in users.items():
@@ -80,30 +75,25 @@ def find_admin_user() -> str | None:
     return next(iter(users), None)
 
 
-def mint_token(owner: str, name: str = "companion") -> tuple[str, str]:
+def mint_token(
+    owner: str,
+    name: str = "companion",
+    *,
+    auth_manager=None,
+) -> tuple[str, str]:
     """Create a chat-scoped API token row and return (token_id, raw_token).
 
-    The raw token is returned ONCE -- only its bcrypt hash + an 8-char prefix
-    are persisted. Mirrors routes/api_token_routes.py so cookie- and
-    companion-minted tokens are indistinguishable to the auth middleware.
+    The raw token is returned ONCE; the database stores only a keyed HMAC
+    digest attached to the immutable account UUID.
     """
-    from core.database import get_db_session, ApiToken
-
-    raw_token = "ody_" + secrets.token_urlsafe(32)
-    token_hash = bcrypt.hashpw(raw_token.encode(), bcrypt.gensalt()).decode()
-    token_id = str(uuid.uuid4())[:8]
-
-    with get_db_session() as db:
-        db.add(ApiToken(
-            id=token_id,
-            owner=owner,
-            name=name,
-            token_hash=token_hash,
-            token_prefix=raw_token[:8],
-            scopes=COMPANION_SCOPE,
-            is_active=True,
-        ))
-    return token_id, raw_token
+    issued = _database_auth_manager(auth_manager).issue_api_token(
+        owner,
+        name=name,
+        scopes=[COMPANION_SCOPE],
+    )
+    if issued is None:
+        raise RuntimeError("Could not issue an account-bound companion token")
+    return issued["id"], issued["token"]
 
 
 def pairing_payload(host: str, port: int, token: str) -> dict:

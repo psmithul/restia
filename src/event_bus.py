@@ -6,13 +6,9 @@ like session creation, message sends, etc.
 """
 
 import asyncio
-import json
 import logging
-import os
 from datetime import datetime
 from typing import Optional
-
-from src.constants import AUTH_FILE
 
 logger = logging.getLogger(__name__)
 
@@ -56,14 +52,9 @@ def _resolve_event_owner(owner: Optional[str]) -> Optional[str]:
         return owner
 
     try:
-        auth_path = AUTH_FILE
-        with open(auth_path, "r", encoding="utf-8") as f:
-            users = (json.load(f).get("users") or {})
-        for username, data in users.items():
-            if data.get("is_admin") is True:
-                return username
-        if users:
-            return next(iter(users))
+        from src.auth_runtime import primary_admin_username
+
+        return primary_admin_username()
     except Exception:
         logger.debug("Could not resolve ownerless event owner", exc_info=True)
     return None

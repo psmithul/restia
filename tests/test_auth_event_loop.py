@@ -7,9 +7,10 @@ freezing every other in-flight request (chat streams, polling, ...). Because
 the endpoint is unauthenticated and rate-limited only per-IP, a burst of login
 attempts serializes the whole server — a cheap DoS-amplification vector.
 
-The fix offloads the bcrypt-bearing AuthManager calls via asyncio.to_thread.
-This test asserts those calls run on a worker thread, not the loop thread; it
-fails if they are awaited inline again.
+The fix offloads the atomic bcrypt/MFA/database-session call via
+``asyncio.to_thread``. This test asserts it runs on a worker thread, not the
+loop thread; it fails if it is awaited inline again or split into race-prone
+authentication steps.
 """
 import os
 import sys
@@ -93,9 +94,11 @@ def test_login_offloads_bcrypt_bearing_calls(monkeypatch):
         return fn(*args, **kwargs)
 
     monkeypatch.setattr("routes.auth_routes.asyncio.to_thread", fake_to_thread)
-    auth.verify_password.return_value = True
-    auth.totp_enabled.return_value = False
-    auth.create_session_trusted.return_value = "tok-123"
+    auth.authenticate_session.return_value = SimpleNamespace(
+        token="tok-123",
+        username="alice",
+        requires_totp=False,
+    )
 
     login = _login_endpoint(auth)
 
@@ -106,11 +109,15 @@ def test_login_offloads_bcrypt_bearing_calls(monkeypatch):
     result = asyncio.run(login(body=body, request=request, response=response))
 
     assert result["ok"] is True
-    auth.verify_password.assert_called_once()
-    auth.create_session_trusted.assert_called_once()
-    # The whole point: the expensive bcrypt-bearing calls go through
+    auth.authenticate_session.assert_called_once_with(
+        "alice",
+        "hunter2",
+        totp_code=None,
+        interface="web",
+    )
+    # The whole point: the atomic bcrypt/MFA/session call goes through
     # asyncio.to_thread rather than running inline in the request coroutine.
-    assert calls == [auth.verify_password, auth.create_session_trusted]
+    assert calls == [auth.authenticate_session]
 
 
 def test_login_offloads_legacy_backup_code_verification(monkeypatch):
@@ -122,10 +129,11 @@ def test_login_offloads_legacy_backup_code_verification(monkeypatch):
         return fn(*args, **kwargs)
 
     monkeypatch.setattr("routes.auth_routes.asyncio.to_thread", fake_to_thread)
-    auth.verify_password.return_value = True
-    auth.totp_enabled.return_value = True
-    auth.totp_verify.return_value = True
-    auth.create_session_trusted.return_value = "tok-2fa"
+    auth.authenticate_session.return_value = SimpleNamespace(
+        token="tok-2fa",
+        username="alice",
+        requires_totp=False,
+    )
 
     login = _login_endpoint(auth)
     request = SimpleNamespace(client=SimpleNamespace(host="198.51.100.9"), cookies={})
@@ -139,8 +147,10 @@ def test_login_offloads_legacy_backup_code_verification(monkeypatch):
     result = asyncio.run(login(body=body, request=request, response=response))
 
     assert result["ok"] is True
-    assert calls == [
-        auth.verify_password,
-        auth.totp_verify,
-        auth.create_session_trusted,
-    ]
+    auth.authenticate_session.assert_called_once_with(
+        "alice",
+        "hunter2",
+        totp_code="legacy-backup",
+        interface="web",
+    )
+    assert calls == [auth.authenticate_session]

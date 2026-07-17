@@ -1,18 +1,17 @@
 """Database deployment-mode validation and explicit process initialization.
 
-Restia currently has one production-safe schema path: the legacy SQLite
-bootstrap in :mod:`core.database`.  V3 introduces an explicit boundary so a
-future shared PostgreSQL deployment cannot accidentally run that SQLite-only
-bootstrap or start with anonymous access and per-node encryption keys.
+Restia uses an explicit Alembic baseline for empty databases and a verified,
+one-time adoption path for pre-Alembic SQLite installations. V3 keeps shared
+PostgreSQL startup separately gated until every runtime state store and worker
+lease is safe across replicas.
 
 ``local-single`` (the default)
-    One private Restia process using SQLite and the existing idempotent schema
-    bootstrap.
+    One private Restia process using SQLite and the Alembic schema authority.
 
 ``shared``
     A future multi-interface/multi-device deployment using PostgreSQL.  Its
     security prerequisites are validated now, but startup remains blocked
-    until a deterministic Alembic baseline replaces the legacy migrations.
+    until remaining SQLite-only runtime components have shared equivalents.
 """
 
 from __future__ import annotations
@@ -30,10 +29,10 @@ LOCAL_SINGLE_MODE = "local-single"
 SHARED_MODE = "shared"
 SUPPORTED_DATABASE_MODES = frozenset({LOCAL_SINGLE_MODE, SHARED_MODE})
 
-# This must only become True in the same change that supplies a deterministic
-# PostgreSQL baseline and removes the SQLite-specific startup migrations.
+# This must only become True in the same change that removes every remaining
+# SQLite/local-file runtime authority from the shared startup path.
 SHARED_SCHEMA_AUTHORITY_READY = False
-SCHEMA_AUTHORITY = "legacy-sqlite-bootstrap"
+SCHEMA_AUTHORITY = "alembic-20260717"
 
 _initialization_lock = threading.Lock()
 _initialized_binding: tuple[int, str] | None = None
@@ -221,10 +220,26 @@ def validate_database_mode(
 
 
 def initialize_database() -> DatabaseRuntimeConfig:
-    """Validate configuration and run the current explicit schema bootstrap."""
+    """Validate configuration and bring the selected database to Alembic head.
+
+    Empty local databases run the explicit baseline. Existing pre-Alembic
+    SQLite databases first run the final compatibility bootstrap and are then
+    stamped only after the frozen baseline manifest verifies them. A database
+    with an unknown revision or unrecognized partial schema is never mutated.
+    """
 
     config = validate_database_mode()
-    from core.database import engine, init_db
+    from core.database import engine, harden_database_permissions, init_db
+    from src.database_migrations import (
+        SchemaRevisionError,
+        application_table_names,
+        backup_legacy_sqlite_database,
+        schema_revision_status,
+        stamp_legacy_baseline,
+        upgrade_schema,
+        validate_head_schema,
+        validate_legacy_adoption_preflight,
+    )
 
     binding = (id(engine), str(engine.url))
     global _initialized_binding
@@ -232,6 +247,47 @@ def initialize_database() -> DatabaseRuntimeConfig:
         return config
     with _initialization_lock:
         if _initialized_binding != binding:
-            init_db()
+            try:
+                status = schema_revision_status(engine)
+                if status.state == "unknown":
+                    current = ", ".join(status.current_revisions) or "unknown"
+                    raise SchemaRevisionError(
+                        f"Database schema revision is unknown ({current}); expected "
+                        f"{status.expected_revision}"
+                    )
+                application_tables = application_table_names(engine)
+                if status.matches_expected:
+                    # A revision row is not proof of a usable database. This
+                    # also catches databases stamped by the pushed 0001
+                    # foundation before the immutable 0002 repair existed.
+                    validate_head_schema(engine)
+                elif not application_tables:
+                    # Alembic's immutable 0001 is stamp-only. Empty databases
+                    # record it without executing code, then run explicit 0002.
+                    upgrade_schema(engine)
+                elif config.mode == LOCAL_SINGLE_MODE:
+                    if status.state == "unstamped":
+                        # No version table is the normal pre-Alembic case. An
+                        # existing-but-empty version table alongside app data is
+                        # instead a failed downgrade/fake authority marker.
+                        from sqlalchemy import inspect
+
+                        if inspect(engine).has_table("alembic_version"):
+                            raise SchemaRevisionError(
+                                "Refusing to adopt application tables with an "
+                                "empty Alembic version table"
+                            )
+                    validate_legacy_adoption_preflight(engine)
+                    backup_legacy_sqlite_database(engine)
+                    init_db()
+                    stamp_legacy_baseline()
+                else:
+                    raise SchemaRevisionError(
+                        "Shared databases must be empty or at a recognized "
+                        "Alembic revision"
+                    )
+                harden_database_permissions()
+            except SchemaRevisionError as exc:
+                raise DatabaseConfigurationError(str(exc)) from exc
             _initialized_binding = binding
     return config
