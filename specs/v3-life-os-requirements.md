@@ -62,10 +62,10 @@ uploads, image/file handling, commands, search, and confirmation surfaces.
 Existing evidence: `/api/mission-control/today`, planning items, project work,
 calendar, notes, Study timer, daily briefs, and deterministic next actions.
 
-- [ ] Today shows primary outcome, top three actions, events, must-do tasks,
+- [x] Today shows primary outcome, top three actions, events, must-do tasks,
       people awaiting replies, health/routines, risks/conflicts, suggested
       schedule, and Restia-owned work.
-- [ ] Every recommendation states why now, effort, delay cost, linked goal or
+- [x] Every recommendation states why now, effort, delay cost, linked goal or
       project, source evidence, and what Restia can handle.
 - [ ] Focus Mode hides unrelated information, opens context, shows definition
       of done, persists a timer, captures interruptions/progress/evidence, and
@@ -76,12 +76,12 @@ calendar, notes, Study timer, daily briefs, and deterministic next actions.
 Existing evidence: Projects, stages/work items/checklists, planning items,
 Notes goals, Study goals, progression, dependencies, attachments, activity.
 
-- [ ] Life Area → Goal → Project → Milestone → Task → Action is represented
+- [x] Life Area → Goal → Project → Milestone → Task → Action is represented
       without duplicating the same commitment across disconnected stores.
 - [ ] Tasks include definition of done, priority, deadline, effort, energy,
       context, project, people, dependencies, documents, source, status, next
       action, and completion evidence.
-- [ ] Restia detects overdue, blocked, waiting, missing-next-action, irrelevant,
+- [x] Restia detects overdue, blocked, waiting, missing-next-action, irrelevant,
       duplicated, and goal-disconnected tasks.
 
 ## 5. Calendar and time — `partial`
@@ -277,13 +277,13 @@ messaging, owner scoping, API scopes, security headers, backups.
 
 ## 23. Minimal navigation — `partial`
 
-Existing evidence: declarative navigation registry and V2 shell; current
-top-level surface remains broader than the target.
+Existing evidence: declarative navigation registry, five-destination adaptive
+shell, contextual Life workspace, and consolidated More menu.
 
-- [ ] Permanent primary navigation is Restia, Today, Inbox, Life, Search.
-- [ ] Goals, Projects, People, Health, Money, Learning, Work, Home, Journal, and
+- [x] Permanent primary navigation is Restia, Today, Inbox, Life, Search.
+- [x] Goals, Projects, People, Health, Money, Learning, Work, Home, Journal, and
       Files are contextual destinations inside Life.
-- [ ] Existing deep links, commands, accessibility, mobile behavior, and user
+- [x] Existing deep links, commands, accessibility, mobile behavior, and user
       visibility preferences migrate without loss.
 
 ## 24. Ideal home screen — `partial`
@@ -333,3 +333,21 @@ entire section complete by itself.
   archive, filters, Today attention, navigation, console state, and 375 px
   mobile behavior. Shared PostgreSQL/auth sessions, connected-source adapters,
   and the remaining Life OS sections deliberately remain incomplete.
+- **2026-07-17 — V3 Planning Spine (`90e769b`)**: completed the first two Today
+  execution requirements (Section 3), canonical Life Area → Action hierarchy
+  and commitment-quality detectors (Section 4), and minimal navigation
+  (Section 23); it also advanced the unified graph, Focus, permission, and
+  trust boundaries without marking those broader sections complete. The
+  implementation is in `core/database.py`, `src/life_graph.py`,
+  `src/focus_mode.py`, `src/action_policy.py`, their API routes, the Today/Life
+  workspace and navigation modules, and migration `20260718_0003`. The full
+  suite passed with **5,789 passed, 3 skipped**; focused migration, encryption,
+  canonical-task, action-policy, Today, and navigation contracts passed.
+  Reviewed `0001 → 0002 → 0003` upgrades and pushed-0001 adoption encrypt
+  planning text plus edge metadata/provenance, reject incomplete head schemas,
+  and preserve recoverable ciphertext. Browser QA on an isolated runtime
+  verified the exact five primary destinations, `/today` and `/life` deep-link
+  reloads, Search open/close selected-state parity, 375 px mobile navigation,
+  contextual More behavior, an actionable degraded-source Settings path, and
+  no console errors. Focus UI completion, complete structured task fields,
+  connected-source ingestion, and shared-runtime readiness remain incomplete.
