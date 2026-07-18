@@ -12,6 +12,11 @@ from types import SimpleNamespace
 
 import pytest
 
+# Ownership handoff is retried on a 0.01s cadence in these tests, but a loaded
+# full-suite run can starve the pollers for seconds — wait on wall-clock time,
+# not a fixed iteration count.
+TAKEOVER_TIMEOUT_SECONDS = 15.0
+
 
 def test_telegram_polling_gate_is_independent_from_task_scheduler(monkeypatch):
     from src.telegram_runtime import inprocess_telegram_polling_enabled
@@ -152,6 +157,10 @@ async def test_only_one_local_process_service_polls_and_standby_takes_over(
 
     monkeypatch.setattr(runtime, "DATA_DIR", str(tmp_path))
     monkeypatch.setattr(runtime, "load_settings", lambda: {})
+    # Mode resolution consults the suite-global core.database session, which
+    # other full-suite tests may leave unusable; this test owns its own engine
+    # and is only about lease takeover, so pin the transport.
+    monkeypatch.setattr(runtime, "telegram_runtime_mode", lambda settings=None: "polling")
     monkeypatch.setattr(
         runtime,
         "load_telegram_config",
@@ -172,13 +181,14 @@ async def test_only_one_local_process_service_polls_and_standby_takes_over(
     first_task = first.start()
     second_task = second.start()
     try:
-        for _ in range(100):
+        deadline = asyncio.get_running_loop().time() + TAKEOVER_TIMEOUT_SECONDS
+        while True:
             statuses = (first.status(), second.status())
             if entered_calls == 1 and sum(s["poller_standby"] for s in statuses) == 1:
                 break
+            if asyncio.get_running_loop().time() >= deadline:
+                pytest.fail("one poller did not become owner while the other stood by")
             await asyncio.sleep(0.01)
-        else:
-            pytest.fail("one poller did not become owner while the other stood by")
 
         assert sum(s["poller_running"] for s in statuses) == 1
         assert entered_calls == 1
@@ -186,12 +196,13 @@ async def test_only_one_local_process_service_polls_and_standby_takes_over(
         owner, standby = (first, second) if first.status()["poller_running"] else (second, first)
         await owner.stop()
 
-        for _ in range(100):
+        deadline = asyncio.get_running_loop().time() + TAKEOVER_TIMEOUT_SECONDS
+        while True:
             if standby.status()["poller_running"] and entered_calls == 2:
                 break
+            if asyncio.get_running_loop().time() >= deadline:
+                pytest.fail("standby poller did not take ownership after owner stopped")
             await asyncio.sleep(0.01)
-        else:
-            pytest.fail("standby poller did not take ownership after owner stopped")
 
         assert standby.status()["poller_standby"] is False
         assert entered_calls == 2
@@ -240,6 +251,9 @@ async def test_database_lease_coordinates_two_hosts_and_standby_takes_over(
 
     monkeypatch.setattr(runtime, "DATA_DIR", str(tmp_path))
     monkeypatch.setattr(runtime, "load_settings", lambda: {})
+    # See test_only_one_local_process_service_polls_and_standby_takes_over:
+    # keep this lease test independent of the suite-global database.
+    monkeypatch.setattr(runtime, "telegram_runtime_mode", lambda settings=None: "polling")
     monkeypatch.setattr(
         runtime,
         "load_telegram_config",
@@ -263,13 +277,14 @@ async def test_database_lease_coordinates_two_hosts_and_standby_takes_over(
     first_task = first.start()
     second_task = second.start()
     try:
-        for _ in range(150):
+        deadline = asyncio.get_running_loop().time() + TAKEOVER_TIMEOUT_SECONDS
+        while True:
             statuses = (first.status(), second.status())
             if len(calls) == 1 and sum(s["poller_standby"] for s in statuses) == 1:
                 break
+            if asyncio.get_running_loop().time() >= deadline:
+                pytest.fail("database lease did not select exactly one polling host")
             await asyncio.sleep(0.01)
-        else:
-            pytest.fail("database lease did not select exactly one polling host")
 
         assert sum(s["database_leased"] for s in statuses) == 1
         owner, standby = (
@@ -278,12 +293,13 @@ async def test_database_lease_coordinates_two_hosts_and_standby_takes_over(
             else (second, first)
         )
         await owner.stop()
-        for _ in range(150):
+        deadline = asyncio.get_running_loop().time() + TAKEOVER_TIMEOUT_SECONDS
+        while True:
             if standby.status()["database_leased"] and len(calls) == 2:
                 break
+            if asyncio.get_running_loop().time() >= deadline:
+                pytest.fail("database standby did not take over after lease release")
             await asyncio.sleep(0.01)
-        else:
-            pytest.fail("database standby did not take over after lease release")
         assert standby.status()["poller_standby"] is False
     finally:
         hold_call.set()

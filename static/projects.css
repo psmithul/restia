@@ -513,6 +513,20 @@ body.hamburger-right .projects-workspace {
 .projects-toolbar__title p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .projects-toolbar__title h2 { margin-bottom: 3px; font-size: 15px; }
 
+/* The actions cell shares the toolbar grid with the centered view tabs; when
+   the workspace is narrow, a flex-end cell paints its overflow leftward across
+   them. Scroll instead, right-aligning with a margin (not justify-content) so
+   the overflowed start edge stays reachable. */
+.projects-workspace:not(.has-task-drawer) .projects-toolbar__actions {
+  min-width: 0;
+  justify-content: flex-start;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+.projects-workspace:not(.has-task-drawer) .projects-toolbar__actions > :first-child {
+  margin-left: auto;
+}
+
 /* The task drawer deliberately narrows the board. Give navigation and task
    commands their own rows instead of allowing three grid tracks to collide. */
 .projects-workspace.has-task-drawer .projects-toolbar {

@@ -580,133 +580,152 @@ class TelegramPollingService:
         backoff = 1.0
         try:
             while True:
-                if not self._process_lease.owned:
-                    try:
-                        owns_process_lease = self._process_lease.try_acquire()
-                    except Exception as exc:
-                        self._running = False
-                        self._standby = False
-                        self._last_error = "Telegram polling ownership unavailable"
-                        logger.error(
-                            "Telegram polling ownership unavailable (%s)",
-                            exc.__class__.__name__,
-                        )
-                        await self._wait(self.OWNERSHIP_RETRY_SECONDS)
-                        continue
-                    if not owns_process_lease:
-                        # Another local worker is healthy enough to hold the
-                        # kernel lease. Stay ready to take over after a crash or
-                        # rolling restart without racing its getUpdates calls.
-                        self._running = False
-                        self._standby = True
-                        self._last_error = ""
-                        await self._wait(self.OWNERSHIP_RETRY_SECONDS)
-                        continue
-                    self._running = True
-                    self._standby = False
-                    self._last_error = ""
-                    logger.info("Telegram polling ownership acquired")
-
-                settings = load_settings()
-                config = load_telegram_config()
-                if (
-                    not config.enabled
-                    or not config.bot_token
-                    or telegram_runtime_mode(settings) != "polling"
-                    or self._update_handler is None
-                ):
-                    if self._database_lease is not None:
-                        await self._drop_database_lease(release=True)
-                    self._token_fingerprint = ""
-                    self._offset = None
-                    self._last_error = ""
-                    await self._wait(3.0)
-                    continue
-
-                from src.telegram_identity import telegram_bot_fingerprint
-
-                fingerprint = (
-                    str(getattr(config, "bot_fingerprint", "") or "")
-                    or telegram_bot_fingerprint(bot_token=config.bot_token)
-                )
-                if fingerprint != self._token_fingerprint:
-                    if self._database_lease is not None:
-                        await self._drop_database_lease(release=True)
-                    self._token_fingerprint = fingerprint
-                    self._offset = None
-                if self._database_lease_lost:
-                    await self._drop_database_lease(release=False)
-                if self._database_lease is None:
-                    try:
-                        self._runtime_authority.adopt_legacy_sidecars(
-                            bot_fingerprint=fingerprint,
-                            bot_token=config.bot_token,
-                            data_dir=DATA_DIR,
-                        )
-                        claim = self._runtime_authority.acquire_polling_lease(
-                            bot_fingerprint=fingerprint,
-                            worker_id=self._worker_id,
-                            lease=self.DATABASE_LEASE,
-                        )
-                    except Exception as exc:
-                        self._running = False
-                        self._standby = False
-                        self._last_error = "Telegram polling ownership unavailable"
-                        logger.error(
-                            "Telegram polling database ownership unavailable (%s)",
-                            exc.__class__.__name__,
-                        )
-                        await self._wait(self.OWNERSHIP_RETRY_SECONDS)
-                        continue
-                    if claim is None:
-                        self._running = False
-                        self._standby = True
-                        self._last_error = ""
-                        await self._wait(self.OWNERSHIP_RETRY_SECONDS)
-                        continue
-                    self._database_lease = claim
-                    self._database_lease_lost = False
-                    self._offset = self._load_durable_offset(fingerprint)
-                    self._database_heartbeat_task = asyncio.create_task(
-                        self._database_heartbeat(claim),
-                        name="restia-telegram-poller-lease",
-                    )
-                    self._running = True
-                    self._standby = False
-                    logger.info("Telegram database polling lease acquired")
-                payload: dict[str, Any] = {
-                    "timeout": 25,
-                    "allowed_updates": ["message", "edited_message"],
-                }
-                if self._offset is not None:
-                    payload["offset"] = self._offset
                 try:
-                    data = await telegram_api_call(
-                        config.bot_token,
-                        "getUpdates",
-                        payload=payload,
-                        timeout=35.0,
+                    if not self._process_lease.owned:
+                        try:
+                            owns_process_lease = self._process_lease.try_acquire()
+                        except Exception as exc:
+                            self._running = False
+                            self._standby = False
+                            self._last_error = "Telegram polling ownership unavailable"
+                            logger.error(
+                                "Telegram polling ownership unavailable (%s)",
+                                exc.__class__.__name__,
+                            )
+                            await self._wait(self.OWNERSHIP_RETRY_SECONDS)
+                            continue
+                        if not owns_process_lease:
+                            # Another local worker is healthy enough to hold the
+                            # kernel lease. Stay ready to take over after a crash or
+                            # rolling restart without racing its getUpdates calls.
+                            self._running = False
+                            self._standby = True
+                            self._last_error = ""
+                            await self._wait(self.OWNERSHIP_RETRY_SECONDS)
+                            continue
+                        self._running = True
+                        self._standby = False
+                        self._last_error = ""
+                        logger.info("Telegram polling ownership acquired")
+
+                    settings = load_settings()
+                    config = load_telegram_config()
+                    if (
+                        not config.enabled
+                        or not config.bot_token
+                        or telegram_runtime_mode(settings) != "polling"
+                        or self._update_handler is None
+                    ):
+                        if self._database_lease is not None:
+                            await self._drop_database_lease(release=True)
+                        self._token_fingerprint = ""
+                        self._offset = None
+                        self._last_error = ""
+                        await self._wait(3.0)
+                        continue
+
+                    from src.telegram_identity import telegram_bot_fingerprint
+
+                    fingerprint = (
+                        str(getattr(config, "bot_fingerprint", "") or "")
+                        or telegram_bot_fingerprint(bot_token=config.bot_token)
                     )
-                    updates = data.get("result") if isinstance(data.get("result"), list) else []
-                    await self._process_updates(updates)
-                    self._last_error = ""
-                    backoff = 1.0
+                    if fingerprint != self._token_fingerprint:
+                        if self._database_lease is not None:
+                            await self._drop_database_lease(release=True)
+                        self._token_fingerprint = fingerprint
+                        self._offset = None
+                    if self._database_lease_lost:
+                        await self._drop_database_lease(release=False)
+                    if self._database_lease is None:
+                        try:
+                            self._runtime_authority.adopt_legacy_sidecars(
+                                bot_fingerprint=fingerprint,
+                                bot_token=config.bot_token,
+                                data_dir=DATA_DIR,
+                            )
+                            claim = self._runtime_authority.acquire_polling_lease(
+                                bot_fingerprint=fingerprint,
+                                worker_id=self._worker_id,
+                                lease=self.DATABASE_LEASE,
+                            )
+                        except Exception as exc:
+                            self._running = False
+                            self._standby = False
+                            self._last_error = "Telegram polling ownership unavailable"
+                            logger.error(
+                                "Telegram polling database ownership unavailable (%s)",
+                                exc.__class__.__name__,
+                            )
+                            await self._wait(self.OWNERSHIP_RETRY_SECONDS)
+                            continue
+                        if claim is None:
+                            self._running = False
+                            self._standby = True
+                            self._last_error = ""
+                            await self._wait(self.OWNERSHIP_RETRY_SECONDS)
+                            continue
+                        self._database_lease = claim
+                        self._database_lease_lost = False
+                        self._offset = self._load_durable_offset(fingerprint)
+                        self._database_heartbeat_task = asyncio.create_task(
+                            self._database_heartbeat(claim),
+                            name="restia-telegram-poller-lease",
+                        )
+                        self._running = True
+                        self._standby = False
+                        logger.info("Telegram database polling lease acquired")
+                    payload: dict[str, Any] = {
+                        "timeout": 25,
+                        "allowed_updates": ["message", "edited_message"],
+                    }
+                    if self._offset is not None:
+                        payload["offset"] = self._offset
+                    try:
+                        data = await telegram_api_call(
+                            config.bot_token,
+                            "getUpdates",
+                            payload=payload,
+                            timeout=35.0,
+                        )
+                        updates = data.get("result") if isinstance(data.get("result"), list) else []
+                        await self._process_updates(updates)
+                        self._last_error = ""
+                        backoff = 1.0
+                    except asyncio.CancelledError:
+                        raise
+                    except TelegramPollingLeaseLost:
+                        self._last_error = ""
+                        await self._drop_database_lease(release=False)
+                        self._running = False
+                        self._standby = True
+                        await self._wait(self.OWNERSHIP_RETRY_SECONDS)
+                    except TelegramAPIError as exc:
+                        self._last_error = str(exc)
+                        logger.warning("Telegram polling paused: %s", exc)
+                        await self._wait(backoff)
+                        backoff = min(backoff * 2, 30.0)
+                    except Exception as exc:
+                        self._last_error = "Telegram polling failed"
+                        logger.warning("Telegram polling failed (%s)", exc.__class__.__name__)
+                        await self._wait(backoff)
+                        backoff = min(backoff * 2, 30.0)
                 except asyncio.CancelledError:
                     raise
-                except TelegramPollingLeaseLost:
-                    self._last_error = ""
-                    await self._drop_database_lease(release=False)
-                    self._running = False
-                    self._standby = True
-                    await self._wait(self.OWNERSHIP_RETRY_SECONDS)
-                except TelegramAPIError as exc:
-                    self._last_error = str(exc)
-                    logger.warning("Telegram polling paused: %s", exc)
-                    await self._wait(backoff)
-                    backoff = min(backoff * 2, 30.0)
                 except Exception as exc:
+                    # Dependencies consulted outside the getUpdates guard
+                    # (settings/mode resolution, fingerprinting, cursor
+                    # loads) can raise on transient database failures. A
+                    # runner that dies here is silent and permanent — no
+                    # standby can take over a lease that was never
+                    # contested — so degrade to a logged retry instead.
+                    self._running = False
+                    self._standby = False
                     self._last_error = "Telegram polling failed"
-                    logger.warning("Telegram polling failed (%s)", exc.__class__.__name__)
+                    logger.error(
+                        "Telegram polling iteration failed (%s)",
+                        exc.__class__.__name__,
+                    )
                     await self._wait(backoff)
                     backoff = min(backoff * 2, 30.0)
         finally:

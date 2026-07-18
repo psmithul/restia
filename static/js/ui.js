@@ -526,6 +526,12 @@ export function getAutoScroll() {
  * Auto-resize textarea based on content
  */
 export function autoResize(textarea) {
+  // A textarea measured while hidden or before first layout (offsetWidth 0)
+  // wraps its placeholder one character per line, so the clone reports a
+  // garbage scrollHeight that then sticks as an inline height until the next
+  // input event — a huge empty composer that covers the welcome screen. Skip
+  // the resize and keep the current height until the element is measurable.
+  if (!textarea || !textarea.offsetWidth) return;
   const lineHeight = parseInt(getComputedStyle(textarea).lineHeight);
   const isMobile = window.innerWidth <= 768;
   const maxHeight = isMobile ? 150 : lineHeight * 8;
