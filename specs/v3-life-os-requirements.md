@@ -246,13 +246,13 @@ notification center.
 - [x] Interruptions are limited to urgent, important, time-sensitive, high-risk,
       or explicitly requested matters; everything else enters a digest.
 
-## 20. Unified life graph — `partial`
+## 20. Unified life graph — `complete`
 
-- [ ] All required core entity types and owner-scoped typed edges exist.
+- [x] All required core entity types and owner-scoped typed edges exist.
 - [x] Existing domain rows can be referenced without duplicating authority.
-- [ ] Source provenance, confidence, permissions, versioning, and deletion
+- [x] Source provenance, confidence, permissions, versioning, and deletion
       behavior are explicit.
-- [ ] Email → person → project → decision → task → deadline → calendar → file →
+- [x] Email → person → project → decision → task → deadline → calendar → file →
       goal is verified as a real traversal.
 
 ## 21. Permission and autonomy — `complete`
@@ -638,3 +638,16 @@ entire section complete by itself.
   strict `3.1.0 → v3.1` preflight. Live model-provider invocation and
   real-device visual QA remain open, so the broader Sections 1, 22, 25, and 26
   stay partial.
+- **2026-07-18 — explicit Unified Life Graph contract (working tree after
+  `dd8e5c1`)**: completed Section 20 without creating a parallel domain store.
+  `core/database.py` names the specification's complete core-node set as
+  `CORE_LIFE_ENTITY_TYPES`, while existing `LifeEntity` references keep mature
+  email, project, calendar, note, document, and other domain rows authoritative.
+  `src/life_graph.py` now exposes the enforced owner boundary,
+  `life:read`/`life:write` scopes, sensitivity, lifecycle version, and exact
+  soft-delete or source-cascade semantics on every serialized source, node,
+  and edge. The canonical source-backed Email → person → project → decision →
+  task → deadline → calendar → file → goal traversal proves all eight typed
+  edges, owner isolation, confidence, provenance, versions, and that deleting
+  the first association removes the reachable traversal without deleting the
+  downstream records. The focused graph contract passed with **12 passed**.

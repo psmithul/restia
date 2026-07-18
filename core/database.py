@@ -1627,11 +1627,17 @@ event.listen(
 )
 
 
+CORE_LIFE_ENTITY_TYPES = (
+    "person", "area", "goal", "project", "milestone", "task", "event",
+    "message", "note", "file", "decision", "habit", "metric",
+    "transaction", "health_record", "place", "asset", "reminder",
+    "automation", "source",
+)
+
+
 LIFE_ENTITY_TYPES = (
-    "person", "area", "goal", "project", "milestone", "task", "action",
-    "event", "communication_thread", "message", "note", "file",
-    "decision", "habit", "metric", "transaction", "health_record",
-    "place", "asset", "reminder", "automation", "source",
+    *CORE_LIFE_ENTITY_TYPES[:6], "action", CORE_LIFE_ENTITY_TYPES[6],
+    "communication_thread", *CORE_LIFE_ENTITY_TYPES[7:],
     "journal_entry", "workspace", "trip", "interaction", "commitment",
     "period_review", "learning_record", "career_item", "home_record",
     "finance_record",

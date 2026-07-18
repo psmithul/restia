@@ -12,6 +12,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from core.database import (
+    CORE_LIFE_ENTITY_TYPES,
     Account,
     ActionAudit,
     AuthIdentity,
@@ -43,6 +44,7 @@ from src.life_graph import (
     list_life_entity_versions,
     list_life_sources,
     search_life_entities,
+    serialize_life_source,
     task_quality_report,
     traverse_life_graph,
     update_life_entity,
@@ -98,6 +100,39 @@ def _account(db, username: str) -> Account:
     account = ensure_account(db, username)
     db.flush()
     return account
+
+
+def test_required_core_entity_types_have_one_owner_scoped_graph_contract(
+    life_graph_env,
+):
+    assert CORE_LIFE_ENTITY_TYPES == (
+        "person", "area", "goal", "project", "milestone", "task", "event",
+        "message", "note", "file", "decision", "habit", "metric",
+        "transaction", "health_record", "place", "asset", "reminder",
+        "automation", "source",
+    )
+    db = life_graph_env.Session()
+    try:
+        alice = _account(db, "alice")
+        rows = []
+        for entity_type in CORE_LIFE_ENTITY_TYPES:
+            row, created = create_life_entity(
+                db,
+                account=alice,
+                entity_type=entity_type,
+                title=f"Core {entity_type}",
+                idempotency_key=f"core-entity-type:{entity_type}",
+            )
+            assert created is True
+            rows.append(row)
+        db.commit()
+
+        assert {row.entity_type for row in rows} == set(CORE_LIFE_ENTITY_TYPES)
+        assert {row.owner_id for row in rows} == {alice.id}
+        assert all(row.version == 1 for row in rows)
+        assert all(row.deleted_at is None for row in rows)
+    finally:
+        db.close()
 
 
 def _seed_domain_reference_records(db):
@@ -890,8 +925,9 @@ def test_full_email_to_goal_chain_is_source_backed_owner_scoped_and_traversable(
             (event, "uses", file),
             (file, "supports", goal),
         )
+        chain_links = []
         for left, relation, right in chain:
-            create_entity_link(
+            link, _ = create_entity_link(
                 db,
                 account=alice,
                 source_id=left.id,
@@ -900,6 +936,7 @@ def test_full_email_to_goal_chain_is_source_backed_owner_scoped_and_traversable(
                 provenance={"source_id": source.id, "authority": "test-chain"},
                 confidence=100,
             )
+            chain_links.append(link)
         foreign, _ = create_life_entity(
             db, account=bob, entity_type="goal", title="Bob private goal",
         )
@@ -939,8 +976,41 @@ def test_full_email_to_goal_chain_is_source_backed_owner_scoped_and_traversable(
         assert all(row["version"] >= 1 for row in traversal["entities"])
         assert all(row["confidence"] == 100 for row in traversal["links"])
         assert all(row["provenance"]["source_id"] == source.id for row in traversal["links"])
+        assert all(row["permissions"] == {
+            "boundary": "owner",
+            "read_scope": "life:read",
+            "write_scope": "life:write",
+            "sensitivity": "private",
+        } for row in traversal["entities"] + traversal["links"])
+        assert all(row["lifecycle"] == {
+            "version": 1,
+            "deletion_mode": "soft_delete",
+            "deleted": False,
+            "deleted_at": None,
+        } for row in traversal["entities"] + traversal["links"])
+        assert serialize_life_source(source)["lifecycle"] == {
+            "version": 1,
+            "deletion_mode": "owner_cascade_only",
+            "deleted": False,
+            "deleted_at": None,
+        }
         assert foreign.id not in {row["id"] for row in traversal["entities"]}
         assert task.due_at == deadline.due_at
+
+        deleted_link = delete_entity_link(
+            db,
+            owner_id=alice.id,
+            link_id=chain_links[0].id,
+            expected_version=1,
+            reason="Remove the source-backed person association",
+        )
+        db.flush()
+        assert deleted_link.version == 2
+        after_delete = traverse_life_graph(
+            db, owner_id=alice.id, entity_id=email.id, depth=8, limit=50,
+        )
+        assert [row["id"] for row in after_delete["entities"]] == [email.id]
+        assert after_delete["links"] == []
     finally:
         db.close()
 

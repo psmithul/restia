@@ -75,6 +75,31 @@ _AUDIT_LINK_CREATED = "Life entities linked"
 _AUDIT_LINK_DELETED = "Life entity link deleted"
 
 
+def _permission_contract(sensitivity: str) -> dict[str, Any]:
+    """Describe the enforced graph boundary without exposing principal ids."""
+
+    return {
+        "boundary": "owner",
+        "read_scope": "life:read",
+        "write_scope": "life:write",
+        "sensitivity": sensitivity,
+    }
+
+
+def _lifecycle_contract(
+    *,
+    version: int,
+    deletion_mode: str,
+    deleted_at: datetime | None = None,
+) -> dict[str, Any]:
+    return {
+        "version": int(version or 1),
+        "deletion_mode": deletion_mode,
+        "deleted": deleted_at is not None,
+        "deleted_at": _iso(deleted_at),
+    }
+
+
 class LifeGraphError(ValueError):
     """Base class for controlled life-graph failures."""
 
@@ -219,6 +244,11 @@ def serialize_life_source(source: LifeSource) -> dict[str, Any]:
         "sensitivity": source.sensitivity,
         "metadata": source.meta_data or {},
         "version": int(source.version or 1),
+        "permissions": _permission_contract(source.sensitivity),
+        "lifecycle": _lifecycle_contract(
+            version=int(source.version or 1),
+            deletion_mode="owner_cascade_only",
+        ),
         "created_at": _iso(source.created_at),
         "updated_at": _iso(source.updated_at),
     }
@@ -242,6 +272,12 @@ def serialize_life_entity(entity: LifeEntity) -> dict[str, Any]:
         "review_at": _iso(entity.review_at),
         "version": int(entity.version or 1),
         "deleted_at": _iso(entity.deleted_at),
+        "permissions": _permission_contract(entity.sensitivity),
+        "lifecycle": _lifecycle_contract(
+            version=int(entity.version or 1),
+            deletion_mode="soft_delete",
+            deleted_at=entity.deleted_at,
+        ),
         "created_at": _iso(entity.created_at),
         "updated_at": _iso(entity.updated_at),
     }
@@ -272,6 +308,12 @@ def serialize_entity_link(link: EntityLink) -> dict[str, Any]:
         "sensitivity": link.sensitivity,
         "version": int(link.version or 1),
         "deleted_at": _iso(link.deleted_at),
+        "permissions": _permission_contract(link.sensitivity),
+        "lifecycle": _lifecycle_contract(
+            version=int(link.version or 1),
+            deletion_mode="soft_delete",
+            deleted_at=link.deleted_at,
+        ),
         "created_at": _iso(link.created_at),
         "updated_at": _iso(link.updated_at),
     }
