@@ -100,6 +100,12 @@ def test_publish_workflow_gates_postgres_exact_platforms_and_native_smokes():
     workflow = _read(".github/workflows/docker-publish.yml")
 
     assert "postgres-gate:" in workflow
+    # Alembic imports core.database through migrations/env.py. The core package
+    # currently registers auth/middleware compatibility exports at import time,
+    # so the deliberately-small migration environment must still install these
+    # direct runtime imports instead of passing locally and failing on CI.
+    for dependency in ("fastapi", "httpx", "bcrypt", "pyotp"):
+        assert dependency in workflow
     assert "shared-gate --migration-smoke --pretty" in workflow
     assert "needs: [preflight, postgres-gate]" in workflow
     assert "platform: linux/amd64" in workflow

@@ -104,6 +104,7 @@ jobs:
         run: >-
           pip install SQLAlchemy 'alembic>=1.14,<2'
           'psycopg[binary]>=3.2,<4' cryptography
+          fastapi httpx bcrypt pyotp
       - name: Create ephemeral shared-runtime key and blob root
         run: |
           python - <<'PY'
