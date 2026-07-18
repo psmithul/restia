@@ -199,7 +199,7 @@ def setup_ambient_routes(*, session_factory=SessionLocal) -> APIRouter:
             with request_account_transaction(
                 db, request, required_scopes=("life:write",), write=True,
             ) as account:
-                source, created = capture_ambient_signal(
+                capture_result = capture_ambient_signal(
                     db,
                     account=account,
                     capability=capability,
@@ -208,9 +208,14 @@ def setup_ambient_routes(*, session_factory=SessionLocal) -> APIRouter:
                     idempotency_key=body.idempotency_key,
                     trusted_device_session=_trusted_device_session(request),
                 )
+                source, created = capture_result
                 return {
                     "source": serialize_life_source(source),
                     "created": created,
+                    "inbox_item_id": (
+                        capture_result.inbox_item.id
+                        if capture_result.inbox_item is not None else None
+                    ),
                     "interpreted_as_instruction": False,
                 }
         except Exception as exc:

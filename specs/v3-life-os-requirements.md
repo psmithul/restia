@@ -45,9 +45,9 @@ uploads, image/file handling, commands, search, and confirmation surfaces.
       spending, and goal-progress queries have verified end-to-end paths.
 - [ ] Answers expose reasoning, sources, assumptions, and available actions.
 
-## 2. Universal Inbox — `partial`
+## 2. Universal Inbox — `complete`
 
-- [ ] Thoughts, voice notes, screenshots, links, email, WhatsApp, files, meeting
+- [x] Thoughts, voice notes, screenshots, links, email, WhatsApp, files, meeting
       notes, tasks, ideas, receipts, reminders, saved posts, and papers use one
       owner-scoped ingestion contract.
 - [x] Classification supports Task, Event, Note, Person update, Project
@@ -665,3 +665,21 @@ entire section complete by itself.
   calendar, action-policy, authority, migration, delivery, Life-tool, schema,
   and release regression set passed with **143 passed**; Python compilation
   and whitespace validation also passed.
+- **2026-07-18 — complete Universal Inbox source contract (working tree after
+  `62723cb`)**: completed Section 2 without adding a parallel capture queue.
+  Every specified source label is accepted by the same owner-scoped,
+  destination-free `/api/inbox` contract with server-owned safety metadata,
+  idempotency, classification evidence, and mutation audit. Browser and server
+  voice, screenshots/files, email, Telegram, read-only WhatsApp, and enabled
+  read-only communication connectors already project automatically. Mobile
+  voice, consented call/meeting transcription, and camera capture now create
+  their Life source and Universal Inbox row atomically, including offline
+  replay, and return the linked Inbox ID to the client; structured location,
+  wearable, and smart-home observations remain out of the unprocessed Inbox to
+  avoid duplicate/noisy records. File uploads can explicitly preserve meeting
+  note, receipt, saved-post, and research-paper provenance while rejecting an
+  attempt to impersonate connector sources such as email. The focused
+  ingestion, ambient, upload, communications, Life-tool, frontend, and release
+  regression set passed with **203 passed**; a forced Inbox failure proved that
+  the corresponding ambient Life source rolls back instead of becoming an
+  orphan.

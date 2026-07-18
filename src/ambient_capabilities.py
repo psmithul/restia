@@ -23,7 +23,7 @@ from typing import Any, Mapping
 
 from sqlalchemy import and_, or_
 
-from core.database import Account, LifeSource
+from core.database import Account, InboxItem, LifeSource
 from src.action_policy import ProposalCreation, create_action_proposal
 from src.action_policy import (
     complete_action,
@@ -31,7 +31,8 @@ from src.action_policy import (
     get_action_proposal,
     start_action,
 )
-from src.life_core import append_action_audit
+from src.life_core import LifeCoreError, append_action_audit, create_inbox_item
+from src.life_ingestion import capture_ingestion_metadata
 from src.life_graph import create_life_source, serialize_life_source
 from src.profile_configuration_service import (
     ProfileConfigurationConflict,
@@ -63,6 +64,21 @@ class SmartHomeExecutionRequest:
     method: str
     path: str
     body: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class AmbientCaptureResult:
+    """Backward-compatible capture result with its Universal Inbox linkage."""
+
+    source: LifeSource
+    created: bool
+    inbox_item: InboxItem | None
+
+    def __iter__(self):
+        # Preserve the established ``source, created = capture(...)`` contract
+        # for local callers while exposing the canonical Inbox row to routes.
+        yield self.source
+        yield self.created
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +159,17 @@ _SOURCE_TO_CAPABILITY = {
     for definition in AMBIENT_CAPABILITIES.values()
     if definition.source_type is not None
 }
+
+# Ambient observations such as location, wearable metrics, and smart-home
+# state are already structured records, so sending them to the unprocessed
+# Inbox would create noise. These three capabilities are genuine Universal
+# Inbox capture surfaces and must enter the same destination-free queue used by
+# browser voice, uploads, email, and messaging connectors.
+_AMBIENT_INBOX_SOURCE_TYPES = MappingProxyType({
+    "mobile_voice": "voice",
+    "transcription": "meeting_note",
+    "camera": "image",
+})
 
 _SMART_HOME_OPERATIONS = frozenset({
     "turn_on", "turn_off", "set_level", "set_temperature", "lock", "unlock",
@@ -521,7 +548,7 @@ def capture_ambient_signal(
     observed_at: datetime | None,
     idempotency_key: object,
     trusted_device_session: bool,
-) -> tuple[LifeSource, bool]:
+) -> AmbientCaptureResult:
     definition, state = _require_operation(
         db,
         owner_id=account.id,
@@ -548,7 +575,16 @@ def capture_ambient_signal(
         "no_training": True,
         "interpreted_as_instruction": False,
     }
-    return create_life_source(
+    # Keep the source and any corresponding Inbox row atomic on SQLite too.
+    # Life graph services use nested savepoints for concurrent idempotency;
+    # without an explicit outer write, releasing the first savepoint can make
+    # the source durable before the Inbox row is attempted.
+    if db.get_bind().dialect.name == "sqlite":
+        connection = db.connection()
+        driver = getattr(connection.connection, "driver_connection", None)
+        if driver is None or not bool(getattr(driver, "in_transaction", False)):
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+    source, created = create_life_source(
         db,
         account=account,
         source_type=definition.source_type,
@@ -560,6 +596,48 @@ def capture_ambient_signal(
         sensitivity="private",
         metadata=stored_metadata,
         idempotency_key=f"ambient:{definition.id}:{raw_idempotency}",
+    )
+    inbox_source_type = _AMBIENT_INBOX_SOURCE_TYPES.get(definition.id)
+    inbox_item = None
+    if inbox_source_type is not None:
+        if definition.id in {"mobile_voice", "transcription"}:
+            inbox_content = str(metadata.get("transcript") or "")
+        else:
+            inbox_content = str(
+                metadata.get("extracted_text") or metadata.get("caption") or excerpt
+            )
+        try:
+            inbox_item, _inbox_created = create_inbox_item(
+                db,
+                account=account,
+                title=title,
+                content=inbox_content,
+                source_type=inbox_source_type,
+                source_ref=f"life_source:{source.id}",
+                metadata=capture_ingestion_metadata(
+                    source_type=inbox_source_type,
+                    metadata={
+                        "life_source_id": source.id,
+                        "ambient_capability": definition.id,
+                        "observed_at": (
+                            observed_at.isoformat() if observed_at is not None else None
+                        ),
+                        "interpreted_as_instruction": False,
+                        "no_training": True,
+                    },
+                ),
+                idempotency_key=(
+                    f"ambient-inbox:{definition.id}:{raw_idempotency}"
+                ),
+            )
+        except LifeCoreError as exc:
+            raise AmbientCapabilityError(
+                "Ambient capture could not enter the Universal Inbox"
+            ) from exc
+    return AmbientCaptureResult(
+        source=source,
+        created=created,
+        inbox_item=inbox_item,
     )
 
 
@@ -590,7 +668,7 @@ def sync_offline_captures(
         observed = item.get("observed_at")
         if observed is not None and not isinstance(observed, datetime):
             raise AmbientCapabilityError(f"Offline capture {index} observed_at is invalid")
-        source, created = capture_ambient_signal(
+        capture = capture_ambient_signal(
             db,
             account=account,
             capability=item.get("capability"),
@@ -599,7 +677,14 @@ def sync_offline_captures(
             idempotency_key=item.get("idempotency_key"),
             trusted_device_session=trusted_device_session,
         )
-        results.append({"source": serialize_life_source(source), "created": created})
+        source, created = capture
+        results.append({
+            "source": serialize_life_source(source),
+            "created": created,
+            "inbox_item_id": (
+                capture.inbox_item.id if capture.inbox_item is not None else None
+            ),
+        })
     return results
 
 
@@ -907,6 +992,7 @@ def finish_smart_home_execution(
 
 
 __all__ = [
+    "AmbientCaptureResult",
     "AMBIENT_CAPABILITIES",
     "AmbientCapabilityDenied",
     "AmbientCapabilityError",

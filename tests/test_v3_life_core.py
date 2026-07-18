@@ -703,6 +703,50 @@ async def test_inbox_api_normalizes_public_sources_and_owns_safety_metadata(life
     assert "Unsupported Universal Inbox capture source" in unsupported.text
 
 
+@pytest.mark.asyncio
+async def test_inbox_api_accepts_every_specified_capture_source(life_env):
+    sources = {
+        "thoughts": "text",
+        "voice notes": "voice",
+        "screenshots": "screenshot",
+        "links": "link",
+        "emails": "email",
+        "WhatsApp": "whatsapp",
+        "files": "file",
+        "meeting notes": "meeting_note",
+        "tasks": "task",
+        "ideas": "idea",
+        "receipts": "receipt",
+        "reminders": "reminder",
+        "saved posts": "saved_post",
+        "research papers": "research_paper",
+    }
+    for index, (public_source, stored_source) in enumerate(sources.items()):
+        response = await _call(
+            life_env,
+            "POST",
+            "/api/inbox",
+            json={
+                "title": f"Capture {index}",
+                "content": f"Evidence from {public_source}",
+                "source_type": public_source,
+                "idempotency_key": f"api-source-{stored_source}",
+            },
+        )
+        assert response.status_code == 201, response.text
+        item = response.json()["item"]
+        assert item["source_type"] == stored_source
+        assert item["metadata"]["ingestion_contract"]["source_type"] == stored_source
+
+    listed = await _call(
+        life_env, "GET", "/api/inbox", params={"status": "inbox", "limit": 100},
+    )
+    assert listed.status_code == 200, listed.text
+    assert {item["source_type"] for item in listed.json()["items"]} == set(
+        sources.values()
+    )
+
+
 def test_concurrent_idempotency_conflict_selects_capture_winner(life_env):
     db = life_env.Session()
     try:

@@ -13,7 +13,11 @@ from core.middleware import require_admin
 from core.database import SessionLocal, GalleryImage, Session as DbSession
 from src.auth_helpers import effective_user, resolved_runtime_owner
 from src.constants import GENERATED_IMAGES_DIR
-from src.life_ingestion import LifeIngestionError, ingest_inbox_capture
+from src.life_ingestion import (
+    LifeIngestionError,
+    ingest_inbox_capture,
+    normalize_capture_source_category,
+)
 from src.upload_handler import count_recent_uploads
 
 logger = logging.getLogger(__name__)
@@ -22,8 +26,26 @@ router = APIRouter(prefix="/api/upload", tags=["upload"])
 UPLOAD_RESPONSE_HEADERS = {"X-Content-Type-Options": "nosniff"}
 
 
-def _upload_capture_source(meta: dict) -> str:
+UPLOAD_CAPTURE_SOURCE_TYPES = frozenset({
+    "file", "image", "screenshot", "voice", "meeting_note", "receipt",
+    "saved_post", "research_paper",
+})
+
+
+def _upload_capture_source(meta: dict, requested: object = None) -> str:
     """Classify the capture surface, never the item's eventual destination."""
+
+    if isinstance(requested, str) and requested.strip():
+        try:
+            normalized = normalize_capture_source_category(requested)
+        except LifeIngestionError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if normalized not in UPLOAD_CAPTURE_SOURCE_TYPES:
+            raise HTTPException(
+                400,
+                "capture_source_type is not valid for a file upload",
+            )
+        return normalized
 
     name = str(meta.get("name") or "").strip().lower()
     mime = str(meta.get("mime") or "").strip().lower()
@@ -199,10 +221,13 @@ def setup_upload_routes(upload_handler):
         request: Request,
         files: List[UploadFile] = File(...),
         session_id: Optional[str] = Form(None),
+        capture_source_type: Optional[str] = Form(None),
     ):
         """Upload files with enhanced security and organization."""
         if not isinstance(session_id, str):
             session_id = None
+        if not isinstance(capture_source_type, str):
+            capture_source_type = None
         if not files:
             raise HTTPException(400, "No files uploaded")
             
@@ -238,7 +263,9 @@ def setup_upload_routes(upload_handler):
                 try:
                     capture = ingest_inbox_capture(
                         owner=owner,
-                        source_type=_upload_capture_source(meta),
+                        source_type=_upload_capture_source(
+                            meta, requested=capture_source_type,
+                        ),
                         title=str(meta.get("name") or "Uploaded file")[:240],
                         content=(
                             f"Uploaded {meta.get('name') or 'file'} "

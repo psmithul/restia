@@ -13,7 +13,9 @@ from fastapi import FastAPI
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
-from core.database import Account, ActionAudit, ActionProposal, Base, LifeSource
+from core.database import (
+    Account, ActionAudit, ActionProposal, Base, InboxItem, LifeSource,
+)
 from routes.ambient_routes import setup_ambient_routes
 from routes.action_policy_routes import setup_action_policy_routes
 from src.action_policy import ActionPolicyDenied, approve_action
@@ -31,6 +33,7 @@ from src.ambient_capabilities import (
 )
 from src.audit_context import bind_request_audit_context
 from src.identity import ensure_account
+from src.life_core import LifeCoreError
 from starlette.requests import Request
 
 
@@ -207,6 +210,23 @@ def test_ambient_capture_offline_replay_and_continuity_are_owner_scoped(ambient_
         assert replay.id == source.id
         assert source.meta_data["interpreted_as_instruction"] is False
         assert db.query(ActionProposal).filter_by(owner_id=alice.id).count() == 0
+        voice_items = db.query(InboxItem).filter_by(
+            owner_id=alice.id, source_type="voice",
+        ).order_by(InboxItem.created_at.asc(), InboxItem.id.asc()).all()
+        assert len(voice_items) == 1
+        assert voice_items[0].content == (
+            "Remember the vibration test result, not a command."
+        )
+        assert voice_items[0].source_ref == f"life_source:{source.id}"
+        assert voice_items[0].meta_data["ingestion_contract"] == {
+            "version": 1,
+            "source_type": "voice",
+            "owner_scoped": True,
+            "destination_required": False,
+            "classification_can_execute_external_action": False,
+            "model_output_has_write_authority": False,
+        }
+        assert db.query(InboxItem).filter_by(owner_id=bob.id).count() == 0
 
         synced = sync_offline_captures(
             db,
@@ -225,6 +245,9 @@ def test_ambient_capture_offline_replay_and_continuity_are_owner_scoped(ambient_
             trusted_device_session=True,
         )
         assert synced[0]["created"] is True
+        assert db.query(InboxItem).filter_by(
+            owner_id=alice.id, source_type="voice",
+        ).count() == 2
         first_page = ambient_continuity(
             db, owner_id=alice.id, limit=1, trusted_device_session=True,
         )
@@ -396,6 +419,18 @@ def test_every_ambient_capture_capability_persists_private_evidence(
         assert source.meta_data["no_training"] is True
         assert source.meta_data["interpreted_as_instruction"] is False
         assert db.query(ActionProposal).filter_by(owner_id=alice.id).count() == 0
+        expected_inbox_type = {
+            "transcription": "meeting_note",
+            "camera": "image",
+        }.get(capability)
+        inbox_items = db.query(InboxItem).filter_by(owner_id=alice.id).all()
+        if expected_inbox_type is None:
+            assert inbox_items == []
+        else:
+            assert len(inbox_items) == 1
+            assert inbox_items[0].source_type == expected_inbox_type
+            assert inbox_items[0].source_ref == f"life_source:{source.id}"
+            assert inbox_items[0].meta_data["ambient_capability"] == capability
     finally:
         db.rollback()
         db.close()
@@ -419,6 +454,40 @@ def test_device_unlock_requirement_rejects_non_device_credentials(ambient_env):
     finally:
         db.rollback()
         db.close()
+
+
+def test_ambient_inbox_failure_rolls_back_source(ambient_env, monkeypatch):
+    import src.ambient_capabilities as ambient
+
+    db = ambient_env.Session()
+    try:
+        alice = db.query(Account).filter_by(username="alice").one()
+        _enable(db, alice, "mobile_voice", ["capture", "read"])
+
+        def fail_inbox(*_args, **_kwargs):
+            raise LifeCoreError("simulated Inbox failure")
+
+        monkeypatch.setattr(ambient, "create_inbox_item", fail_inbox)
+        with pytest.raises(
+            ambient.AmbientCapabilityError,
+            match="could not enter the Universal Inbox",
+        ):
+            capture_ambient_signal(
+                db,
+                account=alice,
+                capability="mobile_voice",
+                payload={"transcript": "Atomic capture"},
+                observed_at=None,
+                idempotency_key="atomic-failure",
+                trusted_device_session=True,
+            )
+        db.rollback()
+    finally:
+        db.close()
+
+    with ambient_env.Session() as verify:
+        assert verify.query(LifeSource).count() == 0
+        assert verify.query(InboxItem).count() == 0
 
 
 @pytest.mark.asyncio
@@ -645,6 +714,7 @@ async def test_ambient_routes_cover_capture_offline_sync_continuity_and_policy(a
         )
         assert captured.status_code == 201, captured.text
         assert captured.json()["created"] is True
+        assert captured.json()["inbox_item_id"]
         assert captured.json()["interpreted_as_instruction"] is False
 
         synced = await client.post(
@@ -659,6 +729,7 @@ async def test_ambient_routes_cover_capture_offline_sync_continuity_and_policy(a
         )
         assert synced.status_code == 200, synced.text
         assert synced.json()["replay_safe"] is True
+        assert synced.json()["items"][0]["inbox_item_id"]
 
         continuity = await client.get(
             "/api/life/ambient/continuity", headers=headers,

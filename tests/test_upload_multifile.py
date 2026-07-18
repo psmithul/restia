@@ -42,6 +42,27 @@ def test_count_recent_uploads_ignores_batch_size():
     assert count_recent_uploads([now - 11], now, window=10) == 0
 
 
+@pytest.mark.parametrize(
+    "source_type",
+    ["file", "image", "screenshot", "voice", "meeting notes", "receipt",
+     "saved post", "research paper"],
+)
+def test_upload_capture_source_accepts_only_file_backed_inbox_sources(source_type):
+    expected = {
+        "meeting notes": "meeting_note",
+        "saved post": "saved_post",
+        "research paper": "research_paper",
+    }.get(source_type, source_type)
+    assert up._upload_capture_source({}, requested=source_type) == expected
+
+
+def test_upload_capture_source_rejects_connector_impersonation():
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException, match="not valid for a file upload"):
+        up._upload_capture_source({}, requested="email")
+
+
 def _fake_handler():
     h = types.SimpleNamespace()
     h.upload_rate_log = {}
@@ -129,6 +150,31 @@ async def test_fresh_multifile_upload_succeeds():
     result = await endpoint(_request(), _files(5))
 
     assert len(result["files"]) == 5
+
+
+async def test_upload_forwards_explicit_universal_inbox_source(monkeypatch):
+    observed = []
+    monkeypatch.setattr(
+        up,
+        "ingest_inbox_capture",
+        lambda **kwargs: (
+            observed.append(kwargs)
+            or types.SimpleNamespace(
+                inbox_id="inbox:paper", created=True,
+                source_type=kwargs["source_type"],
+            )
+        ),
+    )
+    h = _fake_handler()
+    up.setup_upload_routes(h)
+    endpoint = _endpoint(up.router)
+
+    result = await endpoint(
+        _request(), _files(1), capture_source_type="research papers",
+    )
+
+    assert result["files"][0]["capture_source_type"] == "research_paper"
+    assert observed[0]["source_type"] == "research_paper"
 
 
 async def test_genuine_recent_volume_still_throttled():
