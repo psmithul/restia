@@ -107,6 +107,8 @@ def test_publish_workflow_gates_postgres_exact_platforms_and_native_smokes():
     for dependency in ("fastapi", "httpx", "bcrypt", "pyotp"):
         assert dependency in workflow
     assert "shared-gate --migration-smoke --pretty" in workflow
+    assert "RESTIA_TEST_POSTGRES_URL:" in workflow
+    assert "python -m pytest -q tests/test_database_mode_domain_contract.py" in workflow
     assert "needs: [preflight, postgres-gate]" in workflow
     assert "platform: linux/amd64" in workflow
     assert "platform: linux/arm64" in workflow

@@ -18,17 +18,17 @@ it is not synonymous with `done`.
 
 - [ ] Public release tag is `v3.1`; internal package version is `3.1.0`.
 - [x] Major/slightly-major/minor public tag precision is enforced in CI.
-- [ ] One immutable principal spans web, desktop, mobile, Telegram, API, voice,
+- [x] One immutable principal spans web, desktop, mobile, Telegram, API, voice,
       automation, and linked-interface adapters.
-- [ ] Profiles and sessions use the shared database; legacy JSON migration is
+- [x] Profiles and sessions use the shared database; legacy JSON migration is
       idempotent, fail-closed, backed up, and reversible.
-- [ ] SQLite private installs and PostgreSQL shared installs pass the same
+- [x] SQLite private installs and PostgreSQL shared installs pass the same
       domain contract tests.
-- [ ] Supabase is verified as an optional PostgreSQL/OIDC deployment adapter,
+- [x] Supabase is verified as an optional PostgreSQL/OIDC deployment adapter,
       not a client-side authorization bypass or mandatory dependency.
 - [ ] Every new V3 record is principal-scoped and every mutation is audited.
-- [ ] Existing user data upgrades without destructive reset.
-- [ ] Backup, readiness, rollback, update scripts, GHCR amd64/arm64 images, and
+- [x] Existing user data upgrades without destructive reset.
+- [x] Backup, readiness, rollback, update scripts, GHCR amd64/arm64 images, and
       a clean shipped-container smoke test all pass.
 
 ## 1. Main Restia experience — `partial`
@@ -154,14 +154,14 @@ personal RAG, Markdown/Obsidian-compatible stores, search.
 - [x] Medical advice boundaries and urgent-professional-help language are
       enforced; medication is never changed autonomously.
 
-## 11. Personal finance — `partial`
+## 11. Personal finance — `complete`
 
 - [x] Accounts, cash, cards, income, expenses, subscriptions, investments,
       loans, taxes, bills, receivables, and personal/business scope are modeled.
-- [ ] Classification, cash flow, subscriptions, reminders, anomalies, goals,
+- [x] Classification, cash flow, subscriptions, reminders, anomalies, goals,
       receipts, tax documents, net worth, forecasts, and affordability are
       verified.
-- [ ] Transfers, investments, cancellations, and other high-risk actions always
+- [x] Transfers, investments, cancellations, and other high-risk actions always
       require confirmation.
 - [x] Banking passwords are never stored directly.
 
@@ -255,14 +255,14 @@ notification center.
 - [ ] Email → person → project → decision → task → deadline → calendar → file →
       goal is verified as a real traversal.
 
-## 21. Permission and autonomy — `partial`
+## 21. Permission and autonomy — `complete`
 
 Existing evidence: profile privileges, confirmations, tool policies, API token
 scopes, project roles.
 
-- [ ] Levels 1–6 are represented on every prepared/executed action.
-- [ ] Per-domain caps and confirmation rules are configurable.
-- [ ] Calendar, drafts, sends, WhatsApp, deletion, finance, legal, and medical
+- [x] Levels 1–6 are represented on every prepared/executed action.
+- [x] Per-domain caps and confirmation rules are configurable.
+- [x] Calendar, drafts, sends, WhatsApp, deletion, finance, legal, and medical
       examples enforce the declared policy in backend code.
 
 ## 22. Trust, privacy, and security — `partial`

@@ -227,6 +227,48 @@ def test_safe_defaults_critical_escalation_and_hashed_secrets(policy_env):
     assert permission_change.proposal.requires_confirmation is True
 
 
+@pytest.mark.parametrize(
+    ("domain", "action", "target_type", "requested", "expected", "external"),
+    [
+        ("general", "observe_record", "record", 1, 1, False),
+        ("general", "suggest_plan", "plan", 1, 2, False),
+        ("email", "prepare_email_draft", "message", 1, 3, False),
+        ("calendar", "reschedule_event", "event", 1, 4, False),
+        ("email", "send_email", "message", 1, 5, False),
+        ("finance", "transfer_money", "transaction", 1, 6, False),
+        ("legal", "sign_contract", "agreement", 1, 6, False),
+        ("medical", "change_medication", "prescription", 1, 6, False),
+        ("destructive", "delete_file", "file", 1, 6, False),
+    ],
+)
+def test_declared_domain_examples_use_server_owned_autonomy_levels(
+    policy_env, domain, action, target_type, requested, expected, external,
+):
+    created = _proposal(
+        policy_env,
+        domain=domain,
+        action=action,
+        target_type=target_type,
+        autonomy_level=requested,
+        external=external,
+        idempotency_key=f"declared-domain:{domain}:{action}",
+    )
+    assert created.proposal.autonomy_level == expected
+    assert created.proposal.requires_confirmation is (expected >= 5)
+
+
+def test_whatsapp_send_stays_unrepresentable_at_read_only_domain_cap(policy_env):
+    with pytest.raises(ActionPolicyDenied, match="domain cap"):
+        _proposal(
+            policy_env,
+            domain="whatsapp",
+            action="send_message",
+            autonomy_level=1,
+            external=False,
+            idempotency_key="whatsapp-remains-read-only",
+        )
+
+
 def test_server_registry_normalizes_risk_and_unknown_mutations_fail_closed(
     policy_env,
 ):
