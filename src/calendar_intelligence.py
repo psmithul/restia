@@ -20,6 +20,15 @@ from src.life_graph import LifeGraphError
 
 CALENDAR_INTELLIGENCE_LIMIT = 2_000
 CALENDAR_OCCURRENCE_LIMIT = 4_000
+CALENDAR_TASK_LIMIT = 500
+_TERMINAL_TASK_STATUSES = frozenset({
+    "completed", "done", "cancelled", "canceled", "archived", "deleted",
+})
+_TASK_ENERGY_LEVELS = frozenset({"low", "medium", "high", "any"})
+_TASK_PRIORITY_RANK = {"critical": 0, "high": 1, "normal": 2, "low": 3}
+_MEETING_CONTEXT_TYPES = frozenset({
+    "person", "project", "note", "file", "event", "decision", "task",
+})
 
 
 def _aware(value: object, *, field: str) -> datetime:
@@ -165,6 +174,140 @@ def _free_slots(
     return slots[:100]
 
 
+def _task_time_blocks(
+    db,
+    *,
+    owner_id: str,
+    slots: list[dict[str, Any]],
+    offset,
+    preferred_energy: str,
+) -> tuple[list[dict[str, Any]], dict[str, int | str | bool]]:
+    candidates = db.query(LifeEntity).filter(
+        LifeEntity.owner_id == owner_id,
+        LifeEntity.entity_type == "task",
+        LifeEntity.deleted_at.is_(None),
+        ~LifeEntity.status.in_(_TERMINAL_TASK_STATUSES),
+    ).order_by(
+        LifeEntity.due_at.is_(None), LifeEntity.due_at.asc(),
+        LifeEntity.updated_at.asc(), LifeEntity.id.asc(),
+    ).limit(CALENDAR_TASK_LIMIT + 1).all()
+    truncated = len(candidates) > CALENDAR_TASK_LIMIT
+    candidates = candidates[:CALENDAR_TASK_LIMIT]
+    schedulable: list[dict[str, Any]] = []
+    missing_duration = 0
+    for task in candidates:
+        properties = dict(task.properties or {})
+        raw_effort = properties.get("effort_minutes")
+        if isinstance(raw_effort, bool):
+            raw_effort = None
+        try:
+            effort = int(raw_effort)
+        except (TypeError, ValueError):
+            effort = 0
+        if effort < 15 or effort > 1_440:
+            missing_duration += 1
+            continue
+        energy = str(properties.get("energy") or "any").strip().lower()
+        if energy not in _TASK_ENERGY_LEVELS:
+            energy = "any"
+        priority = str(properties.get("priority") or "normal").strip().lower()
+        if priority not in _TASK_PRIORITY_RANK:
+            priority = "normal"
+        due_at = task.due_at
+        if due_at is not None:
+            if due_at.tzinfo is None:
+                due_at = due_at.replace(tzinfo=timezone.utc)
+            due_at = due_at.astimezone(offset)
+        schedulable.append({
+            "entity": task,
+            "effort_minutes": effort,
+            "energy": energy,
+            "priority": priority,
+            "due_at": due_at,
+            "energy_match": preferred_energy == "any" or energy in {
+                "any", preferred_energy,
+            },
+        })
+    schedulable.sort(key=lambda row: (
+        not row["energy_match"],
+        _TASK_PRIORITY_RANK[row["priority"]],
+        row["due_at"] is None,
+        row["due_at"] or datetime.max.replace(tzinfo=offset),
+        row["entity"].id,
+    ))
+
+    available = [{
+        "cursor": datetime.fromisoformat(slot["start"]),
+        "end": datetime.fromisoformat(slot["end"]),
+    } for slot in slots]
+    blocks: list[dict[str, Any]] = []
+    for task in schedulable:
+        duration = timedelta(minutes=task["effort_minutes"])
+        due_at = task["due_at"]
+        deadline_slots = [
+            slot for slot in available
+            if slot["end"] - slot["cursor"] >= duration
+            and (due_at is None or slot["cursor"] + duration <= due_at)
+        ]
+        selected = next(iter(deadline_slots), None)
+        if selected is None:
+            selected = next((
+                slot for slot in available
+                if slot["end"] - slot["cursor"] >= duration
+            ), None)
+        if selected is None:
+            continue
+        block_start = selected["cursor"]
+        block_end = block_start + duration
+        selected["cursor"] = block_end
+        due_text = due_at.isoformat() if due_at is not None else None
+        deadline_fit = due_at is None or block_end <= due_at
+        task_entity = task["entity"]
+        reason = (
+            f"Fits the task's {task['effort_minutes']}-minute estimate and "
+            f"{task['energy']} energy requirement"
+        )
+        if due_text and deadline_fit:
+            reason += f" before its {due_text} deadline"
+        elif due_text:
+            reason += f" at the earliest available time after its {due_text} deadline"
+        reason += "."
+        blocks.append({
+            "task_id": task_entity.id,
+            "task_title": str(task_entity.title or "Untitled task"),
+            "start": block_start.isoformat(),
+            "end": block_end.isoformat(),
+            "duration_minutes": task["effort_minutes"],
+            "energy": task["energy"],
+            "preferred_energy_match": bool(task["energy_match"]),
+            "priority": task["priority"],
+            "due_at": due_text,
+            "deadline_fit": deadline_fit,
+            "reason": reason,
+            "proposed_action": {
+                "tool": "manage_calendar",
+                "action": "create_event",
+                "requires_confirmation": True,
+                "arguments": {
+                    "summary": f"Focus: {str(task_entity.title or 'Untitled task')}",
+                    "dtstart": block_start.isoformat(),
+                    "dtend": block_end.isoformat(),
+                    "event_type": "focus",
+                    "linked_entity_ids": [task_entity.id],
+                },
+            },
+        })
+        if len(blocks) >= 10:
+            break
+    return blocks, {
+        "candidates_considered": len(candidates),
+        "schedulable_candidates": len(schedulable),
+        "missing_duration": missing_duration,
+        "preferred_energy": preferred_energy,
+        "truncated": truncated,
+    }
+
+
 def _linked_context(db, *, owner_id: str, event_uids: list[str]) -> dict[str, list[dict[str, str]]]:
     if not event_uids:
         return {}
@@ -209,6 +352,7 @@ def calendar_time_report(
     window_end: object, minimum_slot_minutes: object = 30,
     day_start_hour: object = 6, day_end_hour: object = 23,
     daily_capacity_minutes: object = 600, travel_buffer_minutes: object = 30,
+    preferred_energy: object = "any",
 ) -> dict[str, Any]:
     """Return a deterministic time plan with evidence and no side effects."""
 
@@ -226,6 +370,9 @@ def calendar_time_report(
         raise LifeGraphError("day_end_hour must be later than day_start_hour")
     capacity = _bounded_int(daily_capacity_minutes, field="daily_capacity_minutes", minimum=30, maximum=1_440)
     travel_buffer = _bounded_int(travel_buffer_minutes, field="travel_buffer_minutes", minimum=0, maximum=240)
+    energy = str(preferred_energy or "any").strip().lower()
+    if energy not in _TASK_ENERGY_LEVELS:
+        raise LifeGraphError("preferred_energy must be low, medium, high, or any")
 
     # The bounded candidate scan is owner-filtered first. Occurrence overlap is
     # evaluated after explicit timezone normalization so naive-local legacy rows
@@ -298,7 +445,7 @@ def calendar_time_report(
             preparation.append({
                 "event_id": row["occurrence_id"], "summary": row["summary"],
                 "starts_at": row["start"], "linked_entities": linked,
-                "missing_context": sorted({"person", "project", "note"} - linked_types),
+                "missing_context": sorted(_MEETING_CONTEXT_TYPES - linked_types),
                 "reason": "Meeting/class starts within 48 hours.",
             })
         if kind in {"meeting", "class", "work"} and now - timedelta(hours=48) <= row["end_value"] < now:
@@ -349,9 +496,20 @@ def calendar_time_report(
                         "reason": "Travel commitment lacks the requested transition buffer.",
                     })
 
-    free = _free_slots(
-        occurrences, start=start, end=end, day_start_hour=day_start,
-        day_end_hour=day_end, minimum_minutes=minimum,
+    free_start = max(start, now)
+    free = (
+        _free_slots(
+            occurrences, start=free_start, end=end, day_start_hour=day_start,
+            day_end_hour=day_end, minimum_minutes=minimum,
+        )
+        if free_start < end else []
+    )
+    task_blocks, task_scheduling = _task_time_blocks(
+        db,
+        owner_id=owner_id,
+        slots=free,
+        offset=start.tzinfo,
+        preferred_energy=energy,
     )
     public_events = [
         {key: value for key, value in row.items() if key not in {"start_value", "end_value"}}
@@ -365,16 +523,19 @@ def calendar_time_report(
         "meeting_preparation": preparation, "meeting_follow_up": follow_up,
         "unfinished_work": unfinished, "focus_protection": focus_risks,
         "travel_buffers": travel_risks,
-        "suggested_time_blocks": [
+        "suggested_time_blocks": task_blocks or [
             {**slot, "reason": "Earliest available bounded focus slot."}
             for slot in free[:3]
         ],
+        "task_time_blocks": task_blocks,
+        "task_scheduling": task_scheduling,
         "assumptions": {
             "timezone_offset": start.strftime("%z"),
             "workday_hours": [day_start, day_end],
             "minimum_slot_minutes": minimum,
             "daily_capacity_minutes": capacity,
             "travel_buffer_minutes": travel_buffer,
+            "preferred_energy": energy,
             "legacy_naive_events": "interpreted in the supplied fixed offset",
         },
         "read_only": True,

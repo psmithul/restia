@@ -25,6 +25,15 @@ def test_manage_calendar_schema_advertises_version_fenced_updates():
     assert "never executes" in function["description"]
     assert "never" in function["description"]
     assert "approval token" in function["description"]
+    assert properties["linked_entity_ids"] == {
+        "type": "array",
+        "maxItems": 50,
+        "items": {"type": "string", "minLength": 1, "maxLength": 255},
+        "description": (
+            "Owner-scoped Life Graph entity IDs to link to the event, such as a "
+            "person, project, note, file, previous meeting, decision, or follow-up task."
+        ),
+    }
 
 
 def test_manage_calendar_schema_has_no_hidden_reminder_write_contract():

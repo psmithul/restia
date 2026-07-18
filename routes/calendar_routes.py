@@ -1609,6 +1609,7 @@ def setup_calendar_routes() -> APIRouter:
         day_end_hour: int = Query(default=23, ge=1, le=24),
         daily_capacity_minutes: int = Query(default=600, ge=30, le=1440),
         travel_buffer_minutes: int = Query(default=30, ge=0, le=240),
+        preferred_energy: str = Query(default="any", min_length=3, max_length=6),
     ):
         db = SessionLocal()
         try:
@@ -1630,6 +1631,7 @@ def setup_calendar_routes() -> APIRouter:
                     day_end_hour=day_end_hour,
                     daily_capacity_minutes=daily_capacity_minutes,
                     travel_buffer_minutes=travel_buffer_minutes,
+                    preferred_energy=preferred_energy,
                 )
         except LifeGraphError as exc:
             db.rollback()

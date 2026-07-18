@@ -63,11 +63,12 @@ _RRULE_KEYS = frozenset({
 })
 _RRULE_FREQS = frozenset({"DAILY", "WEEKLY", "MONTHLY", "YEARLY"})
 _IMPORTANCE = frozenset({"low", "normal", "high", "critical"})
-_EVENT_TYPES = frozenset({
+SCHEDULE_EVENT_TYPES = frozenset({
     "meeting", "class", "work", "personal", "travel", "deadline",
     "routine", "focus", "rest", "reminder", "health", "meal", "social",
     "admin", "other",
 })
+_EVENT_TYPES = SCHEDULE_EVENT_TYPES
 _LINK_TARGET_TYPES = frozenset({
     "life_area", "goal", "project", "milestone", "task", "action",
     "person", "note", "file", "decision", "event", "deadline",

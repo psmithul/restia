@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import uuid
+from datetime import datetime
 from types import SimpleNamespace
 
 import httpx
@@ -15,7 +16,7 @@ from sqlalchemy.orm import sessionmaker
 from core.database import Account, Base
 from routes import calendar_routes
 from src.calendar_intelligence import calendar_time_report
-from src.calendar_service import create_calendar_event
+from src.calendar_service import SCHEDULE_EVENT_TYPES, create_calendar_event
 from src.life_graph import LifeGraphError, create_life_entity
 
 
@@ -68,12 +69,20 @@ def _account(db, env, name="alice"):
     return db.query(Account).filter(Account.id == account_id).one()
 
 
-def _entity(db, account, entity_type, title):
+def _entity(db, account, entity_type, title, **kwargs):
     row, _ = create_life_entity(
         db, account=account, entity_type=entity_type, title=title,
         idempotency_key=f"calendar-time:{entity_type}:{title}",
+        **kwargs,
     )
     return row
+
+
+def test_schedule_model_covers_every_required_commitment_type():
+    assert {
+        "meeting", "class", "work", "personal", "travel", "deadline",
+        "routine", "focus", "rest", "reminder",
+    } <= SCHEDULE_EVENT_TYPES
 
 
 def test_calendar_time_report_covers_free_time_conflicts_context_and_buffers(time_env):
@@ -81,8 +90,18 @@ def test_calendar_time_report_covers_free_time_conflicts_context_and_buffers(tim
         alice = _account(db, time_env)
         bob = _account(db, time_env, "bob")
         project = _entity(db, alice, "project", "V3 launch")
-        task = _entity(db, alice, "task", "Finish migration verification")
-        create_calendar_event(
+        person = _entity(db, alice, "person", "Launch reviewer")
+        note = _entity(db, alice, "note", "Launch agenda")
+        file = _entity(db, alice, "file", "Release evidence")
+        decision = _entity(db, alice, "decision", "Use PostgreSQL parity gate")
+        task = _entity(
+            db, alice, "task", "Finish migration verification",
+            properties={
+                "effort_minutes": 60, "energy": "high", "priority": "critical",
+            },
+            due_at=datetime(2026, 7, 18, 12),
+        )
+        previous = create_calendar_event(
             db, account=alice, summary="Recent review", event_type="meeting",
             dtstart="2026-07-16T14:00:00+05:30",
             dtend="2026-07-16T15:00:00+05:30",
@@ -97,7 +116,10 @@ def test_calendar_time_report_covers_free_time_conflicts_context_and_buffers(tim
             db, account=alice, summary="Launch meeting", event_type="meeting",
             importance="high", dtstart="2026-07-17T15:00:00+05:30",
             dtend="2026-07-17T16:00:00+05:30",
-            linked_entity_ids=[project.id],
+            linked_entity_ids=[
+                project.id, person.id, note.id, file.id, decision.id, task.id,
+                previous.graph_entity.id,
+            ],
         )
         focus = create_calendar_event(
             db, account=alice, summary="Protected focus", event_type="focus",
@@ -127,7 +149,7 @@ def test_calendar_time_report_covers_free_time_conflicts_context_and_buffers(tim
             window_start="2026-07-16T00:00:00+05:30",
             window_end="2026-07-19T00:00:00+05:30",
             minimum_slot_minutes=30, daily_capacity_minutes=120,
-            travel_buffer_minutes=30,
+            travel_buffer_minutes=30, preferred_energy="high",
         )
 
     assert report["event_count"] == 6
@@ -143,7 +165,10 @@ def test_calendar_time_report_covers_free_time_conflicts_context_and_buffers(tim
     }]
     assert report["focus_protection"][0]["event_id"] == focus.event.uid
     assert report["meeting_preparation"][0]["event_id"] == meeting.event.uid
-    assert report["meeting_preparation"][0]["linked_entities"][0]["id"] == project.id
+    assert report["meeting_preparation"][0]["missing_context"] == []
+    assert {row["entity_type"] for row in report["meeting_preparation"][0]["linked_entities"]} == {
+        "person", "project", "note", "file", "event", "decision", "task",
+    }
     assert report["meeting_follow_up"][0]["summary"] == "Recent review"
     assert report["unfinished_work"][0]["task_ids"] == [task.id]
     assert report["travel_buffers"] == [{
@@ -154,7 +179,46 @@ def test_calendar_time_report_covers_free_time_conflicts_context_and_buffers(tim
         "reason": "Travel commitment lacks the requested transition buffer.",
     }]
     assert report["overcommitment"]
+    assert report["task_scheduling"] == {
+        "candidates_considered": 1,
+        "schedulable_candidates": 1,
+        "missing_duration": 0,
+        "preferred_energy": "high",
+        "truncated": False,
+    }
+    block = report["task_time_blocks"][0]
+    assert block["task_id"] == task.id
+    assert block["duration_minutes"] == 60
+    assert block["energy"] == "high"
+    assert block["preferred_energy_match"] is True
+    assert block["deadline_fit"] is True
+    assert datetime.fromisoformat(block["start"]) >= datetime.fromisoformat(report["as_of"])
+    assert block["proposed_action"] == {
+        "tool": "manage_calendar",
+        "action": "create_event",
+        "requires_confirmation": True,
+        "arguments": {
+            "summary": "Focus: Finish migration verification",
+            "dtstart": block["start"],
+            "dtend": block["end"],
+            "event_type": "focus",
+            "linked_entity_ids": [task.id],
+        },
+    }
     assert "Bob" not in str(report)
+
+
+def test_calendar_time_report_rejects_unknown_energy(time_env):
+    with time_env.Session() as db:
+        alice = _account(db, time_env)
+        with pytest.raises(LifeGraphError, match="preferred_energy"):
+            calendar_time_report(
+                db, owner_id=alice.id,
+                as_of="2026-07-17T08:00:00+05:30",
+                window_start="2026-07-17T06:00:00+05:30",
+                window_end="2026-07-18T00:00:00+05:30",
+                preferred_energy="extreme",
+            )
 
 
 def test_calendar_time_report_requires_one_explicit_offset(time_env):
@@ -194,9 +258,11 @@ async def test_calendar_routes_expose_typed_context_and_read_only_intelligence(t
                 "as_of": "2026-07-17T08:00:00+05:30",
                 "start": "2026-07-17T06:00:00+05:30",
                 "end": "2026-07-18T00:00:00+05:30",
+                "preferred_energy": "medium",
             },
         )
         assert report.status_code == 200, report.text
         assert report.json()["event_count"] == 1
         assert report.json()["read_only"] is True
         assert report.json()["can_reschedule_or_create"] is False
+        assert report.json()["task_scheduling"]["preferred_energy"] == "medium"

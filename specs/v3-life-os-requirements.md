@@ -84,17 +84,17 @@ Notes goals, Study goals, progression, dependencies, attachments, activity.
 - [x] Restia detects overdue, blocked, waiting, missing-next-action, irrelevant,
       duplicated, and goal-disconnected tasks.
 
-## 5. Calendar and time — `partial`
+## 5. Calendar and time — `complete`
 
 Existing evidence: local calendars, Google/CalDAV, recurrence, reminders,
 planning-to-calendar scheduling, Today aggregation.
 
-- [ ] Meetings, classes, work, personal commitments, travel, deadlines,
+- [x] Meetings, classes, work, personal commitments, travel, deadlines,
       routines, focus blocks, rest, and reminders share one schedule model.
-- [ ] Free-time finding, conflict resolution, time blocking, unfinished-work
+- [x] Free-time finding, conflict resolution, time blocking, unfinished-work
       rescheduling, meeting preparation/follow-up, focus protection,
       overcommitment, duration, and energy are verified.
-- [ ] Events link people, projects, notes, files, previous meetings, decisions,
+- [x] Events link people, projects, notes, files, previous meetings, decisions,
       and follow-up tasks.
 
 ## 6. Relationship manager — `complete`
@@ -651,3 +651,17 @@ entire section complete by itself.
   edges, owner isolation, confidence, provenance, versions, and that deleting
   the first association removes the reachable traversal without deleting the
   downstream records. The focused graph contract passed with **12 passed**.
+- **2026-07-18 — complete Calendar and Time contract (working tree after
+  `53b96ca`)**: completed Section 5 on the canonical `CalendarEvent` plus Life
+  Graph projection instead of introducing another schedule store. The shared
+  schedule model explicitly covers meetings, classes, work, personal
+  commitments, travel, deadlines, routines, focus, rest, and reminders.
+  Calendar intelligence now excludes past free slots, fits active owner-scoped
+  tasks into bounded availability using effort, energy, priority, and deadline
+  evidence, and returns review-required `manage_calendar` focus-block actions
+  without mutating the calendar. Meeting preparation verifies people,
+  projects, notes, files, previous meetings, decisions, and follow-up tasks;
+  the model-facing calendar schema now exposes those links. The focused
+  calendar, action-policy, authority, migration, delivery, Life-tool, schema,
+  and release regression set passed with **143 passed**; Python compilation
+  and whitespace validation also passed.
