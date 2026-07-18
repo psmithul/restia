@@ -4833,6 +4833,66 @@ def _migrate_add_unified_auth_columns(target_engine=None):
                     "BOOLEAN NOT NULL DEFAULT 0"
                 )
 
+        if "auth_sessions" in tables:
+            columns = column_names("auth_sessions")
+            passkey_columns = (
+                ("user_verified_at", "DATETIME"),
+                ("user_verification_expires_at", "DATETIME"),
+                ("user_verification_method", "VARCHAR(32)"),
+                ("user_verification_credential_id", "VARCHAR(36)"),
+            )
+            for name, definition in passkey_columns:
+                if name not in columns:
+                    conn.exec_driver_sql(
+                        f'ALTER TABLE auth_sessions ADD COLUMN "{name}" {definition}'
+                    )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS "
+                "ix_auth_sessions_user_verification_expires_at "
+                "ON auth_sessions(user_verification_expires_at)"
+            )
+            verification_state = """
+                ((user_verified_at IS NULL
+                  AND user_verification_expires_at IS NULL
+                  AND user_verification_method IS NULL
+                  AND user_verification_credential_id IS NULL)
+                 OR
+                 (user_verified_at IS NOT NULL
+                  AND user_verification_expires_at IS NOT NULL
+                  AND user_verification_method IS NOT NULL
+                  AND user_verification_method = 'webauthn'
+                  AND user_verification_credential_id IS NOT NULL))
+            """
+            invalid = conn.exec_driver_sql(
+                f"SELECT COUNT(*) FROM auth_sessions WHERE NOT {verification_state}"
+            ).scalar_one()
+            if int(invalid or 0):
+                raise RuntimeError(
+                    "Legacy auth session has an invalid user-verification state"
+                )
+            conn.exec_driver_sql(f"""
+                CREATE TRIGGER IF NOT EXISTS
+                    auth_sessions_validate_user_verification_insert
+                BEFORE INSERT ON auth_sessions
+                WHEN NOT {verification_state.replace('user_', 'NEW.user_')}
+                BEGIN
+                    SELECT RAISE(ABORT, 'AuthSession user-verification state is invalid');
+                END
+            """)
+            conn.exec_driver_sql(f"""
+                CREATE TRIGGER IF NOT EXISTS
+                    auth_sessions_validate_user_verification_update
+                BEFORE UPDATE OF user_verified_at,
+                    user_verification_expires_at,
+                    user_verification_method,
+                    user_verification_credential_id
+                ON auth_sessions
+                WHEN NOT {verification_state.replace('user_', 'NEW.user_')}
+                BEGIN
+                    SELECT RAISE(ABORT, 'AuthSession user-verification state is invalid');
+                END
+            """)
+
     _migrate_auth_identities_for_unified_auth(bind)
     _migrate_unified_auth_security_constraints(bind)
 

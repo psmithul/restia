@@ -3,6 +3,13 @@ from services.tts.tts_service import TTSService
 
 def test_tts_cache_stats_counts_mp3(tmp_path):
     service = TTSService(cache_dir=str(tmp_path))
+    service._load_settings = lambda: {
+        "tts_enabled": True,
+        "tts_provider": "disabled",
+        "tts_model": "tts-1",
+        "tts_voice": "alloy",
+        "tts_speed": "1",
+    }
 
     # Put an MP3-headed blob (starts with b'ID3') into cache, with size > 1MB so cache_size_mb > 0
     service._put_cache("k", b"ID3" + b"x" * (1024 * 1024))

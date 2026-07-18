@@ -112,7 +112,7 @@ def test_unrelated_preference_write_does_not_claim_timezone(monkeypatch):
         state.update(json.loads(json.dumps(payload)))
 
     monkeypatch.setattr(prefs, "_save_for_user", save)
-    monkeypatch.setattr(prefs, "load_settings", lambda: {})
+    monkeypatch.setattr(prefs, "load_settings", lambda owner=None: {})
 
     prefs.save_notification_preferences("alice", {"digest_cadence": "daily"})
     assert prefs.notification_timezone_configured("alice") is False
@@ -143,8 +143,12 @@ def test_legacy_telegram_allowlist_migrates_to_one_owner_only(monkeypatch):
 async def test_inbound_reply_is_built_once_and_retried_from_ledger(monkeypatch, tmp_path):
     import routes.telegram_routes as routes
     import src.constants as constants
-    from core.database import Account, SessionLocal
+    import src.telegram_delivery as delivery
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from core.database import Account, Base
     from src.telegram_bot import TelegramConfig
+    from src.telegram_delivery import TelegramRuntimeAuthority
     from src.telegram_inbound_ledger import TelegramReplyPending
 
     monkeypatch.setattr(constants, "DATA_DIR", str(tmp_path))
@@ -153,7 +157,13 @@ async def test_inbound_reply_is_built_once_and_retried_from_ledger(monkeypatch, 
         allowed_chat_ids=frozenset({"111"}), allow_all_chats=False,
         owner="alice", session_map={}, chat_owners={},
     )
-    db = SessionLocal()
+    engine = create_engine(f"sqlite:///{tmp_path / 'telegram-runtime.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, autoflush=False)
+    monkeypatch.setattr(
+        delivery, "telegram_runtime_authority", TelegramRuntimeAuthority(factory)
+    )
+    db = factory()
     try:
         if db.query(Account).filter(Account.id == "account-alice").first() is None:
             db.add(Account(
@@ -197,6 +207,7 @@ async def test_inbound_reply_is_built_once_and_retried_from_ledger(monkeypatch, 
     assert builds == [1]
     assert ingestions == [1]
     assert replies == ["durable answer", "durable answer"]
+    engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -307,7 +318,7 @@ async def test_email_success_waits_for_failed_telegram_mirror_without_resending_
 
     monkeypatch.setattr(notes, "DATA_DIR", str(tmp_path))
     monkeypatch.setattr(notes, "_scheduler_ref", None)
-    monkeypatch.setattr(settings_module, "load_settings", lambda: {})
+    monkeypatch.setattr(settings_module, "load_settings", lambda owner=None: {})
     monkeypatch.setattr(preferences, "settings_with_notification_preferences", lambda owner, base: {
         **base,
         "reminder_channel": "email",
@@ -382,7 +393,7 @@ async def test_cancel_after_primary_telegram_recipient_claim_blocks_send(
     monkeypatch.setattr(notes, "DATA_DIR", str(tmp_path))
     monkeypatch.setattr(notes, "_scheduler_ref", None)
     monkeypatch.setattr(reminder_state, "DATA_DIR", str(tmp_path))
-    monkeypatch.setattr(settings_module, "load_settings", lambda: {})
+    monkeypatch.setattr(settings_module, "load_settings", lambda owner=None: {})
     monkeypatch.setattr(preferences, "settings_with_notification_preferences", lambda owner, base: {
         **base,
         "reminder_channel": "telegram",
@@ -447,7 +458,7 @@ async def test_cancel_after_telegram_mirror_recipient_claim_blocks_send(
     monkeypatch.setattr(notes, "DATA_DIR", str(tmp_path))
     monkeypatch.setattr(notes, "_scheduler_ref", None)
     monkeypatch.setattr(reminder_state, "DATA_DIR", str(tmp_path))
-    monkeypatch.setattr(settings_module, "load_settings", lambda: {})
+    monkeypatch.setattr(settings_module, "load_settings", lambda owner=None: {})
     monkeypatch.setattr(preferences, "settings_with_notification_preferences", lambda owner, base: {
         **base,
         "reminder_channel": "email",
@@ -514,7 +525,7 @@ async def test_multi_chat_telegram_retry_sends_only_failed_recipient(monkeypatch
 
     monkeypatch.setattr(notes, "DATA_DIR", str(tmp_path))
     monkeypatch.setattr(notes, "_scheduler_ref", None)
-    monkeypatch.setattr(settings_module, "load_settings", lambda: {})
+    monkeypatch.setattr(settings_module, "load_settings", lambda owner=None: {})
     monkeypatch.setattr(preferences, "settings_with_notification_preferences", lambda owner, base: {
         **base,
         "reminder_channel": "telegram",

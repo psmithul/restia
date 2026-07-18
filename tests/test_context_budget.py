@@ -3,9 +3,30 @@
 Pins the pure budget computation and the explicit-override detection.
 """
 
-import json
+import uuid
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+import core.database as database
+from core.database import Account, Base
+from src.profile_configuration_models import ProfileConfiguration  # noqa: F401
 
 from src.context_budget import compute_input_token_budget, DEFAULT_HARD_MAX
+from src.profile_configuration_service import ProfileConfigurationError
+
+
+def _install_settings_store(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite:///{tmp_path / 'context-settings.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, autoflush=False)
+    account_id = str(uuid.uuid4())
+    with factory() as db:
+        db.add(Account(id=account_id, username="alice", status="active"))
+        db.commit()
+    monkeypatch.setattr(database, "SessionLocal", factory)
+    return engine, factory, account_id
 
 
 def test_default_scales_to_context_window():
@@ -38,17 +59,29 @@ def test_invalid_numeric_inputs_fall_back_cleanly():
     assert compute_input_token_budget("bad", 128000, explicit=True) == int(128000 * 0.85)
 
 
-def test_is_setting_overridden_reads_raw_saved_file(tmp_path, monkeypatch):
+def test_is_setting_overridden_reads_canonical_sql_rows(tmp_path, monkeypatch):
     import src.settings as settings
 
-    f = tmp_path / "settings.json"
-    f.write_text(json.dumps({"agent_input_token_budget": 12000}), encoding="utf-8")
-    monkeypatch.setattr(settings, "SETTINGS_FILE", str(f))
-    assert settings.is_setting_overridden("agent_input_token_budget") is True
-    assert settings.is_setting_overridden("some_unset_key") is False
+    engine, factory, account_id = _install_settings_store(tmp_path, monkeypatch)
+    settings._invalidate_caches()
+    settings.save_settings({"agent_input_token_budget": 12000}, owner="alice")
+    assert settings.is_setting_overridden(
+        "agent_input_token_budget", owner="alice"
+    ) is True
+    assert settings.is_setting_overridden("some_unset_key", owner="alice") is False
 
-    f.write_text(json.dumps({}), encoding="utf-8")
-    assert settings.is_setting_overridden("agent_input_token_budget") is False
+    with factory() as db:
+        db.query(ProfileConfiguration).filter_by(
+            owner_id=account_id,
+            namespace="setting",
+            key="agent_input_token_budget",
+        ).delete()
+        db.commit()
+    settings._invalidate_caches()
+    assert settings.is_setting_overridden(
+        "agent_input_token_budget", owner="alice"
+    ) is False
+    engine.dispose()
 
 
 # ---------------------------------------------------------------------------
@@ -99,26 +132,23 @@ def test_alias_map_registers_friendly_names():
 
 
 def test_agent_loop_reads_hard_max_setting(tmp_path, monkeypatch):
-    """End-to-end: a saved settings.json value for agent_input_token_hard_max
+    """End-to-end: a saved SQL value for agent_input_token_hard_max
     must reach compute_input_token_budget on the real agent_loop call path."""
     import src.settings as settings
-    # Point SETTINGS_FILE at a temp file with our override.
-    f = tmp_path / "settings.json"
-    f.write_text(json.dumps({"agent_input_token_hard_max": 750_000}), encoding="utf-8")
-    monkeypatch.setattr(settings, "SETTINGS_FILE", str(f))
-    monkeypatch.setattr(settings, "_settings_cache", None)
+    engine, _factory, _account_id = _install_settings_store(tmp_path, monkeypatch)
+    settings._invalidate_caches()
+    settings.save_settings({"agent_input_token_hard_max": 750_000}, owner="alice")
     # Read via the same import path the agent loop uses.
-    assert settings.get_setting("agent_input_token_hard_max", DEFAULT_HARD_MAX) == 750_000
+    assert settings.get_setting(
+        "agent_input_token_hard_max", DEFAULT_HARD_MAX, owner="alice"
+    ) == 750_000
 
-    # Malformed value falls back to DEFAULT_HARD_MAX (defensive, matches the
-    # try/except in src/agent_loop.py).
-    f.write_text(json.dumps({"agent_input_token_hard_max": "huge"}), encoding="utf-8")
-    monkeypatch.setattr(settings, "_settings_cache", None)
-    raw = settings.get_setting("agent_input_token_hard_max", DEFAULT_HARD_MAX)
-    try:
-        parsed = int(raw)
-    except (TypeError, ValueError):
-        parsed = DEFAULT_HARD_MAX
-    if parsed <= 0:
-        parsed = DEFAULT_HARD_MAX
-    assert parsed == DEFAULT_HARD_MAX
+    # Canonical SQL validates the value before it can reach the agent loop.
+    with pytest.raises(ProfileConfigurationError, match="must be an integer"):
+        settings.save_settings(
+            {"agent_input_token_hard_max": "huge"}, owner="alice"
+        )
+    assert settings.get_setting(
+        "agent_input_token_hard_max", DEFAULT_HARD_MAX, owner="alice"
+    ) == 750_000
+    engine.dispose()

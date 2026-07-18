@@ -655,12 +655,17 @@ def _request_is_admin(request: Request) -> bool:
     return True
 
 
-def _pairing_hub_url(request: Request, supplied: Optional[str] = None) -> str:
+def _pairing_hub_url(
+    request: Request,
+    supplied: Optional[str] = None,
+    *,
+    owner: Optional[str] = None,
+) -> str:
     candidate = str(supplied or "").strip()
     if candidate:
         return canonical_shared_origin(candidate, allow_loopback_http=True)
     configured = canonical_shared_origin(
-        get_setting("app_public_url", ""),
+        get_setting("app_public_url", "", owner=owner),
         allow_loopback_http=False,
     )
     if configured:
@@ -2398,7 +2403,7 @@ def setup_project_routes(
                 latest_status, _, _ = _pairing_status(db, candidate)
                 if latest_status in {"waiting", "paired", "pending"}:
                     pairing_payloads.append(_pairing_dict(db, candidate))
-            hub_url = _pairing_hub_url(request)
+            hub_url = _pairing_hub_url(request, owner=actor)
             return {
                 "hub_enabled": enabled,
                 "can_create_pairing": enabled and _request_is_admin(request),
@@ -2429,7 +2434,7 @@ def setup_project_routes(
                 db, project_id, actor, minimum="owner", writable=True
             )
             now = utcnow_naive()
-            hub_url = _pairing_hub_url(request, body.hub_url)
+            hub_url = _pairing_hub_url(request, body.hub_url, owner=actor)
             if not hub_url:
                 raise HTTPException(
                     400,

@@ -173,7 +173,7 @@ def test_notification_preferences_are_owner_scoped_and_validated(monkeypatch):
     state = {}
     monkeypatch.setattr(preferences, "_load_for_user", lambda owner: dict(state.get(owner, {})))
     monkeypatch.setattr(preferences, "_save_for_user", lambda owner, value: state.__setitem__(owner, dict(value)))
-    monkeypatch.setattr(preferences, "load_settings", lambda: {})
+    monkeypatch.setattr(preferences, "load_settings", lambda owner=None: {})
 
     saved = preferences.save_notification_preferences("Alice", {
         "reminder_channel": "telegram",
@@ -265,14 +265,17 @@ async def test_failed_telegram_delivery_is_not_acknowledged_or_cached(monkeypatc
         "notification_topics": ["reminders"],
         "quiet_hours_enabled": False,
     })
-    monkeypatch.setattr("src.settings.load_settings", lambda: {})
+    monkeypatch.setattr("src.settings.load_settings", lambda owner=None: {})
     monkeypatch.setattr(telegram, "load_telegram_config", lambda: _config())
 
     async def fail_send(*args, **kwargs):
         raise telegram.TelegramDeliveryError("Telegram API sendMessage failed (code 503)")
 
     monkeypatch.setattr(telegram, "send_telegram_message", fail_send)
-    scheduler = SimpleNamespace(add_notification=lambda **kwargs: None)
+    scheduler = SimpleNamespace(
+        add_notification=lambda **kwargs: None,
+        _reminder_claim_path=tmp_path / "reminder_delivery_claims.sqlite3",
+    )
     monkeypatch.setattr(notes, "_scheduler_ref", scheduler)
 
     result = await notes.dispatch_reminder(
@@ -300,7 +303,7 @@ async def test_browser_and_scanner_concurrency_share_one_durable_claim(monkeypat
         "notification_topics": ["reminders"],
         "quiet_hours_enabled": False,
     })
-    monkeypatch.setattr("src.settings.load_settings", lambda: {})
+    monkeypatch.setattr("src.settings.load_settings", lambda owner=None: {})
     monkeypatch.setattr(telegram, "load_telegram_config", lambda: _config())
     monkeypatch.setattr(notes, "_scheduler_ref", None)
 
@@ -359,11 +362,12 @@ async def test_external_browser_mirror_is_shown_but_topic_and_quiet_choices_are_
         "quiet_hours_enabled": state["quiet"],
     })
     monkeypatch.setattr(preferences, "quiet_hours_active", lambda settings: state["quiet"])
-    monkeypatch.setattr("src.settings.load_settings", lambda: {})
+    monkeypatch.setattr("src.settings.load_settings", lambda owner=None: {})
     monkeypatch.setattr(telegram, "load_telegram_config", lambda: _config())
     monkeypatch.setattr(telegram, "send_telegram_message", lambda *args, **kwargs: asyncio.sleep(0))
     scheduler = TaskScheduler(None)
     scheduler._notification_outbox_path = tmp_path / "browser-outbox.sqlite3"
+    scheduler._reminder_claim_path = tmp_path / "reminder_delivery_claims.sqlite3"
     monkeypatch.setattr(notes, "_scheduler_ref", scheduler)
 
     delivered = await notes.dispatch_reminder(
@@ -409,7 +413,7 @@ async def test_recurring_browser_reminder_advances_only_after_explicit_outbox_ac
     monkeypatch.setattr(actions, "DATA_DIR", str(tmp_path))
     monkeypatch.setattr(notes, "DATA_DIR", str(tmp_path))
     monkeypatch.setattr(database, "SessionLocal", lambda: db)
-    monkeypatch.setattr("src.settings.load_settings", lambda: {})
+    monkeypatch.setattr("src.settings.load_settings", lambda owner=None: {})
     monkeypatch.setattr(preferences, "load_notification_preferences", lambda owner: {"reminder_channel": "browser"})
     monkeypatch.setattr(preferences, "settings_with_notification_preferences", lambda owner, base: {
         **base,

@@ -50,6 +50,7 @@ def project_env(monkeypatch, tmp_path):
     cdb.Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
     monkeypatch.setattr(project_routes, "SessionLocal", factory)
+    monkeypatch.setattr(cdb, "SessionLocal", factory)
     monkeypatch.setenv("AUTH_ENABLED", "true")
     monkeypatch.delenv("LOCALHOST_BYPASS", raising=False)
 

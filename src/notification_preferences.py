@@ -133,7 +133,11 @@ def load_notification_preferences(
     *,
     global_settings: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    settings = global_settings or load_settings()
+    settings = (
+        global_settings
+        if global_settings is not None
+        else load_settings(owner=owner)
+    )
     result = _defaults(settings)
     try:
         user_prefs = _load_for_user(_owner_key(owner)) or {}
@@ -176,7 +180,7 @@ def notification_timezone_configured(owner: str | None) -> bool:
         saved = all_user_prefs.get(PREFS_KEY)
         if not isinstance(saved, dict) or not str(saved.get("timezone") or "").strip():
             return False
-        default_zone = _defaults(load_settings()).get("timezone") or "UTC"
+        default_zone = _defaults(load_settings(owner=owner)).get("timezone") or "UTC"
         return str(saved.get("timezone")) != str(default_zone)
     except Exception:
         return False
@@ -196,7 +200,11 @@ def settings_with_notification_preferences(
     owner: str | None,
     base_settings: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    settings = dict(base_settings or load_settings())
+    settings = dict(
+        base_settings
+        if base_settings is not None
+        else load_settings(owner=owner)
+    )
     settings.update(load_notification_preferences(owner, global_settings=settings))
     return settings
 

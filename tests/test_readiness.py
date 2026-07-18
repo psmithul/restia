@@ -1,11 +1,32 @@
 """Tests for the readiness / integrity self-check (src/readiness.py)."""
 
 from cryptography.fernet import Fernet
+import pytest
+from sqlalchemy import create_engine
 
 from src.readiness import check_readiness
+from src.database_migrations import upgrade_schema
 
 
-def test_readiness_reports_core_subsystems():
+@pytest.fixture()
+def readiness_env(tmp_path, monkeypatch):
+    import core.constants as constants
+    import core.database as database
+
+    db_path = tmp_path / "readiness.db"
+    url = f"sqlite:///{db_path}"
+    monkeypatch.setenv("DATABASE_URL", url)
+    monkeypatch.setenv("RESTIA_DATABASE_MODE", "local-single")
+    monkeypatch.setenv("RESTIA_ENCRYPTION_KEY", Fernet.generate_key().decode("ascii"))
+    monkeypatch.setattr(constants, "DATA_DIR", str(tmp_path))
+    engine = create_engine(url)
+    upgrade_schema(engine)
+    monkeypatch.setattr(database, "engine", engine)
+    yield
+    engine.dispose()
+
+
+def test_readiness_reports_core_subsystems(readiness_env):
     result = check_readiness()
 
     assert {"ready", "version", "checks", "timestamp"}.issubset(result.keys())
@@ -25,7 +46,7 @@ def test_readiness_reports_core_subsystems():
     assert result["ready"] is True, result
 
 
-def test_local_first_check_is_informational_never_fatal():
+def test_local_first_check_is_informational_never_fatal(readiness_env):
     result = check_readiness()
     lf = result["checks"]["local_first"]
     # local_first reports whether storage stays on-host but must never gate
@@ -35,12 +56,12 @@ def test_local_first_check_is_informational_never_fatal():
 
 
 def test_shared_mode_readiness_accepts_authority_but_rejects_stale_binding(
-    monkeypatch,
+    monkeypatch, readiness_env,
 ):
     monkeypatch.setenv("RESTIA_DATABASE_MODE", "shared")
     monkeypatch.setenv(
         "DATABASE_URL",
-        "postgresql+psycopg://restia:private@db/restia",
+        "postgresql+psycopg://restia:supersecret-db-password@db/restia",
     )
     monkeypatch.setenv("AUTH_ENABLED", "true")
     monkeypatch.setenv("LOCALHOST_BYPASS", "false")
@@ -64,4 +85,4 @@ def test_shared_mode_readiness_accepts_authority_but_rejects_stale_binding(
     assert result["checks"]["database_mode"]["code"] == (
         "database_mode_binding_mismatch"
     )
-    assert "private" not in str(result)
+    assert "supersecret-db-password" not in str(result)

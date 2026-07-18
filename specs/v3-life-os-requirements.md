@@ -600,3 +600,11 @@ entire section complete by itself.
   whitespace checks, and `v3.1` release preflight passed. Live provider,
   shared PostgreSQL operator-backup, real-device WebAuthn, final browser
   accessibility, and public-image evidence remain open.
+- **2026-07-18 — SQLite/PostgreSQL release parity (`d87893f`)**: the release
+  workflow now runs the canonical identity, Life-domain, action-policy,
+  profile, encrypted-column, and distributed-leadership contract against a
+  real PostgreSQL service before either architecture image can build. GitHub
+  Actions run `29630896278` passed PostgreSQL migration and contract checks,
+  amd64/arm64 builds, shipped-container smoke, and shared-Compose smoke. This
+  advances the shared-runtime and shipped-path gates without claiming the
+  still-pending public `v3.1` tag or provider/device verification.

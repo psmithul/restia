@@ -17,6 +17,7 @@ from routes.life_routes import setup_life_routes
 from src.finance_service import (
     FINANCE_ANALYSIS_NOTICE,
     FINANCE_RECORD_TYPES,
+    assert_safe_finance_payload,
     classify_expense_category,
     create_finance_record,
     finance_affordability,
@@ -224,6 +225,14 @@ def test_finance_rejects_secrets_full_numbers_and_executor_payloads_and_masks_la
         assert updated.properties["details"]["reference_last4"] == "••••1234"
     finally:
         db.close()
+
+
+def test_finance_reference_ids_are_not_misread_as_account_numbers():
+    assert_safe_finance_payload({
+        "details": {
+            "account_entity_id": "8a1b4980-4817-4607-9aa2-6757ff237ebe"
+        }
+    })
 
 
 def test_finance_owner_isolation_and_personal_business_scope(finance_env):

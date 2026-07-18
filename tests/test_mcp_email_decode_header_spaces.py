@@ -10,6 +10,8 @@ import json
 import sqlite3
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 pytest.importorskip("mcp")
 
@@ -216,11 +218,15 @@ async def test_mcp_email_owner_cannot_use_other_owner_account_for_list_read_send
 
 @pytest.mark.asyncio
 async def test_mcp_send_email_refuses_partial_legacy_db_without_canonical_owner(tmp_path, monkeypatch):
+    import core.database as database
     import src.constants as constants
 
     app_db_path = tmp_path / "app.db"
     scheduled_path = tmp_path / "scheduled_emails.db"
     _init_accounts_db(app_db_path)
+    engine = create_engine(f"sqlite:///{app_db_path}")
+    database.Base.metadata.create_all(engine)
+    monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=engine))
     monkeypatch.setattr(es, "APP_DB", str(app_db_path))
     monkeypatch.setattr(constants, "SCHEDULED_EMAILS_DB", str(scheduled_path))
     monkeypatch.setattr(es, "_read_agent_email_confirm_setting", lambda: True)
@@ -238,6 +244,7 @@ async def test_mcp_send_email_refuses_partial_legacy_db_without_canonical_owner(
 
     assert "Authenticated email owner does not exist" in out[0].text
     assert not scheduled_path.exists()
+    engine.dispose()
 
 
 @pytest.mark.asyncio

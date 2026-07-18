@@ -81,6 +81,13 @@ _EXECUTION_KEYS = frozenset({
     "purchase", "buy", "sell", "trade", "payment", "pay_now",
     "cancel_subscription", "withdraw", "deposit_funds", "place_order",
 })
+_NON_FINANCIAL_IDENTIFIER_FIELDS = frozenset({
+    "account_entity_id",
+    "related_entity_id",
+    "source_id",
+    "external_id",
+    "content_sha256",
+})
 
 _MONETARY_TYPES = FINANCE_RECORD_TYPES - {"account", "document_reference"}
 _STRICTLY_POSITIVE_TYPES = frozenset({
@@ -351,7 +358,8 @@ def assert_safe_finance_payload(value: object) -> None:
                 "investments, trades, or subscription cancellations"
             )
         if isinstance(nested, str):
-            _assert_no_long_financial_number(nested, field=path)
+            if key not in _NON_FINANCIAL_IDENTIFIER_FIELDS:
+                _assert_no_long_financial_number(nested, field=path)
             if _URL_CREDENTIAL_RE.search(nested):
                 raise LifeGraphError("Finance records must not contain embedded credentials")
 

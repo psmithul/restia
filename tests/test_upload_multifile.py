@@ -13,6 +13,7 @@ The fix counts genuine recent upload *events*, independent of the current
 batch's file count. save_upload still enforces the per-minute rate limit.
 """
 import io
+import hashlib
 import re
 import types
 from pathlib import Path
@@ -51,7 +52,7 @@ def _fake_handler():
         h.upload_rate_log.setdefault(client_ip, []).append(_NOW)
         name = getattr(u, "filename", "f")
         return {
-            "id": "0" * 32 + "." + "txt",
+            "id": hashlib.sha256(name.encode("utf-8")).hexdigest()[:32] + ".txt",
             "name": name,
             "mime": "text/plain",
             "size": 1,
@@ -97,6 +98,15 @@ def _reset_router(monkeypatch):
     monkeypatch.setattr(up, "router", APIRouter(prefix="/api/upload", tags=["upload"]))
     # Freeze time so the seeded "recent upload" is deterministic.
     monkeypatch.setattr(up.time, "time", lambda: _NOW)
+    monkeypatch.setattr(
+        up,
+        "ingest_inbox_capture",
+        lambda **kwargs: types.SimpleNamespace(
+            inbox_id=f"inbox:{kwargs.get('source_ref')}",
+            created=True,
+            source_type=kwargs.get("source_type"),
+        ),
+    )
 
 
 async def test_multifile_after_a_recent_upload_is_not_rejected():

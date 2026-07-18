@@ -30,6 +30,12 @@ class MemoryManager:
 
     def _init_mnemosyne(self):
         try:
+            # Mnemosyne initializes a default SQLite database while its module
+            # is imported, before this instance can pass ``db_path``. Keep that
+            # import-time database inside Restia's reviewed data directory
+            # unless the operator explicitly configured a different location.
+            os.makedirs(self.data_dir, exist_ok=True)
+            os.environ.setdefault("MNEMOSYNE_DATA_DIR", self.data_dir)
             from mnemosyne import Mnemosyne
             db_path = os.path.join(self.data_dir, "mnemosyne.db")
             self.mnemo = Mnemosyne(db_path=db_path)

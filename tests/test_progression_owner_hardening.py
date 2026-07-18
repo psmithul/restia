@@ -60,6 +60,7 @@ def hardening_db(tmp_path):
 def _authenticated_note_app(factory, monkeypatch) -> FastAPI:
     monkeypatch.setenv("AUTH_ENABLED", "true")
     monkeypatch.setattr(note_routes, "SessionLocal", factory)
+    monkeypatch.setattr(cdb, "SessionLocal", factory)
     app = FastAPI()
     app.state.auth_manager = SimpleNamespace(is_configured=True)
     app.include_router(note_routes.setup_note_routes())

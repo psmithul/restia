@@ -60,10 +60,11 @@ class _SpyAsyncClient:
 
 
 def _dispatch():
-    return asyncio.run(dispatch_reminder(
-        "Title", "Body", note_id="", queue_browser=True,
-        settings_override=_settings(),
-    ))
+    with patch("src.settings.load_settings", return_value={}):
+        return asyncio.run(dispatch_reminder(
+            "Title", "Body", note_id="", owner="alice", queue_browser=True,
+            settings_override=_settings(),
+        ))
 
 
 def test_metadata_ip_ntfy_base_url_is_rejected_and_not_fetched():

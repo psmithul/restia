@@ -124,16 +124,33 @@ async def test_direct_duplicate_polling_runner_is_rejected(monkeypatch):
 async def test_only_one_local_process_service_polls_and_standby_takes_over(
     monkeypatch, tmp_path
 ):
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
     import src.telegram_runtime as runtime
+    from src.telegram_delivery import TelegramPollingState, TelegramRuntimeAuthority
 
     lock_path = tmp_path / "telegram_polling.lock"
-    first = runtime.TelegramPollingService(process_lock_path=lock_path)
-    second = runtime.TelegramPollingService(process_lock_path=lock_path)
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'local-process-runtime.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    # Use the metadata bound to the authority's model. Some migration tests
+    # deliberately reload ``core.database`` during the full suite.
+    TelegramPollingState.metadata.create_all(engine)
+    authority = TelegramRuntimeAuthority(sessionmaker(bind=engine, autoflush=False))
+    first = runtime.TelegramPollingService(
+        process_lock_path=lock_path, runtime_authority=authority
+    )
+    second = runtime.TelegramPollingService(
+        process_lock_path=lock_path, runtime_authority=authority
+    )
     first.configure(lambda _update: asyncio.sleep(0))
     second.configure(lambda _update: asyncio.sleep(0))
     first.OWNERSHIP_RETRY_SECONDS = 0.01
     second.OWNERSHIP_RETRY_SECONDS = 0.01
 
+    monkeypatch.setattr(runtime, "DATA_DIR", str(tmp_path))
     monkeypatch.setattr(runtime, "load_settings", lambda: {})
     monkeypatch.setattr(
         runtime,
@@ -183,6 +200,7 @@ async def test_only_one_local_process_service_polls_and_standby_takes_over(
         await second.stop()
         hold_call.set()
         await asyncio.gather(first_task, second_task, return_exceptions=True)
+        engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -195,14 +213,13 @@ async def test_database_lease_coordinates_two_hosts_and_standby_takes_over(
     from sqlalchemy.orm import sessionmaker
 
     import src.telegram_runtime as runtime
-    from core.database import Base
-    from src.telegram_delivery import TelegramRuntimeAuthority
+    from src.telegram_delivery import TelegramPollingState, TelegramRuntimeAuthority
 
     engine = create_engine(
         f"sqlite:///{tmp_path / 'shared-runtime.db'}",
         connect_args={"check_same_thread": False},
     )
-    Base.metadata.create_all(engine)
+    TelegramPollingState.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, autoflush=False)
     authority = TelegramRuntimeAuthority(factory)
     fingerprint = hashlib.sha256(b"shared-bot").hexdigest()
@@ -221,6 +238,7 @@ async def test_database_lease_coordinates_two_hosts_and_standby_takes_over(
     first.OWNERSHIP_RETRY_SECONDS = 0.01
     second.OWNERSHIP_RETRY_SECONDS = 0.01
 
+    monkeypatch.setattr(runtime, "DATA_DIR", str(tmp_path))
     monkeypatch.setattr(runtime, "load_settings", lambda: {})
     monkeypatch.setattr(
         runtime,

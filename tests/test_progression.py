@@ -152,6 +152,7 @@ def test_summary_builds_quests_streaks_and_achievements(factory):
 async def test_todo_false_to_true_awards_once_even_after_reopen(factory, monkeypatch):
     monkeypatch.setenv("AUTH_ENABLED", "true")
     monkeypatch.setattr(note_routes, "SessionLocal", factory)
+    monkeypatch.setattr(cdb, "SessionLocal", factory)
     db = factory()
     try:
         db.add(
@@ -218,6 +219,7 @@ async def test_recurring_todo_cycle_is_server_owned_and_due_date_is_not_an_xp_ke
 ):
     monkeypatch.setenv("AUTH_ENABLED", "true")
     monkeypatch.setattr(note_routes, "SessionLocal", factory)
+    monkeypatch.setattr(cdb, "SessionLocal", factory)
     monkeypatch.setattr(
         note_progression,
         "_utcnow",

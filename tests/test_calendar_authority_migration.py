@@ -617,6 +617,8 @@ def test_guarded_legacy_adoption_repairs_calendar_authority_before_stamp(
     # adds missing new tables but cannot alter the two existing calendar tables.
     Base.metadata.create_all(engine)
     monkeypatch.setattr(database, "engine", engine)
+    assert database._prepare_legacy_calendar_authority_for_fk_validation()
+    database._migrate_add_unified_auth_columns()
     database._migrate_calendar_authority()
     _run_alembic(engine, command.stamp, SCHEMA_HEAD_REVISION)
     validate_head_schema(engine)

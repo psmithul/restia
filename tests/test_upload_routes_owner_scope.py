@@ -340,5 +340,5 @@ def test_put_vision_text_returns_400_on_malformed_json(tmp_path, monkeypatch):
             raise json.JSONDecodeError("Expecting value", "not json", 0)
 
     with pytest.raises(HTTPException) as exc:
-        asyncio.run(put_vision_text(_BadJsonRequest(), alice_id))
+        asyncio.run(put_vision_text(_BadJsonRequest(user="alice"), alice_id))
     assert exc.value.status_code == 400

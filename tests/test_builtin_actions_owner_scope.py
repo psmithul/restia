@@ -241,6 +241,7 @@ async def test_learn_sender_signatures_writes_owner_scoped_cache(monkeypatch, tm
 @pytest.mark.asyncio
 async def test_check_email_urgency_resolves_llm_candidates_for_task_owner(monkeypatch, tmp_path):
     from core import database
+    from src import settings
     from src.builtin_actions import TaskNoop, action_check_email_urgency
 
     class FakeEmailAccount:
@@ -251,15 +252,22 @@ async def test_check_email_urgency_resolves_llm_candidates_for_task_owner(monkey
 
     db = _Db({FakeEmailAccount: []})
     calls = _resolver_spy(monkeypatch)
+    settings_owners = []
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(database, "EmailAccount", FakeEmailAccount)
     monkeypatch.setattr(database, "SessionLocal", lambda: db)
+    monkeypatch.setattr(
+        settings,
+        "load_settings",
+        lambda owner=None: settings_owners.append(owner) or {},
+    )
 
     with pytest.raises(TaskNoop, match="no email accounts configured"):
         await action_check_email_urgency("alice")
 
     assert calls == ["alice"]
+    assert settings_owners == ["alice"]
     assert db.closed is True
 
 
@@ -322,7 +330,13 @@ async def test_email_tagging_bulk_mail_requires_user_specific_consequence(
     """Bulk CTAs stay informational while a real bill remains actionable."""
     from core import database
     from routes import email_helpers
-    from src import builtin_actions, email_runtime_authority, llm_core, task_endpoint
+    from src import (
+        builtin_actions,
+        email_runtime_authority,
+        llm_core,
+        settings,
+        task_endpoint,
+    )
 
     class FakeEmailAccount:
         enabled = _Column()
@@ -381,6 +395,7 @@ async def test_email_tagging_bulk_mail_requires_user_specific_consequence(
     monkeypatch.setattr(email_helpers, "_imap_connect", fake_imap_connect)
     monkeypatch.setattr(builtin_actions, "DATA_DIR", str(tmp_path))
     monkeypatch.setattr(builtin_actions, "EMAIL_URGENCY_CACHE_DIR", str(cache_dir))
+    monkeypatch.setattr(settings, "load_settings", lambda owner=None: {})
     monkeypatch.setattr(task_endpoint, "resolve_task_candidates", lambda **_kwargs: [("http://llm", "model", {})])
     monkeypatch.setattr(llm_core, "llm_call_async_with_fallback", fake_llm)
     monkeypatch.setattr(builtin_actions, "wait_for_interactive_quiet", no_wait)

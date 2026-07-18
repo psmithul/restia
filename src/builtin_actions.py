@@ -683,7 +683,7 @@ async def action_email_auto_translate(owner: str, **kwargs) -> Tuple[str, bool]:
         from src.settings import load_settings
         from src.task_endpoint import task_llm_call_async
 
-        settings = load_settings()
+        settings = load_settings(owner=owner)
         if not settings.get("email_auto_translate", False):
             raise TaskNoop("email auto-translate is disabled")
 
@@ -2745,7 +2745,7 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
     from src.settings import load_settings
 
     try:
-        settings = load_settings()
+        settings = load_settings(owner=owner)
         import json as _json
         import email as _email_mod
         import asyncio as _aio

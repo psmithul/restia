@@ -60,7 +60,7 @@ def pairing_env(monkeypatch, tmp_path):
     monkeypatch.setattr(
         project_routes,
         "get_setting",
-        lambda key, default="": "https://hub.example"
+        lambda key, default="", owner=None: "https://hub.example"
         if key == "app_public_url"
         else default,
     )
@@ -615,7 +615,9 @@ async def test_advertised_pairing_origin_never_trusts_a_remote_host_header(
     monkeypatch,
 ):
     app, _ = pairing_env
-    monkeypatch.setattr(project_routes, "get_setting", lambda _key, default="": default)
+    monkeypatch.setattr(
+        project_routes, "get_setting", lambda _key, default="", owner=None: default
+    )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
         base_url="https://attacker.example",
@@ -654,7 +656,7 @@ async def test_advertised_pairing_origin_never_trusts_a_remote_host_header(
         monkeypatch.setattr(
             project_routes,
             "get_setting",
-            lambda key, default="": "https://trusted.example"
+            lambda key, default="", owner=None: "https://trusted.example"
             if key == "app_public_url"
             else default,
         )
@@ -664,7 +666,9 @@ async def test_advertised_pairing_origin_never_trusts_a_remote_host_header(
         )
         assert configured.json()["hub_url"] == "https://trusted.example"
 
-    monkeypatch.setattr(project_routes, "get_setting", lambda _key, default="": default)
+    monkeypatch.setattr(
+        project_routes, "get_setting", lambda _key, default="", owner=None: default
+    )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
         base_url="http://127.0.0.1:7000",

@@ -8,12 +8,18 @@
   fallback stays conservative instead of scaling off an unproven window.
 """
 
-import json
+import uuid
 from unittest.mock import patch
 
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+import core.database as database
+from core.database import Account, Base
 import src.settings as settings
 import src.model_context as mc
 from src.context_budget import compute_input_token_budget, DEFAULT_BUDGET, budget_is_explicit
+from src.profile_configuration_models import ProfileConfiguration  # noqa: F401
 
 
 def test_default_value_is_the_auto_sentinel():
@@ -25,32 +31,42 @@ def test_default_value_is_the_auto_sentinel():
 def test_saving_an_unrelated_setting_does_not_re_cap_the_budget(tmp_path, monkeypatch):
     """End-to-end regression (WGlynn, #4121): changing ANY setting makes the
     settings-save path persist the merged dict, which materializes the budget
-    default into settings.json. The budget must still AUTO-SCALE — it must not be
+    default into canonical SQL. The budget must still AUTO-SCALE — it must not be
     re-read as an explicit 6000 cap. This locks the exact reopening shut.
     """
-    settings_file = tmp_path / "settings.json"
-    monkeypatch.setattr(settings, "SETTINGS_FILE", str(settings_file))
-    settings._settings_cache = None
+    engine = create_engine(f"sqlite:///{tmp_path / 'budget-settings.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, autoflush=False)
+    with factory() as db:
+        db.add(Account(id=str(uuid.uuid4()), username="alice", status="active"))
+        db.commit()
+    monkeypatch.setattr(database, "SessionLocal", factory)
+    settings._invalidate_caches()
 
     # Simulate a real settings save: a handler loads the merged dict (defaults +
     # saved) and persists it after the user changes one *unrelated* setting.
-    merged = settings.load_settings()
+    merged = settings.load_settings(owner="alice")
     merged["search_result_count"] = 9                  # unrelated user change
-    settings.save_settings(merged)
-    settings._settings_cache = None
+    settings.save_settings(merged, owner="alice")
+    settings._invalidate_caches()
 
-    # The budget default is now physically materialized into the file...
-    raw = json.loads(settings_file.read_text())
-    assert raw["agent_input_token_budget"] == DEFAULT_BUDGET
-    assert raw["search_result_count"] == 9
+    # The budget default is now physically materialized into canonical SQL...
+    loaded = settings.load_settings(owner="alice")
+    assert loaded["agent_input_token_budget"] == DEFAULT_BUDGET
+    assert loaded["search_result_count"] == 9
 
     # ...yet it must read as AUTO (value == default), not an explicit cap — even
     # though is_setting_overridden would report True for it now.
-    assert settings.is_setting_overridden("agent_input_token_budget") is True
-    soft = int(settings.get_setting("agent_input_token_budget", DEFAULT_BUDGET) or 0)
+    assert settings.is_setting_overridden(
+        "agent_input_token_budget", owner="alice"
+    ) is True
+    soft = int(settings.get_setting(
+        "agent_input_token_budget", DEFAULT_BUDGET, owner="alice"
+    ) or 0)
     assert budget_is_explicit(soft) is False
     # And the effective budget scales to the window rather than capping at 6000.
     assert compute_input_token_budget(soft, 131072, explicit=budget_is_explicit(soft)) == int(131072 * 0.85)
+    engine.dispose()
 
 
 def test_auto_scales_on_a_known_window():

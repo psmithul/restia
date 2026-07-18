@@ -233,7 +233,9 @@ async def dispatch_reminder(
     # legacy null-owner notes otherwise create an empty-owner claim that a
     # DEFAULT_LOCAL_OWNER browser can never acknowledge.
     owner = resolved_runtime_owner(owner)
-    settings = settings_with_notification_preferences(owner, load_settings())
+    settings = settings_with_notification_preferences(
+        owner, load_settings(owner=owner)
+    )
     settings.update(settings_override or {})
     channel = settings.get("reminder_channel", "browser")
     telegram_fallback = False

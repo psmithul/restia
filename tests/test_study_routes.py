@@ -64,6 +64,16 @@ def study_db(monkeypatch, tmp_path):
     monkeypatch.setattr(study, "SessionLocal", factory)
     monkeypatch.setattr(study_routes, "SessionLocal", factory)
     monkeypatch.setattr(chat_routes, "SessionLocal", factory)
+    monkeypatch.setattr(
+        study_routes,
+        "effective_owner",
+        lambda request: getattr(request.state, "current_user", None),
+    )
+    monkeypatch.setattr(
+        study_routes,
+        "resolved_request_owner",
+        lambda request, admitted_user="": str(admitted_user or "local").lower(),
+    )
     yield factory
     engine.dispose()
 
