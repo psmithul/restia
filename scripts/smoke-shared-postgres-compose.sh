@@ -71,6 +71,8 @@ chmod 600 "$workdir/restia_fernet_key"
 export RESTIA_IMAGE="$image"
 export RESTIA_POSTGRES_PASSWORD
 RESTIA_POSTGRES_PASSWORD=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+export ODYSSEUS_ADMIN_PASSWORD
+ODYSSEUS_ADMIN_PASSWORD=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
 export RESTIA_ENCRYPTION_KEY_FILE_HOST="$workdir/restia_fernet_key"
 export APP_DATA_DIR="$workdir/data"
 export APP_LOGS_DIR="$workdir/logs"
@@ -114,16 +116,50 @@ wait_ready() {
   while [ "$attempt" -lt 90 ]; do
     if compose exec -T odysseus python -c '
 import json, urllib.request
-with urllib.request.urlopen("http://127.0.0.1:7000/api/ready", timeout=3) as response:
+with urllib.request.urlopen("http://127.0.0.1:7000/api/health", timeout=3) as response:
     payload = json.load(response)
-raise SystemExit(0 if response.status == 200 and payload.get("ready") is True else 1)
+raise SystemExit(0 if response.status == 200 and payload.get("status") == "healthy" else 1)
 ' >/dev/null 2>&1; then
-      return 0
+      break
     fi
     attempt=$((attempt + 1))
     sleep 2
   done
-  return 1
+  if [ "$attempt" -ge 90 ]; then
+    return 1
+  fi
+
+  # Readiness is intentionally authenticated. Verify it with the explicit
+  # ephemeral admin instead of weakening the production auth middleware or
+  # relying on LOCALHOST_BYPASS, which shared mode forbids.
+  compose exec -T odysseus python - <<'PY'
+import http.cookiejar
+import json
+import os
+import urllib.request
+
+base = "http://127.0.0.1:7000"
+opener = urllib.request.build_opener(
+    urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())
+)
+login = urllib.request.Request(
+    base + "/api/auth/login",
+    data=json.dumps({
+        "username": "admin",
+        "password": os.environ["ODYSSEUS_ADMIN_PASSWORD"],
+        "remember": False,
+    }).encode("utf-8"),
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+with opener.open(login, timeout=5) as response:
+    if response.status != 200 or json.load(response).get("ok") is not True:
+        raise SystemExit("ephemeral admin login failed")
+with opener.open(base + "/api/ready", timeout=5) as response:
+    payload = json.load(response)
+    if response.status != 200 or payload.get("ready") is not True:
+        raise SystemExit("authenticated readiness failed")
+PY
 }
 
 wait_ready || {
@@ -134,14 +170,32 @@ wait_ready || {
 compose exec -T odysseus python - \
   "$expected_version" "$expected_short_commit" "$expected_channel" <<'PY'
 import json
+import http.cookiejar
 import os
 import sys
 import urllib.request
 
 expected_version, expected_commit, expected_channel = sys.argv[1:]
+base = "http://127.0.0.1:7000"
+opener = urllib.request.build_opener(
+    urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())
+)
+login = urllib.request.Request(
+    base + "/api/auth/login",
+    data=json.dumps({
+        "username": "admin",
+        "password": os.environ["ODYSSEUS_ADMIN_PASSWORD"],
+        "remember": False,
+    }).encode("utf-8"),
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+with opener.open(login, timeout=5) as response:
+    if response.status != 200 or json.load(response).get("ok") is not True:
+        raise SystemExit("ephemeral admin login failed")
 
 def get_json(path):
-    with urllib.request.urlopen(f"http://127.0.0.1:7000{path}", timeout=5) as response:
+    with opener.open(base + path, timeout=5) as response:
         if response.status != 200:
             raise SystemExit(f"{path} returned {response.status}")
         return json.load(response)
