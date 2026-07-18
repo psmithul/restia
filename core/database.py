@@ -6730,6 +6730,8 @@ from src.webauthn_models import (  # noqa: E402,F401
     WebAuthnChallenge,
     WebAuthnCredential,
 )
+from src.backup_models import BackupRun  # noqa: E402,F401
+from src.communications_polling_models import CommunicationPollState  # noqa: E402,F401
 
 # Schema initialization is intentionally explicit. Production entrypoints call
 # ``src.database_runtime.initialize_database`` before using a session; importing

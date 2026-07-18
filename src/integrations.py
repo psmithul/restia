@@ -22,6 +22,36 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 INTEGRATION_PRESETS: Dict[str, Dict[str, Any]] = {
+    "slack": {
+        "name": "Slack (read-only)",
+        "base_url": "https://slack.com",
+        "auth_type": "bearer",
+        "permissions": {
+            "allowed_methods": ["GET"],
+            "allowed_path_prefixes": ["/api"],
+            "require_action_approval_for_writes": True,
+        },
+        "description": (
+            "Read-only Slack polling for the Communications Hub. Provide a "
+            "least-privilege OAuth token with conversations/history read scopes. "
+            "This preset exposes no message-posting capability."
+        ),
+    },
+    "twilio": {
+        "name": "Twilio SMS and calls (read-only)",
+        "base_url": "https://api.twilio.com",
+        "auth_type": "basic",
+        "permissions": {
+            "allowed_methods": ["GET"],
+            "allowed_path_prefixes": ["/2010-04-01/Accounts"],
+            "require_action_approval_for_writes": True,
+        },
+        "description": (
+            "Read-only Twilio SMS and call-log polling for the Communications "
+            "Hub. Store the credential as ACCOUNT_SID:AUTH_TOKEN. This preset "
+            "does not expose SMS, call, or reply execution."
+        ),
+    },
     "miniflux": {
         "name": "Miniflux",
         "auth_type": "header",

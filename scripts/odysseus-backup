@@ -35,8 +35,20 @@ import tempfile
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 
-_DATA_DIR = _REPO_ROOT / "data"
-_BACKUP_DIR = _REPO_ROOT / "backups"
+def _runtime_path(value: str | None, default: Path) -> Path:
+    path = Path(value).expanduser() if value else default
+    return path if path.is_absolute() else (_REPO_ROOT / path)
+
+
+_DATA_DIR = _runtime_path(
+    os.getenv("RESTIA_DATA_DIR") or os.getenv("ODYSSEUS_DATA_DIR"),
+    _REPO_ROOT / "data",
+)
+_BACKUP_DIR = _runtime_path(
+    os.getenv("RESTIA_BACKUP_DIRECTORY")
+    or os.getenv("ODYSSEUS_BACKUP_DIRECTORY"),
+    _REPO_ROOT / "backups",
+)
 _MAX_PASSPHRASE_FILE_BYTES = 64 * 1024
 
 # Stuff inside data/ that we explicitly skip — anything we can re-derive
@@ -380,7 +392,7 @@ def cmd_restore(args):
             members = tar.getmembers()
             _validate_restore_members(members)
             with tempfile.TemporaryDirectory(
-                prefix=".restia-restore-", dir=_REPO_ROOT
+                prefix=".restia-restore-", dir=_DATA_DIR.parent
             ) as staged_root_raw:
                 staged_root = Path(staged_root_raw)
                 _extract_restore_members(tar, members, staged_root)
@@ -390,7 +402,9 @@ def cmd_restore(args):
 
                 if _DATA_DIR.exists() or _DATA_DIR.is_symlink():
                     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-                    stash = _REPO_ROOT / f"data.before-restore-{stamp}"
+                    stash = _DATA_DIR.with_name(
+                        f"{_DATA_DIR.name}.before-restore-{stamp}"
+                    )
                     os.rename(_DATA_DIR, stash)
                 try:
                     os.replace(staged_data, _DATA_DIR)

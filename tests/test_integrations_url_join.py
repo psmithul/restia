@@ -100,6 +100,11 @@ DISCORD_INTEGRATION = {
     "auth_param": "",
     "description": "",
     "preset": "discord_webhook",
+    "permissions": {
+        "allowed_methods": ["POST"],
+        "allowed_path_prefixes": ["/"],
+        "require_action_approval_for_writes": True,
+    },
 }
 
 
@@ -118,9 +123,11 @@ async def test_api_call_root_path_has_no_trailing_slash():
     with (
         patch.object(integrations, "_find_integration", return_value=DISCORD_INTEGRATION),
         patch("httpx.AsyncClient", return_value=mock_client),
+        patch("src.url_safety.check_outbound_url", return_value=(True, "")),
     ):
         result = await integrations.execute_api_call(
-            "discord_test", "POST", "/", body={"content": "test"}
+            "discord_test", "POST", "/", body={"content": "test"},
+            approved_external_action=True,
         )
 
     assert result.get("exit_code") == 0

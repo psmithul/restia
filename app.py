@@ -1612,6 +1612,59 @@ async def _startup_event():
     else:
         logger.info("In-process Telegram polling disabled (RESTIA_INPROCESS_TELEGRAM=0)")
 
+    # Recurring encrypted backups are deployment infrastructure, not user
+    # Tasks. Run one database-leased worker so disabling TaskScheduler never
+    # disables backup protection and shared replicas cannot race each other.
+    from src.backup_scheduler import (
+        BackupSchedulerError,
+        backup_scheduler_loop,
+        inprocess_backup_scheduler_enabled,
+    )
+    from src.distributed_leadership import run_database_leased_worker
+
+    if inprocess_backup_scheduler_enabled():
+        async def _backup_worker():
+            try:
+                await backup_scheduler_loop()
+            except asyncio.CancelledError:
+                raise
+            except BackupSchedulerError as exc:
+                logger.error("Encrypted backup scheduler disabled: %s", exc.code)
+
+        _startup_tasks.append(asyncio.create_task(
+            run_database_leased_worker(
+                "encrypted-backup-scheduler", _backup_worker,
+            ),
+            name="restia-encrypted-backup-leadership",
+        ))
+    else:
+        logger.info(
+            "Recurring encrypted backups are not configured; set "
+            "RESTIA_BACKUP_PASSPHRASE_FILE to enable the independent worker"
+        )
+
+    # Slack and Twilio reads have their own database-leased lifecycle and
+    # durable encrypted cursors. They intentionally remain available when the
+    # user TaskScheduler is disabled, and the polling module has no external
+    # write/reply operation.
+    from src.communications_connector_polling import (
+        communications_polling_loop,
+        inprocess_communications_polling_enabled,
+    )
+
+    if inprocess_communications_polling_enabled():
+        _startup_tasks.append(asyncio.create_task(
+            run_database_leased_worker(
+                "readonly-communications-polling", communications_polling_loop,
+            ),
+            name="restia-readonly-communications-polling-leadership",
+        ))
+    else:
+        logger.info(
+            "In-process read-only communications polling disabled "
+            "(RESTIA_INPROCESS_COMMUNICATION_POLLING=0)"
+        )
+
     # CardDAV mutation delivery has its own durable outbox and claim leases.
     # It must keep running even when Tasks, email pollers, or Telegram are
     # disabled, and the generic lifespan task cleanup cancels it on shutdown.

@@ -16,7 +16,7 @@ it is not synonymous with `done`.
 
 ## Cross-cutting release gates
 
-- [ ] Public release tag is `v3`; internal package version is `3.0.0`.
+- [ ] Public release tag is `v3.1`; internal package version is `3.1.0`.
 - [x] Major/slightly-major/minor public tag precision is enforced in CI.
 - [ ] One immutable principal spans web, desktop, mobile, Telegram, API, voice,
       automation, and linked-interface adapters.
@@ -119,6 +119,9 @@ notifications, integrations, drafting and email tools.
 - [x] Reading/summarising and drafting policies are distinct from sending.
 - [x] WhatsApp client remains read-only unless a separately approved reply flow
       is implemented; no generic send method exists.
+- [x] Enabled Slack and Twilio integrations poll independently from Tasks with
+      canonical HTTPS origins, GET-only grants, encrypted durable cursors,
+      owner-bound idempotent projection, and no reply/send callable.
 
 ## 8. Personal memory and knowledge — `complete`
 
@@ -274,6 +277,10 @@ messaging, owner scoping, API scopes, security headers, backups.
 - [ ] Every response/action can expose inputs, changes, reason, actor/workflow,
       and reversal path.
 - [ ] No random model output writes directly to authoritative data.
+- [x] Local-single deployments can schedule recurring AES-256-GCM backups
+      independently from Tasks, verify before retention, persist safe run
+      health, and expose current-backup posture. Shared PostgreSQL fails
+      explicitly until the operator backs up both SQL and the blob store.
 
 ## 23. Minimal navigation — `complete`
 
@@ -577,3 +584,19 @@ entire section complete by itself.
   concurrent migration chain. No schema change was required. The section
   remains `partial` pending live browser, PostgreSQL, and shipped-runtime
   evidence; non-communication Universal Inbox source adapters also remain open.
+- **2026-07-18 — v3.1 backup and read-only connector runtime (working tree on
+  `29d4b5d`)**: added a Task-independent, database-leased encrypted backup
+  scheduler for local-single deployments with external owner-only passphrase
+  files, verification-before-retention, durable secret-free health, persistent
+  Docker mounts, and explicit shared-mode operator-backup failure. Added a
+  separate database-leased Slack and Twilio poller with exact canonical HTTPS
+  origins, GET-only integration grants, encrypted owner/account cursors,
+  bounded streamed responses, idempotent Communications Hub projection, and no
+  external send/reply callable. Alembic revisions `20260801_0017` and
+  `20260802_0018` are registered and privacy-validated. A clean local runtime
+  migrated to head `20260802_0018`, reported ready, and created both authority
+  tables. The final backup/connector/migration/security/release/Compose set
+  passed with **261 passed**; Python compilation, Compose YAML parsing,
+  whitespace checks, and `v3.1` release preflight passed. Live provider,
+  shared PostgreSQL operator-backup, real-device WebAuthn, final browser
+  accessibility, and public-image evidence remain open.

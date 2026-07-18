@@ -42,7 +42,7 @@ def test_upload_authority_migration_upgrades_from_0013_and_downgrades(tmp_path):
         assert required <= present
     assert schema_revision_status(engine).current_revisions == ("20260729_0014",)
     assert schema_revision_status(engine).state == "behind"
-    assert SCHEMA_HEAD_REVISION == "20260731_0016"
+    assert SCHEMA_HEAD_REVISION == "20260802_0018"
 
     _run(engine, command.downgrade, PREVIOUS_REVISION)
     assert not (UPLOAD_METADATA_REQUIRED_TABLES & set(inspect(engine).get_table_names()))

@@ -73,6 +73,14 @@ from migrations.versions.passkey_authority_20260731_0016 import (
     PASSKEY_REQUIRED_COLUMNS,
     PASSKEY_REQUIRED_TABLES,
 )
+from migrations.versions.backup_runtime_authority_20260801_0017 import (
+    BACKUP_RUNTIME_REQUIRED_COLUMNS,
+    BACKUP_RUNTIME_REQUIRED_TABLES,
+)
+from migrations.versions.communications_polling_authority_20260802_0018 import (
+    COMMUNICATION_POLLING_REQUIRED_COLUMNS,
+    COMMUNICATION_POLLING_REQUIRED_TABLES,
+)
 from src.database_runtime import (
     SCHEMA_AUTHORITY,
     SHARED_SCHEMA_AUTHORITY_READY,
@@ -84,7 +92,7 @@ from src.database_runtime import (
 
 LEGACY_BASELINE_REVISION = "20260716_0001"
 EXPLICIT_BASELINE_REVISION = "20260717_0002"
-SCHEMA_HEAD_REVISION = "20260731_0016"
+SCHEMA_HEAD_REVISION = "20260802_0018"
 KNOWN_BEHIND_REVISIONS = frozenset({
     LEGACY_BASELINE_REVISION,
     EXPLICIT_BASELINE_REVISION,
@@ -101,6 +109,8 @@ KNOWN_BEHIND_REVISIONS = frozenset({
     "20260728_0013",
     "20260729_0014",
     "20260730_0015",
+    "20260731_0016",
+    "20260801_0017",
 })
 # Compatibility export retained for existing tooling.  This is now the full
 # frozen baseline manifest, not a small sentinel subset.
@@ -1416,6 +1426,89 @@ def _validate_upload_metadata_private_encryption(engine: Engine) -> None:
         private_object("chat_upload_metadata_import_runs.details", details)
 
 
+def _validate_communications_polling_private_encryption(engine: Engine) -> None:
+    """Verify provider cursors stay encrypted and structurally bounded."""
+
+    from src.secret_storage import decrypt, is_content_encrypted, is_decryptable
+
+    with engine.connect() as connection:
+        rows = connection.execute(text(
+            "SELECT provider, cursor, state, error_code, consecutive_failures, "
+            "imported_count, version FROM communication_poll_states"
+        )).all()
+    for provider, cursor, state, error_code, failures, imported, version in rows:
+        envelope = _stored_encrypted_json_envelope(
+            cursor, dialect=engine.dialect.name,
+        )
+        if (
+            envelope is None
+            or not is_content_encrypted(envelope)
+            or not is_decryptable(envelope)
+        ):
+            raise SchemaRevisionError(
+                "communication_poll_states.cursor is plaintext or not decryptable"
+            )
+        try:
+            decoded = json.loads(decrypt(envelope))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise SchemaRevisionError(
+                "communication_poll_states.cursor is not encrypted JSON"
+            ) from exc
+        if not isinstance(decoded, dict):
+            raise SchemaRevisionError(
+                "communication_poll_states.cursor is not an encrypted object"
+            )
+        if provider == "slack":
+            if set(decoded) - {"channels"}:
+                raise SchemaRevisionError("Slack polling cursor has unsupported fields")
+            channels = decoded.get("channels", {})
+            if (
+                not isinstance(channels, dict)
+                or len(channels) > 500
+                or any(
+                    not isinstance(key, str)
+                    or not isinstance(value, str)
+                    or len(key) > 255
+                    or len(value) > 64
+                    for key, value in channels.items()
+                )
+            ):
+                raise SchemaRevisionError("Slack polling cursor is malformed")
+        elif provider == "twilio":
+            if set(decoded) - {"messages_after", "calls_after"} or any(
+                not isinstance(value, str) or len(value) > 64
+                for value in decoded.values()
+            ):
+                raise SchemaRevisionError("Twilio polling cursor is malformed")
+            for value in decoded.values():
+                if not value:
+                    continue
+                try:
+                    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                except ValueError as exc:
+                    raise SchemaRevisionError(
+                        "Twilio polling cursor timestamp is malformed"
+                    ) from exc
+                if parsed.tzinfo is None:
+                    raise SchemaRevisionError(
+                        "Twilio polling cursor timestamp lacks an offset"
+                    )
+        else:
+            raise SchemaRevisionError("Communication poll provider is unsupported")
+        if state == "error":
+            if not isinstance(error_code, str) or re.fullmatch(
+                r"[a-z0-9_]{1,64}", error_code,
+            ) is None:
+                raise SchemaRevisionError("Communication poll error code is unsafe")
+        elif error_code is not None:
+            raise SchemaRevisionError("Healthy communication polling retains an error")
+        if any(
+            not isinstance(value, int) or value < minimum
+            for value, minimum in ((failures, 0), (imported, 0), (version, 1))
+        ):
+            raise SchemaRevisionError("Communication poll counters are invalid")
+
+
 def validate_head_schema(engine: Engine) -> None:
     """Verify frozen baseline plus every reviewed post-baseline contract."""
 
@@ -1433,6 +1526,8 @@ def validate_head_schema(engine: Engine) -> None:
         | UPLOAD_METADATA_REQUIRED_TABLES
         | RUNTIME_LEADERSHIP_REQUIRED_TABLES
         | PASSKEY_REQUIRED_TABLES
+        | BACKUP_RUNTIME_REQUIRED_TABLES
+        | COMMUNICATION_POLLING_REQUIRED_TABLES
     )
     required_columns = {
         **BASELINE_REQUIRED_COLUMNS,
@@ -1449,6 +1544,8 @@ def validate_head_schema(engine: Engine) -> None:
         **UPLOAD_METADATA_REQUIRED_COLUMNS,
         **RUNTIME_LEADERSHIP_REQUIRED_COLUMNS,
         **PASSKEY_REQUIRED_COLUMNS,
+        **BACKUP_RUNTIME_REQUIRED_COLUMNS,
+        **COMMUNICATION_POLLING_REQUIRED_COLUMNS,
     }
     missing = sorted(required_tables - existing)
     if missing:
@@ -1495,6 +1592,7 @@ def validate_head_schema(engine: Engine) -> None:
     _validate_email_runtime_private_encryption(engine)
     _validate_profile_configuration_private_encryption(engine)
     _validate_upload_metadata_private_encryption(engine)
+    _validate_communications_polling_private_encryption(engine)
 
     identity_unique_sets = _identity_unique_sets(inspector)
     expected_identity_key = ("provider", "issuer", "subject")
@@ -2466,20 +2564,13 @@ def upgrade_schema(engine: Engine) -> SchemaRevisionStatus:
     if status.matches_expected:
         validate_head_schema(engine)
         return status
+    # Every reviewed post-baseline revision is an executable Alembic upgrade
+    # point. The stamp-only 0001 legacy marker remains excluded so a pre-
+    # Alembic database must still pass the verified adoption path.
     executable_upgrade = status.current_revisions in {
-        (EXPLICIT_BASELINE_REVISION,),
-        ("20260718_0003",),
-        ("20260719_0004",),
-        ("20260720_0005",),
-        ("20260721_0006",),
-        ("20260722_0007",),
-        ("20260723_0008",),
-        ("20260724_0009",),
-        ("20260725_0010",),
-        ("20260726_0011",),
-        ("20260727_0012",),
-        ("20260728_0013",),
-        ("20260729_0014",),
+        (revision,)
+        for revision in KNOWN_BEHIND_REVISIONS
+        if revision != LEGACY_BASELINE_REVISION
     }
     if application_tables and not executable_upgrade:
         raise SchemaRevisionError(

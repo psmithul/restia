@@ -9,6 +9,7 @@ backup is not reported as current until a valid recent archive is present).
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import os
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,9 @@ from core.database import (
 )
 from src.ambient_capabilities import list_ambient_capabilities
 from src.backup_encryption import BackupEncryptionError, inspect_encrypted_backup
+from src.backup_models import BackupRun
+from src.backup_scheduler import backup_runtime_status
+from src.communications_connector_polling import communications_polling_health
 from src.integration_permissions import normalize_integration_permissions
 from src.profile_configuration_models import ProfileConfiguration
 from src.profile_configuration_service import serialize_configuration
@@ -43,8 +47,13 @@ def _backup_posture(
     *,
     now: datetime,
     max_age: timedelta,
+    latest_run: BackupRun | None,
 ) -> dict[str, Any]:
-    directory = backup_dir or Path(__file__).resolve().parents[1] / "backups"
+    directory = backup_dir or Path(
+        os.getenv("RESTIA_BACKUP_DIRECTORY")
+        or os.getenv("ODYSSEUS_BACKUP_DIRECTORY")
+        or Path(__file__).resolve().parents[1] / "backups"
+    )
     candidates: list[Path] = []
     if directory.is_dir():
         try:
@@ -83,10 +92,31 @@ def _backup_posture(
         latest is not None
         and float(latest["age_days"]) <= max_age.total_seconds() / 86_400
     )
+    scheduler = backup_runtime_status()
+    run = None
+    if latest_run is not None:
+        run = {
+            "state": latest_run.state,
+            "trigger": latest_run.trigger,
+            "database_mode": latest_run.database_mode,
+            "archive_name": latest_run.archive_name,
+            "archive_bytes": latest_run.archive_bytes,
+            "encrypted": bool(latest_run.encrypted),
+            "verified": bool(latest_run.verified),
+            "error_code": latest_run.error_code,
+            "started_at": _iso(latest_run.started_at),
+            "completed_at": _iso(latest_run.completed_at),
+        }
+    scheduler_healthy = not scheduler["enabled"] or bool(
+        run is not None and run["state"] == "completed" and run["verified"]
+    )
     return {
         "supported": True,
         "current": current,
         "latest": latest,
+        "scheduler": scheduler,
+        "scheduler_healthy": scheduler_healthy,
+        "latest_run": run,
         "recommended_max_age_days": int(max_age.total_seconds() / 86_400),
         "command": (
             "./scripts/odysseus-backup snapshot "
@@ -137,6 +167,12 @@ def build_security_posture(
             continue
         if set(permissions["allowed_methods"]) - {"GET"}:
             write_connectors += 1
+    communication_polling = communications_polling_health(
+        db, owner_id=account.id,
+    )
+    polling_errors = sum(
+        1 for item in communication_polling if item["state"] == "error"
+    )
 
     ambient = list_ambient_capabilities(db, owner_id=account.id)
     enabled_ambient = sum(1 for item in ambient if item["enabled"])
@@ -153,11 +189,15 @@ def build_security_posture(
         ActionProposal.owner_id == account.id,
         ActionProposal.state.in_(("prepared", "approved", "executing", "failed")),
     ).count()
+    latest_backup_run = db.query(BackupRun).order_by(
+        BackupRun.started_at.desc(), BackupRun.id.desc(),
+    ).first()
 
     backups = _backup_posture(
         Path(backup_dir) if backup_dir is not None else None,
         now=observed_at,
         max_age=DEFAULT_BACKUP_MAX_AGE,
+        latest_run=latest_backup_run,
     )
     checks = [
         {
@@ -206,11 +246,17 @@ def build_security_posture(
         {
             "id": "connector_permissions",
             "label": "Connector permissions",
-            "status": "protected" if invalid_connectors == 0 else "attention",
+            "status": (
+                "protected"
+                if invalid_connectors == 0 and polling_errors == 0
+                else "attention"
+            ),
             "detail": (
                 f"{len(integration_rows)} connector(s), {write_connectors} with "
                 "approved-write grants, and "
-                f"{invalid_connectors} invalid permission contract(s)."
+                f"{invalid_connectors} invalid permission contract(s); "
+                f"{len(communication_polling)} read-only provider poller(s), "
+                f"{polling_errors} unhealthy."
             ),
         },
         {
@@ -232,11 +278,25 @@ def build_security_posture(
         {
             "id": "encrypted_backups",
             "label": "Encrypted backups",
-            "status": "protected" if backups["current"] else "attention",
+            "status": (
+                "protected"
+                if backups["current"] and backups["scheduler_healthy"]
+                else "attention"
+            ),
             "detail": (
-                "A valid encrypted backup is recent."
-                if backups["current"]
-                else "Create and verify an encrypted backup; none is current within 7 days."
+                "A scheduled, verified encrypted backup is recent."
+                if backups["current"] and backups["scheduler"]["enabled"]
+                and backups["scheduler_healthy"]
+                else (
+                    "A valid encrypted backup is recent; configure the recurring scheduler."
+                    if backups["current"]
+                    else (
+                        "The recurring encrypted-backup worker needs attention."
+                        if backups["scheduler"]["enabled"]
+                        and not backups["scheduler_healthy"]
+                        else "Configure and verify recurring encrypted backups; none is current."
+                    )
+                )
             ),
         },
         {
@@ -258,6 +318,7 @@ def build_security_posture(
         "attention_count": attention,
         "checks": checks,
         "backups": backups,
+        "communications_polling": communication_polling,
         "links": {
             "sessions": "/api/auth/sessions",
             "audit": "/api/life/audit",
