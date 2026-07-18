@@ -16,15 +16,21 @@ from core.database import (
     ActionAudit,
     AuthIdentity,
     Base,
+    CalendarCal,
+    CalendarEvent,
+    Document,
     EntityLink,
     LifeEntity,
     LifeEntityVersion,
     LifeSource,
+    Note,
 )
 from routes.life_routes import setup_life_routes
 from src.identity import ensure_account
+from src.calendar_service import create_calendar_event
 from src.life_graph import (
     LifeGraphConflict,
+    LifeGraphError,
     LifeGraphNotFound,
     create_entity_link,
     create_life_entity,
@@ -94,6 +100,62 @@ def _account(db, username: str) -> Account:
     return account
 
 
+def _seed_domain_reference_records(db):
+    alice = db.query(Account).filter(Account.username == "alice").one()
+    bob = db.query(Account).filter(Account.username == "bob").one()
+    records = {
+        "owned": [
+            ("note", "note", "note-alice"),
+            ("file", "document", "document-alice"),
+            ("event", "calendar_event", "event-alice"),
+        ],
+        "cross_owner": [
+            ("note", "note", "note-bob"),
+            ("file", "document", "document-bob"),
+            ("event", "calendar_event", "event-bob"),
+        ],
+        "null_owner": [
+            ("note", "note", "note-null"),
+            ("file", "document", "document-null"),
+        ],
+    }
+    db.add_all([
+        Note(id="note-alice", owner="alice", title="Alice note"),
+        Note(id="note-bob", owner="bob", title="Bob note"),
+        Note(id="note-null", owner=None, title="Legacy note"),
+        Document(
+            id="document-alice", owner="alice", title="Alice document",
+            current_content="",
+        ),
+        Document(
+            id="document-bob", owner="bob", title="Bob document",
+            current_content="",
+        ),
+        Document(
+            id="document-null", owner=None, title="Legacy document",
+            current_content="",
+        ),
+        CalendarCal(
+            id="calendar-alice", owner_id=alice.id, owner="alice", name="Alice"
+        ),
+        CalendarCal(
+            id="calendar-bob", owner_id=bob.id, owner="bob", name="Bob"
+        ),
+        CalendarEvent(
+            uid="event-alice", owner_id=alice.id, calendar_id="calendar-alice",
+            summary="Alice series", dtstart=datetime(2026, 7, 18, 9),
+            dtend=datetime(2026, 7, 18, 10), rrule="FREQ=DAILY",
+        ),
+        CalendarEvent(
+            uid="event-bob", owner_id=bob.id, calendar_id="calendar-bob",
+            summary="Bob event", dtstart=datetime(2026, 7, 18, 11),
+            dtend=datetime(2026, 7, 18, 12),
+        ),
+    ])
+    db.flush()
+    return records
+
+
 async def _call(env, method: str, path: str, *, user="alice", **kwargs):
     headers = dict(kwargs.pop("headers", {}) or {})
     if user:
@@ -103,6 +165,170 @@ async def _call(env, method: str, path: str, *, user="alice", **kwargs):
         transport=transport, base_url="http://test"
     ) as client:
         return await client.request(method, path, headers=headers, **kwargs)
+
+
+def test_service_claims_owned_note_document_and_exact_base_calendar_uid(
+    life_graph_env,
+):
+    db = life_graph_env.Session()
+    try:
+        alice = _account(db, "alice")
+        _account(db, "bob")
+        records = _seed_domain_reference_records(db)
+        max_uid = "u" * 255
+        db.add(CalendarEvent(
+            uid=max_uid, owner_id=alice.id, calendar_id="calendar-alice",
+            summary="Boundary event",
+            dtstart=datetime(2026, 7, 19, 9), dtend=datetime(2026, 7, 19, 10),
+        ))
+        db.flush()
+
+        accepted = [*records["owned"], ("event", "calendar_event", max_uid)]
+        for index, (entity_type, ref_type, ref_id) in enumerate(accepted):
+            entity, created = create_life_entity(
+                db,
+                account=alice,
+                entity_type=entity_type,
+                title=f"Owned domain record {index}",
+                domain_ref_type=ref_type,
+                domain_ref_id=ref_id,
+            )
+            assert created is True
+            assert entity.domain_ref_type == ref_type
+            assert entity.domain_ref_id == ref_id
+
+        assert db.query(LifeEntity).filter_by(owner_id=alice.id).count() == 4
+    finally:
+        db.close()
+
+
+def test_service_rejects_unowned_missing_and_occurrence_domain_refs(
+    life_graph_env,
+):
+    db = life_graph_env.Session()
+    try:
+        alice = _account(db, "alice")
+        _account(db, "bob")
+        records = _seed_domain_reference_records(db)
+
+        rejected = [
+            *records["cross_owner"],
+            *records["null_owner"],
+            ("note", "note", "missing-note"),
+            ("file", "document", "missing-document"),
+            ("event", "calendar_event", "missing-event"),
+        ]
+        for entity_type, ref_type, ref_id in rejected:
+            with pytest.raises(LifeGraphNotFound, match="Domain record not found"):
+                create_life_entity(
+                    db,
+                    account=alice,
+                    entity_type=entity_type,
+                    title="Rejected domain record",
+                    domain_ref_type=ref_type,
+                    domain_ref_id=ref_id,
+                )
+
+        with pytest.raises(LifeGraphError, match="base event"):
+            create_life_entity(
+                db,
+                account=alice,
+                entity_type="event",
+                title="Generated occurrence",
+                domain_ref_type="calendar_event",
+                domain_ref_id="event-alice::2026-07-19T09:00",
+            )
+        with pytest.raises(LifeGraphError, match="must not exceed 255"):
+            create_life_entity(
+                db,
+                account=alice,
+                entity_type="event",
+                title="Overlong event ref",
+                domain_ref_type="calendar_event",
+                domain_ref_id="u" * 256,
+            )
+        assert db.query(LifeEntity).filter_by(owner_id=alice.id).count() == 0
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_api_domain_refs_enforce_owner_existence_and_base_event_contract(
+    life_graph_env,
+):
+    db = life_graph_env.Session()
+    try:
+        _account(db, "alice")
+        _account(db, "bob")
+        records = _seed_domain_reference_records(db)
+        db.commit()
+    finally:
+        db.close()
+
+    for index, (entity_type, ref_type, ref_id) in enumerate(records["owned"]):
+        response = await _call(
+            life_graph_env,
+            "POST",
+            "/api/life/entities",
+            json={
+                "entity_type": entity_type,
+                "title": f"API-owned domain record {index}",
+                "domain_ref_type": ref_type,
+                "domain_ref_id": ref_id,
+            },
+        )
+        assert response.status_code == 201, response.text
+        assert response.json()["entity"]["domain_ref_type"] == ref_type
+        assert response.json()["entity"]["domain_ref_id"] == ref_id
+
+    rejected = [
+        *records["cross_owner"],
+        *records["null_owner"],
+        ("note", "note", "missing-note"),
+        ("file", "document", "missing-document"),
+        ("event", "calendar_event", "missing-event"),
+    ]
+    for entity_type, ref_type, ref_id in rejected:
+        response = await _call(
+            life_graph_env,
+            "POST",
+            "/api/life/entities",
+            json={
+                "entity_type": entity_type,
+                "title": "API-rejected domain record",
+                "domain_ref_type": ref_type,
+                "domain_ref_id": ref_id,
+            },
+        )
+        assert response.status_code == 404, response.text
+        assert response.json()["detail"] == "Domain record not found"
+
+    occurrence = await _call(
+        life_graph_env,
+        "POST",
+        "/api/life/entities",
+        json={
+            "entity_type": "event",
+            "title": "Generated occurrence",
+            "domain_ref_type": "calendar_event",
+            "domain_ref_id": "event-alice::2026-07-19T09:00",
+        },
+    )
+    assert occurrence.status_code == 400, occurrence.text
+    assert "base event" in occurrence.json()["detail"]
+
+    too_long = await _call(
+        life_graph_env,
+        "POST",
+        "/api/life/entities",
+        json={
+            "entity_type": "event",
+            "title": "Overlong event ref",
+            "domain_ref_type": "calendar_event",
+            "domain_ref_id": "u" * 256,
+        },
+    )
+    assert too_long.status_code == 422, too_long.text
 
 
 def test_source_entity_lifecycle_versions_audits_and_encryption(life_graph_env):
@@ -585,6 +811,136 @@ def test_search_traversal_decision_review_and_all_task_quality_flags(
         )
         assert len(bounded["entities"]) == 2
         assert bounded["truncated"] is True
+    finally:
+        db.close()
+
+
+def test_full_email_to_goal_chain_is_source_backed_owner_scoped_and_traversable(
+    life_graph_env,
+):
+    db = life_graph_env.Session()
+    try:
+        alice = _account(db, "alice")
+        bob = _account(db, "bob")
+        source, _ = create_life_source(
+            db,
+            account=alice,
+            source_type="email",
+            title="Launch review thread",
+            source_ref="email-account:message-42",
+            safe_excerpt="Decision and follow-up context",
+            idempotency_key="full-chain-email-source",
+        )
+
+        def entity(entity_type, title, **kwargs):
+            row, _ = create_life_entity(
+                db,
+                account=alice,
+                entity_type=entity_type,
+                title=title,
+                provenance={"source_id": source.id, "authority": "test-chain"},
+                idempotency_key=f"full-chain:{entity_type}:{title}",
+                **kwargs,
+            )
+            return row
+
+        email = entity(
+            "message", "Launch review email",
+            domain_ref_type="life_source", domain_ref_id=source.id,
+            properties={
+                "channel": "email", "thread_id": "thread-7",
+                "message_id": "message-42",
+            },
+        )
+        person = entity("person", "Alex Reviewer")
+        project = entity("project", "Restia V3")
+        decision = entity("decision", "Use shared SQL authority")
+        task = entity(
+            "task", "Finish release verification",
+            due_at=datetime(2026, 7, 20, 12),
+            properties={"definition_of_done": "All V3 gates pass"},
+        )
+        deadline = entity(
+            "reminder", "Release deadline",
+            due_at=datetime(2026, 7, 20, 12),
+            properties={"kind": "deadline"},
+        )
+        event_result = create_calendar_event(
+            db,
+            account=alice,
+            summary="Release verification block",
+            event_type="focus",
+            dtstart="2026-07-20T10:00:00+05:30",
+            dtend="2026-07-20T12:00:00+05:30",
+            idempotency_key="full-chain-calendar-event",
+        )
+        event = event_result.graph_entity
+        file = entity(
+            "file", "Release evidence.md",
+            properties={"content_sha256": "a" * 64},
+        )
+        goal = entity("goal", "Ship a trustworthy V3")
+        chain = (
+            (email, "from", person),
+            (person, "works_on", project),
+            (project, "has_decision", decision),
+            (decision, "creates", task),
+            (task, "has_deadline", deadline),
+            (deadline, "scheduled_as", event),
+            (event, "uses", file),
+            (file, "supports", goal),
+        )
+        for left, relation, right in chain:
+            create_entity_link(
+                db,
+                account=alice,
+                source_id=left.id,
+                relation=relation,
+                target_id=right.id,
+                provenance={"source_id": source.id, "authority": "test-chain"},
+                confidence=100,
+            )
+        foreign, _ = create_life_entity(
+            db, account=bob, entity_type="goal", title="Bob private goal",
+        )
+        with pytest.raises(LifeGraphNotFound):
+            create_entity_link(
+                db, account=alice, source_id=goal.id,
+                relation="must_not_cross", target_id=foreign.id,
+            )
+        db.commit()
+
+        traversal = traverse_life_graph(
+            db, owner_id=alice.id, entity_id=email.id, depth=8, limit=50,
+        )
+        assert traversal["depth_requested"] == 8
+        assert traversal["depth_reached"] == 8
+        assert traversal["truncated"] is False
+        assert [
+            (left.entity_type, relation, right.entity_type)
+            for left, relation, right in chain
+        ] == [
+            ("message", "from", "person"),
+            ("person", "works_on", "project"),
+            ("project", "has_decision", "decision"),
+            ("decision", "creates", "task"),
+            ("task", "has_deadline", "reminder"),
+            ("reminder", "scheduled_as", "event"),
+            ("event", "uses", "file"),
+            ("file", "supports", "goal"),
+        ]
+        assert {row["id"] for row in traversal["entities"]} == {
+            email.id, person.id, project.id, decision.id, task.id,
+            deadline.id, event.id, file.id, goal.id,
+        }
+        assert all(row.owner_id == alice.id for row in db.query(LifeEntity).filter(
+            LifeEntity.id.in_({item["id"] for item in traversal["entities"]})
+        ))
+        assert all(row["version"] >= 1 for row in traversal["entities"])
+        assert all(row["confidence"] == 100 for row in traversal["links"])
+        assert all(row["provenance"]["source_id"] == source.id for row in traversal["links"])
+        assert foreign.id not in {row["id"] for row in traversal["entities"]}
+        assert task.due_at == deadline.due_at
     finally:
         db.close()
 

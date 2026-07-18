@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from core.database import SessionLocal
 from src.action_policy import (
@@ -25,13 +25,27 @@ from src.action_policy import (
     list_action_policies,
     list_action_proposals,
     reject_action,
-    reverse_action,
     serialize_action_policy,
     serialize_action_proposal,
     set_action_policy,
-    start_action,
+)
+from src.calendar_action_executor import (
+    execute_calendar_action,
+    is_server_calendar_action,
+    reverse_calendar_action,
+)
+from src.email_outbound import (
+    is_server_email_action,
+    mark_email_action_rejected,
+    queue_approved_email_action,
 )
 from src.identity import request_account_transaction
+from src.ambient_capabilities import (
+    call_smart_home_connector,
+    finish_smart_home_execution,
+    is_server_smart_home_action,
+    start_smart_home_execution,
+)
 
 
 class PolicyUpdate(BaseModel):
@@ -62,11 +76,18 @@ class ActionCreate(BaseModel):
 
 
 class VersionBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     version: int = Field(ge=1)
 
 
 class ExecuteBody(VersionBody):
-    undo_ref: str | None = Field(default=None, max_length=255)
+    """A client supplies only the proposal version.
+
+    Reversal references are created by the reviewed server dispatcher in the
+    same transaction as the domain mutation; accepting one from a client would
+    let an untrusted caller invent an undo path.
+    """
 
 
 class ConfirmationBody(VersionBody):
@@ -89,7 +110,7 @@ class CompleteBody(ResultBody):
     undo_ref: str | None = Field(default=None, max_length=255)
 
 
-class ReverseBody(ResultBody):
+class ReverseBody(VersionBody):
     confirmation_token: str | None = Field(default=None, max_length=256)
 
 
@@ -105,6 +126,54 @@ def _raise_domain_error(exc: ActionPolicyError) -> None:
     if isinstance(exc, ActionPolicyDenied):
         raise HTTPException(403, str(exc)) from exc
     raise HTTPException(400, str(exc)) from exc
+
+
+def _serialize_action(db, proposal) -> dict[str, Any]:
+    """Add only reviewed server capabilities to the public proposal shape.
+
+    The browser must never infer that an arbitrary proposal can execute or
+    reverse merely because it has an action name or an undo reference.  These
+    booleans come from the same exact-tuple dispatcher used by the write
+    routes; no confirmation material or internal reversal reference is added.
+    """
+
+    payload = serialize_action_proposal(proposal)
+    reviewed_calendar_action = is_server_calendar_action(proposal)
+    reviewed_email_action = is_server_email_action(db, proposal)
+    reviewed_smart_home_action = is_server_smart_home_action(proposal)
+    payload["reviewed_server_executor"] = bool(
+        reviewed_calendar_action
+        or reviewed_email_action
+        or reviewed_smart_home_action
+    )
+    payload["reviewed_server_reversal"] = bool(
+        reviewed_calendar_action and proposal.undo_ref
+    )
+    payload["transparency"] = {
+        "inputs": dict(payload.get("payload") or {}),
+        "changes": dict(payload.get("result") or {}),
+        "reason": str(payload.get("reason") or ""),
+        "actor": {
+            "prepared_by": "restia_workflow",
+            "approved_by_account_id": payload.get("approved_by_account_id"),
+        },
+        "workflow": {
+            "domain": payload.get("domain"),
+            "action": payload.get("action"),
+            "state": payload.get("state"),
+            "autonomy_level": payload.get("autonomy_level"),
+            "external": bool(payload.get("external")),
+            "requires_confirmation": bool(payload.get("requires_confirmation")),
+        },
+        "reversal": {
+            "reference_recorded": bool(payload.get("undo_ref")),
+            "reviewed_server_reversal": payload["reviewed_server_reversal"],
+            "fresh_confirmation_required": bool(
+                payload.get("requires_confirmation")
+            ),
+        },
+    }
+    return payload
 
 
 def setup_action_policy_routes(*, session_factory=SessionLocal) -> APIRouter:
@@ -195,7 +264,7 @@ def setup_action_policy_routes(*, session_factory=SessionLocal) -> APIRouter:
                     limit=limit,
                 )
                 return {
-                    "actions": [serialize_action_proposal(row) for row in rows],
+                    "actions": [_serialize_action(db, row) for row in rows],
                     "count": len(rows),
                 }
         except ActionPolicyError as exc:
@@ -226,7 +295,7 @@ def setup_action_policy_routes(*, session_factory=SessionLocal) -> APIRouter:
                     idempotency_key=body.idempotency_key,
                 )
                 return {
-                    "action": serialize_action_proposal(created.proposal),
+                    "action": _serialize_action(db, created.proposal),
                     "created": created.created,
                     "confirmation_token": created.confirmation_token,
                 }
@@ -248,7 +317,7 @@ def setup_action_policy_routes(*, session_factory=SessionLocal) -> APIRouter:
                 proposal = get_action_proposal(
                     db, owner_id=account.id, proposal_id=proposal_id
                 )
-                return {"action": serialize_action_proposal(proposal)}
+                return {"action": _serialize_action(db, proposal)}
         except ActionPolicyError as exc:
             db.rollback()
             _raise_domain_error(exc)
@@ -272,7 +341,7 @@ def setup_action_policy_routes(*, session_factory=SessionLocal) -> APIRouter:
                     purpose=body.purpose,
                 )
                 return {
-                    "action": serialize_action_proposal(challenge.proposal),
+                    "action": _serialize_action(db, challenge.proposal),
                     "confirmation_token": challenge.confirmation_token,
                     "purpose": challenge.purpose,
                 }
@@ -298,7 +367,7 @@ def setup_action_policy_routes(*, session_factory=SessionLocal) -> APIRouter:
                     expected_version=body.version,
                     confirmation_token=body.confirmation_token,
                 )
-                return {"action": serialize_action_proposal(proposal)}
+                return {"action": _serialize_action(db, proposal)}
         except ActionPolicyError as exc:
             db.rollback()
             _raise_domain_error(exc)
@@ -314,6 +383,10 @@ def setup_action_policy_routes(*, session_factory=SessionLocal) -> APIRouter:
             with request_account_transaction(
                 db, request, required_scopes=("life:write",), write=True
             ) as account:
+                existing = get_action_proposal(
+                    db, owner_id=account.id, proposal_id=proposal_id
+                )
+                reviewed_email_action = is_server_email_action(db, existing)
                 proposal = reject_action(
                     db,
                     owner_id=account.id,
@@ -321,7 +394,9 @@ def setup_action_policy_routes(*, session_factory=SessionLocal) -> APIRouter:
                     expected_version=body.version,
                     reason=body.reason,
                 )
-                return {"action": serialize_action_proposal(proposal)}
+                if reviewed_email_action:
+                    mark_email_action_rejected(db, proposal)
+                return {"action": _serialize_action(db, proposal)}
         except ActionPolicyError as exc:
             db.rollback()
             _raise_domain_error(exc)
@@ -329,22 +404,94 @@ def setup_action_policy_routes(*, session_factory=SessionLocal) -> APIRouter:
             db.close()
 
     @router.post("/actions/{proposal_id}/execute")
-    def execute(
+    async def execute(
         request: Request, proposal_id: str, body: ExecuteBody
     ) -> dict[str, Any]:
         db = session_factory()
         try:
+            smart_home_execution = None
+            owner_username = None
             with request_account_transaction(
                 db, request, required_scopes=("life:write",), write=True
             ) as account:
-                proposal = start_action(
+                existing = get_action_proposal(
                     db,
                     owner_id=account.id,
                     proposal_id=proposal_id,
-                    expected_version=body.version,
-                    undo_ref=body.undo_ref,
                 )
-                return {"action": serialize_action_proposal(proposal)}
+                if is_server_calendar_action(existing):
+                    executed = execute_calendar_action(
+                        db,
+                        account=account,
+                        proposal_id=proposal_id,
+                        expected_version=body.version,
+                    )
+                    return {
+                        "action": _serialize_action(db, executed.proposal)
+                    }
+                if is_server_email_action(db, existing):
+                    queued = queue_approved_email_action(
+                        db,
+                        account=account,
+                        proposal_id=proposal_id,
+                        expected_version=body.version,
+                    )
+                    return {
+                        "action": _serialize_action(db, queued.proposal),
+                        "delivery": {
+                            "id": queued.delivery.id,
+                            "state": queued.delivery.state,
+                            "network_performed": False,
+                        },
+                    }
+                if is_server_smart_home_action(existing):
+                    smart_home_execution = start_smart_home_execution(
+                        db,
+                        owner_id=account.id,
+                        proposal_id=proposal_id,
+                        expected_version=body.version,
+                    )
+                    owner_username = account.username
+                else:
+                    raise ActionPolicyError(
+                        "Action has no reviewed server executor"
+                    )
+            connector_result = await call_smart_home_connector(
+                smart_home_execution, owner_username=owner_username,
+            )
+            with request_account_transaction(
+                db, request, required_scopes=("life:write",), write=True
+            ) as account:
+                proposal = finish_smart_home_execution(
+                    db,
+                    owner_id=account.id,
+                    execution=smart_home_execution,
+                    connector_result=connector_result,
+                )
+                serialized = _serialize_action(db, proposal)
+            exit_code = connector_result.get("exit_code", 1)
+            if exit_code != 0 and exit_code != "0":
+                raise HTTPException(
+                    502,
+                    {
+                        "message": str(
+                            connector_result.get("error")
+                            or "Smart-home connector failed"
+                        )[:1_000],
+                        "action": serialized,
+                    },
+                )
+            return {
+                "action": serialized,
+                "delivery": {
+                    "connector_id": smart_home_execution.integration_id,
+                    "method": smart_home_execution.method,
+                    "path": smart_home_execution.path,
+                    "network_performed": True,
+                },
+            }
+        except HTTPException:
+            raise
         except ActionPolicyError as exc:
             db.rollback()
             _raise_domain_error(exc)
@@ -360,6 +507,17 @@ def setup_action_policy_routes(*, session_factory=SessionLocal) -> APIRouter:
             with request_account_transaction(
                 db, request, required_scopes=("life:write",), write=True
             ) as account:
+                existing = get_action_proposal(
+                    db, owner_id=account.id, proposal_id=proposal_id
+                )
+                if (
+                    is_server_calendar_action(existing)
+                    or is_server_email_action(db, existing)
+                    or is_server_smart_home_action(existing)
+                ):
+                    raise ActionPolicyConflict(
+                        "Reviewed actions are completed only by their server executor"
+                    )
                 proposal = complete_action(
                     db,
                     owner_id=account.id,
@@ -368,7 +526,7 @@ def setup_action_policy_routes(*, session_factory=SessionLocal) -> APIRouter:
                     result=body.result,
                     undo_ref=body.undo_ref,
                 )
-                return {"action": serialize_action_proposal(proposal)}
+                return {"action": _serialize_action(db, proposal)}
         except ActionPolicyError as exc:
             db.rollback()
             _raise_domain_error(exc)
@@ -384,6 +542,17 @@ def setup_action_policy_routes(*, session_factory=SessionLocal) -> APIRouter:
             with request_account_transaction(
                 db, request, required_scopes=("life:write",), write=True
             ) as account:
+                existing = get_action_proposal(
+                    db, owner_id=account.id, proposal_id=proposal_id
+                )
+                if (
+                    is_server_calendar_action(existing)
+                    or is_server_email_action(db, existing)
+                    or is_server_smart_home_action(existing)
+                ):
+                    raise ActionPolicyConflict(
+                        "Reviewed action failures are recorded only by their server executor"
+                    )
                 proposal = fail_action(
                     db,
                     owner_id=account.id,
@@ -391,7 +560,7 @@ def setup_action_policy_routes(*, session_factory=SessionLocal) -> APIRouter:
                     expected_version=body.version,
                     result=body.result,
                 )
-                return {"action": serialize_action_proposal(proposal)}
+                return {"action": _serialize_action(db, proposal)}
         except ActionPolicyError as exc:
             db.rollback()
             _raise_domain_error(exc)
@@ -407,15 +576,25 @@ def setup_action_policy_routes(*, session_factory=SessionLocal) -> APIRouter:
             with request_account_transaction(
                 db, request, required_scopes=("life:write",), write=True
             ) as account:
-                proposal = reverse_action(
+                existing = get_action_proposal(
                     db,
                     owner_id=account.id,
                     proposal_id=proposal_id,
+                )
+                if not is_server_calendar_action(existing):
+                    raise ActionPolicyError(
+                        "Action has no reviewed server reversal"
+                    )
+                reversed_action = reverse_calendar_action(
+                    db,
+                    account=account,
+                    proposal_id=proposal_id,
                     expected_version=body.version,
-                    result=body.result,
                     confirmation_token=body.confirmation_token,
                 )
-                return {"action": serialize_action_proposal(proposal)}
+                return {
+                    "action": _serialize_action(db, reversed_action.proposal)
+                }
         except ActionPolicyError as exc:
             db.rollback()
             _raise_domain_error(exc)

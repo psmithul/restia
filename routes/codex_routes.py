@@ -12,7 +12,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, Body, HTTPException, Request
+from fastapi import APIRouter, Body, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from core.middleware import require_admin
@@ -375,16 +375,64 @@ def setup_codex_routes(
 
     @router.post("/emails/send")
     async def codex_email_send(request: Request, body: dict[str, Any] = Body(default_factory=dict)):
+        """Prepare an exact Level-5 email action; never call the manual SMTP route."""
+
         owner = _scope_owner(request, EMAIL_SEND_SCOPES)
         if email_send_endpoint is None:
             raise HTTPException(503, "Email integration is not available")
         from routes.email_routes import SendEmailRequest
+        from core.database import SessionLocal
+        from src.email_outbound import EmailOutboundError, prepare_agent_email_action
 
         try:
             req = SendEmailRequest(**body)
         except Exception as exc:
             raise HTTPException(400, f"Invalid send payload: {exc}")
-        return await email_send_endpoint(req=req, background_tasks=BackgroundTasks(), owner=owner)
+        kind = "reply" if (req.in_reply_to or req.source_uid) else "new"
+        db = SessionLocal()
+        try:
+            prepared = prepare_agent_email_action(
+                db,
+                owner_username=owner,
+                email_account_id=req.account_id,
+                to=req.to,
+                cc=req.cc,
+                bcc=req.bcc,
+                subject=req.subject,
+                body=req.body,
+                body_html=req.body_html,
+                attachments=req.attachments,
+                kind=kind,
+                in_reply_to=req.in_reply_to,
+                references=req.references,
+                source_uid=req.source_uid,
+                source_folder=(req.source_folder or "INBOX") if kind == "reply" else None,
+                source={"transport": "codex_api"},
+            )
+            db.commit()
+        except EmailOutboundError as exc:
+            db.rollback()
+            raise HTTPException(400, str(exc)) from exc
+        except Exception as exc:
+            db.rollback()
+            raise HTTPException(
+                503, "Outbound email could not be prepared safely"
+            ) from exc
+        finally:
+            db.close()
+        return {
+            "success": True,
+            "pending": True,
+            "pending_id": prepared.proposal.id,
+            "draft_id": prepared.draft.id,
+            "action_state": prepared.proposal.state,
+            "requires_confirmation": True,
+            "network_performed": False,
+            "message": (
+                "Draft staged for explicit Level-5 review in Restia. "
+                "Nothing has been sent or queued for delivery."
+            ),
+        }
 
     # ── Memory ────────────────────────────────────────────────────────────
 

@@ -60,6 +60,7 @@ from src.progression import build_progression_summary, normalize_progression_own
 from src.identity import (
     LOCAL_IDENTITY_ISSUER,
     LOCAL_IDENTITY_PROVIDER,
+    find_account,
     normalize_identity,
 )
 
@@ -278,6 +279,10 @@ def _load_calendar(
 ) -> dict[str, Any]:
     db = session_factory()
     try:
+        account_alias = scope.owner or scope.calendar_owner
+        account = find_account(db, account_alias) if account_alias else None
+        if account is None:
+            return _items_source([])
         expanded: list[dict[str, Any]] = []
         truncated = False
         # Legacy/local rows are stored as naive local wall time. Imported rows
@@ -293,7 +298,8 @@ def _load_calendar(
                 else or_(CalendarEvent.is_utc.is_(False), CalendarEvent.is_utc.is_(None))
             )
             common_filters = (
-                CalendarCal.owner == scope.calendar_owner,
+                CalendarCal.owner_id == account.id,
+                CalendarEvent.owner_id == account.id,
                 CalendarEvent.status != "cancelled",
                 utc_filter,
             )
@@ -1325,6 +1331,7 @@ def _recommendation(
     supported_project: dict[str, str] | None = None,
     source_evidence: list[dict[str, str]] | None = None,
     what_restia_can_handle: str,
+    focus_target: dict[str, Any] | None = None,
     payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the uniform, bounded V3 recommendation contract.
@@ -1349,8 +1356,24 @@ def _recommendation(
         "supported_project": supported_project,
         "source_evidence": list(source_evidence or [])[:2],
         "what_restia_can_handle": _bounded_text(what_restia_can_handle, 360),
+        "focus_target": dict(focus_target) if focus_target else None,
     })
     return result
+
+
+def _planning_focus_target(row: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        version = int(row.get("version") or 0)
+    except (TypeError, ValueError):
+        return None
+    source_id = _bounded_text(row.get("id"), 240)
+    if not source_id or version < 1 or row.get("status") != "open":
+        return None
+    return {
+        "kind": "planning_item",
+        "id": source_id,
+        "version": version,
+    }
 
 
 def _row_label(row: dict[str, Any]) -> str:
@@ -1481,6 +1504,7 @@ def _enrich_next_action(
     evidence = [
         _source_evidence(source_name, evidence_id, _row_label(row) or action.get("title"))
     ] if source_name != "unknown" else []
+    focus_target = _planning_focus_target(row) if kind == "planning_item" else None
     return _recommendation(
         item_id=action.get("id"),
         kind=kind,
@@ -1495,6 +1519,7 @@ def _enrich_next_action(
         supported_project=project,
         source_evidence=evidence,
         what_restia_can_handle=restia,
+        focus_target=focus_target,
         payload={"source_id": _bounded_text(action.get("source_id"), 240)},
     )
 
@@ -1628,6 +1653,7 @@ def _build_must_do_tasks(
             delay_cost="The commitment rolls forward and competes with tomorrow's work.",
             source_evidence=[_source_evidence("planning", source_id, row.get("title"))],
             what_restia_can_handle="Open the planning item and prepare a realistic focus block.",
+            focus_target=_planning_focus_target(row),
             payload={
                 "source_id": _bounded_text(source_id, 240),
                 "due_date": row.get("due_date"),
@@ -2064,6 +2090,7 @@ def _build_suggested_schedule(
                 "Prepare this focus block for Calendar; saving or moving events "
                 "follows the action policy."
             ),
+            focus_target=action.get("focus_target"),
             payload={
                 "action_id": action_id,
                 "start": start.isoformat(timespec="seconds"),
@@ -2454,6 +2481,52 @@ def _load_activity_feed(
         db.close()
 
 
+def _load_proactive_intelligence(
+    session_factory: Callable[[], Any],
+    scope: _OwnerScope,
+    *,
+    as_of: datetime,
+) -> dict[str, Any]:
+    """Load one deterministic owner-scoped priority report for Today."""
+
+    from src.identity import find_account
+    from src.proactive_intelligence import proactive_intelligence_report
+
+    db = session_factory()
+    try:
+        account = find_account(db, str(scope.owner or "")) if scope.owner else None
+        if account is None:
+            return {
+                "status": "ok",
+                "schema_version": 1,
+                "items": [],
+                "interruptions": [],
+                "digest": [],
+                "count": 0,
+                "total_signals_before_limit": 0,
+                "domain_counts": {},
+                "truncated": False,
+                "as_of_offset": as_of.isoformat(),
+                "safety_policy": {
+                    "deterministic": True,
+                    "model_inference": False,
+                    "record_only": True,
+                    "can_mutate": False,
+                    "can_send_or_notify": False,
+                },
+            }
+        report = proactive_intelligence_report(
+            db,
+            owner_id=account.id,
+            as_of=as_of.isoformat(),
+            limit=100,
+        )
+        return {"status": "ok", **report}
+    finally:
+        db.rollback()
+        db.close()
+
+
 def setup_mission_control_routes(
     rag_manager: Any = None,
     memory_vector: Any = None,
@@ -2492,6 +2565,9 @@ def setup_mission_control_routes(
         scope = _resolve_owner_scope(request)
         now_utc = _as_utc(now_factory())
         local_now = now_utc + timedelta(minutes=utc_offset_minutes)
+        local_instant = now_utc.astimezone(
+            timezone(timedelta(minutes=utc_offset_minutes))
+        )
         local_date = local_now.date()
         local_start = datetime.combine(local_date, time.min)
         local_end = local_start + timedelta(days=1)
@@ -2566,6 +2642,18 @@ def setup_mission_control_routes(
                     now_utc=now_utc,
                 ),
             )
+            proactive = _safe_load(
+                "proactive",
+                lambda: _load_proactive_intelligence(
+                    session_factory, scope, as_of=local_instant,
+                ),
+            )
+            recent_activity = _safe_load(
+                "recent_activity",
+                lambda: _load_activity_feed(
+                    session_factory, scope, limit=8, before=None,
+                ),
+            )
         else:
             owner_problem = {
                 "status": "unavailable",
@@ -2583,6 +2671,8 @@ def setup_mission_control_routes(
             notes_today = _source_problem("notes_today", **owner_problem)
             daily_brief = _source_problem("daily_brief", **owner_problem)
             progression = _source_problem("progression", **owner_problem)
+            proactive = _source_problem("proactive", **owner_problem)
+            recent_activity = _source_problem("recent_activity", **owner_problem)
 
         collector = health_collector
         if collector is None:
@@ -2618,6 +2708,8 @@ def setup_mission_control_routes(
             "notes_today": notes_today,
             "daily_brief": daily_brief,
             "progression": progression,
+            "proactive": proactive,
+            "recent_activity": recent_activity,
             "health": health,
         }
         next_actions = _build_next_actions(sources)
@@ -2649,9 +2741,15 @@ def setup_mission_control_routes(
                     else 0
                 ),
                 "next_actions": len(next_actions),
+                "proactive_interruptions": len(
+                    proactive.get("interruptions") or []
+                ),
+                "proactive_digest": len(proactive.get("digest") or []),
+                "recent_changes": recent_activity["count"],
                 "health": health["overall"],
             },
             "next_actions": next_actions,
+            "proactive": proactive,
             **today_sections,
             "sources": sources,
         }

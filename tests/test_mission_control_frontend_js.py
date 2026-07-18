@@ -153,6 +153,11 @@ def test_today_renders_the_v3_execution_contract_without_repeating_legacy_panels
     for label in ("Why now", "If delayed", "Restia can", "Supports", "Sources"):
         assert label in source
     assert "function renderTodayExecution()" in source
+    assert "function renderWhatChanged()" in source
+    assert "'What changed?', 'recent_activity', 'activity'" in source
+    assert "Ask Restia anything…" in source
+    assert "className: 'mission-ask-restia-button', target: 'new-chat'" in source
+    assert ".mission-ask-restia" in css
     home_render = source[source.index("  renderSummary();"):source.index("async function activateInboxNavigation")]
     assert "...renderTodayExecution(), renderInboxAttention()" in home_render
     for repeated_panel in (
@@ -169,6 +174,21 @@ def test_today_renders_the_v3_execution_contract_without_repeating_legacy_panels
         ".mission-recommendation-details",
     ):
         assert selector in css
+
+
+def test_home_answers_the_five_v3_questions_and_ends_with_ask_restia():
+    source = MODULE.read_text(encoding="utf-8")
+
+    for heading in (
+        "What matters now?",
+        "What is happening today?",
+        "What needs attention?",
+        "What is Restia handling?",
+        "What changed?",
+    ):
+        assert heading in source
+    assert "content.append(focusStatus, summary, quickActions, grid, askRestia);" in source
+    assert "content.append(focusStatus, askRestia" not in source
 
 
 def test_today_settings_target_uses_a_real_trigger_and_missing_targets_fail():

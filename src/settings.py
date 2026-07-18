@@ -1,25 +1,13 @@
 # src/settings.py
-"""Centralized settings and features management.
+"""Canonical Account.id-owned settings and feature preference adapters."""
 
-Single source of truth for reading/writing data/settings.json and data/features.json.
-All modules should import from here instead of accessing files directly.
-"""
-
-import json
 import time
-import logging
 from typing import Any
 
-from src.constants import SETTINGS_FILE, FEATURES_FILE
-
-logger = logging.getLogger(__name__)
-
-# Tiny TTL cache for settings/features. get_setting() is called on hot paths
-# (every chat, every preprocess); without this it re-parses the JSON each call.
-# Picks up edits within _CACHE_TTL seconds, which is fine for human-edited config.
+# Tiny per-profile TTL cache for hot-path SQL configuration reads.
 _CACHE_TTL = 2.0
-_settings_cache: tuple[float, dict] | None = None
-_features_cache: tuple[float, dict] | None = None
+_settings_cache: dict[str, tuple[float, dict]] = {}
+_features_cache: dict[str, tuple[float, dict]] = {}
 
 # Values in this file are configuration, but several are credentials.  The
 # explicit set documents current fields while suffix matching also protects
@@ -56,51 +44,18 @@ def _is_secret_setting(key: Any, value: Any) -> bool:
     )
 
 
-def _encrypt_settings_for_storage(settings: dict) -> dict:
-    """Return a shallow copy whose configured credentials are encrypted."""
-    from src.secret_storage import encrypt
-
-    protected = dict(settings)
-    for key, value in protected.items():
-        if _is_secret_setting(key, value):
-            protected[key] = encrypt(value)
-    return protected
-
-
-def _decrypt_settings_for_runtime(settings: dict) -> dict:
-    """Return settings with secret envelopes opened for existing callers."""
-    from src.secret_storage import decrypt
-
-    plaintext = dict(settings)
-    for key, value in plaintext.items():
-        if _is_secret_setting(key, value):
-            plaintext[key] = decrypt(value)
-    return plaintext
-
-
-def _blank_secret_settings(settings: dict) -> dict:
-    """Fail closed while retaining non-secret configuration values."""
-    safe = dict(settings)
-    for key, value in safe.items():
-        if _is_secret_setting(key, value):
-            safe[key] = ""
-    return safe
-
 def _invalidate_caches():
     global _settings_cache, _features_cache
-    _settings_cache = None
-    _features_cache = None
+    _settings_cache = {}
+    _features_cache = {}
 
 # ── Default values ──
 
 DEFAULT_SETTINGS = {
-    # Agent email safety: when True, the MCP send_email / reply_to_email
-    # tools don't SMTP directly. They stage the composed message into the
-    # scheduled_emails table with status='agent_draft' and return a
-    # pending_id + the rendered email so the user can review and approve
-    # (or cancel) before it actually goes out. Default ON because models
-    # have been observed inventing signatures and sending to real
-    # recipients without confirmation.
+    # Retained only so older settings files/UI clients round-trip cleanly.
+    # Agent mail safety is no longer configurable: every model-originated
+    # send/reply creates an encrypted Level-5 ActionProposal and never opens
+    # SMTP/IMAP or writes to the legacy scheduled-email sidecar.
     "agent_email_confirm": True,
     "image_gen_enabled": False,
     "image_model": "",
@@ -170,7 +125,7 @@ DEFAULT_SETTINGS = {
     # runaway jobs. Set to 0 to disable the cap entirely (unlimited) — only
     # for very long deep-research runs, since a stalled job then runs an
     # unbounded model/API bill. Other values are bounded to [60, 86400].
-    # Tune via Settings or by editing data/settings.json.
+    # Tune through the authenticated Settings surface.
     "research_run_timeout_seconds": 1800,
     "agent_max_tool_calls": 0,
     "agent_max_rounds": 20,  # per-message agent step cap (clamped 1..200)
@@ -266,12 +221,15 @@ DEFAULT_SETTINGS = {
     "telegram_bot_username": "",
     "telegram_bot_first_name": "",
     "telegram_registered_webhook_url": "",
+    # Identity fields below are retained only as an import source for installs
+    # upgrading from settings.json. Runtime authorization is SQL-backed and
+    # must never fall back to these values.
     "telegram_allowed_chat_ids": [],
     "telegram_allow_all_chats": False,
     "telegram_owner": "",
     "telegram_session_map": {},
-    # Multi-user Telegram routing. Chats are linked to local accounts through
-    # short-lived one-time codes; code records contain only a hash + expiry.
+    # Legacy multi-user Telegram routing import fields. New chats are linked to
+    # immutable Account.id values with SQL-backed, one-time link codes.
     "telegram_chat_owners": {},
     "telegram_link_codes": {},
     # IANA timezone for Telegram conversations (e.g. "Asia/Kolkata"). Telegram
@@ -312,75 +270,142 @@ DEFAULT_FEATURES = {
 }
 
 
-# ── Settings (data/settings.json) ──
+# ── Canonical Account.id-owned settings ──
 
-def load_settings() -> dict:
-    """Load settings merged with defaults. Always returns a complete dict."""
-    global _settings_cache
-    now = time.monotonic()
-    if _settings_cache and (now - _settings_cache[0]) < _CACHE_TTL:
-        return _settings_cache[1]
+def _runtime_owner(owner: str | None = None) -> str:
+    if str(owner or "").strip():
+        return str(owner).strip().lower()
     try:
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-            saved = json.load(f)
-        if not isinstance(saved, dict):
-            raise ValueError("settings must be an object")
-        protected = saved
-        migration_failed = False
-        # Best-effort in-place migration for legacy plaintext files.  A
-        # read-only key/data directory must not make settings unavailable, but
-        # the next successful save will retry encryption.
-        try:
-            protected = _encrypt_settings_for_storage(saved)
-            if protected != saved:
-                from core.atomic_io import atomic_write_json
-                atomic_write_json(SETTINGS_FILE, protected, indent=2)
-        except (OSError, UnicodeError, ValueError):
-            protected = saved
-            migration_failed = True
-            logger.warning("Could not migrate plaintext settings credentials")
-        runtime_settings = _decrypt_settings_for_runtime(protected)
-        if migration_failed:
-            runtime_settings = _blank_secret_settings(runtime_settings)
-        merged = {**DEFAULT_SETTINGS, **runtime_settings}
-    except (FileNotFoundError, PermissionError, json.JSONDecodeError, ValueError):
-        merged = dict(DEFAULT_SETTINGS)
-    _settings_cache = (now, merged)
-    return merged
+        from src.auth_runtime import primary_admin_username
+
+        primary = str(primary_admin_username() or "").strip().lower()
+        if primary:
+            return primary
+    except Exception:
+        pass
+    from src.auth_helpers import resolved_runtime_owner
+
+    return resolved_runtime_owner()
 
 
-def save_settings(settings: dict):
-    """Persist settings to disk (atomic; see core.atomic_io)."""
-    from core.atomic_io import atomic_write_json
-    atomic_write_json(
-        SETTINGS_FILE,
-        _encrypt_settings_for_storage(settings),
-        indent=2,
+def _configuration_account(db, owner: str | None, *, write: bool):
+    from src.identity import ensure_account, find_account
+
+    username = _runtime_owner(owner)
+    return ensure_account(db, username) if write else find_account(db, username)
+
+
+def load_settings(owner: str | None = None) -> dict:
+    """Load canonical SQL settings merged with immutable application defaults."""
+
+    global _settings_cache
+
+    from core.database import SessionLocal
+    from src.profile_configuration_adapters import profile_settings
+
+    cache_key = _runtime_owner(owner)
+    now = time.monotonic()
+    if not isinstance(_settings_cache, dict):
+        # A stale extension/test may still clear the pre-SQL singleton cache by
+        # assigning None. Recover without changing the canonical authority.
+        _settings_cache = {}
+    cached = _settings_cache.get(cache_key)
+    if cached and (now - cached[0]) < _CACHE_TTL:
+        return dict(cached[1])
+    db = SessionLocal()
+    try:
+        account = _configuration_account(db, cache_key, write=False)
+        merged = (
+            profile_settings(db, owner_id=account.id)
+            if account is not None else dict(DEFAULT_SETTINGS)
+        )
+        db.rollback()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+    _settings_cache[cache_key] = (now, dict(merged))
+    return dict(merged)
+
+
+def save_settings(settings: dict, owner: str | None = None):
+    """Persist mutable settings to canonical SQL with optimistic versions."""
+
+    if not isinstance(settings, dict):
+        raise ValueError("settings must be an object")
+    from core.database import SessionLocal
+    from src.profile_configuration_service import (
+        list_configurations,
+        put_configuration,
+        serialize_configuration,
     )
+
+    db = SessionLocal()
+    try:
+        account = _configuration_account(db, owner, write=True)
+        rows, truncated = list_configurations(
+            db, owner_id=account.id, namespace="setting", limit=500,
+        )
+        if truncated:
+            raise RuntimeError("Canonical setting count exceeds the adapter limit")
+        existing = {row.key: row for row in rows}
+        for key in DEFAULT_SETTINGS:
+            if key not in settings:
+                continue
+            current = existing.get(key)
+            if (
+                current is not None
+                and serialize_configuration(current)["value"] == settings[key]
+            ):
+                continue
+            put_configuration(
+                db,
+                account=account,
+                namespace="setting",
+                key=key,
+                value=settings[key],
+                expected_version=int(current.version) if current is not None else None,
+                source="domain_service",
+            )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
     _invalidate_caches()
 
 
-def get_setting(key: str, default: Any = None) -> Any:
+def get_setting(key: str, default: Any = None, owner: str | None = None) -> Any:
     """Read a single setting value."""
-    return load_settings().get(key, default)
+    return load_settings(owner=owner).get(key, default)
 
 
-def is_setting_overridden(key: str) -> bool:
-    """True if ``key`` is explicitly present in the saved settings file.
+def is_setting_overridden(key: str, owner: str | None = None) -> bool:
+    """Whether a canonical SQL row explicitly overrides this setting."""
 
-    ``load_settings`` merges DEFAULT_SETTINGS with the saved file, so a value
-    equal to its default is indistinguishable from "never set" via get_setting.
-    Callers that must distinguish an explicit user choice from a default read
-    the raw saved file via this. (Note: a materialized default is also "present",
-    so value-sensitive callers should compare against the default — see
-    ``context_budget.budget_is_explicit``.)
-    """
+    from core.database import SessionLocal
+    from src.profile_configuration_service import (
+        ProfileConfigurationNotFound,
+        get_configuration,
+    )
+
+    db = SessionLocal()
     try:
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-            saved = json.load(f)
-        return isinstance(saved, dict) and key in saved
-    except (FileNotFoundError, json.JSONDecodeError):
-        return False
+        account = _configuration_account(db, owner, write=False)
+        if account is None:
+            return False
+        try:
+            get_configuration(
+                db, owner_id=account.id, namespace="setting", key=key,
+            )
+        except ProfileConfigurationNotFound:
+            return False
+        return True
+    finally:
+        db.rollback()
+        db.close()
 
 
 # Per-user settings (user prefs override the global admin default). Used for
@@ -415,31 +440,82 @@ def get_user_setting(key: str, owner: str = "", default: Any = None) -> Any:
                 return prefs[key]
         except Exception:
             pass
-    return get_setting(key, default)
+    return get_setting(key, default, owner=owner or None)
 
 
-# ── Features (data/features.json) ──
+# ── Canonical Account.id-owned feature preferences ──
 
-def load_features() -> dict:
-    """Load feature flags merged with defaults."""
+def load_features(owner: str | None = None) -> dict:
     global _features_cache
+
+    from core.database import SessionLocal
+    from src.profile_configuration_adapters import profile_features
+
+    cache_key = _runtime_owner(owner)
     now = time.monotonic()
-    if _features_cache and (now - _features_cache[0]) < _CACHE_TTL:
-        return _features_cache[1]
+    if not isinstance(_features_cache, dict):
+        _features_cache = {}
+    cached = _features_cache.get(cache_key)
+    if cached and (now - cached[0]) < _CACHE_TTL:
+        return dict(cached[1])
+    db = SessionLocal()
     try:
-        with open(FEATURES_FILE, "r", encoding="utf-8") as f:
-            saved = json.load(f)
-        if not isinstance(saved, dict):
-            raise ValueError("features must be an object")
-        merged = {**DEFAULT_FEATURES, **saved}
-    except (FileNotFoundError, PermissionError, json.JSONDecodeError, ValueError):
-        merged = dict(DEFAULT_FEATURES)
-    _features_cache = (now, merged)
-    return merged
+        account = _configuration_account(db, cache_key, write=False)
+        merged = (
+            profile_features(db, owner_id=account.id)
+            if account is not None else dict(DEFAULT_FEATURES)
+        )
+        db.rollback()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+    _features_cache[cache_key] = (now, dict(merged))
+    return dict(merged)
 
 
-def save_features(features: dict):
-    """Persist feature flags to disk (atomic)."""
-    from core.atomic_io import atomic_write_json
-    atomic_write_json(FEATURES_FILE, features, indent=2)
+def save_features(features: dict, owner: str | None = None):
+    if not isinstance(features, dict):
+        raise ValueError("features must be an object")
+    from core.database import SessionLocal
+    from src.profile_configuration_service import (
+        list_configurations,
+        put_configuration,
+        serialize_configuration,
+    )
+
+    db = SessionLocal()
+    try:
+        account = _configuration_account(db, owner, write=True)
+        rows, truncated = list_configurations(
+            db, owner_id=account.id, namespace="feature", limit=100,
+        )
+        if truncated:
+            raise RuntimeError("Canonical feature count exceeds the adapter limit")
+        existing = {row.key: row for row in rows}
+        for key in DEFAULT_FEATURES:
+            if key not in features:
+                continue
+            current = existing.get(key)
+            if (
+                current is not None
+                and serialize_configuration(current)["value"] == features[key]
+            ):
+                continue
+            put_configuration(
+                db,
+                account=account,
+                namespace="feature",
+                key=key,
+                value=features[key],
+                expected_version=int(current.version) if current is not None else None,
+                source="domain_service",
+            )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
     _invalidate_caches()

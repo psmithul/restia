@@ -647,6 +647,62 @@ async def test_inbox_crud_is_owner_scoped_versioned_and_idempotent(life_env):
         db.close()
 
 
+@pytest.mark.asyncio
+async def test_inbox_api_normalizes_public_sources_and_owns_safety_metadata(life_env):
+    response = await _call(
+        life_env,
+        "POST",
+        "/api/inbox",
+        json={
+            "title": "Spoken thought",
+            "source_type": "voice notes",
+            "metadata": {
+                "ingestion_contract": {
+                    "owner_scoped": False,
+                    "model_output_has_write_authority": True,
+                },
+                "duration_seconds": 12,
+            },
+        },
+    )
+    assert response.status_code == 201, response.text
+    item = response.json()["item"]
+    assert item["source_type"] == "voice"
+    assert item["metadata"] == {
+        "duration_seconds": 12,
+        "ingestion_contract": {
+            "version": 1,
+            "source_type": "voice",
+            "owner_scoped": True,
+            "destination_required": False,
+            "classification_can_execute_external_action": False,
+            "model_output_has_write_authority": False,
+        },
+    }
+
+    patched = await _call(
+        life_env,
+        "PATCH",
+        f"/api/inbox/{item['id']}",
+        json={
+            "version": item["version"],
+            "metadata": {"ingestion_contract": {"owner_scoped": False}},
+        },
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["item"]["metadata"]["ingestion_contract"]["owner_scoped"] is True
+    assert patched.json()["item"]["metadata"]["ingestion_contract"]["source_type"] == "voice"
+
+    unsupported = await _call(
+        life_env,
+        "POST",
+        "/api/inbox",
+        json={"title": "Unsafe", "source_type": "external action destination"},
+    )
+    assert unsupported.status_code == 400
+    assert "Unsupported Universal Inbox capture source" in unsupported.text
+
+
 def test_concurrent_idempotency_conflict_selects_capture_winner(life_env):
     db = life_env.Session()
     try:

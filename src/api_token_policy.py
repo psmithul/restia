@@ -57,12 +57,17 @@ MEMORY_READ = frozenset({"memory:read", "memory:write"})
 MEMORY_WRITE = frozenset({"memory:write"})
 LIFE_READ = frozenset({"life:read", "life:write"})
 LIFE_WRITE = frozenset({"life:write"})
+PROFILE_READ = frozenset({"profile:read", "profile:write"})
+PROFILE_WRITE = frozenset({"profile:write"})
 CALENDAR_READ = frozenset({"calendar:read", "calendar:write"})
 CALENDAR_WRITE = frozenset({"calendar:write"})
 DOCUMENT_READ = frozenset({"documents:read", "documents:write"})
 DOCUMENT_WRITE = frozenset({"documents:write"})
 COOKBOOK_READ = frozenset({"cookbook:read", "cookbook:launch"})
 COOKBOOK_LAUNCH = frozenset({"cookbook:launch"})
+CONTACTS_READ = frozenset({"contacts:read", "contacts:write"})
+CONTACTS_WRITE = frozenset({"contacts:write"})
+CONTACTS_CONFIGURE = frozenset({"contacts:configure"})
 
 
 _API_TOKEN_ROUTE_RULES: tuple[_RouteRule, ...] = (
@@ -95,6 +100,19 @@ _API_TOKEN_ROUTE_RULES: tuple[_RouteRule, ...] = (
     _rule("POST", r"/api/inject_context/[^/]+", CHAT),
     _rule("GET", r"/api/search", CHAT),
 
+    # Owner-scoped contacts share the same Account UUID across browser, API,
+    # CLI and agent tools. Connector credentials have a separate capability.
+    _rule("GET", r"/api/contacts/(?:list|search|export)", CONTACTS_READ),
+    _rule("GET", r"/api/contacts/config", CONTACTS_CONFIGURE),
+    _rule("POST", r"/api/contacts/refresh", CONTACTS_READ),
+    _rule(
+        "POST", r"/api/contacts/[^/]+/resolve-conflict", CONTACTS_WRITE,
+    ),
+    _rule("POST", r"/api/contacts/(?:add|import)", CONTACTS_WRITE),
+    _rule("PUT", r"/api/contacts/config", CONTACTS_CONFIGURE),
+    _rule("PUT", r"/api/contacts/[^/]+", CONTACTS_WRITE),
+    _rule("DELETE", r"/api/contacts/(?:clear|[^/]+)", CONTACTS_WRITE),
+
     # V3 universal inbox.  Its transaction barrier also checks these scopes.
     _rule("GET", r"/api/inbox", INBOX_READ),
     _rule("POST", r"/api/inbox", TODO_WRITE),
@@ -105,8 +123,22 @@ _API_TOKEN_ROUTE_RULES: tuple[_RouteRule, ...] = (
     # Principal-scoped Life OS graph, focus, and action-policy APIs.  The
     # request transaction inside each handler narrows ownership and versions;
     # this boundary prevents a chat/todo token from reaching the life graph.
+    # Evaluation accepts structured event input but is rollback-only and never
+    # prepares or executes an action, so it retains the read capability.
+    _rule(
+        "POST", r"/api/life/automations/[^/]+/evaluate", LIFE_READ,
+    ),
     _rule("GET", r"/api/life(?:/.*)?", LIFE_READ),
     _rule(("POST", "PUT", "PATCH", "DELETE"), r"/api/life(?:/.*)?", LIFE_WRITE),
+
+    # Profile settings/preferences use their own capability because integration
+    # credentials and private configuration are broader than Life graph reads.
+    _rule("GET", r"/api/profile/configuration(?:/.*)?", PROFILE_READ),
+    _rule(
+        ("POST", "PUT", "PATCH", "DELETE"),
+        r"/api/profile/configuration(?:/.*)?",
+        PROFILE_WRITE,
+    ),
 
     # Codex discovery/bundle routes intentionally expose no owner data.  Every
     # owner-data route below has an explicit method/path scope rule.

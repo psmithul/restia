@@ -549,12 +549,12 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "manage_calendar",
-            "description": "Manage calendar events: list events in a date range, create, update, delete. Each event can carry a tag/category (event_type) and importance level. Resolve relative dates like today/tomorrow against the 'Current date and time' system context, then pass ISO 8601 datetimes in the user's local wall time; for all-day events set all_day=true and pass YYYY-MM-DD. For event reminders/alarms, pass reminder_minutes; the tool creates the Restia note reminder, so do not also call manage_notes for the same reminder. Do not set rrule for single-occurrence requests such as 'next Wednesday only'; use rrule only when the user explicitly wants recurrence.",
+            "description": "Manage owner-scoped calendar events: list events in a date range, create, update, or prepare a cancellation for human approval. list_events returns each event's uid and version; update_event and cancel_event MUST pass both exact values so stale edits fail safely. cancel_event only creates a pending Level-5 proposal and never executes the cancellation or returns an approval token. delete_event remains manual-only and fail-closed. Resolve relative dates against the Current date and time context, then pass ISO 8601 datetimes in the user's local wall time; for all-day events set all_day=true and pass YYYY-MM-DD. Calendar reminders are a separate explicit manage_notes action and are not created by this tool. Do not set rrule for single-occurrence requests; use it only for explicit recurrence.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string",
-                               "enum": ["list_events", "create_event", "update_event", "delete_event", "list_calendars"],
+                               "enum": ["list_events", "create_event", "update_event", "cancel_event", "delete_event", "list_calendars"],
                                "description": "Action to perform"},
                     "summary": {"type": "string", "description": "Event title (for create/update)"},
                     "dtstart": {"type": "string", "description": "Start ISO datetime, or YYYY-MM-DD if all_day"},
@@ -562,15 +562,89 @@ FUNCTION_TOOL_SCHEMAS = [
                     "all_day": {"type": "boolean", "description": "Whether this is an all-day event"},
                     "description": {"type": "string", "description": "Event description / notes"},
                     "location": {"type": "string", "description": "Event location"},
-                    "uid": {"type": "string", "description": "Event UID (for update/delete)"},
+                    "uid": {"type": "string", "description": "Exact event UID returned by list_events (for update/cancel/delete)"},
+                    "version": {"type": "integer", "minimum": 1, "description": "Current event version returned by list_events/create_event. Required for update_event and cancel_event; pass it unchanged so concurrent edits fail safely."},
                     "calendar_href": {"type": "string", "description": "Specific calendar URL (optional; defaults to first calendar)"},
                     "calendar": {"type": "string", "description": "Filter list_events by calendar name or href"},
                     "start": {"type": "string", "description": "list_events range start (ISO datetime). Use this for month/week requests after resolving the date range; do not pass a loose query string. Prefer start; backend also accepts start_time, start_date, range_start, from, dtstart, since."},
                     "end": {"type": "string", "description": "list_events range end (ISO datetime). Use this for month/week requests after resolving the date range; defaults to +14 days only when no range is requested. Prefer end; backend also accepts end_time, end_date, range_end, to, dtend, until."},
                     "event_type": {"type": "string", "description": "Tag / category for the event. Common values: work, personal, health, travel, meal, social, admin, other. Aliases accepted: tag, category, type."},
                     "importance": {"type": "string", "enum": ["low", "normal", "high", "critical"], "description": "Priority level (defaults to 'normal')"},
-                    "reminder_minutes": {"type": "integer", "description": "For create_event: create an Restia reminder this many minutes before the event, e.g. 5 for 'reminder 5 min before'."},
                     "rrule": {"type": "string", "description": "Recurrence rule in iCalendar RRULE format, e.g. 'FREQ=WEEKLY;BYDAY=MO' for weekly on Monday. Use with create_event or update_event. For update_event, pass an explicit empty string to remove recurrence and make the event single-occurrence."}
+                },
+                "required": ["action"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_life",
+            "description": "Read the authenticated user's canonical Life OS graph and typed domains. Use communications for the owner-scoped, read-only unified communications view; it can summarize and suggest a draft but never acknowledges, sends, or changes a connector. Use proactive_report for deterministic what-next prioritization, knowledge_evidence for citation-backed personal knowledge with explicit epistemic labels, and automation_definitions/automation_get/automation_history for automation inspection. automation_evaluate only classifies a supplied event and returns typed plans; it never prepares, executes, approves, or sends. Generic graph reads intentionally exclude typed knowledge so staleness, contradiction, gap, and inference safeguards cannot be bypassed. This tool never mutates or executes an action.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["summary", "list", "search", "get", "traverse", "task_quality", "decisions_due", "health_trends", "calendar_time", "communications", "finance_summary", "finance_cash_flow", "finance_subscriptions", "finance_due", "finance_anomalies", "finance_net_worth", "finance_forecast", "finance_affordability", "habit_weekly", "habits_missed", "habit_adjustments", "relationship_profiles", "relationship_reminders", "journal_entries", "journal_search", "journal_get", "journal_review", "home_records", "home_search", "home_alerts", "travel_records", "travel_mode", "learning_career_records", "learning_career_search", "career_learning_plan", "work_business_workspaces", "work_business_records", "work_business_search", "work_business_summary", "proactive_report", "knowledge_records", "knowledge_search", "knowledge_stale", "knowledge_evidence", "knowledge_sources", "knowledge_source_search", "knowledge_markdown_manifest", "automation_definitions", "automation_get", "automation_history", "automation_evaluate"],
+                        "description": "Read-only query to perform"
+                    },
+                    "query": {"type": "string", "description": "Search text for action=search or communications"},
+                    "connectors": {"type": "array", "maxItems": 9, "items": {"type": "string", "enum": ["email", "telegram", "restia_message", "whatsapp", "slack", "sms", "call", "notification", "other"]}, "description": "Optional enabled-source filter for communications"},
+                    "unread_only": {"type": "boolean", "description": "For communications, return only threads with source-backed unread items"},
+                    "important_only": {"type": "boolean", "description": "For communications, return only high-importance threads"},
+                    "entity_id": {"type": "string", "description": "Exact Life entity id for get/traverse"},
+                    "automation_id": {"type": "string", "description": "Exact owner-scoped automation id for automation_get, automation_history, or automation_evaluate"},
+                    "enabled": {"type": "boolean", "description": "Optional enabled-state filter for automation_definitions"},
+                    "event": {"type": "object", "description": "Structured trigger event for automation_evaluate. Classification is read-only and never prepares, executes, approves, or sends."},
+                    "entity_type": {"type": "string", "description": "Optional list/search type filter, such as task, project, decision, health_record, or finance_record"},
+                    "status": {"type": "string", "description": "Optional list/search status filter"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Maximum returned records"},
+                    "depth": {"type": "integer", "minimum": 1, "maximum": 8, "description": "Bounded graph traversal depth; use 8 only for a full cross-domain evidence chain"},
+                    "due_before": {"type": "string", "description": "ISO date/datetime cutoff for decisions_due or finance_due"},
+                    "stale_after_days": {"type": "integer", "minimum": 1, "maximum": 3650, "description": "Assumption staleness window for decisions_due"},
+                    "record_type": {"type": "string", "description": "Typed health record type for health_trends"},
+                    "metric": {"type": "string", "description": "Health metric name for health_trends"},
+                    "group_by": {"type": "string", "enum": ["day", "week", "month"], "description": "Health-trend or finance cash-flow grouping"},
+                    "unit": {"type": "string", "description": "Optional exact health metric unit"},
+                    "from_at": {"type": "string", "description": "Optional ISO health/finance range start"},
+                    "to_at": {"type": "string", "description": "Optional ISO health/finance range end"},
+                    "scope": {"type": "string", "enum": ["personal", "business"], "description": "Optional private finance scope"},
+                    "currency": {"type": "string", "description": "Optional ISO-style currency filter for finance reads"},
+                    "amount": {"type": "string", "description": "Positive hypothetical amount required by finance_affordability; this is analyzed only and never executed"},
+                    "include_overdue": {"type": "boolean", "description": "For finance_due, include already-overdue records (default true)"},
+                    "week_start": {"type": "string", "description": "Required Monday YYYY-MM-DD for habit reports or career_learning_plan"},
+                    "habit_id": {"type": "string", "description": "Optional exact habit id for a habit report"},
+                    "as_of": {"type": "string", "description": "Offset-aware ISO datetime required by proactive_report, habits_missed, travel_mode, knowledge_stale, and knowledge_evidence; optional for knowledge listing/search staleness labels"},
+                    "lookback_days": {"type": "integer", "minimum": 1, "maximum": 366, "description": "Bounded missed-routine lookback (default 14)"},
+                    "subject_kind": {"type": "string", "enum": ["person", "organization"], "description": "Optional relationship profile kind"},
+                    "from_date": {"type": "string", "description": "Optional YYYY-MM-DD lower journal-entry bound"},
+                    "to_date": {"type": "string", "description": "Optional YYYY-MM-DD upper journal-entry bound"},
+                    "period": {"type": "string", "enum": ["weekly", "monthly", "annual"], "description": "Required review period for journal_review"},
+                    "anchor_date": {"type": "string", "description": "Required YYYY-MM-DD date inside the requested journal review period"},
+                    "horizon_days": {"type": "integer", "minimum": 1, "maximum": 365, "description": "Bounded Home/proactive horizon"},
+                    "include_archived": {"type": "boolean", "description": "Include archived Home records when listing"},
+                    "record_kind": {"type": "string", "description": "Optional typed Travel record kind for travel_records"},
+                    "trip_id": {"type": "string", "description": "Optional owner-scoped root trip id for travel_records"},
+                    "offline_only": {"type": "boolean", "description": "For travel_mode, include only explicitly offline-available trips and facts (default true)"},
+                    "trip_limit": {"type": "integer", "minimum": 1, "maximum": 3, "description": "Maximum current and upcoming trips in travel_mode"},
+                    "fact_limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Maximum bounded facts in travel_mode"},
+                    "domain": {"type": "string", "enum": ["learning", "career"], "description": "Optional Learning/Career domain filter"},
+                    "career_target_id": {"type": "string", "description": "Owner-scoped role, application, company, or university id for career_learning_plan"},
+                    "workspace_id": {"type": "string", "description": "Required owner-scoped Work/Business workspace id for record, search, and summary reads"},
+                    "workspace_kind": {"type": "string", "enum": ["work", "business"], "description": "Optional isolated workspace-kind filter"},
+                    "memory_kind": {"type": "string", "enum": ["semantic", "episodic", "decision", "preference", "procedural", "relationship", "project", "task", "source"], "description": "Optional personal-knowledge memory-kind filter"},
+                    "epistemic_status": {"type": "string", "enum": ["confirmed_fact", "user_statement", "assumption", "inference", "stale", "gap"], "description": "Optional stored personal-knowledge epistemic status"},
+                    "source_kind": {"type": "string", "enum": ["note", "document", "research", "bookmark", "web_page", "meeting", "writing", "academic_record", "business_record", "idea", "lesson", "markdown"], "description": "Optional personal-knowledge source-kind filter"},
+                    "stale_project_days": {"type": "integer", "minimum": 1, "maximum": 3650, "description": "Explicit proactive project-staleness threshold"},
+                    "stale_decision_days": {"type": "integer", "minimum": 1, "maximum": 3650, "description": "Explicit proactive decision-assumption staleness threshold"},
+                    "daily_capacity_minutes": {"type": "integer", "minimum": 30, "maximum": 1440, "description": "Deterministic daily capacity for proactive overload checks"},
+                    "minimum_slot_minutes": {"type": "integer", "minimum": 15, "maximum": 480, "description": "Minimum free-slot duration for calendar_time"},
+                    "day_start_hour": {"type": "integer", "minimum": 0, "maximum": 22, "description": "Calendar-time search day start hour in the supplied offset"},
+                    "day_end_hour": {"type": "integer", "minimum": 1, "maximum": 24, "description": "Calendar-time search day end hour in the supplied offset"},
+                    "travel_buffer_minutes": {"type": "integer", "minimum": 0, "maximum": 240, "description": "Requested calendar transition buffer around travel"},
+                    "scan_limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Per-domain bounded proactive scan limit"},
+                    "explicit_interrupts": {"type": "array", "maxItems": 50, "items": {"type": "string"}, "description": "Signal kinds or ids the user explicitly requested as interruptions"}
                 },
                 "required": ["action"]
             }
@@ -1068,13 +1142,17 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "send_email",
-            "description": "Send a new email. Use resolve_contact first if you only have a name and need to find the email address. If multiple accounts exist, pass account from list_email_accounts.",
+            "description": "Prepare an exact new email for mandatory Level-5 human review. This tool never sends or opens SMTP/IMAP. Use resolve_contact first if you only have a name; pass account from list_email_accounts.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "to": {"type": "string", "description": "Recipient email address"},
                     "subject": {"type": "string", "description": "Email subject line"},
                     "body": {"type": "string", "description": "Email body text"},
+                    "cc": {"type": "string", "description": "Optional comma-separated CC addresses"},
+                    "bcc": {"type": "string", "description": "Optional comma-separated BCC addresses"},
+                    "attachments": {"type": "array", "items": {"type": "object"}, "description": "Optional exact attachment references for review"},
+                    "idempotency_key": {"type": "string", "description": "Optional stable request identifier"},
                     "account": {"type": "string", "description": "Optional account name/email/id from list_email_accounts, e.g. Gmail or user@example.com"},
                 },
                 "required": ["to", "subject", "body"]
@@ -1119,16 +1197,24 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "reply_to_email",
-            "description": "SEND a reply email immediately by UID. Do not use this when the user asks to write/draft/open/start a reply; use ui_control action=open_email_reply with body instead so the user can review. Only use when the user explicitly says to send now. Use the exact UID from the latest read_email/list_emails result; never invent UID 1. Automatically threads with In-Reply-To/References headers.",
+            "description": "Prepare an exact threaded reply for mandatory Level-5 human review. This tool never sends or fetches IMAP on the action path. Copy exact recipient, subject, Message-ID, UID, and references from read_email.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "uid": {"type": "string", "description": "Exact UID of the email to reply to from list_emails/read_email; never invent UID 1"},
                     "body": {"type": "string", "description": "Reply body text"},
+                    "to": {"type": "string", "description": "Exact original sender address from read_email"},
+                    "subject": {"type": "string", "description": "Exact original subject from read_email"},
+                    "in_reply_to": {"type": "string", "description": "Exact Message-ID from read_email"},
+                    "references": {"type": "array", "items": {"type": "string"}, "description": "Exact existing References chain"},
+                    "cc": {"type": "string", "description": "Exact reply-all CC addresses, if requested"},
+                    "bcc": {"type": "string", "description": "Optional BCC addresses"},
+                    "reply_all": {"type": "boolean", "description": "Include the reviewed CC list"},
+                    "idempotency_key": {"type": "string", "description": "Optional stable request identifier"},
                     "folder": {"type": "string", "description": "IMAP folder (default: INBOX)"},
                     "account": {"type": "string", "description": "Optional account name/email/id from list_email_accounts, especially when the UID came from a non-default mailbox"},
                 },
-                "required": ["uid", "body"]
+                "required": ["uid", "body", "to", "subject", "in_reply_to"]
             }
         }
     },

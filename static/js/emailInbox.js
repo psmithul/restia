@@ -10,6 +10,9 @@ import * as Modals from './modalManager.js';
 import { applyEdgeDock } from './modalSnap.js';
 import { buildReplyAllCc, extractEmail } from './emailLibrary/replyRecipients.js';
 import { emailApiUrl, emailAccountQuery } from './emailShared.js';
+import {
+  clearAnsweredEmailTags, normalizeEmailTagsForRender,
+} from './emailTagTaxonomy.js';
 import { bindMenuDismiss, dismissOrRemove } from './escMenuStack.js';
 
 const API_BASE = window.location.origin;
@@ -28,7 +31,6 @@ const _starFilledIcon = '<svg width="14" height="14" viewBox="0 0 24 24" fill="c
 const _bellIcon = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>';
 const _icon = (svg) => `<span class="dropdown-icon">${svg}</span>`;
 const _replySeparator = '---------- Previous message ----------';
-const _DONE_RESPONSE_TAGS = new Set(['urgent', 'reply-soon', 'action-needed']);
 
 function _splitEmailAddresses(raw) {
   return (typeof raw === 'string' ? raw : '')
@@ -89,14 +91,11 @@ function _emailTagGroupHtml(tags, em) {
 }
 
 function _visibleEmailTagsForRender(em) {
-  const tags = Array.isArray(em?.tags) ? em.tags : [];
-  if (!em?.is_answered) return tags;
-  return tags.filter(t => !_DONE_RESPONSE_TAGS.has(String(t || '').trim().toLowerCase().replace(/_/g, '-')));
+  return normalizeEmailTagsForRender(em?.tags, { answered: Boolean(em?.is_answered) });
 }
 
 function _clearDoneResponseTagsLocal(em) {
-  if (!em || !Array.isArray(em.tags)) return;
-  em.tags = em.tags.filter(t => !_DONE_RESPONSE_TAGS.has(String(t || '').trim().toLowerCase().replace(/_/g, '-')));
+  clearAnsweredEmailTags(em);
 }
 
 function _cleanAiReplyText(text) {
@@ -723,7 +722,9 @@ function _createEmailItem(em) {
     unflagBtn.addEventListener('click', async (e) => {
       e.stopPropagation();
       try {
-        await fetch(`${API_BASE}/api/email/${em.uid}/unflag-spam`, {
+        await fetch(emailApiUrl(`/api/email/${em.uid}/unflag-spam`, {
+          folder: _currentFolder,
+        }), {
           method: 'POST', credentials: 'same-origin',
         });
         em.is_spam_verdict = false;

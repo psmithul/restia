@@ -22,10 +22,12 @@ from src.focus_mode import (
     add_focus_progress,
     complete_focus_session,
     get_current_focus_session,
+    get_focus_context,
     get_owned_focus_entities,
     list_focus_history,
     pause_focus_session,
     resume_focus_session,
+    resolve_planning_focus_entity,
     serialize_focus_session,
     start_focus_session,
 )
@@ -33,8 +35,11 @@ from src.identity import request_account_transaction
 
 
 class FocusStart(BaseModel):
-    entity_id: str = Field(min_length=1, max_length=36)
-    entity_version: int = Field(ge=1)
+    entity_id: str | None = Field(default=None, min_length=1, max_length=36)
+    entity_version: int | None = Field(default=None, ge=1)
+    domain_ref_type: str | None = Field(default=None, min_length=1, max_length=48)
+    domain_ref_id: str | None = Field(default=None, min_length=1, max_length=255)
+    domain_ref_version: int | None = Field(default=None, ge=1)
     definition_of_done: str = Field(
         min_length=1, max_length=MAX_DEFINITION_OF_DONE_LENGTH
     )
@@ -94,6 +99,16 @@ def _serialize_follow_up(entity: LifeEntity) -> dict[str, Any]:
     }
 
 
+def _serialize_live_session(db, owner_id: str, session) -> dict[str, Any]:
+    entity = get_owned_focus_entities(
+        db, owner_id=owner_id, entity_ids=(session.entity_id,)
+    ).get(session.entity_id)
+    context = get_focus_context(
+        db, owner_id=owner_id, entity_id=session.entity_id
+    ) if entity is not None else []
+    return serialize_focus_session(session, entity=entity, context=context)
+
+
 def setup_focus_routes(*, session_factory=SessionLocal) -> APIRouter:
     router = APIRouter(prefix="/api/life/focus", tags=["life-focus"])
 
@@ -109,12 +124,7 @@ def setup_focus_routes(*, session_factory=SessionLocal) -> APIRouter:
                 session = get_current_focus_session(db, owner_id=account.id)
                 if session is None:
                     return {"session": None}
-                entity = get_owned_focus_entities(
-                    db, owner_id=account.id, entity_ids=(session.entity_id,)
-                ).get(session.entity_id)
-                return {
-                    "session": serialize_focus_session(session, entity=entity)
-                }
+                return {"session": _serialize_live_session(db, account.id, session)}
         except FocusError as exc:
             _raise_domain_error(exc)
         finally:
@@ -162,23 +172,50 @@ def setup_focus_routes(*, session_factory=SessionLocal) -> APIRouter:
             with request_account_transaction(
                 db, request, required_scopes=("life:write",), write=True
             ) as account:
+                direct_target = bool(
+                    body.entity_id is not None or body.entity_version is not None
+                )
+                domain_target = bool(
+                    body.domain_ref_type is not None
+                    or body.domain_ref_id is not None
+                    or body.domain_ref_version is not None
+                )
+                if direct_target == domain_target:
+                    raise FocusError(
+                        "Supply exactly one Life entity or canonical domain target"
+                    )
+                if direct_target:
+                    if body.entity_id is None or body.entity_version is None:
+                        raise FocusError(
+                            "entity_id and entity_version are required"
+                        )
+                    entity_id = body.entity_id
+                    entity_version = body.entity_version
+                else:
+                    if body.domain_ref_type != "planning_item":
+                        raise FocusError(
+                            "Only planning_item canonical Focus targets are supported"
+                        )
+                    if body.domain_ref_id is None or body.domain_ref_version is None:
+                        raise FocusError(
+                            "domain_ref_id and domain_ref_version are required"
+                        )
+                    entity = resolve_planning_focus_entity(
+                        db,
+                        account=account,
+                        planning_item_id=body.domain_ref_id,
+                        expected_planning_version=body.domain_ref_version,
+                    )
+                    entity_id = entity.id
+                    entity_version = int(entity.version or 1)
                 session = start_focus_session(
                     db,
                     account=account,
-                    entity_id=body.entity_id,
-                    expected_entity_version=body.entity_version,
+                    entity_id=entity_id,
+                    expected_entity_version=entity_version,
                     definition_of_done=body.definition_of_done,
                 )
-                return {
-                    "session": serialize_focus_session(
-                        session,
-                        entity=get_owned_focus_entities(
-                            db,
-                            owner_id=account.id,
-                            entity_ids=(session.entity_id,),
-                        ).get(session.entity_id),
-                    )
-                }
+                return {"session": _serialize_live_session(db, account.id, session)}
         except FocusError as exc:
             _raise_domain_error(exc)
         finally:
@@ -201,7 +238,9 @@ def setup_focus_routes(*, session_factory=SessionLocal) -> APIRouter:
                     session_id=session_id,
                     expected_version=body.version,
                 )
-                return {"session": serialize_focus_session(session)}
+                return {
+                    "session": _serialize_live_session(db, account.id, session)
+                }
         except FocusError as exc:
             _raise_domain_error(exc)
         finally:
@@ -243,7 +282,7 @@ def setup_focus_routes(*, session_factory=SessionLocal) -> APIRouter:
                     metadata=body.metadata,
                 )
                 return {
-                    "session": serialize_focus_session(session),
+                    "session": _serialize_live_session(db, account.id, session),
                     "entry": entry,
                 }
         except FocusError as exc:
@@ -290,7 +329,7 @@ def setup_focus_routes(*, session_factory=SessionLocal) -> APIRouter:
                     follow_ups=[_model_dict(item) for item in body.follow_ups],
                 )
                 return {
-                    "session": serialize_focus_session(session),
+                    "session": _serialize_live_session(db, account.id, session),
                     "follow_ups": [_serialize_follow_up(task) for task in tasks],
                 }
         except FocusError as exc:

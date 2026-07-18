@@ -90,3 +90,34 @@ def test_email_filter_ui_exposes_every_api_tag_from_one_frontend_taxonomy():
     frontend_tags = json.loads(proc.stdout)
     assert len(frontend_tags) == len(set(frontend_tags))
     assert set(frontend_tags) == set(EMAIL_VISIBLE_TAGS) | {"spam"}
+
+
+@pytest.mark.skipif(not _HAS_NODE, reason="node binary not on PATH")
+def test_final_email_render_boundary_deduplicates_and_clears_answered_tags():
+    script = f"""
+      const mod = await import('{_TAG_MODULE.as_uri()}');
+      const raw = ['RECEIPT', 'receipt', 'promo', 'marketing', 'urgent',
+                   'reply_soon', 'unknown'];
+      const email = {{ tags: [...raw] }};
+      console.log(JSON.stringify({{
+        visible: mod.normalizeEmailTagsForRender(raw),
+        answered: mod.normalizeEmailTagsForRender(raw, {{ answered: true }}),
+        cleared: mod.clearAnsweredEmailTags(email),
+        stored: email.tags,
+      }}));
+    """
+    proc = subprocess.run(
+        ["node", "--input-type=module"],
+        input=script,
+        capture_output=True,
+        text=True,
+        cwd=str(_REPO),
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == {
+        "visible": ["receipt", "marketing", "urgent", "reply-soon"],
+        "answered": ["receipt", "marketing"],
+        "cleared": ["receipt", "marketing"],
+        "stored": ["receipt", "marketing"],
+    }

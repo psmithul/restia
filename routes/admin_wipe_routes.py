@@ -143,7 +143,17 @@ def setup_admin_wipe_routes(session_manager):
                 db.query(ProjectRemoteGrant).delete()
                 db.query(Project).delete()
                 db.commit()
-                _rmtree_quiet(PROJECT_FILES_DIR)
+                from src.blob_store import resolve_blob_store_config
+
+                blob_config = resolve_blob_store_config(create=False)
+                project_root = (
+                    str(blob_config.project_root)
+                    if blob_config.shared
+                    or os.getenv("RESTIA_BLOB_ROOT")
+                    or os.getenv("ODYSSEUS_BLOB_ROOT")
+                    else PROJECT_FILES_DIR
+                )
+                _rmtree_quiet(project_root)
                 return {"status": "deleted", "kind": kind, "count": count}
 
             if kind == "skills":

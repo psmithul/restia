@@ -27,6 +27,14 @@ from src.life_core import append_action_audit
 
 
 AUTONOMY_LEVELS = frozenset(range(1, 7))
+AUTONOMY_LEVEL_LABELS: Mapping[int, str] = MappingProxyType({
+    1: "observe",
+    2: "suggest",
+    3: "prepare",
+    4: "execute_reversible",
+    5: "execute_external",
+    6: "high_risk",
+})
 ACTION_STATES = frozenset({
     "prepared",
     "approved",
@@ -51,7 +59,10 @@ SAFE_DOMAIN_DEFAULTS: dict[str, int] = {
     "search": 3,
     "tasks": 4,
     "planning": 4,
-    "calendar": 4,
+    # Calendar create/update/reschedule remain reversible Level 4 actions.
+    # Cancellation is an external Level 5 action and therefore always needs
+    # fresh human approval even though the domain cap permits preparing it.
+    "calendar": 5,
     "notes": 4,
     "projects": 4,
     "files": 4,
@@ -60,6 +71,10 @@ SAFE_DOMAIN_DEFAULTS: dict[str, int] = {
     "communications": 5,
     "email": 5,
     "messaging": 5,
+    # The connector boundary remains read-only.  Raising this cap alone still
+    # cannot create a transport executor; it merely makes an explicitly
+    # reviewed future proposal representable behind human confirmation.
+    "whatsapp": 1,
     "bookings": 5,
     "travel": 5,
     "smart_home": 5,
@@ -268,6 +283,8 @@ REGISTERED_ACTION_RISKS: Mapping[str, RegisteredActionRisk] = MappingProxyType(
         "observe_record": RegisteredActionRisk(1, executable=False),
         "suggest_plan": RegisteredActionRisk(2, executable=False),
         "prepare_summary": RegisteredActionRisk(3, executable=False),
+        "prepare_email_draft": RegisteredActionRisk(3, executable=False),
+        "prepare_message_draft": RegisteredActionRisk(3, executable=False),
         # Known reversible local mutations. Both fields must match; an action
         # name alone is never sufficient to claim the Level-4 path.
         "create_event": RegisteredActionRisk(
@@ -282,6 +299,12 @@ REGISTERED_ACTION_RISKS: Mapping[str, RegisteredActionRisk] = MappingProxyType(
         ),
         "update_event": RegisteredActionRisk(
             4,
+            allowed_domains=frozenset({"calendar"}),
+            allowed_target_types=frozenset({"event"}),
+        ),
+        "cancel_event": RegisteredActionRisk(
+            5,
+            external=True,
             allowed_domains=frozenset({"calendar"}),
             allowed_target_types=frozenset({"event"}),
         ),
@@ -303,11 +326,53 @@ REGISTERED_ACTION_RISKS: Mapping[str, RegisteredActionRisk] = MappingProxyType(
         "sync_record": RegisteredActionRisk(5, external=True),
         "submit": RegisteredActionRisk(5, external=True),
         "transmit_email": RegisteredActionRisk(5, external=True),
+        # Ambient smart-home changes are external actions.  The action policy
+        # can prepare them, but execution still requires both fresh approval
+        # and a reviewed server connector executor.
+        "smart_home_turn_on": RegisteredActionRisk(
+            5,
+            external=True,
+            allowed_domains=frozenset({"smart_home"}),
+            allowed_target_types=frozenset({"device"}),
+        ),
+        "smart_home_turn_off": RegisteredActionRisk(
+            5,
+            external=True,
+            allowed_domains=frozenset({"smart_home"}),
+            allowed_target_types=frozenset({"device"}),
+        ),
+        "smart_home_set_level": RegisteredActionRisk(
+            5,
+            external=True,
+            allowed_domains=frozenset({"smart_home"}),
+            allowed_target_types=frozenset({"device"}),
+        ),
+        "smart_home_set_temperature": RegisteredActionRisk(
+            5,
+            external=True,
+            allowed_domains=frozenset({"smart_home"}),
+            allowed_target_types=frozenset({"device"}),
+        ),
+        "smart_home_lock": RegisteredActionRisk(
+            5,
+            external=True,
+            allowed_domains=frozenset({"smart_home"}),
+            allowed_target_types=frozenset({"device"}),
+        ),
         # High-risk actions retain Level 6 even if their domain is mislabeled.
+        "change_medication": RegisteredActionRisk(6),
         "delete": RegisteredActionRisk(6),
+        "delete_file": RegisteredActionRisk(6),
         "destroy": RegisteredActionRisk(6),
         "grant_access": RegisteredActionRisk(6),
         "revoke_access": RegisteredActionRisk(6),
+        "sign_contract": RegisteredActionRisk(6, external=True),
+        "smart_home_unlock": RegisteredActionRisk(
+            6,
+            external=True,
+            allowed_domains=frozenset({"smart_home"}),
+            allowed_target_types=frozenset({"device"}),
+        ),
         "transfer": RegisteredActionRisk(6, external=True),
         "transfer_money": RegisteredActionRisk(6, external=True),
     }
@@ -545,6 +610,7 @@ def serialize_action_policy(policy: EffectiveActionPolicy | ActionPolicy) -> dic
         "id": policy.id,
         "domain": policy.domain,
         "max_autonomy": policy.max_autonomy,
+        "max_autonomy_label": AUTONOMY_LEVEL_LABELS[policy.max_autonomy],
         "external_requires_confirmation": policy.external_requires_confirmation,
         "enabled": policy.enabled,
         "rules": dict(policy.rules),
@@ -710,6 +776,7 @@ def _proposal_state(proposal: ActionProposal) -> dict[str, Any]:
         "domain": proposal.domain,
         "action": proposal.action,
         "autonomy_level": int(proposal.autonomy_level),
+        "autonomy_label": AUTONOMY_LEVEL_LABELS[int(proposal.autonomy_level)],
         "state": proposal.state,
         "external": bool(proposal.external),
         "requires_confirmation": bool(proposal.requires_confirmation),
@@ -727,6 +794,7 @@ def serialize_action_proposal(proposal: ActionProposal) -> dict[str, Any]:
         "domain": proposal.domain,
         "action": proposal.action,
         "autonomy_level": int(proposal.autonomy_level),
+        "autonomy_label": AUTONOMY_LEVEL_LABELS[int(proposal.autonomy_level)],
         "state": proposal.state,
         "target_type": proposal.target_type,
         "target_id": proposal.target_id,

@@ -22,6 +22,8 @@ still passes through :func:`decrypt` unchanged until a migration rewrites it.
 
 import base64
 import binascii
+import hashlib
+import hmac
 import os
 import logging
 import stat
@@ -38,6 +40,7 @@ _KEY_PATH = Path(APP_KEY_FILE)
 _PREFIX = "enc:"
 _CONTENT_PREFIX = "enc:c1:"
 _fernet: Fernet | None = None
+_digest_key: bytes | None = None
 
 
 def _harden_key_permissions(path: Path) -> None:
@@ -149,10 +152,26 @@ def _load_or_create_key() -> bytes:
 
 
 def _get_fernet() -> Fernet:
-    global _fernet
+    global _fernet, _digest_key
     if _fernet is None:
-        _fernet = Fernet(_load_or_create_key())
+        key = _load_or_create_key()
+        _fernet = Fernet(key)
+        _digest_key = key
     return _fernet
+
+
+def private_digest(namespace: str, value: object) -> str:
+    """Return a deterministic keyed digest without exposing the storage key."""
+
+    scope = str(namespace or "").strip()
+    if not scope:
+        raise ValueError("Digest namespace is required")
+    global _digest_key
+    _get_fernet()
+    if _digest_key is None:  # pragma: no cover - defensive initialization
+        raise RuntimeError("Private digest key is unavailable")
+    message = scope.encode("utf-8") + b"\0" + str(value or "").encode("utf-8")
+    return hmac.new(_digest_key, message, hashlib.sha256).hexdigest()
 
 
 def _envelope_token(value: str) -> str | None:

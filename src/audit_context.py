@@ -13,6 +13,7 @@ _INTERFACES = frozenset({
     "web",
     "api",
     "cli",
+    "email",
     "telegram",
     "voice",
     "automation",

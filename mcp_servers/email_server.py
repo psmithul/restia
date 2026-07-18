@@ -1175,173 +1175,104 @@ def _smtp_connect(account=None, cfg=None):
 
 
 def _read_agent_email_confirm_setting() -> bool:
-    """True if the user wants agent send_email/reply_to_email calls to be
-    queued for manual approval instead of SMTPed immediately. Defaults to
-    True so a fresh install is safe — agents have been observed inventing
-    signatures and sending to real recipients without the user's review."""
-    try:
-        from src.settings import get_setting
-        return bool(get_setting("agent_email_confirm", True))
-    except Exception:
-        return True
+    """Compatibility shim: model-originated email is always review-first."""
+
+    return True
 
 
 def _stash_agent_draft(*, to, subject, body, in_reply_to=None, references=None,
-                      cc=None, bcc=None, account=None) -> dict:
-    """Insert the composed email into scheduled_emails with status
-    'agent_draft' and a far-future send_at so the scheduled-send poller
-    never picks it up. Returns the pending payload the model surfaces to
-    the user (and that the chat UI can render as an approval card)."""
+                      cc=None, bcc=None, account=None, attachments=None,
+                      kind="new", source_uid=None, source_folder=None,
+                      idempotency_key=None) -> dict:
+    """Write one exact Level-5 proposal to canonical SQL without network I/O."""
+
+    owner = _current_owner()
+    if not owner:
+        return {
+            "success": False,
+            "error": "Authenticated owner is required to prepare outbound email",
+        }
+    selected = _resolve_account(account)
+    if selected is None or not selected.get("id"):
+        if account:
+            try:
+                _load_config(account)
+            except ValueError as exc:
+                return {"success": False, "error": str(exc)}
+        return {
+            "success": False,
+            "error": "A configured owner-scoped email account is required",
+        }
+
+    from core.database import SessionLocal
+    from src.email_outbound import EmailOutboundError, prepare_agent_email_action
+
+    db = SessionLocal()
     try:
-        from src.constants import SCHEDULED_EMAILS_DB
+        prepared = prepare_agent_email_action(
+            db,
+            owner_username=owner,
+            email_account_id=selected["id"],
+            to=to,
+            subject=subject,
+            body=body,
+            cc=cc,
+            bcc=bcc,
+            attachments=attachments,
+            kind=kind,
+            in_reply_to=in_reply_to,
+            references=references,
+            source_uid=source_uid,
+            source_folder=source_folder,
+            source={"transport": "mcp"},
+            idempotency_key=idempotency_key,
+        )
+        db.commit()
+    except EmailOutboundError as exc:
+        db.rollback()
+        return {"success": False, "error": str(exc)}
     except Exception:
-        return {"success": False, "error": "Pending-email storage unavailable"}
-    pending_id = uuid.uuid4().hex[:16]
-    far_future = "9999-12-31T00:00:00"
-    now = datetime.utcnow().isoformat()
-    try:
-        conn = sqlite3.connect(SCHEDULED_EMAILS_DB)
-        # Touch the schema in case the email-routes init hasn't run yet
-        # (MCP server can boot independently).
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS scheduled_emails (
-                id TEXT PRIMARY KEY,
-                to_addr TEXT NOT NULL,
-                cc TEXT,
-                bcc TEXT,
-                subject TEXT,
-                body TEXT NOT NULL,
-                in_reply_to TEXT,
-                references_hdr TEXT,
-                attachments TEXT,
-                send_at TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                error TEXT,
-                owner TEXT DEFAULT '',
-                account_id TEXT,
-                odysseus_kind TEXT
-            )
-        """)
-        conn.execute("""
-            INSERT INTO scheduled_emails
-            (id, to_addr, cc, bcc, subject, body, in_reply_to, references_hdr,
-             attachments, send_at, created_at, status, account_id, odysseus_kind, owner)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'agent_draft', ?, ?, ?)
-        """, (
-            pending_id,
-            to if isinstance(to, str) else ", ".join(to),
-            cc if isinstance(cc, str) else (", ".join(cc) if cc else None),
-            bcc if isinstance(bcc, str) else (", ".join(bcc) if bcc else None),
-            subject or "",
-            body or "",
-            in_reply_to or None,
-            references if isinstance(references, str) else (" ".join(references) if references else None),
-            "[]",
-            far_future,
-            now,
-            account or None,
-            "agent_draft",
-            _current_owner(),
-        ))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        return {"success": False, "error": f"Failed to stash draft: {e}"}
+        db.rollback()
+        return {
+            "success": False,
+            "error": "Outbound email could not be prepared safely",
+        }
+    finally:
+        db.close()
     return {
         "success": True,
         "pending": True,
-        "pending_id": pending_id,
-        "to": to if isinstance(to, str) else ", ".join(to),
-        "subject": subject or "",
-        "body": body or "",
+        "pending_id": prepared.proposal.id,
+        "draft_id": prepared.draft.id,
+        "action_state": prepared.proposal.state,
+        "requires_confirmation": True,
         "message": (
-            "✋ Draft staged for your approval — nothing has been sent yet.\n"
-            "Review the To/Subject/Body above. Reply 'send' to deliver, or "
-            "'cancel' to discard."
+            "Draft staged for explicit review in Restia. Nothing has been "
+            "sent or queued for delivery."
         ),
     }
 
 
-def _send_email(to, subject, body, in_reply_to=None, references=None, cc=None, bcc=None, account=None):
-    """Send an email via SMTP. Returns dict with status.
+def _send_email(to, subject, body, in_reply_to=None, references=None, cc=None,
+                bcc=None, account=None, attachments=None, kind="new",
+                source_uid=None, source_folder=None, idempotency_key=None):
+    """Prepare an approval-backed outbound action; never send from MCP."""
 
-    When the `agent_email_confirm` setting is on (the default), the email
-    is NOT SMTPed — instead it lands in scheduled_emails as an
-    `agent_draft` row and the user reviews + approves it from the chat
-    UI. This closes the auto-send hole that let earlier models invent
-    signatures and ship them to real recipients without confirmation."""
-    if _read_agent_email_confirm_setting():
-        # Even confirmation-first sends must resolve the selected account now.
-        # Otherwise a caller could stage a pending draft against another
-        # owner's account selector before browser approval handles it.
-        cfg = _load_config(account)
-        return _stash_agent_draft(
-            to=to, subject=subject, body=body,
-            in_reply_to=in_reply_to, references=references,
-            cc=cc, bcc=bcc, account=cfg.get("account_id") or account,
-        )
-    send_account, cfg = _resolve_send_config(account)
-    msg = EmailMessage()
-    msg["From"] = _clean_header_value(cfg["from_address"])
-    msg["To"] = _clean_header_value(to if isinstance(to, str) else ", ".join(to))
-    msg["Subject"] = _clean_header_value(subject)
-    if cc:
-        msg["Cc"] = _clean_header_value(cc if isinstance(cc, str) else ", ".join(cc))
-    if in_reply_to:
-        msg["In-Reply-To"] = _clean_header_value(in_reply_to)
-    if references:
-        msg["References"] = _clean_header_value(references if isinstance(references, str) else " ".join(references))
-    if "Date" not in msg:
-        msg["Date"] = email.utils.formatdate(localtime=True)
-    if "Message-ID" not in msg:
-        msg["Message-ID"] = email.utils.make_msgid()
-    msg.set_content(body)
-
-    recipients = []
-    if isinstance(to, str):
-        recipients.extend([a.strip() for a in to.split(",") if a.strip()])
-    else:
-        recipients.extend(to)
-    if cc:
-        recipients.extend([a.strip() for a in cc.split(",")] if isinstance(cc, str) else cc)
-    if bcc:
-        recipients.extend([a.strip() for a in bcc.split(",")] if isinstance(bcc, str) else bcc)
-
-    conn = _smtp_connect(send_account, cfg=cfg)
-    try:
-        conn.send_message(msg, from_addr=cfg["from_address"], to_addrs=recipients)
-    finally:
-        conn.quit()
-
-    sent_folder = None
-    sent_uid = None
-    try:
-        imap = _imap_connect(send_account)
-        try:
-            sent_folder = _detect_sent_folder(imap)
-            append_st, append_data = imap.append(_q(sent_folder), "\\Seen", None, msg.as_bytes())
-            if append_st == "OK" and append_data:
-                m = re.search(rb"APPENDUID\s+\d+\s+(\d+)", append_data[0] or b"")
-                if m:
-                    sent_uid = m.group(1).decode("ascii", errors="ignore")
-        finally:
-            imap.logout()
-    except Exception:
-        # Delivery already succeeded; Sent-copy failure should not turn a sent
-        # message into a hard failure for the user.
-        pass
-
-    return {
-        "sent": True,
-        "to": recipients,
-        "subject": subject,
-        "account": cfg.get("account_name"),
-        "account_id": cfg.get("account_id"),
-        "sent_folder": sent_folder,
-        "sent_uid": sent_uid,
-        "message_id": msg.get("Message-ID", ""),
-    }
+    return _stash_agent_draft(
+        to=to,
+        subject=subject,
+        body=body,
+        in_reply_to=in_reply_to,
+        references=references,
+        cc=cc,
+        bcc=bcc,
+        account=account,
+        attachments=attachments,
+        kind=kind,
+        source_uid=source_uid,
+        source_folder=source_folder,
+        idempotency_key=idempotency_key,
+    )
 
 
 def _build_email_document_content(
@@ -1678,50 +1609,43 @@ async def _ai_draft_reply_to_email(uid, folder="INBOX", reply_all=False, account
     )
 
 
-def _reply_to_email(uid, body, folder="INBOX", reply_all=False, account=None):
-    """Reply to an existing email by UID. Threads via In-Reply-To/References."""
-    conn = None
-    try:
-        conn = _imap_connect(account)
-        conn.select(_q(folder), readonly=True)
-        status, msg_data = conn.uid("FETCH", _b(uid), "(BODY.PEEK[])")
-    finally:
-        if conn:
-            try: conn.logout()
-            except Exception: pass
-    if status != "OK" or not msg_data or not msg_data[0]:
-        return {"error": f"Failed to fetch email UID {uid}"}
-    raw = msg_data[0][1]
-    orig = email.message_from_bytes(raw)
+def _reply_to_email(uid, body, folder="INBOX", reply_all=False, account=None,
+                    to=None, subject=None, in_reply_to=None, references=None,
+                    cc=None, bcc=None, idempotency_key=None):
+    """Prepare an exact reply proposal without fetching IMAP on this path.
 
-    orig_subject = _decode_header(orig.get("Subject", ""))
-    reply_subject = orig_subject if orig_subject.lower().startswith("re:") else f"Re: {orig_subject}"
-    orig_message_id = orig.get("Message-ID", "")
-    orig_references = orig.get("References", "")
-    new_references = (orig_references + " " + orig_message_id).strip() if orig_references else orig_message_id
+    The caller must copy the exact recipient, subject, and Message-ID from a
+    prior ``read_email`` result.  Missing threading metadata fails closed
+    instead of allowing the model to trigger pre-approval network access.
+    """
 
-    sender = _decode_header(orig.get("From", ""))
-    _, sender_addr = email.utils.parseaddr(sender)
-    to_addrs = sender_addr
-
-    cc = None
-    if reply_all:
-        cc_addrs = []
-        for header_name in ("To", "Cc"):
-            for _, addr in email.utils.getaddresses([orig.get(header_name, "")]):
-                if addr and addr != sender_addr:
-                    cc_addrs.append(addr)
-        if cc_addrs:
-            cc = ", ".join(cc_addrs)
-
+    if not to or not subject or not in_reply_to:
+        return {
+            "error": (
+                "Reply preparation requires exact to, subject, and "
+                "in_reply_to values from read_email; nothing was sent"
+            )
+        }
+    reply_subject = str(subject)
+    if not reply_subject.lower().startswith("re:"):
+        reply_subject = f"Re: {reply_subject}"
+    reference_values = references or []
+    if isinstance(reference_values, str):
+        reference_values = [reference_values]
+    reference_values = [*reference_values, in_reply_to]
     return _send_email(
-        to=to_addrs,
+        to=to,
         subject=reply_subject,
         body=body,
-        in_reply_to=orig_message_id,
-        references=new_references,
-        cc=cc,
+        in_reply_to=in_reply_to,
+        references=reference_values,
+        cc=cc if reply_all else None,
+        bcc=bcc,
         account=account,
+        kind="reply",
+        source_uid=uid,
+        source_folder=folder,
+        idempotency_key=idempotency_key,
     )
 
 
@@ -1970,11 +1894,10 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="send_email",
             description=(
-                "Send a new email via SMTP. Provide recipient(s), subject, and body. "
-                "This sends immediately; for normal assistant-written email, prefer "
-                "draft_email so the user can review and send from Restia. "
-                "For replying to an existing thread, use reply_to_email instead. "
-                "Pass `account` to send from a non-default mailbox."
+                "Prepare an exact outbound email as a Level-5 Restia action. "
+                "This never sends or opens SMTP/IMAP; the owning human must review "
+                "To/Cc/Bcc/Subject/body/attachments, freshly approve, and queue it "
+                "from Restia. For a threaded reply use reply_to_email."
             ),
             inputSchema={
                 "type": "object",
@@ -1984,6 +1907,15 @@ async def list_tools() -> list[Tool]:
                     "body": {"type": "string", "description": "Plain text body"},
                     "cc": {"type": "string", "description": "CC address(es), comma-separated (optional)"},
                     "bcc": {"type": "string", "description": "BCC address(es), comma-separated (optional)"},
+                    "attachments": {
+                        "type": "array",
+                        "description": "Optional exact attachment reference objects for human review",
+                        "items": {"type": "object"},
+                    },
+                    "idempotency_key": {
+                        "type": "string",
+                        "description": "Optional stable request identifier for retry-safe preparation",
+                    },
                     **ACCOUNT_PROP,
                 },
                 "required": ["to", "subject", "body"],
@@ -2015,25 +1947,36 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="reply_to_email",
             description=(
-                "Reply to an existing email by UID. This sends immediately. Do NOT use "
-                "for normal 'write/draft a reply saying X' requests; use "
-                "draft_email_reply so the user can review and send from Restia. "
-                "Only use this when the user explicitly says to send now. Automatically threads the reply with "
-                "In-Reply-To and References headers, prefixes 'Re:' on the subject, and "
-                "uses the original sender as the recipient. Set reply_all=true to also CC "
-                "the original To/Cc recipients. For follow-up 'reply ...' requests, use "
-                "the exact UID from the latest list_emails/read_email result; never invent UID 1."
+                "Prepare an exact threaded reply as a Level-5 Restia action. This "
+                "never sends or fetches IMAP on the action path. Copy the exact UID, "
+                "sender address as `to`, original subject, Message-ID as "
+                "`in_reply_to`, and references from read_email. The owning human must "
+                "review and freshly approve the exact content in Restia."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "uid": {"type": "string", "description": "Exact Email UID from list_emails/read_email; never invent UID 1"},
                     "body": {"type": "string", "description": "Reply body text"},
+                    "to": {"type": "string", "description": "Exact original sender address from read_email"},
+                    "subject": {"type": "string", "description": "Exact original subject from read_email"},
+                    "in_reply_to": {"type": "string", "description": "Exact Message-ID from read_email"},
+                    "references": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Exact References chain from read_email, if present",
+                    },
+                    "cc": {"type": "string", "description": "Exact reply-all CC recipients, if requested"},
+                    "bcc": {"type": "string", "description": "Optional BCC recipients for review"},
                     "folder": {"type": "string", "description": "IMAP folder (default: INBOX)", "default": "INBOX"},
                     "reply_all": {"type": "boolean", "description": "Reply to all recipients (default: false)", "default": False},
+                    "idempotency_key": {
+                        "type": "string",
+                        "description": "Optional stable request identifier for retry-safe preparation",
+                    },
                     **ACCOUNT_PROP,
                 },
-                "required": ["uid", "body"],
+                "required": ["uid", "body", "to", "subject", "in_reply_to"],
             },
         ),
         Tool(
@@ -2412,6 +2355,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 cc=arguments.get("cc"),
                 bcc=arguments.get("bcc"),
                 account=acct,
+                attachments=arguments.get("attachments"),
+                idempotency_key=arguments.get("idempotency_key"),
             )
             if "error" in result:
                 return [TextContent(type="text", text=f"Error: {result['error']}")]
@@ -2423,8 +2368,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         "Nothing has been sent yet. Review and approve it in Restia before delivery."
                     ),
                 )]
-            acct_note = f" (from {result['account']})" if result.get("account") else ""
-            return [TextContent(type="text", text=f"Sent email to {result['to']} with subject '{result['subject']}'{acct_note}.")]
+            return [TextContent(
+                type="text",
+                text="Outbound email was not sent because no reviewed delivery path was available.",
+            )]
 
         elif name == "draft_email":
             to = arguments.get("to")
@@ -2462,15 +2409,28 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 folder=arguments.get("folder", "INBOX"),
                 reply_all=bool(arguments.get("reply_all", False)),
                 account=acct,
+                to=arguments.get("to"),
+                subject=arguments.get("subject"),
+                in_reply_to=arguments.get("in_reply_to"),
+                references=arguments.get("references"),
+                cc=arguments.get("cc"),
+                bcc=arguments.get("bcc"),
+                idempotency_key=arguments.get("idempotency_key"),
             )
             if "error" in result:
                 return [TextContent(type="text", text=f"Error: {result['error']}")]
-            # Mark original as answered
-            try:
-                _set_flag(uid, arguments.get("folder", "INBOX"), "\\Answered", add=True, account=acct)
-            except Exception:
-                pass
-            return [TextContent(type="text", text=f"Replied to UID {uid}: '{result['subject']}' → {result['to']}")]
+            if result.get("pending"):
+                return [TextContent(
+                    type="text",
+                    text=(
+                        f"Reply staged for approval (pending id: {result.get('pending_id')}). "
+                        "Nothing has been sent and the source message was not modified."
+                    ),
+                )]
+            return [TextContent(
+                type="text",
+                text="Reply was not sent because no reviewed delivery path was available.",
+            )]
 
         elif name == "draft_email_reply":
             uid = arguments.get("uid")

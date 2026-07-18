@@ -2310,6 +2310,126 @@ function initAccount() {
     render2FA();
   }
 
+  // ── Account-owned devices and security posture ──
+  const deviceSessionsEl = el('settings-device-sessions');
+  async function renderDeviceSessions() {
+    if (!deviceSessionsEl) return;
+    try {
+      const response = await fetch('/api/auth/sessions', { credentials: 'same-origin' });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || 'Could not load active devices');
+      const sessions = Array.isArray(result.sessions) ? result.sessions : [];
+      if (!sessions.length) {
+        deviceSessionsEl.innerHTML = '<div style="font-size:11px;opacity:.55">No active device sessions.</div>';
+        return;
+      }
+      deviceSessionsEl.innerHTML = sessions.map(session => {
+        const lastSeen = session.last_seen_at || session.created_at;
+        const timestamp = lastSeen ? new Date(lastSeen).toLocaleString() : 'Unknown activity';
+        const label = `${session.interface || 'web'} · ${session.auth_method || 'local'}`;
+        return `<div class="settings-device-session" data-session-id="${esc(session.id || '')}" data-current="${session.current ? '1' : '0'}" style="display:flex;align-items:center;gap:9px;padding:8px 0;border-top:1px solid var(--border)">
+          <div style="flex:1;min-width:0">
+            <div style="font-size:12px;font-weight:600">${esc(label)}${session.current ? ' <span style="font-size:9px;opacity:.55">CURRENT</span>' : ''}</div>
+            <div style="font-size:10px;opacity:.55">Last active ${esc(timestamp)}</div>
+          </div>
+          <button class="admin-btn-sm settings-device-revoke" style="color:var(--color-error)">${session.current ? 'Sign out' : 'Revoke'}</button>
+        </div>`;
+      }).join('');
+      deviceSessionsEl.querySelectorAll('.settings-device-revoke').forEach(button => {
+        button.addEventListener('click', async () => {
+          const row = button.closest('.settings-device-session');
+          const sessionId = row?.dataset.sessionId || '';
+          const current = row?.dataset.current === '1';
+          const prompt = current
+            ? 'Sign out this current device session?'
+            : 'Revoke this device session? It will need to sign in again.';
+          const confirmed = uiModule.styledConfirm
+            ? await uiModule.styledConfirm(prompt, { confirmText: current ? 'Sign out' : 'Revoke', danger: true })
+            : window.confirm(prompt);
+          if (!confirmed) return;
+          button.disabled = true;
+          try {
+            const response = await fetch(`/api/auth/sessions/${encodeURIComponent(sessionId)}`, {
+              method: 'DELETE', credentials: 'same-origin',
+            });
+            const result = await response.json();
+            if (!response.ok) throw new Error(result.detail || 'Could not revoke device');
+            if (result.current) {
+              window.location.href = '/login';
+              return;
+            }
+            await renderDeviceSessions();
+          } catch (error) {
+            button.disabled = false;
+            uiModule.showError?.(error?.message || 'Could not revoke device');
+          }
+        });
+      });
+    } catch (error) {
+      deviceSessionsEl.innerHTML = `<div style="font-size:11px;color:var(--color-error)">${esc(error?.message || 'Could not load active devices')}</div>`;
+    }
+  }
+
+  const securityPostureEl = el('settings-security-posture');
+  const securityMsgEl = el('settings-security-msg');
+  let securityBackupCommand = '';
+  async function renderSecurityPosture() {
+    if (!securityPostureEl) return;
+    securityPostureEl.innerHTML = '<div style="font-size:11px;opacity:.5">Checking security controls…</div>';
+    try {
+      const response = await fetch('/api/life/security-posture', { credentials: 'same-origin' });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || 'Could not load security posture');
+      securityBackupCommand = result.backups?.command || '';
+      const checks = Array.isArray(result.checks) ? result.checks : [];
+      const summaryColor = result.overall === 'protected' ? 'var(--color-save-green, #4caf50)' : 'var(--color-warning, #d99a2b)';
+      securityPostureEl.innerHTML = `
+        <div style="display:flex;align-items:center;gap:7px;margin-bottom:5px;font-size:12px;font-weight:600;color:${summaryColor}">${result.overall === 'protected' ? 'Protected' : `${Number(result.attention_count || 0)} item(s) need attention`}</div>
+        ${checks.map(check => {
+          const color = check.status === 'protected' ? 'var(--color-save-green, #4caf50)' : (check.status === 'attention' ? 'var(--color-warning, #d99a2b)' : 'var(--accent, var(--red))');
+          return `<div style="display:grid;grid-template-columns:8px minmax(0,1fr);gap:8px;padding:7px 0;border-top:1px solid var(--border)">
+            <span aria-hidden="true" style="width:7px;height:7px;border-radius:50%;background:${color};margin-top:4px"></span>
+            <div><div style="font-size:11px;font-weight:600">${esc(check.label || check.id || 'Security control')}</div><div style="font-size:10px;opacity:.58;line-height:1.45">${esc(check.detail || '')}</div></div>
+          </div>`;
+        }).join('')}`;
+    } catch (error) {
+      securityPostureEl.innerHTML = `<div style="font-size:11px;color:var(--color-error)">${esc(error?.message || 'Could not load security posture')}</div>`;
+    }
+  }
+  el('settings-security-refresh')?.addEventListener('click', async () => {
+    await Promise.all([renderDeviceSessions(), renderSecurityPosture()]);
+  });
+  el('settings-security-copy-backup')?.addEventListener('click', async () => {
+    if (!securityBackupCommand) await renderSecurityPosture();
+    try {
+      await navigator.clipboard.writeText(securityBackupCommand);
+      if (securityMsgEl) securityMsgEl.textContent = 'Encrypted backup command copied.';
+    } catch (_) {
+      if (securityMsgEl) securityMsgEl.textContent = securityBackupCommand || 'Backup command is unavailable.';
+    }
+  });
+  el('settings-security-export')?.addEventListener('click', async () => {
+    if (securityMsgEl) securityMsgEl.textContent = 'Preparing owner-scoped export…';
+    try {
+      const response = await fetch('/api/life/privacy-export', { credentials: 'same-origin' });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || 'Export failed');
+      const url = URL.createObjectURL(new Blob([JSON.stringify(result, null, 2)], { type: 'application/json' }));
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `restia-v3-privacy-export-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      if (securityMsgEl) securityMsgEl.textContent = result.complete ? 'Export downloaded.' : 'Export downloaded; one or more collections were truncated.';
+    } catch (error) {
+      if (securityMsgEl) securityMsgEl.textContent = error?.message || 'Export failed';
+    }
+  });
+  renderDeviceSessions();
+  renderSecurityPosture();
+
   // Logout
   const logoutBtn = el('settings-logout-btn');
   if (logoutBtn) {
@@ -3515,7 +3635,10 @@ async function initEmailSettings() {
   try {
     const res = await fetch('/api/contacts/config');
     const cfg = await res.json();
-    if (el('set-carddav-url')) el('set-carddav-url').value = cfg.url || '';
+    if (el('set-carddav-url')) {
+      el('set-carddav-url').value = cfg.url || '';
+      el('set-carddav-url').dataset.version = cfg.version == null ? '' : String(cfg.version);
+    }
     if (el('set-carddav-user')) el('set-carddav-user').value = cfg.username || '';
     if (el('set-carddav-pass')) el('set-carddav-pass').value = '';
   } catch (_) {}
@@ -3559,6 +3682,8 @@ async function initEmailSettings() {
       carddav_url: el('set-carddav-url').value,
       carddav_username: el('set-carddav-user').value,
     };
+    const configVersion = Number(el('set-carddav-url')?.dataset.version || 0);
+    if (configVersion > 0) data.expected_version = configVersion;
     const pass = el('set-carddav-pass').value;
     if (pass) data.carddav_password = pass;
     try {
@@ -3568,7 +3693,10 @@ async function initEmailSettings() {
         body: JSON.stringify(data),
       });
       const result = await res.json();
-      if (msg) msg.textContent = result.success ? '✓ Saved' : (result.error || 'Failed');
+      if (res.ok && result.version != null) {
+        el('set-carddav-url').dataset.version = String(result.version);
+      }
+      if (msg) msg.textContent = result.success ? '✓ Saved' : (result.detail || result.error || 'Failed');
       setTimeout(() => { if (msg) msg.textContent = ''; }, 3000);
     } catch (e) {
       if (msg) msg.textContent = 'Failed';
@@ -4044,7 +4172,7 @@ async function initUnifiedIntegrations() {
         <div style="font-size:11px;opacity:0.5;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${item.detail || ''}</div>
       </div>
       ${statusDot}
-      <button class="admin-btn-sm intg-del-btn" data-intg-id="${item.id}" data-intg-type="${item.type}" data-intg-name="${(item.name || '').replace(/"/g, '&quot;')}" title="Remove" style="background:none;border:none;padding:4px;cursor:pointer;color:var(--red);opacity:0.55;display:inline-flex;align-items:center;justify-content:center;">
+      <button class="admin-btn-sm intg-del-btn" data-intg-id="${item.id}" data-intg-type="${item.type}" data-intg-version="${item.data?.version ?? ''}" data-intg-name="${(item.name || '').replace(/"/g, '&quot;')}" title="Remove" style="background:none;border:none;padding:4px;cursor:pointer;color:var(--red);opacity:0.55;display:inline-flex;align-items:center;justify-content:center;">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
       </button>
     </div>`;
@@ -4095,7 +4223,10 @@ async function initUnifiedIntegrations() {
             await fetch('/api/contacts/clear', { method: 'DELETE', credentials: 'same-origin' });
           }
           else if (type === 'carddav') {
-            await fetch('/api/contacts/config', { method: 'PUT', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ carddav_url: '', carddav_username: '', carddav_password: '' }) });
+            const version = Number(btn.dataset.intgVersion || 0);
+            const body = { carddav_url: '', carddav_username: '', carddav_password: '' };
+            if (version > 0) body.expected_version = version;
+            await fetch('/api/contacts/config', { method: 'PUT', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
           }
           else if (type === 'email') await fetch(`/api/email/accounts/${id}`, { method: 'DELETE', credentials: 'same-origin' });
           else if (type === 'mcp') await fetch(`/api/mcp/servers/${id}`, { method: 'DELETE', credentials: 'same-origin' });
@@ -4192,6 +4323,9 @@ async function initUnifiedIntegrations() {
           <div class="settings-row"><label class="settings-label">Auth${_apiHint('How this service expects the credential to be sent. <b>Bearer</b> = sends "Authorization: Bearer YOUR_KEY" (most modern APIs, ntfy, OpenAI-style). <b>Header</b> = sends YOUR_KEY verbatim under a header name you choose (Miniflux uses X-Auth-Token). <b>Basic</b> = HTTP basic auth (user:pass). <b>None</b> = the API is open / no auth.')}</label><select id="uf-api-auth" class="settings-input"><option value="bearer">Bearer (most common)</option><option value="header">Header</option><option value="basic">Basic</option><option value="none">None</option></select></div>
           <div class="settings-row" id="uf-api-header-row"><label class="settings-label">Header${_apiHint('The HTTP header name the key goes under (Miniflux: X-Auth-Token; most others: Authorization). Only used when Auth = Header.')}</label><input id="uf-api-header" class="settings-input" placeholder="X-Auth-Token"></div>
           <div class="settings-row"><label class="settings-label">API Key${_apiHint('The secret token the service issued you (generated in its admin panel / settings). Used to prove your identity on each request. Required for any Auth mode except None.')}</label><input id="uf-api-key" class="settings-input" type="password" placeholder="Token/key"></div>
+          <div class="settings-row" style="align-items:flex-start"><label class="settings-label" style="padding-top:3px">Methods${_apiHint('Grant only the HTTP methods Restia may use. GET is read-only. POST, PUT, PATCH, and DELETE remain blocked until a freshly approved external action reaches the reviewed executor.')}</label><div id="uf-api-methods" style="display:flex;flex-wrap:wrap;gap:6px 12px;flex:1;font-size:11px">${['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].map(method => `<label><input type="checkbox" data-connector-method="${method}"${method === 'GET' ? ' checked' : ''}> ${method}</label>`).join('')}</div></div>
+          <div class="settings-row" style="align-items:flex-start"><label class="settings-label" style="padding-top:6px">Allowed paths${_apiHint('One absolute path prefix per line. A grant for /api/states includes /api/states/light.desk but not /api/config. Traversal and host changes are rejected server-side.')}</label><textarea id="uf-api-paths" class="settings-input" rows="3" style="resize:vertical;font-family:ui-monospace,monospace" placeholder="/api/states">/</textarea></div>
+          <div style="font-size:10px;opacity:.58;margin:-2px 0 2px 106px">Connector writes always require a freshly approved external action; this cannot be disabled.</div>
           <div class="settings-row" style="margin-top:10px;align-items:center;justify-content:flex-end;gap:6px;">
             <span id="uf-api-msg" style="font-size:11px;flex:1;margin-right:8px"></span>
             <button class="admin-btn-add" id="uf-api-test" style="display:inline-flex;align-items:center;gap:5px;background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));">Test</button>
@@ -4244,7 +4378,7 @@ async function initUnifiedIntegrations() {
       _setFromKey(sel.value || '');
     })();
 
-    const preset = el('uf-api-preset'), name = el('uf-api-name'), url = el('uf-api-url'), auth = el('uf-api-auth'), header = el('uf-api-header'), key = el('uf-api-key'), ntfyHint = el('uf-api-ntfy-hint');
+    const preset = el('uf-api-preset'), name = el('uf-api-name'), url = el('uf-api-url'), auth = el('uf-api-auth'), header = el('uf-api-header'), key = el('uf-api-key'), ntfyHint = el('uf-api-ntfy-hint'), paths = el('uf-api-paths');
     let _editId = editId && editId !== 'new' ? editId : null;
     // Load existing
     if (_editId) {
@@ -4252,7 +4386,16 @@ async function initUnifiedIntegrations() {
         const r = await fetch('/api/auth/integrations', { credentials: 'same-origin' });
         const d = await r.json();
         const item = (d.integrations || []).find(i => i.id === _editId);
-        if (item) { name.value = item.name || ''; url.value = item.base_url || ''; auth.value = item.auth_type || 'none'; header.value = item.auth_header || ''; }
+        if (item) {
+          name.value = item.name || '';
+          url.value = item.base_url || '';
+          auth.value = item.auth_type || 'none';
+          header.value = item.auth_header || '';
+          const permissions = item.permissions || {};
+          const methods = new Set(permissions.allowed_methods || ['GET']);
+          formEl.querySelectorAll('[data-connector-method]').forEach(input => { input.checked = methods.has(input.dataset.connectorMethod); });
+          paths.value = (permissions.allowed_path_prefixes || ['/']).join('\n');
+        }
       } catch (_) {}
     }
     // Native <select>: the option `value` is the preset key directly, so
@@ -4292,7 +4435,22 @@ async function initUnifiedIntegrations() {
       const urlValue = url.value.trim();
       if (!nameValue) { el('uf-api-msg').textContent = 'Name required'; el('uf-api-msg').style.color = 'var(--red)'; return; }
       if (!urlValue) { el('uf-api-msg').textContent = 'Base URL required'; el('uf-api-msg').style.color = 'var(--red)'; return; }
-      const body = { name: nameValue, base_url: urlValue, auth_type: auth.value, auth_header: header.value, preset: presetKey };
+      const allowedMethods = [...formEl.querySelectorAll('[data-connector-method]:checked')].map(input => input.dataset.connectorMethod);
+      const allowedPaths = paths.value.split(/\r?\n/).map(value => value.trim()).filter(Boolean);
+      if (!allowedMethods.length) { el('uf-api-msg').textContent = 'Grant at least one HTTP method'; el('uf-api-msg').style.color = 'var(--red)'; return; }
+      if (!allowedPaths.length) { el('uf-api-msg').textContent = 'Grant at least one absolute path'; el('uf-api-msg').style.color = 'var(--red)'; return; }
+      const body = {
+        name: nameValue,
+        base_url: urlValue,
+        auth_type: auth.value,
+        auth_header: header.value,
+        preset: presetKey,
+        permissions: {
+          allowed_methods: allowedMethods,
+          allowed_path_prefixes: allowedPaths,
+          require_action_approval_for_writes: true,
+        },
+      };
       if (key.value) body.api_key = key.value;
       try {
         const u = _editId ? `/api/auth/integrations/${_editId}` : '/api/auth/integrations';
@@ -4479,6 +4637,7 @@ async function initUnifiedIntegrations() {
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
           <h2 style="font-size:13px;margin:0;display:flex;align-items:center;gap:6px;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--accent, var(--red));flex-shrink:0;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>Contacts Import <span id="cm-count" style="opacity:0.5;font-weight:normal;font-size:11px;"></span></h2>
           <button class="admin-btn-sm" id="cm-import-btn" style="margin-left:auto;">Import</button>
+          <button class="admin-btn-sm" id="cm-refresh-btn">Refresh</button>
           <button class="admin-btn-sm" id="cm-export-vcf-btn">Export .vcf</button>
           <button class="admin-btn-sm" id="cm-export-csv-btn">Export .csv</button>
           <button class="admin-btn-sm" id="cm-add-toggle">+ Add</button>
@@ -4496,19 +4655,30 @@ async function initUnifiedIntegrations() {
       </div>`;
     try {
       const r = await fetch('/api/contacts/config', { credentials: 'same-origin' }); const d = await r.json();
-      el('uf-carddav-url').value = d.url || ''; el('uf-carddav-user').value = d.username || '';
+      el('uf-carddav-url').value = d.url || '';
+      el('uf-carddav-url').dataset.version = d.version == null ? '' : String(d.version);
+      el('uf-carddav-user').value = d.username || '';
       // Server masks the password as '***' when one is saved (or '' when
       // none). Surface that state via the input's placeholder so users
       // can tell their password is already on file without us echoing it.
       const passInput = el('uf-carddav-pass');
       if (passInput && d.password) passInput.placeholder = '(unchanged)';
+      if (d.sync_error && el('uf-carddav-msg')) {
+        el('uf-carddav-msg').textContent = 'CardDAV sync needs attention';
+        el('uf-carddav-msg').style.color = 'var(--red)';
+      }
     } catch (_) {}
     el('uf-carddav-cancel').addEventListener('click', () => { formEl.style.display = 'none'; });
     el('uf-carddav-save').addEventListener('click', async () => {
       const body = { carddav_url: el('uf-carddav-url').value, carddav_username: el('uf-carddav-user').value };
+      const configVersion = Number(el('uf-carddav-url')?.dataset.version || 0);
+      if (configVersion > 0) body.expected_version = configVersion;
       if (el('uf-carddav-pass').value) body.carddav_password = el('uf-carddav-pass').value;
       try {
-        await fetch('/api/contacts/config', { method: 'PUT', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const res = await fetch('/api/contacts/config', { method: 'PUT', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const result = await res.json();
+        if (!res.ok) throw new Error(result.detail || 'Failed');
+        if (result.version != null) el('uf-carddav-url').dataset.version = String(result.version);
         el('uf-carddav-msg').textContent = 'Saved';
         el('uf-carddav-msg').style.color = 'var(--green, #50fa7b)';
         // Refresh both the sub-panel (contacts manager) AND the
@@ -4538,8 +4708,13 @@ async function initUnifiedIntegrations() {
       // name aren't useful as a contact.
       if (!name && !email) { (name ? el('cm-add-email') : el('cm-add-name')).focus(); return; }
       try {
-        await fetch('/api/contacts/add', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, email, phone, address }) });
-      } catch (_) {}
+        const response = await fetch('/api/contacts/add', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, email, phone, address }) });
+        const result = await response.json();
+        if (!response.ok || result.success === false) throw new Error(result.detail || result.error || 'Contact could not be saved');
+      } catch (err) {
+        uiModule.showError ? uiModule.showError(err?.message || 'Contact could not be saved') : null;
+        return;
+      }
       el('cm-add-name').value = '';
       el('cm-add-email').value = '';
       if (el('cm-add-phone')) el('cm-add-phone').value = '';
@@ -4571,6 +4746,23 @@ async function initUnifiedIntegrations() {
     };
     el('cm-export-vcf-btn')?.addEventListener('click', () => _downloadContacts('vcf'));
     el('cm-export-csv-btn')?.addEventListener('click', () => _downloadContacts('csv'));
+    el('cm-refresh-btn')?.addEventListener('click', async () => {
+      const btn = el('cm-refresh-btn');
+      const original = btn?.textContent || 'Refresh';
+      if (btn) { btn.textContent = 'Refreshing…'; btn.disabled = true; }
+      try {
+        const response = await fetch('/api/contacts/refresh', {
+          method: 'POST', credentials: 'same-origin',
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || 'CardDAV refresh failed');
+        await _renderContactsManager();
+      } catch (err) {
+        uiModule.showError ? uiModule.showError(err?.message || 'CardDAV refresh failed') : null;
+      } finally {
+        if (btn) { btn.textContent = original; btn.disabled = false; }
+      }
+    });
 
     // Import .vcf/.csv — read each selected file as text, concatenate by type,
     // then POST. Imported CardDAV contacts immediately feed email autocomplete
@@ -4665,17 +4857,21 @@ async function initUnifiedIntegrations() {
         const phones = (c.phones || []).join(', ');
         const address = c.address || '';
         const sub = [emails, phones, address].filter(Boolean).join(' · ');
-        return `<div class="contact-row" data-uid="${esc(c.uid)}">
+        const conflictBadge = c.sync_state === 'conflict'
+          ? `<span title="${c.deleted ? 'The server still has this contact. Choose whether to retry deletion or restore it.' : 'The server changed this contact. Choose which copy wins.'}" style="font-size:9px;color:var(--red);border:1px solid color-mix(in srgb,var(--red) 45%,transparent);border-radius:4px;padding:1px 4px;">${c.deleted ? 'Deletion conflict' : 'Sync conflict'}</span>`
+          : c.sync_state === 'pending' ? '<span title="Waiting for CardDAV delivery" style="font-size:9px;opacity:.55;">Syncing…</span>' : '';
+        return `<div class="contact-row" data-uid="${esc(c.uid)}" data-source-id="${esc(c.source_id || '')}" data-version="${Number(c.version || 1)}" data-deleted="${c.deleted ? '1' : '0'}">
           <div class="contact-row-view" style="display:flex;align-items:center;gap:8px;">
             <div style="flex:1;min-width:0;">
-              <div class="contact-name" style="font-size:12px;font-weight:600;">${esc(c.name || '(no name)')}</div>
+              <div class="contact-name" style="font-size:12px;font-weight:600;display:flex;align-items:center;gap:6px;">${esc(c.name || '(no name)')}${conflictBadge}</div>
               <div class="contact-sub" style="font-size:10px;opacity:0.55;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(sub)}</div>
             </div>
-            <button class="admin-btn-sm contact-edit" title="Edit" style="display:inline-flex;align-items:center;gap:4px;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 35%, var(--border));">
+            ${c.sync_state === 'conflict' ? '<button class="admin-btn-sm contact-conflict-local" title="Rebase your current contact onto the latest server version">Keep mine</button><button class="admin-btn-sm contact-conflict-remote" title="Discard queued local changes and use the server version">Use server</button>' : ''}
+            <button class="admin-btn-sm contact-edit" title="Edit" style="${c.deleted ? 'display:none;' : 'display:inline-flex;'}align-items:center;gap:4px;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 35%, var(--border));">
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
               Edit
             </button>
-            <button class="admin-btn-sm contact-del" title="Delete" style="opacity:0.85;display:inline-flex;align-items:center;gap:4px;">
+            <button class="admin-btn-sm contact-del" title="Delete" style="opacity:0.85;${c.deleted ? 'display:none;' : 'display:inline-flex;'}align-items:center;gap:4px;">
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
               Delete
             </button>
@@ -4715,16 +4911,55 @@ async function initUnifiedIntegrations() {
         editForm.style.display = 'none';
         view.style.display = 'flex';
       });
+      const _resolveConflict = async (resolution) => {
+        const useRemote = resolution === 'use_remote';
+        const deleting = row.dataset.deleted === '1';
+        const message = deleting
+          ? (useRemote
+              ? 'Restore the server copy and cancel your queued deletion?'
+              : 'Keep this contact deleted and retry deletion against the latest server version?')
+          : (useRemote
+              ? 'Use the server copy and discard all queued local changes for this contact?'
+              : 'Keep your current copy and retry it against the latest server version?');
+        const ok = uiModule.styledConfirm
+          ? await uiModule.styledConfirm(message, { confirmText: useRemote ? 'Use server' : 'Keep mine', danger: useRemote })
+          : window.confirm(message);
+        if (!ok) return;
+        try {
+          const response = await fetch('/api/contacts/' + encodeURIComponent(uid) + '/resolve-conflict', {
+            method: 'POST', credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              resolution,
+              expected_version: Number(row.dataset.version || 1),
+              source_id: row.dataset.sourceId || undefined,
+            }),
+          });
+          const result = await response.json();
+          if (!response.ok || result.success === false) throw new Error(result.detail || result.error || 'Conflict could not be resolved');
+        } catch (err) {
+          uiModule.showError ? uiModule.showError(err?.message || 'Conflict could not be resolved') : null;
+        }
+        await _renderContactsManager();
+      };
+      row.querySelector('.contact-conflict-local')?.addEventListener('click', () => _resolveConflict('keep_local'));
+      row.querySelector('.contact-conflict-remote')?.addEventListener('click', () => _resolveConflict('use_remote'));
       row.querySelector('.contact-save')?.addEventListener('click', async () => {
         const body = {
           name: row.querySelector('.contact-edit-name').value.trim(),
           emails: row.querySelector('.contact-edit-emails').value.split(',').map(s => s.trim()).filter(Boolean),
           phones: row.querySelector('.contact-edit-phones').value.split(',').map(s => s.trim()).filter(Boolean),
           address: row.querySelector('.contact-edit-address')?.value.trim() || '',
+          expected_version: Number(row.dataset.version || 1),
+          source_id: row.dataset.sourceId || undefined,
         };
         try {
-          await fetch('/api/contacts/' + encodeURIComponent(uid), { method: 'PUT', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-        } catch (_) {}
+          const response = await fetch('/api/contacts/' + encodeURIComponent(uid), { method: 'PUT', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+          const result = await response.json();
+          if (!response.ok || result.success === false) throw new Error(result.detail || result.error || 'Contact could not be updated');
+        } catch (err) {
+          uiModule.showError ? uiModule.showError(err?.message || 'Contact could not be updated') : null;
+        }
         await _renderContactsManager();
       });
       row.querySelector('.contact-del')?.addEventListener('click', async () => {
@@ -4733,8 +4968,16 @@ async function initUnifiedIntegrations() {
           : window.confirm('Delete this contact?');
         if (!ok) return;
         try {
-          await fetch('/api/contacts/' + encodeURIComponent(uid), { method: 'DELETE', credentials: 'same-origin' });
-        } catch (_) {}
+          const params = new URLSearchParams({
+            expected_version: row.dataset.version || '1',
+          });
+          if (row.dataset.sourceId) params.set('source_id', row.dataset.sourceId);
+          const response = await fetch('/api/contacts/' + encodeURIComponent(uid) + '?' + params.toString(), { method: 'DELETE', credentials: 'same-origin' });
+          const result = await response.json();
+          if (!response.ok || result.success === false) throw new Error(result.detail || result.error || 'Contact could not be deleted');
+        } catch (err) {
+          uiModule.showError ? uiModule.showError(err?.message || 'Contact could not be deleted') : null;
+        }
         await _renderContactsManager();
       });
     });
@@ -5602,6 +5845,9 @@ async function initUnifiedIntegrations() {
       { key: 'email:send', label: 'Email send', detail: 'Send email directly' },
       { key: 'calendar:read', label: 'Calendar', detail: 'Read calendar events when enabled' },
       { key: 'calendar:write', label: 'Calendar write', detail: 'Create and update calendar events' },
+      { key: 'contacts:read', label: 'Contacts', detail: 'Read the account owner\'s contacts' },
+      { key: 'contacts:write', label: 'Contacts write', detail: 'Create, update, import, and delete contacts' },
+      { key: 'contacts:configure', label: 'Contacts configure', detail: 'Change CardDAV server credentials' },
       { key: 'memory:read', label: 'Memory', detail: 'Read memory when enabled' },
       { key: 'memory:write', label: 'Memory write', detail: 'Write memory when enabled' },
       { key: 'cookbook:read', label: 'Cookbook', detail: 'List cookbook tasks + tail their tmux output (debug a model serve from outside the UI)' },
@@ -5617,6 +5863,7 @@ async function initUnifiedIntegrations() {
       documents: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>',
       email: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><polyline points="2 6 12 13 22 6"/></svg>',
       calendar: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>',
+      contacts: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>',
       memory: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 2a2.5 2.5 0 0 0-2.5 2.5 2.5 2.5 0 0 0-2.5 2.5A2.5 2.5 0 0 0 2 9.5v3A2.5 2.5 0 0 0 4.5 15a2.5 2.5 0 0 0 2.5 2.5A2.5 2.5 0 0 0 9.5 20H10V2z"/><path d="M14.5 2a2.5 2.5 0 0 1 2.5 2.5 2.5 2.5 0 0 1 2.5 2.5A2.5 2.5 0 0 1 22 9.5v3A2.5 2.5 0 0 1 19.5 15a2.5 2.5 0 0 1-2.5 2.5A2.5 2.5 0 0 1 14.5 20H14V2z"/></svg>',
       cookbook: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>',
     };

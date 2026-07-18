@@ -291,6 +291,10 @@ def _require_api_scopes(request: Request, required_scopes: Iterable[str]) -> Non
     # legacy scope families retain their established independent contracts.
     if "life:write" in granted:
         granted.add("life:read")
+    if "contacts:write" in granted:
+        granted.add("contacts:read")
+    if "profile:write" in granted:
+        granted.add("profile:read")
     missing = sorted(required - granted)
     if missing:
         raise HTTPException(403, f"API token requires scope: {', '.join(missing)}")

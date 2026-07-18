@@ -15,7 +15,15 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from starlette.requests import Request
 
-from core.database import Account, ActionAudit, ActionPolicy, ActionProposal, Base
+from core.database import (
+    Account,
+    ActionAudit,
+    ActionPolicy,
+    ActionProposal,
+    Base,
+    CalendarCal,
+    CalendarEvent,
+)
 from routes.action_policy_routes import setup_action_policy_routes
 from src.action_policy import (
     ActionApprovalRequired,
@@ -336,16 +344,17 @@ def test_server_registry_normalizes_risk_and_unknown_mutations_fail_closed(
 def test_external_confirmation_setting_only_tightens_and_never_weakens_level_five(
     policy_env,
 ):
-    with pytest.raises(ActionPolicyDenied, match="domain cap"):
-        _proposal(
-            policy_env,
-            domain="calendar",
-            action="create_event",
-            autonomy_level=4,
-            target_type="event",
-            external=True,
-            idempotency_key="calendar-default",
-        )
+    calendar_default = _proposal(
+        policy_env,
+        domain="calendar",
+        action="create_event",
+        autonomy_level=4,
+        target_type="event",
+        external=True,
+        idempotency_key="calendar-default",
+    )
+    assert calendar_default.proposal.autonomy_level == 5
+    assert calendar_default.proposal.requires_confirmation is True
 
     # External work is Level 5 even when its action name is neutral, so the
     # domain must explicitly permit Level 5 and confirmation stays mandatory.
@@ -392,6 +401,19 @@ def test_external_confirmation_setting_only_tightens_and_never_weakens_level_fiv
     )
     assert still_level_five.proposal.autonomy_level == 5
     assert still_level_five.proposal.requires_confirmation is True
+
+    cancellation = _proposal(
+        policy_env,
+        domain="calendar",
+        action="cancel_event",
+        autonomy_level=1,
+        target_type="event",
+        external=False,
+        idempotency_key="calendar-cancel-risk",
+    )
+    assert cancellation.proposal.autonomy_level == 5
+    assert cancellation.proposal.external is True
+    assert cancellation.proposal.requires_confirmation is True
 
     email_policy = set_action_policy(
         policy_env.db,
@@ -1134,13 +1156,16 @@ async def test_execute_route_enforces_level_semantics_and_reversal_path(route_en
     )
     assert prepared.status_code == 201, prepared.text
     prepared_action = prepared.json()["action"]
+    assert prepared_action["reviewed_server_executor"] is False
+    assert prepared_action["reviewed_server_reversal"] is False
     denied = await _call(
         route_env,
         "POST",
         f"/api/life/actions/{prepared_action['id']}/execute",
         json={"version": prepared_action["version"]},
     )
-    assert denied.status_code == 403
+    assert denied.status_code == 400
+    assert "reviewed server executor" in denied.json()["detail"]
 
     reversible = await _call(
         route_env,
@@ -1148,24 +1173,35 @@ async def test_execute_route_enforces_level_semantics_and_reversal_path(route_en
         "/api/life/actions",
         json={
             "domain": "calendar",
-            "action": "update_event",
+            "action": "create_event",
             "autonomy_level": 4,
             "target_type": "event",
             "external": False,
             "idempotency_key": "route-level-four",
+            "payload": {
+                "summary": "Review control design",
+                "dtstart": "2026-07-21T09:00:00Z",
+                "dtend": "2026-07-21T10:00:00Z",
+            },
         },
     )
     assert reversible.status_code == 201, reversible.text
     reversible_action = reversible.json()["action"]
-    missing_undo = await _call(
+    assert reversible_action["reviewed_server_executor"] is True
+    assert reversible_action["reviewed_server_reversal"] is False
+    executing = await _call(
         route_env,
         "POST",
         f"/api/life/actions/{reversible_action['id']}/execute",
         json={"version": reversible_action["version"]},
     )
-    assert missing_undo.status_code == 400
+    assert executing.status_code == 200, executing.text
+    completed_action = executing.json()["action"]
+    assert completed_action["state"] == "completed"
+    assert completed_action["undo_ref"]
+    assert completed_action["reviewed_server_reversal"] is True
 
-    executing = await _call(
+    client_undo = await _call(
         route_env,
         "POST",
         f"/api/life/actions/{reversible_action['id']}/execute",
@@ -1174,12 +1210,129 @@ async def test_execute_route_enforces_level_semantics_and_reversal_path(route_en
             "undo_ref": "calendar-event:restore:route",
         },
     )
-    assert executing.status_code == 200, executing.text
-    assert executing.json()["action"]["state"] == "executing"
-    assert (
-        executing.json()["action"]["undo_ref"]
-        == "calendar-event:restore:route"
+    assert client_undo.status_code == 422
+
+    reversed_response = await _call(
+        route_env,
+        "POST",
+        f"/api/life/actions/{reversible_action['id']}/reverse",
+        json={"version": completed_action["version"]},
     )
+    assert reversed_response.status_code == 200, reversed_response.text
+    assert reversed_response.json()["action"]["state"] == "reversed"
+
+
+@pytest.mark.asyncio
+async def test_cancel_event_uses_human_approve_execute_and_reverse_routes(route_env):
+    db = route_env.Session()
+    try:
+        alice = db.query(Account).filter(Account.username == "alice").one()
+        alice_id = alice.id
+        db.add(CalendarCal(
+            id="route-cancel-calendar",
+            owner_id=alice_id,
+            owner="alice",
+            name="Route cancellation",
+            source="local",
+            config_version=1,
+        ))
+        db.add(CalendarEvent(
+            uid="route-cancel-event",
+            owner_id=alice_id,
+            calendar_id="route-cancel-calendar",
+            summary="Route cancellation test",
+            dtstart=datetime(2026, 7, 25, 9),
+            dtend=datetime(2026, 7, 25, 10),
+            version=1,
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    prepared_response = await _call(
+        route_env,
+        "POST",
+        "/api/life/actions",
+        json={
+            "domain": "calendar",
+            "action": "cancel_event",
+            "autonomy_level": 1,
+            "target_type": "event",
+            "target_id": "route-cancel-event",
+            "payload": {"expected_event_version": 1},
+            "external": False,
+            "idempotency_key": "route-cancel-idempotent",
+        },
+    )
+    assert prepared_response.status_code == 201, prepared_response.text
+    prepared = prepared_response.json()["action"]
+    token = prepared_response.json()["confirmation_token"]
+    assert prepared["state"] == "prepared"
+    assert prepared["autonomy_level"] == 5
+    assert prepared["external"] is True
+    assert prepared["requires_confirmation"] is True
+    assert prepared["reviewed_server_executor"] is True
+    assert prepared["reviewed_server_reversal"] is False
+    assert token
+
+    approved_response = await _call(
+        route_env,
+        "POST",
+        f"/api/life/actions/{prepared['id']}/approve",
+        json={"version": prepared["version"], "confirmation_token": token},
+    )
+    assert approved_response.status_code == 200, approved_response.text
+    approved = approved_response.json()["action"]
+    assert approved["state"] == "approved"
+
+    executed_response = await _call(
+        route_env,
+        "POST",
+        f"/api/life/actions/{prepared['id']}/execute",
+        json={"version": approved["version"]},
+    )
+    assert executed_response.status_code == 200, executed_response.text
+    completed = executed_response.json()["action"]
+    assert completed["state"] == "completed"
+    assert completed["reviewed_server_reversal"] is True
+    db = route_env.Session()
+    try:
+        event = db.query(CalendarEvent).filter_by(
+            uid="route-cancel-event", owner_id=alice_id
+        ).one()
+        assert event.status == "cancelled"
+        assert event.version == 2
+    finally:
+        db.close()
+
+    confirmation_response = await _call(
+        route_env,
+        "POST",
+        f"/api/life/actions/{prepared['id']}/confirmation",
+        json={"version": completed["version"], "purpose": "reverse"},
+    )
+    assert confirmation_response.status_code == 200, confirmation_response.text
+    challenge = confirmation_response.json()
+    reversed_response = await _call(
+        route_env,
+        "POST",
+        f"/api/life/actions/{prepared['id']}/reverse",
+        json={
+            "version": challenge["action"]["version"],
+            "confirmation_token": challenge["confirmation_token"],
+        },
+    )
+    assert reversed_response.status_code == 200, reversed_response.text
+    assert reversed_response.json()["action"]["state"] == "reversed"
+    db = route_env.Session()
+    try:
+        event = db.query(CalendarEvent).filter_by(
+            uid="route-cancel-event", owner_id=alice_id
+        ).one()
+        assert event.status == "confirmed"
+        assert event.version == 3
+    finally:
+        db.close()
 
 
 @pytest.mark.asyncio

@@ -115,7 +115,17 @@ def test_capture_patch_and_actions_use_canonical_versioned_payloads():
         "body": {
             "title": "Remember this",
             "content": "Remember this",
-            "source_type": "user",
+            "source_type": "text",
+            "metadata": {
+                "ingestion_contract": {
+                    "version": 1,
+                    "source_type": "text",
+                    "owner_scoped": True,
+                    "destination_required": False,
+                    "classification_can_execute_external_action": False,
+                    "model_output_has_write_authority": False,
+                }
+            },
             "idempotency_key": "capture-retry-key",
         },
     }

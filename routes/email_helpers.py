@@ -478,8 +478,6 @@ OWNER_SCOPED_EMAIL_CACHE_TABLES = {
     "email_summaries",
     "email_ai_replies",
     "email_translations",
-    "email_calendar_extractions",
-    "email_urgency_alerts",
     "sender_signatures",
 }
 
@@ -610,24 +608,10 @@ def attachment_extract_dir(folder: str, uid: str) -> Path:
 def _init_scheduled_db():
     import sqlite3
     conn = sqlite3.connect(SCHEDULED_DB)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS scheduled_emails (
-            id TEXT PRIMARY KEY,
-            to_addr TEXT NOT NULL,
-            cc TEXT,
-            bcc TEXT,
-            subject TEXT,
-            body TEXT NOT NULL,
-            in_reply_to TEXT,
-            references_hdr TEXT,
-            attachments TEXT,
-            send_at TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            error TEXT,
-            owner TEXT DEFAULT ''
-        )
-    """)
+    # `scheduled_emails`, `email_tags`, `email_event_seen`, and calendar/action
+    # result tables are legacy import sources only. Never create a fresh local
+    # mutable authority; new installs keep only rebuildable connector/LLM
+    # caches in this file.
     # Email summary cache. SECURITY: Message-IDs are global, so AI-derived
     # cache rows must be owner-scoped just like email_tags.
     _ensure_owner_scoped_email_cache_table(conn, "email_summaries", """
@@ -676,109 +660,8 @@ def _init_scheduled_db():
         "body_hash", "owner", "target_language", "uid", "folder", "subject", "sender",
         "translation", "same_language", "model_used", "created_at",
     ], ["body_hash", "owner", "target_language"])
-    # Email tags / spam classification cache. SECURITY: keyed by
-    # (message_id, owner) because Message-IDs are GLOBAL (a newsletter goes
-    # to many users with the same Message-ID). Without owner-scoping, a
-    # tag-write for user A's row clobbered user B's row and surfaced A's
-    # UID in B's `tag:urgent` IMAP filter (review C2).
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS email_tags (
-            message_id TEXT,
-            owner TEXT DEFAULT '',
-            account_id TEXT DEFAULT '',
-            uid TEXT,
-            folder TEXT,
-            subject TEXT,
-            sender TEXT,
-            tags TEXT,
-            spam_verdict INTEGER DEFAULT 0,
-            spam_reason TEXT,
-            moved_to TEXT,
-            model_used TEXT,
-            created_at TEXT NOT NULL,
-            PRIMARY KEY (message_id, owner, account_id)
-        )
-    """)
-    # Backfill migration: older installs created the table with
-    # message_id as a bare PK and no owner column. Add the column +
-    # promote it into the PK by rebuild-copy-swap (SQLite can't ALTER PK).
-    try:
-        _cols = [r[1] for r in conn.execute("PRAGMA table_info(email_tags)")]
-        _pk_cols = [r[1] for r in sorted(conn.execute("PRAGMA table_info(email_tags)").fetchall(), key=lambda row: row[5] or 99) if r[5]]
-        if "owner" not in _cols:
-            conn.execute("ALTER TABLE email_tags ADD COLUMN owner TEXT DEFAULT ''")
-            _cols.append("owner")
-        if "account_id" not in _cols:
-            conn.execute("ALTER TABLE email_tags ADD COLUMN account_id TEXT DEFAULT ''")
-            _cols.append("account_id")
-        if _pk_cols != ["message_id", "owner", "account_id"]:
-            # Rebuild with account-aware composite PK. Existing rows get
-            # account_id='' and are still readable as legacy fallback rows;
-            # fresh task runs write exact account ids and no longer block each
-            # other when two accounts share a Message-ID.
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS email_tags__new (
-                    message_id TEXT,
-                    owner TEXT DEFAULT '',
-                    account_id TEXT DEFAULT '',
-                    uid TEXT, folder TEXT, subject TEXT, sender TEXT,
-                    tags TEXT, spam_verdict INTEGER DEFAULT 0,
-                    spam_reason TEXT, moved_to TEXT, model_used TEXT,
-                    created_at TEXT NOT NULL,
-                    PRIMARY KEY (message_id, owner, account_id)
-                )
-            """)
-            conn.execute("""
-                INSERT OR IGNORE INTO email_tags__new
-                  (message_id, owner, account_id, uid, folder, subject, sender, tags,
-                   spam_verdict, spam_reason, moved_to, model_used, created_at)
-                SELECT message_id, COALESCE(owner, ''), COALESCE(account_id, ''), uid, folder, subject,
-                       sender, tags, spam_verdict, spam_reason, moved_to,
-                       model_used, created_at
-                FROM email_tags
-            """)
-            conn.execute("DROP TABLE email_tags")
-            conn.execute("ALTER TABLE email_tags__new RENAME TO email_tags")
-    except Exception as _mig_e:
-        # Best-effort — log via the module logger if available
-        import logging as _lg
-        _lg.getLogger(__name__).warning(f"email_tags owner-migration skipped: {_mig_e}")
-    _ensure_owner_scoped_email_cache_table(conn, "email_calendar_extractions", """
-        CREATE TABLE IF NOT EXISTS email_calendar_extractions (
-            message_id TEXT,
-            owner TEXT DEFAULT '',
-            uid TEXT,
-            event_uids TEXT DEFAULT '[]',
-            events_created INTEGER DEFAULT 0,
-            created_at TEXT NOT NULL,
-            PRIMARY KEY (message_id, owner)
-        )
-    """, ["message_id", "owner", "uid", "event_uids", "events_created", "created_at"])
-    _ensure_owner_scoped_email_cache_table(conn, "email_urgency_alerts", """
-        CREATE TABLE IF NOT EXISTS email_urgency_alerts (
-            message_id TEXT,
-            owner TEXT DEFAULT '',
-            uid TEXT,
-            folder TEXT,
-            subject TEXT,
-            sender TEXT,
-            urgency TEXT,
-            reason TEXT,
-            alerted INTEGER DEFAULT 0,
-            created_at TEXT NOT NULL,
-            PRIMARY KEY (message_id, owner)
-        )
-    """, ["message_id", "owner", "uid", "folder", "subject", "sender", "urgency", "reason", "alerted", "created_at"])
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS email_event_seen (
-            owner TEXT NOT NULL,
-            account_key TEXT NOT NULL,
-            folder TEXT NOT NULL,
-            message_key TEXT NOT NULL,
-            first_seen_at TEXT NOT NULL,
-            PRIMARY KEY (owner, account_key, folder, message_key)
-        )
-    """)
+    # Legacy `email_tags` is intentionally not created, altered, or written.
+    # `src.email_runtime_authority` imports it through a query-only connection.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS email_message_index (
             owner TEXT NOT NULL DEFAULT '',
@@ -798,9 +681,31 @@ def _init_scheduled_db():
             flags TEXT DEFAULT '',
             has_attachments INTEGER DEFAULT 0,
             updated_at TEXT NOT NULL,
+            projection_payload_ciphertext TEXT,
             PRIMARY KEY (owner, account_key, folder, uid)
         )
     """)
+    _index_columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(email_message_index)")
+    }
+    if "projection_payload_ciphertext" not in _index_columns:
+        try:
+            conn.execute(
+                "ALTER TABLE email_message_index "
+                "ADD COLUMN projection_payload_ciphertext TEXT"
+            )
+        except sqlite3.OperationalError:
+            # Two local startup processes can observe the old shape before
+            # either ALTER commits. Treat only the verified duplicate-column
+            # race as success; every other schema error remains loud.
+            refreshed = {
+                str(row[1]) for row in conn.execute(
+                    "PRAGMA table_info(email_message_index)"
+                )
+            }
+            if "projection_payload_ciphertext" not in refreshed:
+                raise
     conn.execute("""
         CREATE INDEX IF NOT EXISTS ix_email_message_index_folder_date
         ON email_message_index(owner, account_key, folder, date_epoch DESC)
@@ -851,44 +756,8 @@ def _init_scheduled_db():
             created_at TEXT NOT NULL
         )
     """)
-    # Lazy migration: add account_id column to scheduled_emails if missing
-    try:
-        cols = [r[1] for r in conn.execute("PRAGMA table_info(scheduled_emails)").fetchall()]
-        if "account_id" not in cols:
-            conn.execute("ALTER TABLE scheduled_emails ADD COLUMN account_id TEXT")
-        if "odysseus_kind" not in cols:
-            conn.execute("ALTER TABLE scheduled_emails ADD COLUMN odysseus_kind TEXT")
-        if "owner" not in cols:
-            conn.execute("ALTER TABLE scheduled_emails ADD COLUMN owner TEXT DEFAULT ''")
-        conn.execute("CREATE INDEX IF NOT EXISTS ix_scheduled_emails_owner_status ON scheduled_emails(owner, status)")
-        # Backfill owner on legacy rows from the owning email account so the
-        # owner-scoped list/cancel routes surface pre-migration scheduled
-        # sends to the right user (the poller already resolves these by
-        # account at send time; this aligns the UI with that).
-        legacy_accounts = conn.execute(
-            "SELECT DISTINCT account_id FROM scheduled_emails "
-            "WHERE (owner IS NULL OR owner = '') AND account_id IS NOT NULL AND account_id != ''"
-        ).fetchall()
-        if legacy_accounts:
-            try:
-                from core.database import SessionLocal as _SL, EmailAccount as _EA
-                _db = _SL()
-                try:
-                    for (acct_id,) in legacy_accounts:
-                        row = _db.query(_EA.owner).filter(_EA.id == acct_id).first()
-                        acct_owner = (row[0] or "") if row else ""
-                        if acct_owner:
-                            conn.execute(
-                                "UPDATE scheduled_emails SET owner = ? "
-                                "WHERE account_id = ? AND (owner IS NULL OR owner = '')",
-                                (acct_owner, acct_id),
-                            )
-                finally:
-                    _db.close()
-            except Exception:
-                pass
-    except Exception:
-        pass
+    # Legacy `scheduled_emails` is a read-only import source. Canonical
+    # scheduled delivery lives in the main SQL database.
     # Lazy migration: add turns_json to email_boundaries for server-side
     # thread parsing cache (talon-style precomputed reply chain).
     try:
@@ -1686,6 +1555,37 @@ def _fetch_sender_thread_context(sender_addr: str,
     return "\n\n=====\n\n".join(blocks)
 
 
+def _owner_contact_snapshot(owner: str) -> list[dict]:
+    """Read only the explicitly named owner's contact materialization."""
+
+    normalized = str(owner or "").strip().lower()
+    if not normalized or normalized == "api":
+        return []
+    from core.database import SessionLocal
+    from src.contact_service import list_contacts
+    from src.identity import find_account
+
+    db = SessionLocal()
+    try:
+        account = find_account(db, normalized)
+        if account is None:
+            return []
+        rows = list_contacts(
+            db,
+            owner_id=account.id,
+            refresh=False,
+            create_local=False,
+        )
+        # A stale CardDAV snapshot may have been refreshed while reading.
+        db.commit()
+        return rows
+    except Exception:
+        db.rollback()
+        return []
+    finally:
+        db.close()
+
+
 def _pre_retrieve_context(
     body: str,
     sender: str,
@@ -1715,34 +1615,21 @@ def _pre_retrieve_context(
         # ── Known-sender check: only retrieve context for senders we already
         # have a relationship with. New / cold senders get an empty context.
         sender_addr = email.utils.parseaddr(sender or "")[1].lower()
-        # The CardDAV address book is global admin data backed by a single
-        # Radicale instance, so only fold it into reply context for an admin /
-        # single-user owner. Non-admin owners still get their own (owner-scoped)
-        # IMAP history below, just not the shared contacts.
-        try:
-            from src.tool_security import owner_is_admin_or_single_user
-            contacts_allowed = owner_is_admin_or_single_user(owner or None)
-        except Exception:
-            contacts_allowed = not bool(owner)
         is_known = False
-        if contacts_allowed:
-            try:
-                from routes.contacts_routes import _fetch_contacts
-                for c in _fetch_contacts() or []:
-                    # Contacts are normalized to plural `emails` lists, but
-                    # keep the legacy singular key fallback for older data.
-                    contact_emails = []
-                    raw_emails = c.get("emails")
-                    if isinstance(raw_emails, list):
-                        contact_emails.extend(str(e or "") for e in raw_emails)
-                    legacy_email = c.get("email")
-                    if legacy_email:
-                        contact_emails.append(str(legacy_email))
-                    if any((addr or "").strip().lower() == sender_addr for addr in contact_emails):
-                        is_known = True
-                        break
-            except Exception:
-                pass
+        owner_contacts = _owner_contact_snapshot(owner)
+        for c in owner_contacts:
+            contact_emails = [
+                str(value or "") for value in (c.get("emails") or [])
+            ]
+            legacy_email = c.get("email")
+            if legacy_email:
+                contact_emails.append(str(legacy_email))
+            if any(
+                (address or "").strip().lower() == sender_addr
+                for address in contact_emails
+            ):
+                is_known = True
+                break
         if not is_known and sender_addr:
             try:
                 with _imap(account_id, owner=owner) as _ck:
@@ -1827,11 +1714,9 @@ def _pre_retrieve_context(
                 except Exception: pass
 
         try:
-            from routes.contacts_routes import _fetch_contacts
-            all_contacts = _fetch_contacts() if contacts_allowed else []
             for term in terms_list:
                 t_lower = term.lower()
-                matches = [c for c in all_contacts
+                matches = [c for c in owner_contacts
                            if t_lower in (c.get("name") or "").lower()
                            or any(t_lower in (e or "").lower() for e in (c.get("emails") or []))]
                 for c in matches[:2]:

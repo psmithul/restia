@@ -1,27 +1,47 @@
-import json
 import asyncio
 from types import SimpleNamespace
+import uuid
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
+from core.database import Account, Base
 from src import integrations
+from src.profile_configuration_models import ProfileConfiguration  # noqa: F401
 
 
-def test_load_integrations_skips_non_object_rows(tmp_path, monkeypatch):
-    data_file = tmp_path / "integrations.json"
-    data_file.write_text(json.dumps([{"id": "good", "name": "Good"}, "bad", None]))
-    monkeypatch.setattr(integrations, "DATA_FILE", str(data_file))
+def test_save_integrations_rejects_non_object_rows_atomically(integrations_routes):
+    with pytest.raises(ValueError, match="rows must be objects"):
+        integrations.save_integrations([
+            {"id": "good", "name": "Good", "base_url": "https://example.test"},
+            "bad",
+        ])
 
-    assert integrations.load_integrations() == [{"id": "good", "name": "Good"}]
+    assert integrations.load_integrations() == []
 
 
 @pytest.fixture
 def integrations_routes(tmp_path, monkeypatch):
     fastapi = pytest.importorskip("fastapi")
+    import core.database as database
     from routes import auth_routes
+    from src import settings
 
-    monkeypatch.setattr(integrations, "DATA_FILE", str(tmp_path / "integrations.json"))
     monkeypatch.setattr(auth_routes, "migrate_from_settings", lambda: None)
+    engine = create_engine(f"sqlite:///{tmp_path / 'integrations.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, autoflush=False)
+    db = factory()
+    db.add(Account(id=str(uuid.uuid4()), username="admin", status="active"))
+    db.commit()
+    db.close()
+    monkeypatch.setattr(database, "SessionLocal", factory)
+    monkeypatch.setattr(
+        settings,
+        "_runtime_owner",
+        lambda owner=None: str(owner or "admin").strip().lower(),
+    )
 
     class _AuthManager:
         def get_username_for_token(self, token):
@@ -38,7 +58,8 @@ def integrations_routes(tmp_path, monkeypatch):
                 return route.endpoint
         raise AssertionError(f"{method} {path} route not registered")
 
-    return endpoint, auth_routes.SESSION_COOKIE, fastapi.HTTPException
+    yield endpoint, auth_routes.SESSION_COOKIE, fastapi.HTTPException
+    engine.dispose()
 
 
 class _JsonRequest(SimpleNamespace):

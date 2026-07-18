@@ -23,6 +23,7 @@ from src.tools.cookbook import (  # noqa: F401
 from src.tools.search import do_search_chats  # noqa: F401
 from src.tools.notes import do_manage_notes  # noqa: F401
 from src.tools.calendar import do_manage_calendar  # noqa: F401
+from src.tools.life import do_query_life  # noqa: F401
 from src.tools.image import do_edit_image  # noqa: F401
 from src.tools.research import do_manage_research, do_trigger_research  # noqa: F401
 from src.tools.contacts import do_resolve_contact, do_manage_contact  # noqa: F401

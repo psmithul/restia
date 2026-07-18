@@ -158,7 +158,7 @@ def test_docker_workflow_runs_version_preflight_before_build_matrix():
 
     assert workflow.index("\n  preflight:") < workflow.index("\n  build:")
     assert "python3 -m src.release_version" in workflow
-    assert "needs: preflight" in workflow
+    assert "needs: [preflight, postgres-gate]" in workflow
     assert "needs: [preflight, build]" in workflow
     assert 'args+=(--release-tag "$RELEASE_TAG")' in workflow
 

@@ -42,6 +42,32 @@ def _clean_line(text, fallback: str = "") -> str:
     return value or fallback
 
 
+def _telegram_digest_calendar_candidates(db, owner, *, limit: int = 2500):
+    """Return one account's calendar rows for digest occurrence expansion."""
+
+    from core.database import CalendarCal, CalendarEvent
+    from src.identity import find_account
+
+    owner_alias = str(owner or "").strip()
+    if not owner_alias:
+        return []
+    account = find_account(db, owner_alias)
+    if account is None:
+        return []
+    return (
+        db.query(CalendarEvent)
+        .join(CalendarCal, CalendarEvent.calendar_id == CalendarCal.id)
+        .filter(
+            CalendarCal.owner_id == account.id,
+            CalendarEvent.owner_id == account.id,
+            CalendarEvent.status != "cancelled",
+        )
+        .order_by(CalendarEvent.dtstart.desc())
+        .limit(limit)
+        .all()
+    )
+
+
 class TaskNoop(BaseException):
     """Raised by an action when it determined there's nothing to do.
 
@@ -1664,8 +1690,8 @@ async def _action_telegram_hourly_digest_locked(owner: str, **kwargs) -> Tuple[s
         from zoneinfo import ZoneInfo
 
         from core.database import (
-            CalendarCal, CalendarEvent, Note, Project, ProjectMember, ProjectWorkItem,
-            ScheduledTask, SessionLocal,
+            Note, Project, ProjectMember, ProjectWorkItem, ScheduledTask,
+            SessionLocal,
         )
         from routes.email_helpers import SCHEDULED_DB, _email_cache_owner_clause, _init_scheduled_db
         from src.notification_preferences import (
@@ -1887,17 +1913,12 @@ async def _action_telegram_hourly_digest_locked(owner: str, **kwargs) -> Tuple[s
             if "calendar" in digest_topics:
                 from routes.calendar_routes import _expand_rrule
 
-                event_q = db.query(CalendarEvent).join(
-                    CalendarCal, CalendarEvent.calendar_id == CalendarCal.id
-                ).filter(CalendarEvent.status != "cancelled")
-                if owner:
-                    event_q = event_q.filter(CalendarCal.owner == owner)
                 utc_start = local_now.astimezone(_timezone.utc).replace(tzinfo=None)
                 utc_end = (local_now + _td(hours=24)).astimezone(_timezone.utc).replace(tzinfo=None)
                 local_start = local_now.replace(tzinfo=None)
                 local_end = (local_now + _td(hours=24)).replace(tzinfo=None)
                 occurrence_rows: list[tuple[_dt, str]] = []
-                for ev in event_q.order_by(CalendarEvent.dtstart.desc()).limit(2500).all():
+                for ev in _telegram_digest_calendar_candidates(db, owner):
                     range_start, range_end = (
                         (utc_start, utc_end) if bool(getattr(ev, "is_utc", False))
                         else (local_start, local_end)
@@ -3271,17 +3292,14 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
             except Exception as e:
                 logger.warning(f"urgency: cache write failed for {acc.id}: {e}")
 
-        # ── 3.5  Mirror triage verdicts into email_tags so inbox filters and
+        # ── 3.5  Mirror triage verdicts into canonical email tag state so inbox filters and
         # pills show urgency + category tags. Runs for BOTH cached and freshly
         # classified items; message_id lives on the cached verdict so this is cheap.
         try:
-            import sqlite3 as _sql3
-            from routes.email_helpers import SCHEDULED_DB, _init_scheduled_db
-            from datetime import datetime as _dt2
-            _init_scheduled_db()
-            _conn = _sql3.connect(SCHEDULED_DB)
-            try:
-                for _key, _v in per_uid_scores.items():
+            from src.email_runtime_authority import (
+                list_email_tag_states, upsert_email_tag_state,
+            )
+            for _key, _v in per_uid_scores.items():
                     _msg_id = (_v.get("message_id") or "").strip()
                     _score = _v.get("score", 0)
                     if not _msg_id:
@@ -3303,17 +3321,13 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
                     # _key is "<account_id>:<uid>" — extract uid for the row.
                     _acc_id, _uid_only = (_key.split(":", 1) + [""])[:2]
                     _owner_key = owner or ""
-                    _row = _conn.execute(
-                        "SELECT tags FROM email_tags WHERE message_id=? AND owner=? AND account_id=?",
-                        (_msg_id, _owner_key, _acc_id),
-                    ).fetchone()
+                    _rows = list_email_tag_states(
+                        owner=_owner_key, account_id=_acc_id,
+                        message_ids=[_msg_id],
+                    )
+                    _row = _rows[0] if _rows else None
                     if _row:
-                        try:
-                            _existing = _json.loads(_row[0] or "[]")
-                            if not isinstance(_existing, list):
-                                _existing = []
-                        except Exception:
-                            _existing = []
+                        _existing = list(_row.get("tags") or [])
                         # Drop previous triage-owned tags so re-classification
                         # can upgrade/downgrade/clear without touching manual tags.
                         _existing = [
@@ -3334,22 +3348,24 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
                                 "reason": _v.get("reason", ""),
                                 "updated": True,
                             })
-                        _conn.execute(
-                            "UPDATE email_tags SET tags=?, spam_verdict=?, spam_reason=?, uid=?, folder=?, subject=?, sender=? "
-                            "WHERE message_id=? AND owner=? AND account_id=?",
-                            (_json.dumps(_existing), _spam, _v.get("reason", ""), _uid_only, "INBOX",
-                             _v.get("subject", ""), _v.get("from", ""), _msg_id, _owner_key, _acc_id),
+                        upsert_email_tag_state(
+                            owner=_owner_key, account_id=_acc_id,
+                            message_id=_msg_id, uid=_uid_only, folder="INBOX",
+                            subject=_v.get("subject", ""),
+                            sender=_v.get("from", ""), tags=_existing,
+                            spam_verdict=bool(_spam),
+                            spam_reason=_v.get("reason", ""),
                         )
                     else:
                         if not _new_tags and not _spam:
                             continue
-                        _conn.execute(
-                            "INSERT INTO email_tags "
-                            "(message_id, owner, account_id, uid, folder, subject, sender, tags, spam_verdict, spam_reason, created_at) "
-                            "VALUES (?, ?, ?, ?, 'INBOX', ?, ?, ?, ?, ?, ?)",
-                            (_msg_id, _owner_key, _acc_id, _uid_only, _v.get("subject", ""),
-                             _v.get("from", ""), _json.dumps(_new_tags), _spam, _v.get("reason", ""),
-                             _dt2.utcnow().isoformat()),
+                        upsert_email_tag_state(
+                            owner=_owner_key, account_id=_acc_id,
+                            message_id=_msg_id, uid=_uid_only, folder="INBOX",
+                            subject=_v.get("subject", ""),
+                            sender=_v.get("from", ""), tags=_new_tags,
+                            spam_verdict=bool(_spam),
+                            spam_reason=_v.get("reason", ""),
                         )
                         tag_write_details.append({
                             "uid": _uid_only,
@@ -3360,9 +3376,6 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
                             "reason": _v.get("reason", ""),
                             "updated": False,
                         })
-                _conn.commit()
-            finally:
-                _conn.close()
         except Exception as _te:
             logger.warning(f"urgency: bulk tag write failed: {_te}")
 

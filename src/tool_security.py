@@ -63,6 +63,7 @@ NON_ADMIN_BLOCKED_TOOLS = BUILTIN_EMAIL_TOOLS | {
     "resolve_contact",
     "manage_contact",
     "manage_calendar",
+    "query_life",
     "vault_search",
     "vault_get",
     "vault_unlock",
@@ -94,6 +95,7 @@ PLAN_MODE_READONLY_TOOLS = {
     "web_search",
     "web_fetch",
     "search_chats",
+    "query_life",
     "list_models",
     "list_sessions",
     # Read-only email tools. list_email_accounts must be here because the

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
 import json
 import subprocess
@@ -42,6 +43,35 @@ def _config(**overrides):
     }
     values.update(overrides)
     return TelegramConfig(**values)
+
+
+def _leased_polling_service(tmp_path, *, label="bot"):
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from core.database import Base
+    from src.telegram_delivery import TelegramRuntimeAuthority
+    from src.telegram_runtime import TelegramPollingService
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / (label + '.db')}",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, autoflush=False)
+    authority = TelegramRuntimeAuthority(factory)
+    fingerprint = hashlib.sha256(label.encode("utf-8")).hexdigest()
+    service = TelegramPollingService(
+        runtime_authority=authority,
+        worker_id=f"test-{label}",
+        process_lock_path=tmp_path / (label + ".lock"),
+    )
+    service._token_fingerprint = fingerprint
+    service._database_lease = authority.acquire_polling_lease(
+        bot_fingerprint=fingerprint, worker_id=f"test-{label}"
+    )
+    assert service._database_lease is not None
+    return service, authority, factory, fingerprint
 
 
 @pytest.mark.asyncio
@@ -1025,12 +1055,9 @@ async def test_notification_api_merges_profile_and_legacy_single_user_outboxes(
 
 @pytest.mark.asyncio
 async def test_poller_retries_before_offset_then_dead_letters_poison_update(tmp_path):
-    import src.telegram_runtime as runtime
-
-    service = runtime.TelegramPollingService()
-    service._dead_letter_path = tmp_path / "telegram_dead_letters.json"
-    service._offset_state_path = tmp_path / "telegram_polling_state.json"
-    service._token_fingerprint = "bot-a"
+    service, authority, factory, fingerprint = _leased_polling_service(
+        tmp_path, label="poison"
+    )
     attempts = []
 
     async def poison(update):
@@ -1049,32 +1076,31 @@ async def test_poller_retries_before_offset_then_dead_letters_poison_update(tmp_
     await service._process_updates([update])
     assert service._offset == 101
     assert attempts == [100, 100, 100]
-    dead_letters = json.loads(service._dead_letter_path.read_text())
-    assert dead_letters == [{
-        "update_id": 100,
-        "failed_at": dead_letters[0]["failed_at"],
-        "error_type": "RuntimeError",
-        "attempts": 3,
-    }]
-    assert "private text" not in service._dead_letter_path.read_text()
+    assert authority.dead_letter_count(fingerprint) == 1
+    from core.database import TelegramDeadLetter
+
+    db = factory()
+    try:
+        row = db.query(TelegramDeadLetter).one()
+    finally:
+        db.close()
+    assert (row.update_id, row.error_type, row.attempts) == (
+        100, "RuntimeError", 3
+    )
 
 
 @pytest.mark.asyncio
 async def test_poller_offset_survives_restart_and_is_scoped_to_bot(monkeypatch, tmp_path):
-    import src.telegram_runtime as runtime
-
-    state_path = tmp_path / "telegram_polling_state.json"
     handled = []
-    first = runtime.TelegramPollingService()
-    first._offset_state_path = state_path
-    first._token_fingerprint = "bot-a"
+    first, authority, _factory, fingerprint = _leased_polling_service(
+        tmp_path, label="offset"
+    )
     first.configure(lambda update: asyncio.sleep(0, result=handled.append(update["update_id"])))
     await first._process_updates([{"update_id": 40, "message": {}}])
 
-    restarted = runtime.TelegramPollingService()
-    restarted._offset_state_path = state_path
-    assert restarted._load_durable_offset("bot-a") == 41
-    assert restarted._load_durable_offset("different-bot") is None
+    assert authority.polling_cursor(fingerprint) == 41
+    different = hashlib.sha256(b"different-bot").hexdigest()
+    assert authority.polling_cursor(different) is None
     assert handled == [40]
 
 

@@ -47,6 +47,24 @@ def test_snapshot_rejects_output_inside_data_dir(tmp_path, monkeypatch):
         backup._reject_output_inside_data(data / "self.tar.gz")
 
 
+def test_local_snapshot_refuses_to_misrepresent_shared_postgres_backup(
+    tmp_path, monkeypatch
+):
+    backup = _load_backup_cli()
+    repo = tmp_path / "repo"
+    (repo / "data").mkdir(parents=True)
+    _patch_repo(backup, monkeypatch, repo)
+    monkeypatch.setenv("RESTIA_DATABASE_MODE", "shared")
+    monkeypatch.setenv(
+        "DATABASE_URL", "postgresql+psycopg://restia:redacted@db/restia"
+    )
+
+    with pytest.raises(SystemExit):
+        backup.cmd_snapshot(_snapshot_args(tmp_path / "not-created.tar.gz"))
+
+    assert not (tmp_path / "not-created.tar.gz").exists()
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits are not the Windows ACL boundary")
 def test_snapshot_is_owner_only_even_under_permissive_umask(tmp_path, monkeypatch):
     backup = _load_backup_cli()
@@ -154,3 +172,113 @@ def test_restore_extracts_regular_files_without_extractall(tmp_path, monkeypatch
     assert (repo / "data" / "nested" / "new.txt").read_text(encoding="utf-8") == "new"
     assert not (repo / "data" / "old.txt").exists()
     assert list(repo.glob("data.before-restore-*"))
+
+
+def test_restore_extraction_failure_leaves_live_data_untouched(tmp_path, monkeypatch):
+    backup = _load_backup_cli()
+    repo = tmp_path / "repo"
+    data = repo / "data"
+    data.mkdir(parents=True)
+    (data / "keep.txt").write_text("live", encoding="utf-8")
+    _patch_repo(backup, monkeypatch, repo)
+
+    tar_path = tmp_path / "valid.tar.gz"
+    with tarfile.open(tar_path, "w:gz") as tar:
+        payload = b"replacement"
+        item = tarfile.TarInfo("data/new.txt")
+        item.size = len(payload)
+        tar.addfile(item, io.BytesIO(payload))
+
+    def fail_staged_extract(*_args, **_kwargs):
+        raise OSError("simulated staging failure")
+
+    monkeypatch.setattr(backup, "_extract_restore_members", fail_staged_extract)
+    with pytest.raises(OSError, match="staging failure"):
+        backup.cmd_restore(_restore_args(tar_path))
+
+    assert (data / "keep.txt").read_text(encoding="utf-8") == "live"
+    assert not list(repo.glob("data.before-restore-*"))
+
+
+def test_live_sqlite_backup_failure_never_falls_back_to_raw_copy(
+    tmp_path, monkeypatch
+):
+    backup = _load_backup_cli()
+    source = tmp_path / "live.db"
+    source.write_bytes(b"SQLite format 3\x00" + b"incomplete")
+    destination = tmp_path / "copy.db"
+
+    def fail_connect(*_args, **_kwargs):
+        raise backup.sqlite3.OperationalError("simulated busy database")
+
+    monkeypatch.setattr(backup.sqlite3, "connect", fail_connect)
+    with pytest.raises(RuntimeError, match="online SQLite backup failed"):
+        backup._sqlite_safe_copy(source, destination)
+
+    assert not destination.exists()
+
+
+def test_verify_rejects_duplicate_archive_entries(tmp_path):
+    backup = _load_backup_cli()
+    tar_path = tmp_path / "duplicate.tar.gz"
+    with tarfile.open(tar_path, "w:gz") as tar:
+        for payload in (b"first", b"second"):
+            item = tarfile.TarInfo("data/value.txt")
+            item.size = len(payload)
+            tar.addfile(item, io.BytesIO(payload))
+
+    with pytest.raises(SystemExit):
+        backup.cmd_verify(_verify_args(tar_path))
+
+
+def test_encrypted_snapshot_verify_and_restore_use_external_private_passphrase(
+    tmp_path, monkeypatch
+):
+    backup = _load_backup_cli()
+    repo = tmp_path / "repo"
+    data = repo / "data"
+    data.mkdir(parents=True)
+    (data / ".app_key").write_text("application-key", encoding="utf-8")
+    (data / "private.txt").write_text("original private value", encoding="utf-8")
+    _patch_repo(backup, monkeypatch, repo)
+
+    passphrase = tmp_path / "backup-passphrase"
+    passphrase.write_text("a separate long backup passphrase", encoding="utf-8")
+    if os.name != "nt":
+        passphrase.chmod(0o600)
+    encrypted = tmp_path / "snapshot.tar.gz.restia"
+    snapshot_args = _snapshot_args(encrypted)
+    snapshot_args.encrypt_with_passphrase_file = str(passphrase)
+
+    backup.cmd_snapshot(snapshot_args)
+
+    assert encrypted.exists()
+    assert b"original private value" not in encrypted.read_bytes()
+    verify_args = _verify_args(encrypted)
+    verify_args.passphrase_file = str(passphrase)
+    backup.cmd_verify(verify_args)
+
+    (data / "private.txt").write_text("changed", encoding="utf-8")
+    restore_args = _restore_args(encrypted)
+    restore_args.passphrase_file = str(passphrase)
+    backup.cmd_restore(restore_args)
+    assert (data / "private.txt").read_text(encoding="utf-8") == "original private value"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file mode contract")
+def test_encryption_rejects_group_readable_passphrase_file(tmp_path, monkeypatch):
+    backup = _load_backup_cli()
+    source = tmp_path / "snapshot.tar.gz"
+    source.write_bytes(b"plaintext")
+    passphrase = tmp_path / "passphrase"
+    passphrase.write_text("a separate long backup passphrase", encoding="utf-8")
+    passphrase.chmod(0o644)
+
+    args = SimpleNamespace(
+        path=str(source),
+        out=str(tmp_path / "snapshot.restia"),
+        passphrase_file=str(passphrase),
+        pretty=False,
+    )
+    with pytest.raises(SystemExit):
+        backup.cmd_encrypt(args)

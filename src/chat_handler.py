@@ -176,6 +176,7 @@ class ChatHandler:
         # bearer-like references; never trust them without an owner check.
         files_by_id: Dict[str, Dict] = {}
         owner = getattr(sess, "owner", None)
+        upload_root = getattr(self.upload_handler, "upload_dir", UPLOAD_DIR)
         effective_att_ids = att_ids if allow_tool_preprocessing else []
         if effective_att_ids:
             for att_id in effective_att_ids:
@@ -228,7 +229,7 @@ class ChatHandler:
                         # hint so even vision-capable models respect the
                         # correction (otherwise the model would silently use
                         # whatever it reads from the pixels).
-                        _vcache = os.path.join(UPLOAD_DIR, ".vision", att_id + ".txt")
+                        _vcache = os.path.join(upload_root, ".vision", att_id + ".txt")
                         if os.path.exists(_vcache):
                             try:
                                 with open(_vcache, encoding="utf-8") as _vf:
@@ -246,7 +247,7 @@ class ChatHandler:
                         # Prefer the cached/user-edited text in UPLOAD_DIR/.vision/{id}.txt
                         # so a manual correction (via the chat attachment dropdown's
                         # editable textarea) overrides what the vision model would say.
-                        _vcache = os.path.join(UPLOAD_DIR, ".vision", att_id + ".txt")
+                        _vcache = os.path.join(upload_root, ".vision", att_id + ".txt")
                         vl_desc = None
                         vl_model = get_setting("vision_model", "") or ""
                         if os.path.exists(_vcache):
@@ -264,7 +265,7 @@ class ChatHandler:
                             vl_model = vl_result.get("model", "")
                             if vl_desc and not vl_desc.startswith("["):
                                 try:
-                                    os.makedirs(os.path.join(UPLOAD_DIR, ".vision"), exist_ok=True)
+                                    os.makedirs(os.path.join(upload_root, ".vision"), exist_ok=True)
                                     with open(_vcache, "w", encoding="utf-8") as _vf:
                                         _vf.write(vl_desc)
                                     _sync_upload_vision_to_gallery(file_info, owner, vl_desc)
@@ -280,7 +281,7 @@ class ChatHandler:
                             _m["vision_model"] = vl_model
 
         user_content = build_user_content(
-            enhanced_message, effective_att_ids, UPLOAD_DIR, self.upload_handler,
+            enhanced_message, effective_att_ids, upload_root, self.upload_handler,
             session_id=getattr(sess, "id", None),
             auto_opened_docs=auto_opened_docs,
             owner=owner,

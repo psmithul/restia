@@ -5,7 +5,7 @@ that conn.logout() is still called exactly once (guaranteed by try/finally).
 
 Functions covered:
   - routes/email_helpers.py: _fetch_sender_thread_context, _pre_retrieve_context
-  - mcp_servers/email_server.py: _list_emails, _read_email, _reply_to_email,
+  - mcp_servers/email_server.py: _list_emails, _read_email,
     _download_attachment
 """
 
@@ -194,23 +194,30 @@ def test_mcp_read_email_logs_out_on_fetch_failure(monkeypatch):
     )
 
 
-def test_mcp_reply_to_email_logs_out_on_select_failure(monkeypatch):
+def test_mcp_reply_action_uses_supplied_snapshot_and_never_opens_imap(monkeypatch):
     import mcp_servers.email_server as srv
 
-    captured = {}
-    conn = _make_failing_conn(captured, raises_on="select")
-    monkeypatch.setattr(srv, "_imap_connect", lambda *a, **kw: conn)
-
-    # Exception propagates; the finally still runs before it does.
-    try:
-        srv._reply_to_email(uid="1", body="hi")
-    except RuntimeError:
-        pass
-
-    assert captured.get("logout_calls", 0) == 1, (
-        f"conn.logout() must be called after select raises in _reply_to_email. "
-        f"Got logout_calls={captured.get('logout_calls')}"
+    monkeypatch.setattr(
+        srv,
+        "_imap_connect",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("reply action must not open IMAP")
+        ),
     )
+    monkeypatch.setattr(srv, "_send_email", lambda **kwargs: kwargs)
+
+    result = srv._reply_to_email(
+        uid="1",
+        body="hi",
+        to="sender@example.test",
+        subject="Original subject",
+        in_reply_to="<message@example.test>",
+        references=["<earlier@example.test>"],
+    )
+
+    assert result["kind"] == "reply"
+    assert result["source_uid"] == "1"
+    assert result["in_reply_to"] == "<message@example.test>"
 
 
 def test_mcp_download_attachment_logs_out_on_select_failure(monkeypatch):

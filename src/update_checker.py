@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Any
 
@@ -31,6 +32,7 @@ def build_update_result(
     current_commit: str,
     release: dict[str, Any] | None = None,
     branch_commit: dict[str, Any] | None = None,
+    build_channel: str | None = None,
 ) -> dict[str, Any]:
     """Build the stable JSON contract consumed by ``updateChecker.js``."""
     release = release or {}
@@ -41,9 +43,16 @@ def build_update_result(
         and not release.get("prerelease")
         and release_is_newer(current_version, tag)
     )
+    current_build_channel = str(
+        build_channel if build_channel is not None else os.getenv("BUILD_CHANNEL") or "source"
+    ).strip().lower()
+    if current_build_channel not in {"source", "dev", "stable", "release"}:
+        current_build_channel = "source"
+    allow_dev_updates = current_build_channel in {"source", "dev"}
     remote_sha = str((branch_commit or {}).get("sha") or "")[:12]
     commit_update = bool(
         not release_update
+        and allow_dev_updates
         and current_commit
         and current_commit != "unknown"
         and remote_sha
@@ -55,6 +64,7 @@ def build_update_result(
         "channel": "release" if release_update else "dev" if commit_update else "current",
         "current_version": current_version,
         "current_commit": current_commit,
+        "build_channel": current_build_channel,
         "latest_version": tag.lstrip("vV") if tag else "",
         "latest_commit": remote_sha,
         "repo": repo,

@@ -22,3 +22,29 @@ export const EMAIL_TAG_FILTERS = Object.freeze([
 ].map(item => Object.freeze({ ...item, keywords: Object.freeze(item.keywords) })));
 
 export const EMAIL_FILTERABLE_TAGS = Object.freeze(EMAIL_TAG_FILTERS.map(item => item.tag));
+
+const EMAIL_RENDERABLE_TAGS = new Set(
+  EMAIL_FILTERABLE_TAGS.filter(tag => tag !== 'spam'),
+);
+const DONE_RESPONSE_TAGS = new Set(['urgent', 'reply-soon', 'action-needed']);
+
+/** Mirror the API's canonicalization at the final rendering boundary. */
+export function normalizeEmailTagsForRender(tags, { answered = false } = {}) {
+  const result = [];
+  const seen = new Set();
+  for (const raw of (Array.isArray(tags) ? tags : [])) {
+    let tag = String(raw || '').trim().toLowerCase().replace(/_/g, '-');
+    if (tag === 'promo') tag = 'marketing';
+    if (!EMAIL_RENDERABLE_TAGS.has(tag) || seen.has(tag)) continue;
+    if (answered && DONE_RESPONSE_TAGS.has(tag)) continue;
+    seen.add(tag);
+    result.push(tag);
+  }
+  return result;
+}
+
+export function clearAnsweredEmailTags(email) {
+  if (!email || !Array.isArray(email.tags)) return [];
+  email.tags = normalizeEmailTagsForRender(email.tags, { answered: true });
+  return email.tags;
+}

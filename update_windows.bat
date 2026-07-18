@@ -1,53 +1,44 @@
 @echo off
 setlocal
 title Update Restia Docker Deployment
+set "EXIT_CODE=0"
 
 pushd "%~dp0" >nul
 
-echo =========================================
-echo Updating Restia Docker deployment
-echo =========================================
-echo.
-
 where docker >nul 2>nul
 if errorlevel 1 (
-  echo [!] Docker was not found on PATH.
-  echo     Start Docker Desktop, then run this script again.
+  echo [!] Docker was not found on PATH. Start Docker Desktop, then retry.
   goto :fail
 )
 
 docker compose version >nul 2>nul
 if errorlevel 1 (
-  echo [!] Docker Compose is not available.
-  echo     Update Docker Desktop, then run this script again.
+  echo [!] Docker Compose is not available. Update Docker Desktop, then retry.
   goto :fail
 )
 
-if "%RESTIA_IMAGE%"=="" set "RESTIA_IMAGE=ghcr.io/psmithul/restia:latest"
-echo [+] Pulling %RESTIA_IMAGE%...
-docker compose pull odysseus
-if errorlevel 1 goto :fail
+where powershell >nul 2>nul
+if errorlevel 1 (
+  echo [!] Windows PowerShell is required for safe backup and rollback handling.
+  goto :fail
+)
 
-echo.
-echo [+] Restarting Restia while preserving data and logs...
-docker compose up -d --no-build odysseus
-if errorlevel 1 goto :fail
-
-echo.
-echo [+] Removing dangling Docker images...
-docker image prune -f
+powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0update_windows.ps1" %*
 if errorlevel 1 goto :fail
 
 echo.
 echo =========================================
-echo Update completed successfully.
+echo Update operation completed successfully.
 echo =========================================
 goto :done
 
 :fail
+set "EXIT_CODE=1"
 echo.
-echo Update failed. Check the message above and try again.
+echo Update failed. Restia keeps the verified pre-update snapshot and attempts
+echo to restore the prior image whenever the new image does not become ready.
 
 :done
 popd >nul
 pause
+exit /b %EXIT_CODE%

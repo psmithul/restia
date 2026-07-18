@@ -111,4 +111,7 @@ graphify-out/
 
 # Backups
 backups/
-
+.restia-update-state
+.restia-update-state.json
+secrets/*
+!secrets/.gitkeep

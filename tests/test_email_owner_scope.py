@@ -45,7 +45,7 @@ def test_email_tag_clause_keeps_legacy_rows_for_single_user_mode(monkeypatch):
     assert params == [""]
 
 
-def test_email_ai_cache_tables_are_owner_scoped_and_migrate_legacy_rows(tmp_path, monkeypatch):
+def test_only_rebuildable_email_cache_tables_are_created_and_owner_scoped(tmp_path, monkeypatch):
     import routes.email_helpers as email_helpers
 
     db_path = tmp_path / "scheduled_emails.db"
@@ -83,12 +83,19 @@ def test_email_ai_cache_tables_are_owner_scoped_and_migrate_legacy_rows(tmp_path
         for table in (
             "email_summaries",
             "email_ai_replies",
-            "email_calendar_extractions",
-            "email_urgency_alerts",
         ):
             info = conn.execute(f"PRAGMA table_info({table})").fetchall()
             pk_cols = [r[1] for r in sorted((r for r in info if r[5]), key=lambda r: r[5])]
             assert pk_cols == ["message_id", "owner"]
+        tables = {
+            row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        assert not {
+            "scheduled_emails", "email_tags", "email_calendar_extractions",
+            "email_urgency_alerts", "email_event_seen",
+        }.intersection(tables)
         assert conn.execute(
             "SELECT owner, summary FROM email_summaries WHERE message_id=?",
             ("<shared@example.com>",),
@@ -227,6 +234,7 @@ def test_email_index_helpers_roundtrip_and_update_flags(tmp_path, monkeypatch):
     db_path = tmp_path / "scheduled_emails.db"
     monkeypatch.setattr(email_helpers, "SCHEDULED_DB", db_path)
     monkeypatch.setattr(email_routes, "SCHEDULED_DB", db_path)
+    monkeypatch.setattr(email_routes, "ingest_email_headers", lambda **kwargs: [])
     email_helpers._init_scheduled_db()
 
     email_routes._email_index_upsert(
@@ -450,13 +458,46 @@ async def test_sender_signature_clear_cache_keeps_other_owner_rows(tmp_path, mon
 
 @pytest.mark.asyncio
 async def test_scheduled_email_routes_are_owner_scoped(tmp_path, monkeypatch):
+    from cryptography.fernet import Fernet
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from core.database import Account, Base, EmailAccount
+
     import routes.email_helpers as email_helpers
     import routes.email_routes as email_routes
+    import src.email_runtime_authority as email_runtime_authority
+    import src.secret_storage as secret_storage
 
     db_path = tmp_path / "scheduled_emails.db"
     monkeypatch.setattr(email_helpers, "SCHEDULED_DB", db_path)
     monkeypatch.setattr(email_routes, "SCHEDULED_DB", db_path)
     email_helpers._init_scheduled_db()
+    monkeypatch.setenv("RESTIA_ENCRYPTION_KEY", Fernet.generate_key().decode("ascii"))
+    monkeypatch.setattr(secret_storage, "_fernet", None)
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'email-authority.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    db = factory()
+    db.add_all([
+        Account(id="owner-alice", username="alice"),
+        Account(id="owner-bob", username="bob"),
+        EmailAccount(
+            id="mail-alice", owner="alice", name="Alice Mail",
+            enabled=True, is_default=True,
+        ),
+        EmailAccount(
+            id="mail-bob", owner="bob", name="Bob Mail",
+            enabled=True, is_default=True,
+        ),
+    ])
+    db.commit()
+    db.close()
+    monkeypatch.setattr(email_runtime_authority, "SessionLocal", factory)
+    monkeypatch.setattr(email_routes, "_start_poller", lambda: None)
 
     router = email_routes.setup_email_routes()
     schedule_email = _route_endpoint(router, "/api/email/schedule", "POST")
@@ -489,19 +530,35 @@ async def test_scheduled_email_routes_are_owner_scoped(tmp_path, monkeypatch):
     await cancel_scheduled(alice["id"], owner="alice")
     alice_rows = await list_scheduled(owner="alice")
     assert alice_rows["scheduled"] == []
+    engine.dispose()
 
 
 @pytest.mark.asyncio
-async def test_pending_agent_draft_routes_do_not_expose_ownerless_rows(tmp_path, monkeypatch):
+async def test_legacy_agent_draft_routes_are_fail_closed_and_source_is_immutable(tmp_path, monkeypatch):
     import routes.email_helpers as email_helpers
     import routes.email_routes as email_routes
 
     db_path = tmp_path / "scheduled_emails.db"
     monkeypatch.setattr(email_helpers, "SCHEDULED_DB", db_path)
     monkeypatch.setattr(email_routes, "SCHEDULED_DB", db_path)
-    email_helpers._init_scheduled_db()
 
     conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE scheduled_emails (
+            id TEXT PRIMARY KEY,
+            to_addr TEXT,
+            subject TEXT,
+            body TEXT,
+            attachments TEXT,
+            send_at TEXT,
+            created_at TEXT,
+            status TEXT,
+            account_id TEXT,
+            owner TEXT
+        )
+        """
+    )
     conn.executemany(
         """
         INSERT INTO scheduled_emails
@@ -516,6 +573,7 @@ async def test_pending_agent_draft_routes_do_not_expose_ownerless_rows(tmp_path,
     conn.commit()
     conn.close()
 
+    monkeypatch.setattr(email_routes, "_start_poller", lambda: None)
     router = email_routes.setup_email_routes()
     list_pending = _route_endpoint(router, "/api/email/pending", "GET")
     approve_pending = _route_endpoint(router, "/api/email/pending/{sid}/approve", "POST")
@@ -525,9 +583,14 @@ async def test_pending_agent_draft_routes_do_not_expose_ownerless_rows(tmp_path,
     bob_rows = await list_pending(owner="bob")
 
     assert alice_rows["pending"] == []
-    assert [row["id"] for row in bob_rows["pending"]] == ["draft-bob"]
-    assert (await approve_pending("draft-ownerless", owner="alice"))["success"] is False
-    assert (await cancel_pending("draft-ownerless", owner="bob"))["success"] is False
+    assert bob_rows["pending"] == []
+    assert bob_rows["authority"] == "action_proposals"
+    approve_result = await approve_pending("draft-bob", owner="bob")
+    cancel_result = await cancel_pending("draft-bob", owner="bob")
+    assert approve_result["success"] is False
+    assert approve_result["code"] == "level5_review_required"
+    assert cancel_result["success"] is False
+    assert cancel_result["code"] == "level5_review_required"
 
     conn = sqlite3.connect(db_path)
     try:
@@ -540,35 +603,42 @@ async def test_pending_agent_draft_routes_do_not_expose_ownerless_rows(tmp_path,
 
 
 def test_scheduled_poller_resolves_config_with_row_owner(tmp_path, monkeypatch):
-    import routes.email_helpers as email_helpers
+    from cryptography.fernet import Fernet
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    import core.database as database
+    from core.database import Account, Base, EmailAccount, EmailScheduledDelivery
     import routes.email_pollers as email_pollers
+    import src.email_runtime_authority as email_runtime_authority
+    import src.secret_storage as secret_storage
 
-    db_path = tmp_path / "scheduled_emails.db"
-    monkeypatch.setattr(email_helpers, "SCHEDULED_DB", db_path)
-    monkeypatch.setattr(email_pollers, "SCHEDULED_DB", db_path)
-    email_helpers._init_scheduled_db()
-
-    conn = sqlite3.connect(db_path)
-    conn.execute(
-        """
-        INSERT INTO scheduled_emails
-        (id, to_addr, subject, body, attachments, send_at, created_at, status, account_id, owner)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
-        """,
-        (
-            "sched-1",
-            "recipient@example.com",
-            "Subject",
-            "Body",
-            "[]",
-            "2000-01-01T00:00:00",
-            "1999-12-31T00:00:00",
-            "acct-alice",
-            "alice",
-        ),
+    monkeypatch.setenv("RESTIA_ENCRYPTION_KEY", Fernet.generate_key().decode("ascii"))
+    monkeypatch.setattr(secret_storage, "_fernet", None)
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'email-authority.db'}",
+        connect_args={"check_same_thread": False},
     )
-    conn.commit()
-    conn.close()
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    db = factory()
+    db.add(Account(id="owner-alice", username="alice"))
+    db.add(EmailAccount(
+        id="acct-alice", owner="alice", name="Alice Mail",
+        enabled=True, is_default=True,
+    ))
+    db.commit()
+    db.close()
+    monkeypatch.setattr(email_runtime_authority, "SessionLocal", factory)
+    monkeypatch.setattr(database, "SessionLocal", factory)
+    email_runtime_authority.create_scheduled_delivery(
+        owner="alice", email_account_id="acct-alice",
+        scheduled_for=datetime(2000, 1, 1), delivery_id="sched-1",
+        payload={
+            "to": "recipient@example.com", "subject": "Subject",
+            "body": "Body", "attachments": [],
+        },
+    )
 
     calls = []
 
@@ -599,9 +669,20 @@ def test_scheduled_poller_resolves_config_with_row_owner(tmp_path, monkeypatch):
     monkeypatch.setattr(email_pollers, "_imap", FakeImap)
     monkeypatch.setattr(email_pollers, "_detect_sent_folder", lambda imap: "Sent")
     monkeypatch.setattr(email_pollers, "_cleanup_compose_uploads", lambda attachments: calls.append(("cleanup", attachments)))
+    monkeypatch.setattr(email_pollers, "drain_email_outbox_once", lambda: {
+        "attempted": 0, "delivered": [], "retried": [], "failed": [],
+        "incomplete": [], "at_least_once": True,
+    })
+    monkeypatch.setattr(email_pollers, "import_legacy_email_runtime", lambda **_kwargs: {})
 
     result = email_pollers._scheduled_poll_once()
 
     assert result == {"sent": ["sched-1"], "failed": []}
     assert ("config", "acct-alice", "alice") in calls
     assert ("imap", "acct-alice", "alice") in calls
+    check = factory()
+    try:
+        assert check.get(EmailScheduledDelivery, "sched-1").state == "delivered"
+    finally:
+        check.close()
+        engine.dispose()

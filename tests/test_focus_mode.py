@@ -16,6 +16,7 @@ from core.database import (
     Account,
     ActionAudit,
     Base,
+    EntityLink,
     FocusSession,
     LifeEntity,
     LifeEntityVersion,
@@ -727,3 +728,191 @@ async def test_life_api_token_scopes_share_the_same_principal(focus_env):
     )
     assert api_read.status_code == 200
     assert api_read.json()["session"]["id"] == session_id
+
+
+@pytest.mark.asyncio
+async def test_current_focus_includes_only_owned_linked_work_context(focus_env):
+    with focus_env.Session() as db:
+        note = LifeEntity(
+            id="00000000-0000-4000-8000-000000000201",
+            owner_id=focus_env.alice.id,
+            entity_type="note",
+            title="Controller notes",
+            summary="Tuning observations",
+            status="active",
+            properties={},
+            provenance={},
+            version=1,
+        )
+        project = LifeEntity(
+            id="00000000-0000-4000-8000-000000000202",
+            owner_id=focus_env.alice.id,
+            entity_type="project",
+            title="Controls capstone",
+            status="active",
+            properties={},
+            provenance={},
+            version=1,
+        )
+        db.add_all([note, project])
+        db.flush()
+        db.add_all([
+            EntityLink(
+                id="00000000-0000-4000-8000-000000000211",
+                owner_id=focus_env.alice.id,
+                source_type="life_entity",
+                source_id=focus_env.entities["task"].id,
+                relation="uses",
+                target_type="life_entity",
+                target_id=note.id,
+                meta_data={},
+                provenance={},
+                confidence=100,
+                sensitivity="private",
+                version=1,
+            ),
+            EntityLink(
+                id="00000000-0000-4000-8000-000000000212",
+                owner_id=focus_env.alice.id,
+                source_type="life_entity",
+                source_id=project.id,
+                relation="contains",
+                target_type="life_entity",
+                target_id=focus_env.entities["task"].id,
+                meta_data={},
+                provenance={},
+                confidence=100,
+                sensitivity="private",
+                version=1,
+            ),
+            # A corrupt edge carrying Alice's owner id must not expose Bob's
+            # endpoint through Focus context.
+            EntityLink(
+                id="00000000-0000-4000-8000-000000000213",
+                owner_id=focus_env.alice.id,
+                source_type="life_entity",
+                source_id=focus_env.entities["task"].id,
+                relation="mentions",
+                target_type="life_entity",
+                target_id=focus_env.entities["bob_task"].id,
+                meta_data={},
+                provenance={},
+                confidence=100,
+                sensitivity="private",
+                version=1,
+            ),
+        ])
+        db.commit()
+
+    started = await _call(
+        focus_env, "POST", "/api/life/focus/start", json=_start_body(focus_env)
+    )
+    assert started.status_code == 201, started.text
+    session = started.json()["session"]
+    assert session["entity"]["properties"] == {}
+    assert [(row["entity_type"], row["title"], row["direction"]) for row in session["context"]] == [
+        ("note", "Controller notes", "outgoing"),
+        ("project", "Controls capstone", "incoming"),
+    ]
+    assert "Bob private task" not in str(session)
+
+    restored = await _call(focus_env, "GET", "/api/life/focus/current")
+    assert restored.status_code == 200
+    assert restored.json()["session"]["context"] == session["context"]
+
+
+@pytest.mark.asyncio
+async def test_today_planning_target_is_projected_only_on_explicit_focus_start(
+    focus_env,
+):
+    item_id = "00000000-0000-4000-8000-000000000220"
+    with focus_env.Session() as db:
+        db.add(PlanningItem(
+            id=item_id,
+            owner="alice",
+            title="Finish Today plan",
+            details="Verify the owner-scoped result",
+            status="open",
+            priority="high",
+            source="user",
+            version=4,
+        ))
+        db.commit()
+        assert db.query(LifeEntity).filter_by(
+            owner_id=focus_env.alice.id,
+            domain_ref_type="planning_item",
+            domain_ref_id=item_id,
+        ).count() == 0
+
+    started = await _call(
+        focus_env,
+        "POST",
+        "/api/life/focus/start",
+        json={
+            "domain_ref_type": "planning_item",
+            "domain_ref_id": item_id,
+            "domain_ref_version": 4,
+            "definition_of_done": "The plan is finished and verified",
+        },
+    )
+    assert started.status_code == 201, started.text
+    entity = started.json()["session"]["entity"]
+    assert entity["domain_ref_type"] == "planning_item"
+    assert entity["domain_ref_id"] == item_id
+    assert entity["title"] == "Finish Today plan"
+
+    with focus_env.Session() as db:
+        projections = db.query(LifeEntity).filter_by(
+            owner_id=focus_env.alice.id,
+            domain_ref_type="planning_item",
+            domain_ref_id=item_id,
+        ).all()
+        assert len(projections) == 1
+
+
+@pytest.mark.asyncio
+async def test_today_planning_focus_rejects_stale_or_mixed_targets(focus_env):
+    item_id = "00000000-0000-4000-8000-000000000230"
+    with focus_env.Session() as db:
+        db.add(PlanningItem(
+            id=item_id,
+            owner="alice",
+            title="Versioned plan",
+            details="",
+            status="open",
+            priority="normal",
+            source="user",
+            version=3,
+        ))
+        db.commit()
+
+    stale = await _call(
+        focus_env,
+        "POST",
+        "/api/life/focus/start",
+        json={
+            "domain_ref_type": "planning_item",
+            "domain_ref_id": item_id,
+            "domain_ref_version": 2,
+            "definition_of_done": "Must not start stale work",
+        },
+    )
+    assert stale.status_code == 409
+
+    mixed = await _call(
+        focus_env,
+        "POST",
+        "/api/life/focus/start",
+        json={
+            **_start_body(focus_env),
+            "domain_ref_type": "planning_item",
+            "domain_ref_id": item_id,
+            "domain_ref_version": 3,
+        },
+    )
+    assert mixed.status_code == 400
+    with focus_env.Session() as db:
+        assert db.query(FocusSession).count() == 0
+        assert db.query(LifeEntity).filter_by(
+            domain_ref_type="planning_item", domain_ref_id=item_id
+        ).count() == 0

@@ -40,6 +40,28 @@ from src.auth_helpers import legacy_owner_storage_key, owner_storage_key
 from src.constants import DATA_DIR
 
 from src.llm_core import llm_call_async
+from src.email_life_projection_ledger import (
+    drain_email_life_projections,
+    encode_email_life_projection_recovery_payload,
+    enqueue_email_life_headers,
+)
+from src.email_runtime_authority import (
+    AUTOMATION_RULE_KEYS,
+    cancel_scheduled_delivery,
+    claim_email_automation,
+    clear_done_email_tags,
+    complete_email_automation,
+    completed_email_automation_results,
+    create_scheduled_delivery,
+    get_email_automation_rules,
+    has_email_automation_history,
+    import_legacy_email_runtime,
+    list_email_tag_states,
+    list_scheduled_deliveries,
+    set_email_automation_rules,
+    unflag_email_spam,
+)
+from src.life_ingestion import ingest_email_headers
 from src.upload_limits import read_upload_limited, EMAIL_COMPOSE_UPLOAD_MAX_BYTES
 
 from routes.email_helpers import (
@@ -167,28 +189,10 @@ def _hide_unlinked_calendar_tags(emails: list[dict]) -> None:
 
 def _clear_done_response_tags(owner: str, account_id: str | None, folder: str, uid: str) -> None:
     try:
-        conn = _sql3.connect(SCHEDULED_DB)
-        owner_clause, owner_params = _email_tag_owner_clause(account_id, owner)
-        account_clause, account_params = _email_tag_account_clause(account_id)
-        rows = conn.execute(
-            f"SELECT rowid, tags FROM email_tags WHERE folder=? AND uid=? AND {owner_clause} AND {account_clause}",
-            [folder, str(uid), *owner_params, *account_params],
-        ).fetchall()
-        for rowid, tags_raw in rows:
-            try:
-                tags = json.loads(tags_raw or "[]")
-            except Exception:
-                tags = []
-            if not isinstance(tags, list):
-                tags = []
-            kept = [
-                t for t in tags
-                if str(t).strip().lower().replace("_", "-") not in _DONE_RESPONSE_TAGS
-            ]
-            if kept != tags:
-                conn.execute("UPDATE email_tags SET tags=? WHERE rowid=?", (json.dumps(kept), rowid))
-        conn.commit()
-        conn.close()
+        clear_done_email_tags(
+            owner=owner, account_id=account_id, folder=folder, uid=str(uid),
+            done_tags=_DONE_RESPONSE_TAGS,
+        )
     except Exception as e:
         logger.debug(f"clear done response tags skipped: {e}")
 
@@ -200,7 +204,6 @@ def _record_email_received_events(owner: str, account_id: str | None, folder: st
     try:
         from src.event_bus import fire_event
         account_key = (account_id or "default").strip() or "default"
-        now = datetime.utcnow().isoformat() + "Z"
         keys = []
         for e in emails:
             key = (e.get("message_id") or e.get("uid") or "").strip()
@@ -209,41 +212,24 @@ def _record_email_received_events(owner: str, account_id: str | None, folder: st
         if not keys:
             return
 
-        conn = _sql3.connect(SCHEDULED_DB)
-        try:
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS email_event_seen ("
-                "owner TEXT NOT NULL, account_key TEXT NOT NULL, folder TEXT NOT NULL, "
-                "message_key TEXT NOT NULL, first_seen_at TEXT NOT NULL, "
-                "PRIMARY KEY (owner, account_key, folder, message_key))"
+        had_baseline = has_email_automation_history(
+            owner=owner, account_id=account_key, operation="email_received",
+        )
+        fired = 0
+        for key in keys[:50]:
+            claim = claim_email_automation(
+                owner=owner, account_id=account_key,
+                operation="email_received", message_id=key,
+                payload={"message_id": key, "folder": folder},
             )
-            count = conn.execute(
-                "SELECT COUNT(*) FROM email_event_seen WHERE owner=? AND account_key=? AND folder=?",
-                (owner, account_key, folder),
-            ).fetchone()[0]
-            existing = set()
-            if count:
-                placeholders = ",".join("?" * len(keys))
-                rows = conn.execute(
-                    f"SELECT message_key FROM email_event_seen "
-                    f"WHERE owner=? AND account_key=? AND folder=? AND message_key IN ({placeholders})",
-                    (owner, account_key, folder, *keys),
-                ).fetchall()
-                existing = {r[0] for r in rows}
-            new_keys = [k for k in keys if k not in existing]
-            conn.executemany(
-                "INSERT OR IGNORE INTO email_event_seen "
-                "(owner, account_key, folder, message_key, first_seen_at) VALUES (?, ?, ?, ?, ?)",
-                [(owner, account_key, folder, k, now) for k in keys],
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-        if count and new_keys:
-            for _ in new_keys[:50]:
+            if claim is None:
+                continue
+            if had_baseline:
                 fire_event("email_received", owner)
-            logger.info("Fired email_received for %d new message(s)", min(len(new_keys), 50))
+                fired += 1
+            complete_email_automation(claim, result={"event_fired": had_baseline})
+        if fired:
+            logger.info("Fired email_received for %d new message(s)", fired)
     except Exception:
         logger.debug("email_received event detection skipped", exc_info=True)
 
@@ -408,6 +394,16 @@ def _parse_email_list_record(meta_b: bytes, raw_header: bytes | None) -> dict | 
         sender = _decode_header(msg.get("From", "unknown"))
         date_str = msg.get("Date", "")
         message_id = (msg.get("Message-ID", "") or "").strip()
+        references = list(dict.fromkeys(re.findall(
+            r"<[^<>\s]+>", " ".join(msg.get_all("References", [])),
+        )))
+        in_reply_to_raw = (msg.get("In-Reply-To", "") or "").strip()
+        in_reply_to_tokens = re.findall(r"<[^<>\s]+>", in_reply_to_raw)
+        in_reply_to = (
+            in_reply_to_tokens[0]
+            if in_reply_to_tokens
+            else in_reply_to_raw
+        )
         sender_name, sender_addr = email.utils.parseaddr(sender)
         to_str = _decode_header(msg.get("To", ""))
         cc_str = _decode_header(msg.get("Cc", ""))
@@ -422,6 +418,8 @@ def _parse_email_list_record(meta_b: bytes, raw_header: bytes | None) -> dict | 
         return {
             "uid": uid_num,
             "message_id": message_id,
+            "references": references,
+            "in_reply_to": in_reply_to,
             "subject": subject,
             "from_name": sender_name or sender_addr,
             "from_address": sender_addr,
@@ -749,15 +747,75 @@ def _email_imap_search_criteria(query: str) -> str:
     return "(" + " ".join(term_exprs) + ")"
 
 
+def _drain_email_life_projection_ledger(
+    owner: str,
+    account_id: str | None,
+    folder: str | None,
+    *,
+    limit: int = 8,
+    backfill_limit: int = 32,
+    raise_on_failure: bool = False,
+):
+    """Drain the durable email projection outbox without exposing content."""
+
+    try:
+        return drain_email_life_projections(
+            SCHEDULED_DB,
+            ingest=ingest_email_headers,
+            owner=owner or "",
+            account_key=_account_cache_key(account_id, owner),
+            folder=folder,
+            limit=limit,
+            backfill_limit=backfill_limit,
+            raise_on_failure=raise_on_failure,
+        )
+    except Exception:
+        if raise_on_failure:
+            raise
+        # Do not log the exception chain: connector/server failures can contain
+        # subjects, addresses, or credentials. The ledger retains a structural
+        # error code and the next cache hit will retry the bounded drain.
+        logger.error("Email Life projection backfill deferred; source retained")
+        try:
+            # A malformed/temporarily unreadable legacy cache must not starve
+            # already-enqueued canonical SQL rows. Skip only this backfill
+            # attempt; claims still retain their own retry/fencing contract.
+            return drain_email_life_projections(
+                None,
+                ingest=ingest_email_headers,
+                owner=owner or "",
+                account_key=_account_cache_key(account_id, owner),
+                folder=folder,
+                limit=limit,
+                backfill_limit=0,
+                raise_on_failure=False,
+            )
+        except Exception:
+            logger.error(
+                "Email Life projection drain deferred; durable retry retained"
+            )
+            return None
+
+
 def _email_index_upsert(owner: str, account_id: str | None, folder: str, emails: list[dict]):
     if not emails:
         return
     now = datetime.utcnow().isoformat() + "Z"
     rows = []
+    indexed_emails = []
     for e in emails:
         uid = str(e.get("uid") or "").strip()
         if not uid:
             continue
+        try:
+            recovery_payload = encode_email_life_projection_recovery_payload(e)
+        except Exception:
+            logger.error(
+                "Email index recovery envelope could not be encrypted; "
+                "cache update deferred"
+            )
+            return
+        indexed_emails.append(e)
         rows.append((
             owner or "",
             _account_cache_key(account_id, owner),
@@ -776,6 +834,7 @@ def _email_index_upsert(owner: str, account_id: str | None, folder: str, emails:
             e.get("flags") or "",
             1 if e.get("has_attachments") else 0,
             now,
+            recovery_payload,
         ))
     if not rows:
         return
@@ -787,8 +846,9 @@ def _email_index_upsert(owner: str, account_id: str | None, folder: str, emails:
                 INSERT INTO email_message_index
                 (owner, account_key, folder, uid, message_id, subject, from_name,
                  from_address, to_text, cc_text, date_iso, date_display, date_epoch,
-                 size, flags, has_attachments, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 size, flags, has_attachments, updated_at,
+                 projection_payload_ciphertext)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(owner, account_key, folder, uid) DO UPDATE SET
                     message_id=excluded.message_id,
                     subject=excluded.subject,
@@ -802,15 +862,47 @@ def _email_index_upsert(owner: str, account_id: str | None, folder: str, emails:
                     size=excluded.size,
                     flags=excluded.flags,
                     has_attachments=excluded.has_attachments,
-                    updated_at=excluded.updated_at
+                    updated_at=excluded.updated_at,
+                    projection_payload_ciphertext=excluded.projection_payload_ciphertext
                 """,
                 rows,
             )
             conn.commit()
         finally:
             conn.close()
-    except Exception as e:
-        logger.debug(f"email index write skipped: {e}")
+    except Exception:
+        logger.error("Email index update deferred; transaction rolled back")
+        return
+
+    # The rebuildable cache and canonical projection outbox are different
+    # database authorities, so this is deliberately not described as atomic.
+    # Commit the cache first, then durably enqueue its immutable headers. If
+    # the process or SQL authority fails in this gap, every bounded drain below
+    # backfills the committed index rows idempotently before claiming work.
+    try:
+        enqueue_email_life_headers(
+            owner=owner or "",
+            account_key=_account_cache_key(account_id, owner),
+            folder=folder,
+            emails=indexed_emails,
+        )
+    except Exception:
+        # Do not expose connector/header/key material. The committed cache is
+        # the non-destructive recovery source for the next list/search drain.
+        logger.error("Email Life projection enqueue deferred; cache backfill retained")
+
+    _drain_email_life_projection_ledger(
+        owner,
+        account_id,
+        folder,
+        limit=max(1, min(len(indexed_emails), 16)),
+        backfill_limit=max(16, min(len(indexed_emails) * 2, 64)),
+        # Life projection is a secondary consumer of the authoritative IMAP
+        # result.  The cache row and encrypted retry payload are already
+        # durable at this point, so a main-database outage must not turn a
+        # successfully fetched mailbox page into a user-visible mail error.
+        raise_on_failure=False,
+    )
 
 
 def _email_index_update_flags(owner: str, account_id: str | None, folder: str, uid: str, flag: str, add: bool):
@@ -1600,6 +1692,13 @@ def setup_email_routes():
         conn = None
         conn_ok = False
         try:
+            if owner:
+                try:
+                    import_legacy_email_runtime(
+                        owner=owner, sidecar_path=SCHEDULED_DB,
+                    )
+                except Exception:
+                    logger.error("Canonical email runtime import failed")
             conn, _reused_conn = _pooled_connect(account_id, owner=owner)
             conn_ok = True
             select_status, _ = conn.select(_q(folder), readonly=True)
@@ -1643,7 +1742,8 @@ def setup_email_routes():
                 _before = (_dt.utcnow() - _td(days=30)).strftime("%d-%b-%Y")
                 status, data = _imap_uid_search(conn, f'(UNANSWERED BEFORE "{_before}"{from_clause})')
             elif filter_ and filter_.startswith("tag:"):
-                # Tag-based filter — resolve UIDs from email_tags first, then
+                # Tag-based filter — resolve UIDs from canonical SQL tag state,
+                # then
                 # ask IMAP for those messages by Message-ID. `tag:spam` reads
                 # spam_verdict=1; any other tag matches JSON-array membership
                 # in `tags`.
@@ -1651,41 +1751,25 @@ def setup_email_routes():
                 _tag_message_ids = []
                 _tag_seq_fallback = []
                 try:
-                    import sqlite3 as _sql3t
-                    _ct = _sql3t.connect(SCHEDULED_DB)
-                    _owner_clause, _owner_params = _email_tag_owner_clause(account_id, owner)
-                    _account_clause, _account_params = _email_tag_account_clause(account_id)
-                    # SECURITY: owner-scope the lookup (review C2/H8). Without
-                    # this, user A's `tag:urgent` filter would surface UIDs
-                    # written by user B and IMAP would return whatever
-                    # happens to live at those UIDs in A's mailbox. Account
-                    # mailbox aliases are included because the background
-                    # urgency task may be owned by the mailbox address while
-                    # the UI is owned by the app user.
+                    rows_t = list_email_tag_states(
+                        owner=owner, account_id=account_id, folder=folder,
+                    )
                     if _tag_name == "spam":
-                        rows_t = _ct.execute(
-                            "SELECT message_id, uid FROM email_tags "
-                            "WHERE folder=? AND spam_verdict=1 "
-                            f"AND {_owner_clause} AND {_account_clause}",
-                            (folder, *_owner_params, *_account_params),
-                        ).fetchall()
-                        for mid, uid in rows_t:
+                        for row_t in rows_t:
+                            if not row_t.get("spam_verdict"):
+                                continue
+                            mid = row_t.get("message_id")
+                            uid = row_t.get("uid")
                             if mid:
                                 _tag_message_ids.append(str(mid).strip())
                             elif uid:
                                 _tag_seq_fallback.append(str(uid).strip())
                     else:
-                        rows_t = _ct.execute(
-                            "SELECT message_id, uid, tags FROM email_tags "
-                            "WHERE folder=? AND tags IS NOT NULL AND tags != '' "
-                            f"AND {_owner_clause} AND {_account_clause}",
-                            (folder, *_owner_params, *_account_params),
-                        ).fetchall()
                         _idx_flags_by_uid = {}
                         _idx_flags_by_mid = {}
                         try:
-                            _uid_vals = [str(r[1]).strip() for r in rows_t if r[1]]
-                            _mid_vals = [str(r[0]).strip() for r in rows_t if r[0]]
+                            _uid_vals = [str(r.get("uid")).strip() for r in rows_t if r.get("uid")]
+                            _mid_vals = [str(r.get("message_id")).strip() for r in rows_t if r.get("message_id")]
                             _idx_clauses = []
                             _idx_params = [owner or "", _account_cache_key(account_id, owner), folder]
                             if _uid_vals:
@@ -1695,30 +1779,33 @@ def setup_email_routes():
                                 _idx_clauses.append("message_id IN (" + ",".join("?" * len(_mid_vals)) + ")")
                                 _idx_params.extend(_mid_vals)
                             if _idx_clauses:
-                                for _uid_i, _mid_i, _flags_i in _ct.execute(
-                                    "SELECT uid, message_id, flags FROM email_message_index "
-                                    "WHERE owner=? AND account_key=? AND folder=? AND (" + " OR ".join(_idx_clauses) + ")",
-                                    _idx_params,
-                                ).fetchall():
+                                with _sql3.connect(SCHEDULED_DB) as _ct:
+                                    _idx_rows = _ct.execute(
+                                        "SELECT uid, message_id, flags FROM email_message_index "
+                                        "WHERE owner=? AND account_key=? AND folder=? AND (" + " OR ".join(_idx_clauses) + ")",
+                                        _idx_params,
+                                    ).fetchall()
+                                for _uid_i, _mid_i, _flags_i in _idx_rows:
                                     if _uid_i:
                                         _idx_flags_by_uid[str(_uid_i)] = _flags_i or ""
                                     if _mid_i:
                                         _idx_flags_by_mid[str(_mid_i).strip()] = _flags_i or ""
                         except Exception as _idx_e:
                             logger.debug(f"tag filter index flag lookup skipped: {_idx_e}")
-                        for r in rows_t:
+                        for row_t in rows_t:
                             try:
-                                tg = json.loads(r[2] or "[]")
-                                flags = _idx_flags_by_mid.get(str(r[0] or "").strip()) or _idx_flags_by_uid.get(str(r[1] or "").strip()) or ""
+                                tg = row_t.get("tags") or []
+                                mid = row_t.get("message_id")
+                                uid = row_t.get("uid")
+                                flags = _idx_flags_by_mid.get(str(mid or "").strip()) or _idx_flags_by_uid.get(str(uid or "").strip()) or ""
                                 row_tags = set(_sanitize_visible_email_tags(tg, is_answered="\\Answered" in flags))
                                 if _tag_name in row_tags:
-                                    if r[0]:
-                                        _tag_message_ids.append(str(r[0]).strip())
-                                    elif r[1]:
-                                        _tag_seq_fallback.append(str(r[1]).strip())
+                                    if mid:
+                                        _tag_message_ids.append(str(mid).strip())
+                                    elif uid:
+                                        _tag_seq_fallback.append(str(uid).strip())
                             except Exception:
                                 continue
-                    _ct.close()
                 except Exception as _te:
                     logger.warning(f"tag filter lookup failed: {_te}")
                 if not _tag_message_ids and not _tag_seq_fallback:
@@ -1766,27 +1853,19 @@ def setup_email_routes():
             # Preload tag rows once — keyed by uid (as str) for the emails we'll render
             _tag_by_uid = {}
             try:
-                import sqlite3 as _sql3
-                _c = _sql3.connect(SCHEDULED_DB)
                 _uid_strs = [u.decode() for u in uid_list]
                 if _uid_strs:
-                    placeholders = ",".join("?" * len(_uid_strs))
-                    _owner_clause, _owner_params = _email_tag_owner_clause(account_id, owner)
-                    _account_clause, _account_params = _email_tag_account_clause(account_id)
-                    rows = _c.execute(
-                        f"SELECT uid, tags, spam_verdict FROM email_tags "
-                        f"WHERE folder=? AND {_owner_clause} AND {_account_clause} AND uid IN ({placeholders})",
-                        [folder, *_owner_params, *_account_params, *_uid_strs],
-                    ).fetchall()
+                    rows = list_email_tag_states(
+                        owner=owner, account_id=account_id, folder=folder,
+                        uids=_uid_strs,
+                    )
                     for r in rows:
-                        try:
-                            tg = json.loads(r[1] or "[]")
-                        except Exception:
-                            tg = []
+                        tg = r.get("tags") or []
                         if isinstance(tg, list):
                             tg = _sanitize_visible_email_tags(tg)
-                        _tag_by_uid[r[0]] = {"tags": tg, "spam": bool(r[2])}
-                _c.close()
+                        _tag_by_uid[str(r.get("uid") or "")] = {
+                            "tags": tg, "spam": bool(r.get("spam_verdict")),
+                        }
             except Exception as e:
                 logger.warning(f"Tag preload failed: {e}")
 
@@ -1827,28 +1906,18 @@ def setup_email_routes():
                         if mid:
                             header_ids.append(mid)
                     if header_ids:
-                        import sqlite3 as _sql3m
-                        _cm = _sql3m.connect(SCHEDULED_DB)
-                        _owner_clause_m, _owner_params_m = _email_tag_owner_clause(account_id, owner)
-                        _account_clause_m, _account_params_m = _email_tag_account_clause(account_id)
-                        _mid_ph = ",".join("?" * len(header_ids))
-                        rows_m = _cm.execute(
-                            f"SELECT message_id, tags, spam_verdict FROM email_tags "
-                            f"WHERE folder=? AND {_owner_clause_m} AND {_account_clause_m} "
-                            f"AND message_id IN ({_mid_ph})",
-                            [folder, *_owner_params_m, *_account_params_m, *header_ids],
-                        ).fetchall()
-                        _cm.close()
-                        for mid, tags_raw, spam_raw in rows_m:
-                            try:
-                                tags = json.loads(tags_raw or "[]")
-                            except Exception:
-                                tags = []
+                        rows_m = list_email_tag_states(
+                            owner=owner, account_id=account_id, folder=folder,
+                            message_ids=header_ids,
+                        )
+                        for row_m in rows_m:
+                            mid = row_m.get("message_id")
+                            tags = row_m.get("tags") or []
                             if isinstance(tags, list):
                                 tags = _sanitize_visible_email_tags(tags)
                             _tag_by_message_id[(mid or "").strip()] = {
                                 "tags": tags if isinstance(tags, list) else [],
-                                "spam": bool(spam_raw),
+                                "spam": bool(row_m.get("spam_verdict")),
                             }
                 except Exception as e:
                     logger.warning(f"Message-ID tag preload failed: {e}")
@@ -1876,41 +1945,29 @@ def setup_email_routes():
 
             if emails:
                 try:
-                    import sqlite3 as _sql3i
-                    _ci = _sql3i.connect(SCHEDULED_DB)
-                    _owner_clause_i, _owner_params_i = _email_tag_owner_clause(account_id, owner)
-                    _account_clause_i, _account_params_i = _email_tag_account_clause(account_id)
                     uid_vals = [str(e.get("uid") or "") for e in emails if e.get("uid")]
                     mid_vals = [(e.get("message_id") or "").strip() for e in emails if e.get("message_id")]
-                    clauses = []
-                    params = [folder, *_owner_params_i, *_account_params_i]
-                    if uid_vals:
-                        clauses.append("uid IN (" + ",".join("?" * len(uid_vals)) + ")")
-                        params.extend(uid_vals)
-                    if mid_vals:
-                        clauses.append("message_id IN (" + ",".join("?" * len(mid_vals)) + ")")
-                        params.extend(mid_vals)
                     tag_by_uid = {}
                     tag_by_mid = {}
-                    if clauses:
-                        rows_i = _ci.execute(
-                            f"SELECT uid, message_id, tags, spam_verdict FROM email_tags "
-                            f"WHERE folder=? AND {_owner_clause_i} AND {_account_clause_i} AND ({' OR '.join(clauses)})",
-                            params,
-                        ).fetchall()
-                        for uid_i, mid_i, tags_raw_i, spam_i in rows_i:
-                            try:
-                                tags_i = json.loads(tags_raw_i or "[]")
-                            except Exception:
-                                tags_i = []
+                    if uid_vals or mid_vals:
+                        rows_i = list_email_tag_states(
+                            owner=owner, account_id=account_id, folder=folder,
+                            uids=uid_vals, message_ids=mid_vals,
+                        )
+                        for row_i in rows_i:
+                            uid_i = row_i.get("uid")
+                            mid_i = row_i.get("message_id")
+                            tags_i = row_i.get("tags") or []
                             if isinstance(tags_i, list):
                                 tags_i = _sanitize_visible_email_tags(tags_i)
-                            entry_i = {"tags": tags_i if isinstance(tags_i, list) else [], "spam": bool(spam_i)}
+                            entry_i = {
+                                "tags": tags_i if isinstance(tags_i, list) else [],
+                                "spam": bool(row_i.get("spam_verdict")),
+                            }
                             if uid_i:
                                 tag_by_uid[str(uid_i)] = entry_i
                             if mid_i:
                                 tag_by_mid[str(mid_i).strip()] = entry_i
-                    _ci.close()
                     for e in emails:
                         tag_entry = tag_by_mid.get((e.get("message_id") or "").strip()) or tag_by_uid.get(str(e.get("uid") or ""))
                         if tag_entry:
@@ -1920,26 +1977,20 @@ def setup_email_routes():
                     logger.debug(f"email index tag merge skipped: {e}")
 
                 try:
-                    import sqlite3 as _sql3c
                     ids = [(e.get("message_id") or "").strip() for e in emails if e.get("message_id")]
                     if ids:
-                        _ccal = _sql3c.connect(SCHEDULED_DB)
-                        owner_clause, owner_params = _email_cache_owner_clause(owner)
-                        ph = ",".join("?" * len(ids))
-                        cal_rows = _ccal.execute(
-                            f"SELECT message_id, event_uids FROM email_calendar_extractions "
-                            f"WHERE message_id IN ({ph}) AND {owner_clause}",
-                            (*ids, *owner_params),
-                        ).fetchall()
-                        _ccal.close()
-                        by_mid = {}
-                        for mid, raw_uids in cal_rows:
-                            try:
-                                uids = json.loads(raw_uids or "[]")
-                            except Exception:
-                                uids = []
-                            if isinstance(uids, list):
-                                by_mid[(mid or "").strip()] = [str(u).strip() for u in uids if str(u).strip()]
+                        cal_rows = completed_email_automation_results(
+                            owner=owner, account_id=account_id,
+                            operation="calendar", message_ids=ids,
+                        )
+                        by_mid = {
+                            mid: [
+                                str(value).strip()
+                                for value in (result.get("event_uids") or [])
+                                if str(value).strip()
+                            ]
+                            for mid, result in cal_rows.items()
+                        }
                         for e in emails:
                             event_uids = by_mid.get((e.get("message_id") or "").strip()) or []
                             if event_uids:
@@ -2088,6 +2139,18 @@ def setup_email_routes():
         fixture_result = _fixture_email_list(folder, limit, offset, filter, from_addr, owner)
         if fixture_result is not None:
             return fixture_result
+        # A memory/index cache hit must not suppress a projection that failed
+        # after the sidecar commit or that predates the durable ledger. Keep the
+        # work bounded and off the event loop; failures remain retryable without
+        # making the user's mailbox cache unavailable.
+        await _asyncio.to_thread(
+            _drain_email_life_projection_ledger,
+            owner,
+            account_id,
+            folder,
+            limit=8,
+            backfill_limit=max(16, min(int(limit or 50), 64)),
+        )
         # SECURITY: include `owner` in the cache key so two users with
         # different account scopes don't share a cached list.
         ck = _list_cache_key(account_id, folder, filter, limit, offset, from_addr or "") + (int(bool(has_attachments)), owner)
@@ -2225,18 +2288,21 @@ def setup_email_routes():
         }
 
     @router.post("/{uid}/unflag-spam")
-    async def unflag_spam(uid: str, owner: str = Depends(require_owner)):
+    async def unflag_spam(
+        uid: str,
+        folder: str = Query("INBOX"),
+        account_id: str | None = Query(None),
+        owner: str = Depends(require_owner),
+    ):
         """User override — mark email as not spam."""
         try:
-            owner_clause, owner_params = _email_tag_owner_clause(None, owner)
-            _c = _sql3.connect(SCHEDULED_DB)
-            _c.execute(
-                f"UPDATE email_tags SET spam_verdict=0, spam_reason='' WHERE uid=? AND {owner_clause}",
-                [uid, *owner_params],
-            )
-            _c.commit()
-            _c.close()
-            return {"ok": True}
+            return {
+                "ok": True,
+                "updated": unflag_email_spam(
+                    owner=owner, uid=uid, account_id=account_id,
+                    folder=folder,
+                ),
+            }
         except Exception as e:
             logger.error(f"unflag-spam failed: {e}")
             return {"ok": False, "error": "Mail operation failed"}
@@ -2247,20 +2313,18 @@ def setup_email_routes():
         limit: int = Query(20),
         owner: str = Depends(require_owner),
     ):
-        """Distinct name/address pairs aggregated from the email_tags table
+        """Distinct name/address pairs aggregated from canonical email tags
         — used by the from-sender sidebar's autocomplete to convert typed
         names into chips. Backed by the AI-classification cache so it's a
         cheap SQL read; people you've never received a tagged email from
         won't appear yet."""
         ql = (q or "").strip().lower()
         try:
-            conn = _sql3.connect(SCHEDULED_DB)
-            owner_clause, owner_params = _email_tag_owner_clause(None, owner)
-            rows = conn.execute(
-                f"SELECT sender FROM email_tags WHERE sender IS NOT NULL AND sender != '' AND {owner_clause}",
-                owner_params,
-            ).fetchall()
-            conn.close()
+            rows = [
+                (row.get("sender"),)
+                for row in list_email_tag_states(owner=owner)
+                if row.get("sender")
+            ]
             seen = {}
             for (s,) in rows:
                 try:
@@ -2313,6 +2377,13 @@ def setup_email_routes():
         global_search = (scope or "all").lower() != "folder"
         indexed_response = None
         try:
+            _drain_email_life_projection_ledger(
+                owner,
+                account_id,
+                None if global_search else folder,
+                limit=8,
+                backfill_limit=max(16, min(int(limit or 50), 64)),
+            )
             indexed_emails, indexed_total, indexed_at = _email_index_search(owner, account_id, folder, q, limit, global_search=global_search)
             indexed_response = {
                 "emails": indexed_emails,
@@ -3037,8 +3108,6 @@ def setup_email_routes():
 
             # ── PDF path (existing) ────────────────────────────────────
             if ext == ".pdf":
-                import shutil as _shutil
-                from src.constants import UPLOAD_DIR
                 from src.pdf_forms import has_form_fields, extract_fields
                 from src.pdf_form_doc import (
                     save_field_sidecar,
@@ -3046,12 +3115,29 @@ def setup_email_routes():
                     create_plain_pdf_document,
                 )
 
-                upload_id = f"{uuid.uuid4().hex}.pdf"
-                today = datetime.utcnow().strftime("%Y/%m/%d")
-                dated_dir = _os.path.join(UPLOAD_DIR, today)
-                _os.makedirs(dated_dir, exist_ok=True)
-                dest_path = _os.path.join(dated_dir, upload_id)
-                _shutil.copyfile(str(filepath), dest_path)
+                # The document marker must point at the same canonical SQL
+                # upload authority as chat/document routes. Direct filesystem
+                # copies create unowned bytes that shared replicas cannot
+                # authorize or recover.
+                upload_handler = getattr(request.app.state, "upload_handler", None)
+                if upload_handler is None:
+                    return {"error": "Upload authority unavailable"}
+                from fastapi import UploadFile as _UploadFile
+
+                try:
+                    with filepath.open("rb") as source:
+                        stored = upload_handler.save_upload(
+                            _UploadFile(file=source, filename=base),
+                            request.client.host if request.client else "unknown",
+                            owner=owner,
+                        )
+                except HTTPException:
+                    raise
+                except Exception:
+                    logger.exception("Failed to adopt email PDF attachment")
+                    return {"error": "Failed to store PDF attachment"}
+                upload_id = str(stored["id"])
+                dest_path = str(stored["path"])
 
                 is_form = False
                 try:
@@ -3675,8 +3761,6 @@ def setup_email_routes():
     @router.post("/schedule")
     async def schedule_email(req: dict, owner: str = Depends(require_owner)):
         """Schedule an email to be sent at a specific time. ISO8601 UTC."""
-        import sqlite3
-        import uuid as _uuid
         try:
             send_at = req.get("send_at")
             if not send_at:
@@ -3708,32 +3792,29 @@ def setup_email_routes():
                 parsed_at = parsed_at.astimezone(_tz.utc).replace(tzinfo=None)
             send_at = parsed_at.isoformat()
 
-            sid = _uuid.uuid4().hex[:16]
-            conn = sqlite3.connect(SCHEDULED_DB)
-            conn.execute("""
-                INSERT INTO scheduled_emails
-                (id, to_addr, cc, bcc, subject, body, in_reply_to, references_hdr, attachments, send_at, created_at, status, account_id, odysseus_kind, owner)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
-            """, (
-                sid,
-                req.get("to", ""),
-                req.get("cc") or None,
-                req.get("bcc") or None,
-                req.get("subject") or "",
-                req.get("body") or "",
-                req.get("in_reply_to") or None,
-                req.get("references") or None,
-                json.dumps(req.get("attachments") or []),
-                send_at,
-                datetime.utcnow().isoformat(),
-                req.get("account_id") or None,
-                req.get("odysseus_kind") or "scheduled",
-                owner or "",
-            ))
-            conn.commit()
-            conn.close()
+            sid = str(uuid.uuid4())
+            row = create_scheduled_delivery(
+                owner=owner,
+                email_account_id=req.get("account_id"),
+                scheduled_for=parsed_at,
+                delivery_id=sid,
+                payload={
+                    "to": req.get("to", ""),
+                    "cc": req.get("cc") or "",
+                    "bcc": req.get("bcc") or "",
+                    "subject": req.get("subject") or "",
+                    "body": req.get("body") or "",
+                    "in_reply_to": req.get("in_reply_to") or "",
+                    "references": req.get("references") or "",
+                    "attachments": req.get("attachments") or [],
+                    "odysseus_kind": req.get("odysseus_kind") or "scheduled",
+                },
+            )
             logger.info(f"Scheduled email {sid} for {send_at}")
-            return {"success": True, "id": sid, "send_at": send_at}
+            return {
+                "success": True, "id": row.id,
+                "send_at": row.scheduled_for.isoformat(),
+            }
         except Exception as e:
             logger.error(f"Failed to schedule email: {e}")
             return {"success": False, "error": "Mail operation failed"}
@@ -3741,22 +3822,11 @@ def setup_email_routes():
     @router.get("/scheduled")
     async def list_scheduled(owner: str = Depends(require_owner)):
         """List all scheduled (pending) emails."""
-        import sqlite3
         try:
-            conn = sqlite3.connect(SCHEDULED_DB)
-            rows = conn.execute("""
-                SELECT id, to_addr, cc, subject, send_at, created_at, status, error
-                FROM scheduled_emails
-                WHERE status IN ('pending', 'failed') AND owner = ?
-                ORDER BY send_at ASC
-            """, (owner or "",)).fetchall()
-            conn.close()
-            return {"scheduled": [
-                {
-                    "id": r[0], "to": r[1], "cc": r[2], "subject": r[3],
-                    "send_at": r[4], "created_at": r[5], "status": r[6], "error": r[7],
-                } for r in rows
-            ]}
+            import_legacy_email_runtime(
+                owner=owner, sidecar_path=SCHEDULED_DB,
+            )
+            return {"scheduled": list_scheduled_deliveries(owner)}
         except Exception as e:
             logger.error(f"list_scheduled failed: {e}")
             return {"scheduled": [], "error": "Mail operation failed"}
@@ -3764,90 +3834,51 @@ def setup_email_routes():
     @router.delete("/scheduled/{sid}")
     async def cancel_scheduled(sid: str, owner: str = Depends(require_owner)):
         """Cancel a scheduled email."""
-        import sqlite3
         try:
-            conn = sqlite3.connect(SCHEDULED_DB)
-            conn.execute(
-                "DELETE FROM scheduled_emails WHERE id = ? AND status = 'pending' AND owner = ?",
-                (sid, owner or ""),
-            )
-            conn.commit()
-            conn.close()
-            return {"success": True}
+            return {
+                "success": cancel_scheduled_delivery(
+                    owner=owner, delivery_id=sid,
+                )
+            }
         except Exception as e:
             logger.error(f"cancel_scheduled {sid!r} failed: {e}")
             return {"success": False, "error": "Mail operation failed"}
 
-    # ── Agent send-confirm: list/approve/cancel ──────────────────────────
-    # When `agent_email_confirm` is on, the MCP send_email tool drops the
-    # composed email into scheduled_emails with status='agent_draft' (a
-    # far-future send_at so the poller never picks it up). These endpoints
-    # let the chat UI surface them for the user and either approve (flip
-    # to status='pending' with send_at=now so the poller delivers it) or
-    # cancel (status='cancelled').
+    # ── Retired legacy agent-draft surface ───────────────────────────────
+    # Agent-originated mail now lives in encrypted SQL ActionProposals and
+    # can only be reviewed through the Level-5 action flow.  Keep these old
+    # URLs fail-closed for stale clients, but never read or mutate the legacy
+    # scheduled_emails rows: changing agent_draft -> pending would let the
+    # scheduled poller bypass fresh approval and perform SMTP delivery.
     @router.get("/pending")
     async def list_pending_agent_drafts(owner: str = Depends(require_owner)):
-        import sqlite3
-        try:
-            conn = sqlite3.connect(SCHEDULED_DB)
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                """SELECT id, to_addr, subject, body, created_at, account_id
-                   FROM scheduled_emails
-                   WHERE status = 'agent_draft' AND owner = ?
-                   ORDER BY created_at DESC""",
-                (owner or "",),
-            ).fetchall()
-            conn.close()
-            return {"pending": [dict(r) for r in rows]}
-        except Exception as e:
-            logger.error(f"list_pending_agent_drafts failed: {e}")
-            return {"pending": [], "error": "Mail operation failed"}
+        return {
+            "pending": [],
+            "authority": "action_proposals",
+            "legacy_source_preserved": True,
+        }
 
     @router.post("/pending/{sid}/approve")
     async def approve_agent_draft(sid: str, owner: str = Depends(require_owner)):
-        """Approve a draft staged by the agent: flip status → pending and
-        backdate send_at so the scheduled-send poller picks it up
-        immediately."""
-        import sqlite3
-        try:
-            conn = sqlite3.connect(SCHEDULED_DB)
-            cur = conn.execute(
-                """UPDATE scheduled_emails
-                   SET status = 'pending', send_at = ?
-                   WHERE id = ? AND status = 'agent_draft' AND owner = ?""",
-                (datetime.utcnow().isoformat(), sid, owner or ""),
-            )
-            conn.commit()
-            affected = cur.rowcount
-            conn.close()
-            if not affected:
-                return {"success": False, "error": "Draft not found or already handled"}
-            return {"success": True}
-        except Exception as e:
-            logger.error(f"approve_agent_draft {sid!r} failed: {e}")
-            return {"success": False, "error": "Mail operation failed"}
+        """Reject the pre-Level-5 approval shortcut without touching its row."""
+
+        return {
+            "success": False,
+            "code": "level5_review_required",
+            "error": "Review imported agent email drafts in the Actions panel",
+            "legacy_source_preserved": True,
+        }
 
     @router.delete("/pending/{sid}")
     async def cancel_agent_draft(sid: str, owner: str = Depends(require_owner)):
-        """Discard a draft the agent staged for approval."""
-        import sqlite3
-        try:
-            conn = sqlite3.connect(SCHEDULED_DB)
-            cur = conn.execute(
-                """UPDATE scheduled_emails SET status = 'cancelled'
-                   WHERE id = ? AND status = 'agent_draft' AND owner = ?""",
-                (sid, owner or ""),
-            )
-            conn.commit()
-            affected = cur.rowcount
-            conn.close()
-            if not affected:
-                return {"success": False, "error": "Draft not found or already handled"}
-            return {"success": True}
-        except Exception as e:
-            logger.error(f"cancel_agent_draft {sid!r} failed: {e}")
-            return {"success": False, "error": "Mail operation failed"}
+        """Keep the immutable legacy source; reject this retired mutation path."""
+
+        return {
+            "success": False,
+            "code": "level5_review_required",
+            "error": "Review or reject imported agent email drafts in the Actions panel",
+            "legacy_source_preserved": True,
+        }
 
     @router.get("/resolve-contact")
     async def resolve_contact(name: str = Query(..., description="Name to search for"), owner: str = Depends(require_owner)):
@@ -4836,13 +4867,10 @@ def setup_email_routes():
         cfg = _get_email_config(owner=owner)
         cfg["smtp_password"] = "***" if cfg["smtp_password"] else ""
         cfg["imap_password"] = "***" if cfg["imap_password"] else ""
-        # Include preferences from settings.json
+        # Automation rules are Account.id-owned SQL state. settings.json is
+        # consulted only for the one-time legacy import.
         settings = _load_settings()
-        cfg["email_auto_summarize"] = bool(settings.get("email_auto_summarize", False))
-        cfg["email_auto_reply"] = bool(settings.get("email_auto_reply", False))
-        cfg["email_auto_tag"] = bool(settings.get("email_auto_tag", False))
-        cfg["email_auto_spam"] = bool(settings.get("email_auto_spam", False))
-        cfg["email_auto_calendar"] = bool(settings.get("email_auto_calendar", False))
+        cfg.update(get_email_automation_rules(owner, legacy_settings=settings))
         # Email translation is owned by the background task now; opening an email
         # should not trigger reader-side auto-translation from Settings.
         cfg["email_auto_translate"] = False
@@ -4853,17 +4881,20 @@ def setup_email_routes():
     async def update_email_config(data: dict, owner: str = Depends(require_owner)):
         """Update email configuration.
 
-        Automation flags (email_auto_*) still live in settings.json. Credentials
+        Automation flags (email_auto_*) live in owner-scoped SQL. Credentials
         are written to the default EmailAccount row. Passwords are only
         overwritten when a non-empty value is provided, so saving the form
         without retyping the password no longer wipes it.
         """
-        # Automation flags stay in settings.json (they're global, not per-account)
+        # Import legacy flags once, then keep cross-interface authority in SQL.
         settings = _load_settings()
-        for key in ["email_auto_summarize", "email_auto_reply", "email_auto_tag", "email_auto_spam", "email_auto_calendar"]:
-            if key in data:
-                settings[key] = data[key]
-        _save_settings(settings)
+        automation_updates = {
+            key: data[key] for key in AUTOMATION_RULE_KEYS if key in data
+        }
+        if automation_updates:
+            set_email_automation_rules(
+                owner, automation_updates, legacy_settings=settings,
+            )
 
         # Credentials go into the default account row
         from core.database import SessionLocal, EmailAccount

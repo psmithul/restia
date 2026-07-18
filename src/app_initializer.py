@@ -5,7 +5,7 @@ import logging
 from typing import Dict, Any
 
 from src.constants import (
-    DATA_DIR, PERSONAL_DIR, RUNBOOK_DIR, UPLOAD_DIR,
+    DATA_DIR, PERSONAL_DIR, RUNBOOK_DIR,
     SESSIONS_FILE, DEFAULT_HOST, OPENAI_API_KEY
 )
 from src.brain_memory import build_brain_memory_manager
@@ -21,14 +21,19 @@ from src.chat_processor import ChatProcessor
 from src.model_discovery import ModelDiscovery
 from src.chat_handler import ChatHandler
 from src.research_handler import ResearchHandler
-from src.upload_handler import UploadHandler
+from src.blob_store import resolve_blob_store_config
+from src.upload_handler import create_production_upload_handler
 from src.search import update_search_config
 
 logger = logging.getLogger(__name__)
 
 def create_directories():
     """Create necessary directories if they don't exist."""
-    for directory in (DATA_DIR, PERSONAL_DIR, RUNBOOK_DIR, UPLOAD_DIR):
+    blob_config = resolve_blob_store_config(create=True)
+    for directory in (
+        DATA_DIR, PERSONAL_DIR, RUNBOOK_DIR,
+        str(blob_config.chat_root), str(blob_config.project_root),
+    ):
         os.makedirs(directory, exist_ok=True)
         
 def initialize_managers(base_dir: str, rag_manager=None) -> Dict[str, Any]:
@@ -49,7 +54,7 @@ def initialize_managers(base_dir: str, rag_manager=None) -> Dict[str, Any]:
     skills_manager = SkillsManager(DATA_DIR)
     session_manager = SessionManager(SESSIONS_FILE)
     set_session_manager(session_manager)  # Enable Session.add_message() persistence
-    upload_handler = UploadHandler(base_dir, UPLOAD_DIR)
+    upload_handler = create_production_upload_handler(base_dir)
     personal_docs_manager = PersonalDocsManager(PERSONAL_DIR, rag_manager)
     api_key_manager = APIKeyManager(DATA_DIR)
     preset_manager = PresetManager(DATA_DIR)

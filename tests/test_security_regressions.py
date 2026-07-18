@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 from cryptography.fernet import Fernet
+from sqlalchemy import text
 
 
 # ── prompt-injection context wrapper ────────────────────────────
@@ -193,60 +194,112 @@ def test_ollama_cookbook_runner_does_not_force_public_bind():
 
 
 def _import_integrations(tmp_path, monkeypatch):
-    """Import src.integrations with data + encryption key redirected to tmp."""
+    """Bind canonical integration storage to an isolated encrypted SQL DB."""
     _import_secret_storage(tmp_path, monkeypatch)
-    sys.modules.pop("src.integrations", None)
+    import core.database as database
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from core.database import Account, Base
+    from src import settings
+    from src.profile_configuration_models import ProfileConfiguration  # noqa: F401
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'integrations.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    db = factory()
+    db.add(Account(id="00000000-0000-0000-0000-000000000001", username="admin", status="active"))
+    db.commit()
+    db.close()
+    monkeypatch.setattr(database, "SessionLocal", factory)
+    monkeypatch.setattr(
+        settings,
+        "_runtime_owner",
+        lambda owner=None: str(owner or "admin").strip().lower(),
+    )
     from src import integrations  # noqa: WPS433
-    monkeypatch.setattr(integrations, "DATA_FILE", str(tmp_path / "integrations.json"))
-    return integrations
+    return integrations, factory, engine
 
 
 def test_integrations_api_keys_are_encrypted_at_rest(tmp_path, monkeypatch):
-    integrations = _import_integrations(tmp_path, monkeypatch)
+    integrations, factory, engine = _import_integrations(tmp_path, monkeypatch)
+    try:
+        integrations.save_integrations([
+            {
+                "id": "miniflux",
+                "name": "Miniflux",
+                "base_url": "https://rss.example",
+                "auth_type": "bearer",
+                "api_key": "secret-token",
+            }
+        ])
 
-    integrations.save_integrations([
+        db = factory()
+        try:
+            raw_text = str(db.execute(text(
+                "SELECT private_value FROM profile_configurations "
+                "WHERE namespace = 'integration' AND key = 'miniflux'"
+            )).scalar_one())
+        finally:
+            db.close()
+        assert "enc:c1:" in raw_text
+        assert "secret-token" not in raw_text
+
+        loaded = integrations.load_integrations()
+        assert loaded[0]["api_key"] == "secret-token"
+        assert integrations.mask_integration_secret(loaded[0])["api_key"] == "secr****"
+    finally:
+        engine.dispose()
+
+
+def test_integrations_plaintext_keys_import_to_encrypted_sql_without_mutating_source(
+    tmp_path, monkeypatch,
+):
+    integrations, factory, engine = _import_integrations(tmp_path, monkeypatch)
+    data_file = tmp_path / "integrations.json"
+    original = json.dumps([
         {
-            "id": "miniflux",
-            "name": "Miniflux",
-            "base_url": "https://rss.example",
-            "auth_type": "bearer",
-            "api_key": "secret-token",
+            "id": "legacy",
+            "name": "Legacy API",
+            "base_url": "https://api.example",
+            "auth_type": "header",
+            "api_key": "legacy-secret",
         }
     ])
-
-    raw_text = (tmp_path / "integrations.json").read_text(encoding="utf-8")
-    raw = json.loads(raw_text)
-    assert raw[0]["api_key"].startswith("enc:")
-    assert "secret-token" not in raw_text
-
-    loaded = integrations.load_integrations()
-    assert loaded[0]["api_key"] == "secret-token"
-    assert integrations.mask_integration_secret(loaded[0])["api_key"] == "secr****"
-
-
-def test_integrations_plaintext_keys_migrate_on_load(tmp_path, monkeypatch):
-    integrations = _import_integrations(tmp_path, monkeypatch)
-    data_file = tmp_path / "integrations.json"
     data_file.write_text(
-        json.dumps([
-            {
-                "id": "legacy",
-                "name": "Legacy API",
-                "base_url": "https://api.example",
-                "auth_type": "header",
-                "api_key": "legacy-secret",
-            }
-        ]),
+        original,
         encoding="utf-8",
     )
 
-    loaded = integrations.load_integrations()
+    from src.profile_configuration_import import adopt_legacy_profile_configuration
 
-    assert loaded[0]["api_key"] == "legacy-secret"
-    migrated_text = data_file.read_text(encoding="utf-8")
-    migrated = json.loads(migrated_text)
-    assert migrated[0]["api_key"].startswith("enc:")
-    assert "legacy-secret" not in migrated_text
+    try:
+        result = adopt_legacy_profile_configuration(
+            session_factory=factory,
+            auth_enabled=True,
+            primary_admin_resolver=lambda: "admin",
+            settings_path=tmp_path / "missing-settings.json",
+            preferences_path=tmp_path / "missing-preferences.json",
+            features_path=tmp_path / "missing-features.json",
+            integrations_path=data_file,
+        )
+        assert result.imported == 1
+        assert result.source_preserved is True
+        assert data_file.read_text(encoding="utf-8") == original
+
+        loaded = integrations.load_integrations()
+        assert loaded[0]["api_key"] == "legacy-secret"
+        db = factory()
+        try:
+            raw_text = str(db.execute(text(
+                "SELECT private_value FROM profile_configurations "
+                "WHERE namespace = 'integration' AND key = 'legacy'"
+            )).scalar_one())
+        finally:
+            db.close()
+        assert "enc:c1:" in raw_text
+        assert "legacy-secret" not in raw_text
+    finally:
+        engine.dispose()
 
 
 # ── _q IMAP mailbox quoter ─────────────────────────────────────
@@ -589,7 +642,7 @@ def test_require_user_rejects_unauthenticated(monkeypatch):
 
 
 def test_inprocess_pollers_gate(monkeypatch):
-    """The ODYSSEUS_INPROCESS_POLLERS env var must let operators kill
+    """The canonical gate and legacy alias must let operators kill
     the asyncio pollers when cron / systemd is driving the one-shot
     `odysseus-mail poll-*` CLI subcommands instead. Two pollers racing
     on the same SQLite would mark scheduled rows as 'sent' twice."""
@@ -598,18 +651,27 @@ def test_inprocess_pollers_gate(monkeypatch):
     from routes.email_pollers import _inprocess_pollers_enabled  # noqa: WPS433
 
     # Defaults to enabled (preserves single-process deployments).
+    monkeypatch.delenv("RESTIA_INPROCESS_POLLERS", raising=False)
     monkeypatch.delenv("ODYSSEUS_INPROCESS_POLLERS", raising=False)
     assert _inprocess_pollers_enabled() is True
 
-    # Any of the off-values disables.
+    # Any canonical off-value disables.
     for off in ("0", "false", "no", "off", "FALSE", "Off"):
-        monkeypatch.setenv("ODYSSEUS_INPROCESS_POLLERS", off)
+        monkeypatch.setenv("RESTIA_INPROCESS_POLLERS", off)
         assert _inprocess_pollers_enabled() is False, f"{off!r} should disable"
 
     # Explicit on-values stay enabled.
     for on in ("1", "true", "yes", "anything-truthy"):
-        monkeypatch.setenv("ODYSSEUS_INPROCESS_POLLERS", on)
+        monkeypatch.setenv("RESTIA_INPROCESS_POLLERS", on)
         assert _inprocess_pollers_enabled() is True, f"{on!r} should enable"
+
+    # The legacy name remains supported, while the canonical name wins when
+    # both are present so container and app configuration cannot disagree.
+    monkeypatch.delenv("RESTIA_INPROCESS_POLLERS", raising=False)
+    monkeypatch.setenv("ODYSSEUS_INPROCESS_POLLERS", "0")
+    assert _inprocess_pollers_enabled() is False
+    monkeypatch.setenv("RESTIA_INPROCESS_POLLERS", "1")
+    assert _inprocess_pollers_enabled() is True
 
 
 def test_require_user_accepts_loopback_when_unconfigured(monkeypatch):

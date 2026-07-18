@@ -6,8 +6,8 @@ Background loops that periodically scan IMAP and act on mail:
     - `_auto_summarize_pass` / `_auto_summarize_pass_single` — daily/hourly
       summary + AI-reply + spam-classification pass over recently received mail.
     - `_auto_summarize_poller` — driver that wakes the pass on a 30-min cadence.
-    - `_scheduled_email_poller` — polls the `scheduled_emails` SQLite for
-      due rows and delivers them via SMTP.
+    - `_scheduled_email_poller` — drains canonical SQL approved and manual
+      delivery queues after a bounded read-only legacy import.
     - `_start_poller` — entry point called once at app startup; spawns both
       pollers + handles the deferred-start trick when the event loop is not
       yet running.
@@ -19,6 +19,7 @@ Pure helpers live in `email_helpers.py`. Routes themselves live in
 import email as email_mod
 import email.utils  # the `email` binding is referenced as email.utils.parseaddr inside the pass
 import smtplib
+import hashlib
 import json
 import re
 import html
@@ -30,6 +31,19 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
 from src.task_endpoint import resolve_task_candidates, task_llm_call_async
+from src.email_delivery_worker import drain_email_outbox_once
+from src.email_runtime_authority import (
+    claim_due_scheduled_delivery,
+    claim_email_automation,
+    complete_email_automation,
+    complete_scheduled_delivery,
+    completed_email_automation_results,
+    fail_email_automation,
+    fail_scheduled_delivery,
+    get_email_automation_rules,
+    import_legacy_email_runtime,
+    upsert_email_tag_state,
+)
 
 from routes.email_helpers import (
     _strip_think, _extract_reply, _apply_email_style_mechanics, _load_settings, _save_settings, _get_email_config,
@@ -86,6 +100,37 @@ def _extract_json_array_from_text(text: str):
     return last
 
 
+def _email_calendar_idempotency_key(
+    *,
+    owner: object,
+    message_id: object,
+    event_ref: object,
+    action: object,
+) -> str:
+    """Return a privacy-preserving source-stable calendar proposal key."""
+
+    material = "\0".join(
+        str(value or "").strip()
+        for value in (owner, message_id, event_ref, action)
+    )
+    return "email-calendar:v1:" + hashlib.sha256(
+        material.encode("utf-8")
+    ).hexdigest()
+
+
+def _email_calendar_expected_version(operation: object) -> int:
+    """Require an exact integer version for email-driven update/cancel."""
+
+    if not isinstance(operation, dict):
+        raise ValueError("Calendar operation must be an object")
+    version = operation.get("version")
+    if type(version) is not int or version < 1:
+        raise ValueError(
+            "Email calendar update/cancel requires an exact positive version"
+        )
+    return version
+
+
 def _owner_for_email_account(account_id: str | None) -> str:
     if not account_id:
         return ""
@@ -121,30 +166,24 @@ async def _run_auto_summarize_once(do_summary: bool = True, do_reply: bool = Tru
                                    account_id: str | None = None,
                                    max_process: int | None = None,
                                    progress_cb=None) -> str:
-    """One iteration of the email scan. Temporarily flips settings flags
-    so the existing background-loop logic runs exactly once for the requested ops."""
-    settings = _load_settings()
-    prev = {k: settings.get(k, False) for k in
-            ("email_auto_summarize", "email_auto_reply", "email_auto_tag",
-             "email_auto_spam", "email_auto_calendar")}
-    settings["email_auto_summarize"] = bool(do_summary)
-    settings["email_auto_reply"] = bool(do_reply)
-    settings["email_auto_tag"] = bool(do_tag)
-    settings["email_auto_spam"] = bool(do_spam)
-    settings["email_auto_calendar"] = bool(do_calendar)
-    _save_settings(settings)
-    try:
-        return await _auto_summarize_pass(
-            days_back=days_back,
-            account_id=account_id,
-            max_process=max_process,
-            progress_cb=progress_cb,
-        )
-    finally:
-        s2 = _load_settings()
-        for k, v in prev.items():
-            s2[k] = v
-        _save_settings(s2)
+    """Run one scan with request-local operation overrides.
+
+    Canonical automation rules are never temporarily mutated, avoiding a
+    cross-worker race where one manual task changed another owner's poller.
+    """
+    return await _auto_summarize_pass(
+        days_back=days_back,
+        account_id=account_id,
+        max_process=max_process,
+        progress_cb=progress_cb,
+        automation_overrides={
+            "email_auto_summarize": bool(do_summary),
+            "email_auto_reply": bool(do_reply),
+            "email_auto_tag": bool(do_tag),
+            "email_auto_spam": bool(do_spam),
+            "email_auto_calendar": bool(do_calendar),
+        },
+    )
 
 
 def _latest_inbox_fallback_uids(conn, reconnect):
@@ -177,7 +216,7 @@ def _latest_inbox_fallback_uids(conn, reconnect):
         return [], reconnect()
 
 
-async def _auto_summarize_pass(days_back: int = 1, account_id: str | None = None, max_process: int | None = None, progress_cb=None) -> str:
+async def _auto_summarize_pass(days_back: int = 1, account_id: str | None = None, max_process: int | None = None, progress_cb=None, automation_overrides: dict | None = None) -> str:
     """Single pass of the auto-summarize/reply scan.
 
     When account_id is None, iterates over every enabled account in
@@ -209,6 +248,7 @@ async def _auto_summarize_pass(days_back: int = 1, account_id: str | None = None
                 account_id=(ids[0] if ids else None),
                 max_process=max_process,
                 progress_cb=progress_cb,
+                automation_overrides=automation_overrides,
             )
         outs = []
         for idx, aid in enumerate(ids, start=1):
@@ -219,6 +259,7 @@ async def _auto_summarize_pass(days_back: int = 1, account_id: str | None = None
                     account_id=aid,
                     max_process=max_process,
                     progress_cb=progress_cb,
+                    automation_overrides=automation_overrides,
                 )
                 outs.append(f"[{names.get(aid, aid[:8])}] {result}")
             except Exception as e:
@@ -230,24 +271,16 @@ async def _auto_summarize_pass(days_back: int = 1, account_id: str | None = None
         account_id=account_id,
         max_process=max_process,
         progress_cb=progress_cb,
+        automation_overrides=automation_overrides,
     )
 
 
-async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None = None, max_process: int | None = None, progress_cb=None) -> str:
+async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None = None, max_process: int | None = None, progress_cb=None, automation_overrides: dict | None = None) -> str:
     """Single pass of the auto-summarize/reply scan for ONE account.
     Reads current settings flags."""
     import asyncio
     import sqlite3 as _sql3
     from src.llm_core import _uses_max_completion_tokens
-
-    settings = _load_settings()
-    auto_sum = settings.get("email_auto_summarize", False)
-    auto_reply = settings.get("email_auto_reply", False)
-    auto_tag = settings.get("email_auto_tag", False)
-    auto_spam = settings.get("email_auto_spam", False)
-    auto_cal = settings.get("email_auto_calendar", False)
-    if not auto_sum and not auto_reply and not auto_tag and not auto_spam and not auto_cal:
-        return "Nothing to do"
 
     # Owner of the account being processed. All calendar + mailbox reads/writes
     # below are scoped to this user: the multi-account fan-out runs every user's
@@ -256,6 +289,26 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
     # calendar path (_acct_owner, which expects None rather than "").
     account_owner = _owner_for_email_account(account_id)
     _acct_owner = account_owner or None
+    settings = _load_settings()
+    if automation_overrides is not None:
+        automation_rules = dict(automation_overrides)
+    elif account_owner:
+        automation_rules = get_email_automation_rules(
+            account_owner, legacy_settings=settings,
+        )
+    else:
+        # Compatibility for an unconfigured single-user fixture. Production
+        # accounts always have a concrete owner and therefore SQL authority.
+        automation_rules = settings
+    auto_sum = bool(automation_rules.get("email_auto_summarize", False))
+    auto_reply = bool(automation_rules.get("email_auto_reply", False))
+    auto_tag = bool(automation_rules.get("email_auto_tag", False))
+    auto_spam = bool(automation_rules.get("email_auto_spam", False))
+    auto_cal = bool(automation_rules.get("email_auto_calendar", False))
+    if not auto_sum and not auto_reply and not auto_tag and not auto_spam and not auto_cal:
+        return "Nothing to do"
+    if not account_owner:
+        return "Email account owner unavailable"
 
     conn = None
     try:
@@ -305,40 +358,53 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
 
         _c = _sql3.connect(SCHEDULED_DB)
         _cache_owner_clause, _cache_owner_params = _email_cache_owner_clause(account_owner)
-        _sum_existing = {r[0] for r in _c.execute(
+        _legacy_sum_existing = {r[0] for r in _c.execute(
             f"SELECT message_id FROM email_summaries WHERE {_cache_owner_clause}",
             _cache_owner_params,
         ).fetchall()}
-        _reply_existing = {r[0] for r in _c.execute(
+        _legacy_reply_existing = {r[0] for r in _c.execute(
             f"SELECT message_id FROM email_ai_replies WHERE {_cache_owner_clause}",
             _cache_owner_params,
         ).fetchall()}
-        if auto_tag or auto_spam:
-            if account_owner:
-                _tag_existing = {r[0] for r in _c.execute(
-                    "SELECT message_id FROM email_tags WHERE owner=? AND (account_id=? OR account_id='' OR account_id IS NULL)",
-                    (account_owner, account_id or ""),
-                ).fetchall()}
-            else:
-                _tag_existing = {r[0] for r in _c.execute(
-                    "SELECT message_id FROM email_tags WHERE (owner='' OR owner IS NULL) AND (account_id=? OR account_id='' OR account_id IS NULL)",
-                    (account_id or "",),
-                ).fetchall()}
-        else:
-            _tag_existing = set()
-        _cal_existing = {r[0] for r in _c.execute(
-            f"SELECT message_id FROM email_calendar_extractions WHERE {_cache_owner_clause}",
-            _cache_owner_params,
-        ).fetchall()} if auto_cal else set()
+        _legacy_cal_existing: set[str] = set()
         # Urgency is handled by the built-in `check_email_urgency` task. Keep
         # this legacy poller path disabled so users don't get two independent
         # urgent-email systems.
         auto_urgent = False
-        _urgent_existing = {r[0] for r in _c.execute(
-            f"SELECT message_id FROM email_urgency_alerts WHERE {_cache_owner_clause}",
-            _cache_owner_params,
-        ).fetchall()} if auto_urgent else set()
+        _urgent_existing: set[str] = set()
         _c.close()
+
+        _sum_existing = set() if account_owner else set(_legacy_sum_existing)
+        _reply_existing = set() if account_owner else set(_legacy_reply_existing)
+        _tag_existing: set[str] = set()
+        _cal_existing = set() if account_owner else set(_legacy_cal_existing)
+        if account_owner:
+            try:
+                import_legacy_email_runtime(
+                    owner=account_owner, sidecar_path=SCHEDULED_DB,
+                )
+                if auto_sum:
+                    _sum_existing.update(completed_email_automation_results(
+                        owner=account_owner, account_id=account_id,
+                        operation="summary",
+                    ))
+                if auto_reply:
+                    _reply_existing.update(completed_email_automation_results(
+                        owner=account_owner, account_id=account_id,
+                        operation="reply",
+                    ))
+                if auto_tag or auto_spam:
+                    _tag_existing.update(completed_email_automation_results(
+                        owner=account_owner, account_id=account_id,
+                        operation="classify",
+                    ))
+                if auto_cal:
+                    _cal_existing.update(completed_email_automation_results(
+                        owner=account_owner, account_id=account_id,
+                        operation="calendar",
+                    ))
+            except Exception:
+                logger.error("Canonical email runtime import/read failed")
 
         # Hoist the self-address lookup OUT of the per-email loop — fetching
         # this per-iteration was making big inbox scans crawl. Used by the
@@ -365,6 +431,7 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
         examined = 0
         _summaries_created = 0
         _events_created = 0
+        _cancellations_proposed = 0
         _replies_drafted = 0
         _reply_failed = 0
         _detail_lines = []
@@ -385,6 +452,7 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
                 _folder, uid = _entry
             else:
                 _folder, uid = "INBOX", _entry
+            _claims = {}
             try:
                 if _folder != _current_folder:
                     conn.select(_q(_folder), readonly=True)
@@ -403,10 +471,31 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
                     seed = f"{_folder}|{uid_str}|{msg.get('From','')}|{msg.get('Date','')}|{msg.get('Subject','')}"
                     message_id = f"<synth-{_hl.sha256(seed.encode()).hexdigest()[:16]}@local>"
                     no_msgid += 1
-                need_sum = auto_sum and message_id not in _sum_existing
-                need_reply = auto_reply and message_id not in _reply_existing
-                need_class = (auto_tag or auto_spam) and message_id not in _tag_existing
-                need_cal = bool(settings.get("email_auto_calendar", False)) and message_id not in _cal_existing
+                requested_operations = {
+                    "summary": auto_sum and message_id not in _sum_existing,
+                    "reply": auto_reply and message_id not in _reply_existing,
+                    "classify": (auto_tag or auto_spam) and message_id not in _tag_existing,
+                    "calendar": auto_cal and message_id not in _cal_existing,
+                }
+                if account_owner:
+                    uid_text = uid.decode() if isinstance(uid, bytes) else str(uid)
+                    for operation, requested in requested_operations.items():
+                        if not requested:
+                            continue
+                        claim = claim_email_automation(
+                            owner=account_owner, account_id=account_id,
+                            operation=operation, message_id=message_id,
+                            payload={
+                                "message_id": message_id, "folder": _folder,
+                                "uid": uid_text,
+                            },
+                        )
+                        if claim is not None:
+                            _claims[operation] = claim
+                    need_sum = "summary" in _claims
+                    need_reply = "reply" in _claims
+                    need_class = "classify" in _claims
+                    need_cal = "calendar" in _claims
                 # Only check urgency on INBOX (received mail), not Sent
                 # Skip messages that are themselves urgency alerts, or that
                 # we sent to ourselves — otherwise the alert loop re-flags
@@ -457,6 +546,11 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
                         body = subject
                 elif (not body or len(body) < 100) and not att_text:
                     too_short += 1
+                    for operation, claim in list(_claims.items()):
+                        complete_email_automation(
+                            claim, result={"skipped": "content_too_short"},
+                        )
+                        _claims.pop(operation, None)
                     continue
                 # Augmented body sent to the LLM: original body + attachment text.
                 body_for_llm = body
@@ -489,10 +583,19 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
                             _c.commit()
                             _c.close()
                             _sum_existing.add(message_id)
+                            if "summary" in _claims:
+                                complete_email_automation(
+                                    _claims.pop("summary"),
+                                    result={"cached": True},
+                                )
                             _summaries_created += 1
                             _uid_text = uid.decode() if isinstance(uid, bytes) else str(uid)
                             _detail_lines.append(f"summary · {_folder}#{_uid_text} · {subject or '(no subject)'} — {sender or '(unknown sender)'}")
+                        elif "summary" in _claims:
+                            fail_email_automation(_claims.pop("summary"))
                     except Exception as e:
+                        if "summary" in _claims:
+                            fail_email_automation(_claims.pop("summary"))
                         _uid_text = uid.decode() if isinstance(uid, bytes) else str(uid)
                         _detail_lines.append(f"summary failed · {_folder}#{_uid_text} · {subject or '(no subject)'} — {sender or '(unknown sender)'}")
                         logger.warning(f"Auto-summary {uid} failed: {e}")
@@ -532,11 +635,20 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
                             _c.commit()
                             _c.close()
                             _reply_existing.add(message_id)
+                            if "reply" in _claims:
+                                complete_email_automation(
+                                    _claims.pop("reply"),
+                                    result={"cached": True},
+                                )
                             _replies_drafted += 1
                             _uid_text = uid.decode() if isinstance(uid, bytes) else str(uid)
                             _detail_lines.append(f"reply · {_folder}#{_uid_text} · {subject or '(no subject)'} — {sender or '(unknown sender)'}")
                             await _emit_progress(progress_cb, f"Drafted {_replies_drafted} repl" + ("y" if _replies_drafted == 1 else "ies") + f" · checked {examined}/{len(uid_list)}")
+                        elif "reply" in _claims:
+                            fail_email_automation(_claims.pop("reply"))
                     except Exception as e:
+                        if "reply" in _claims:
+                            fail_email_automation(_claims.pop("reply"))
                         _reply_failed += 1
                         _uid_text = uid.decode() if isinstance(uid, bytes) else str(uid)
                         _detail_lines.append(f"reply failed · {_folder}#{_uid_text} · {subject or '(no subject)'} — {sender or '(unknown sender)'}")
@@ -553,7 +665,13 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
                         # create vs update vs cancel based on what already exists.
                         from core.database import get_upcoming_events
                         # Owner-scoped so the LLM never sees other tenants' events.
-                        _existing_summary = get_upcoming_events(_acct_owner, horizon_days=60, limit=40)
+                        _existing_summary = [
+                            row for row in get_upcoming_events(
+                                _acct_owner, horizon_days=60, limit=40
+                            )
+                            if type(row.get("version")) is int
+                            and row["version"] >= 1
+                        ]
                         existing_json = json.dumps(_existing_summary)
                         is_sent = _folder.lower().startswith("sent") or "sent" in _folder.lower()
                         cal_extract = await task_llm_call_async(
@@ -568,7 +686,8 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
                                     "THIS email is clearly about that same event.\n\n"
                                     "Return ONLY a JSON array. Each item has:\n"
                                     '  "action": "create" | "update" | "cancel" | "noop"\n'
-                                    '  "uid": (only for update/cancel — use a uid from EXISTING_EVENTS below)\n'
+                                    '  "uid": (only for update/cancel — use the exact uid from EXISTING_EVENTS below)\n'
+                                    '  "version": (only for update/cancel — copy the exact integer version paired with that uid in EXISTING_EVENTS)\n'
                                     '  "title": short descriptive title with WHO or WHAT (e.g. "Call with Sam", "Flight to Berlin", "Hotel check-in", "Dinner reservation")\n'
                                     '  "date": ISO 8601 like "2026-04-25T14:00:00" (best guess if vague)\n'
                                     '  "end_date": ISO 8601 or null\n'
@@ -593,8 +712,8 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
                                     "- Concert/show: ticket URL, venue, seat, performer.\n"
                                     "- Delivery: tracking number, carrier name, tracking URL.\n\n"
                                     "Rules:\n"
-                                    "- If the email confirms / changes time of an event already in EXISTING_EVENTS, return action=update with that event's uid.\n"
-                                    "- If the email cancels a known event, return action=cancel with the uid.\n"
+                                    "- If the email confirms / changes time of an event already in EXISTING_EVENTS, return action=update with that event's exact uid AND version.\n"
+                                    "- If the email cancels a known event, return action=cancel with its exact uid AND version. Cancellation is only proposed for later human approval; it is never completed here.\n"
                                     "- Otherwise, action=create with full details.\n"
                                     "- PRESERVE identifiers (flight numbers, confirmation codes, tracking numbers, meeting IDs, passcodes, phone numbers) verbatim — do NOT paraphrase or drop them.\n"
                                     "- If no event-related content at all, return [].\n"
@@ -634,17 +753,63 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
                                             cuid = op.get("uid")
                                             if not cuid:
                                                 continue
-                                            r = await do_manage_calendar(json.dumps({"action": "delete_event", "uid": cuid}), owner=_acct_owner)
+                                            try:
+                                                event_version = _email_calendar_expected_version(op)
+                                            except ValueError:
+                                                logger.warning(
+                                                    "[cal-extract] cancellation proposal rejected: "
+                                                    "missing exact uid/version"
+                                                )
+                                                continue
+                                            proposal_key = _email_calendar_idempotency_key(
+                                                owner=account_owner,
+                                                message_id=message_id,
+                                                event_ref=cuid,
+                                                action="cancel_event",
+                                            )
+                                            r = await do_manage_calendar(json.dumps({
+                                                "action": "cancel_event",
+                                                "uid": cuid,
+                                                "version": event_version,
+                                                "idempotency_key": proposal_key,
+                                            }), owner=_acct_owner)
                                             if r.get("exit_code", 0) == 0:
-                                                logger.info(f"[cal-extract] Cancelled event uid={cuid}")
+                                                logger.info(
+                                                    "[cal-extract] Proposed cancellation "
+                                                    f"uid={cuid} proposal={r.get('proposal_id')}"
+                                                )
+                                                if cuid not in _cal_event_uids:
+                                                    _cal_event_uids.append(cuid)
+                                                _cancellations_proposed += 1
                                                 _cal_run_count += 1
                                             else:
-                                                logger.warning(f"[cal-extract] cancel failed: {r.get('error')}")
+                                                logger.warning(
+                                                    "[cal-extract] cancellation proposal failed: "
+                                                    f"{r.get('error')}"
+                                                )
                                         elif action == "update":
                                             cuid = op.get("uid")
                                             if not cuid or not op.get("date"):
                                                 continue
-                                            args = {"action": "update_event", "uid": cuid, "dtstart": op["date"]}
+                                            try:
+                                                event_version = _email_calendar_expected_version(op)
+                                            except ValueError:
+                                                logger.warning(
+                                                    "[cal-extract] update rejected: missing exact uid/version"
+                                                )
+                                                continue
+                                            args = {
+                                                "action": "update_event",
+                                                "uid": cuid,
+                                                "version": event_version,
+                                                "dtstart": op["date"],
+                                                "idempotency_key": _email_calendar_idempotency_key(
+                                                    owner=account_owner,
+                                                    message_id=message_id,
+                                                    event_ref=cuid,
+                                                    action="update_event",
+                                                ),
+                                            }
                                             if op.get("end_date"): args["dtend"] = op["end_date"]
                                             if op.get("title"): args["summary"] = op["title"]
                                             if op.get("description"):
@@ -723,6 +888,9 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
                                                     _desc_parts.append(_lnk)
                                             except Exception:
                                                 pass
+                                            create_ref = "|".join(str(value or "").strip() for value in (
+                                                op.get("title"), op.get("date"), op.get("end_date")
+                                            ))
                                             cal_args = json.dumps({
                                                 "action": "create_event",
                                                 "summary": op["title"],
@@ -730,6 +898,12 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
                                                 "dtend": _dtend,
                                                 "location": _loc,
                                                 "description": "\n\n".join(filter(None, _desc_parts)),
+                                                "idempotency_key": _email_calendar_idempotency_key(
+                                                    owner=account_owner,
+                                                    message_id=message_id,
+                                                    event_ref=create_ref,
+                                                    action="create_event",
+                                                ),
                                             })
                                             r = await do_manage_calendar(cal_args, owner=_acct_owner)
                                             if r.get("exit_code", 0) == 0:
@@ -746,31 +920,25 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
                         else:
                             logger.warning(f"[cal-extract] no JSON array found on raw={cal_extract[:200]!r}")
                     except Exception as e:
+                        if "calendar" in _claims:
+                            fail_email_automation(_claims.pop("calendar"))
                         logger.warning(f"[cal-extract] Meeting extraction LLM call failed for uid={uid}: {e}")
                     else:
                         # Record successfully parsed results so we don't re-LLM
                         # no-op emails. Transient LLM failures are retried on
                         # the next poll run.
-                        try:
-                            if _cal_parse_ok:
-                                _cc = _sql3.connect(SCHEDULED_DB)
-                                _cc.execute(
-                                    "INSERT OR REPLACE INTO email_calendar_extractions "
-                                    "(message_id, owner, uid, event_uids, events_created, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                                    (
-                                        message_id,
-                                        account_owner or "",
-                                        uid.decode() if isinstance(uid, bytes) else str(uid),
-                                        json.dumps(_cal_event_uids),
-                                        _cal_run_count,
-                                        datetime.utcnow().isoformat(),
-                                    ),
+                        if _cal_parse_ok:
+                            if "calendar" in _claims:
+                                complete_email_automation(
+                                    _claims.pop("calendar"),
+                                    result={
+                                        "event_uids": list(_cal_event_uids),
+                                        "events_created": _cal_run_count,
+                                    },
                                 )
-                                _cc.commit()
-                                _cc.close()
-                                _cal_existing.add(message_id)
-                        except Exception as ce:
-                            logger.debug(f"Could not cache calendar extraction: {ce}")
+                            _cal_existing.add(message_id)
+                        elif "calendar" in _claims:
+                            fail_email_automation(_claims.pop("calendar"))
 
                 if need_urgent:
                     try:
@@ -816,24 +984,6 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
                             urgency = (urg_obj.get("urgency") or "none").lower()
                             reason = urg_obj.get("reason") or ""
                             logger.info(f"[urgency] uid={uid} level={urgency} reason={reason[:80]}")
-
-                            # Record immediately so we don't re-alert
-                            try:
-                                _uc = _sql3.connect(SCHEDULED_DB)
-                                _uc.execute(
-                                    "INSERT OR REPLACE INTO email_urgency_alerts "
-                                    "(message_id, owner, uid, folder, subject, sender, urgency, reason, alerted, created_at) "
-                                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                    (message_id, account_owner or "", uid.decode() if isinstance(uid, bytes) else str(uid),
-                                     _folder, subject, sender, urgency, reason,
-                                     1 if urgency in ("critical", "high") else 0,
-                                     datetime.utcnow().isoformat())
-                                )
-                                _uc.commit()
-                                _uc.close()
-                                _urgent_existing.add(message_id)
-                            except Exception as ue:
-                                logger.debug(f"Could not cache urgency: {ue}")
 
                             # Send alert email immediately if critical or high
                             if urgency in ("critical", "high"):
@@ -956,30 +1106,53 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
                             is_spam = bool(parsed.get("spam"))
                             spam_reason = str(parsed.get("reason") or "")[:200]
 
+                            uid_value = uid.decode() if isinstance(uid, bytes) else str(uid)
                             moved_to = ""
+                            upsert_email_tag_state(
+                                owner=account_owner, account_id=account_id,
+                                message_id=message_id, uid=uid_value,
+                                folder=_folder, subject=subject, sender=sender,
+                                tags=tags, spam_verdict=is_spam,
+                                spam_reason=spam_reason, moved_to="",
+                                model_used=model,
+                            )
                             if is_spam and auto_spam and spam_folder:
                                 if _imap_move(uid, spam_folder, account_id=account_id, owner=account_owner):
                                     moved_to = spam_folder
-                                    logger.info(f"Auto-spam moved uid={uid.decode() if isinstance(uid, bytes) else str(uid)} to {spam_folder}: {spam_reason}")
-
-                            _c = _sql3.connect(SCHEDULED_DB)
-                            _c.execute("""
-                                INSERT OR REPLACE INTO email_tags
-                                (message_id, owner, account_id, uid, folder, subject, sender, tags, spam_verdict,
-                                 spam_reason, moved_to, model_used, created_at)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """, (message_id, account_owner or "", account_id or "", uid.decode() if isinstance(uid, bytes) else str(uid), _folder, subject, sender,
-                                  json.dumps(tags), 1 if is_spam else 0,
-                                  spam_reason, moved_to, model, datetime.utcnow().isoformat()))
-                            _c.commit()
-                            _c.close()
+                                    if account_owner:
+                                        upsert_email_tag_state(
+                                            owner=account_owner, account_id=account_id,
+                                            message_id=message_id, uid=uid_value,
+                                            folder=_folder, subject=subject, sender=sender,
+                                            tags=tags, spam_verdict=is_spam,
+                                            spam_reason=spam_reason,
+                                            moved_to=moved_to, model_used=model,
+                                        )
+                                    logger.info(f"Auto-spam moved uid={uid_value} to {spam_folder}: {spam_reason}")
                             _tag_existing.add(message_id)
+                            if "classify" in _claims:
+                                complete_email_automation(
+                                    _claims.pop("classify"),
+                                    result={"tagged": True, "moved_to": moved_to},
+                                )
+                        elif "classify" in _claims:
+                            fail_email_automation(_claims.pop("classify"))
                     except Exception as e:
+                        if "classify" in _claims:
+                            fail_email_automation(_claims.pop("classify"))
                         logger.warning(f"Auto-classify {uid} failed: {e}")
 
+                for claim in list(_claims.values()):
+                    fail_email_automation(claim)
+                _claims.clear()
                 processed += 1
                 await asyncio.sleep(1)
             except Exception as e:
+                for claim in list(_claims.values()):
+                    try:
+                        fail_email_automation(claim)
+                    except Exception:
+                        logger.error("Email automation claim cleanup failed")
                 logger.warning(f"Auto-process {uid} failed: {e}")
                 continue
 
@@ -992,6 +1165,7 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
         if auto_reply: ops.append("reply")
         if auto_tag: ops.append("tag")
         if auto_spam: ops.append("spam")
+        if auto_cal: ops.append("calendar")
         ops_label = "/".join(ops) or "none"
         parts = [f"Scanned {len(uid_list)} email(s) ({ops_label})"]
         if processed:
@@ -1010,6 +1184,11 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
             parts.append(f"{no_msgid} missing Message-ID")
         if _events_created:
             parts.append(f"created {_events_created} calendar event(s)")
+        if _cancellations_proposed:
+            parts.append(
+                f"proposed {_cancellations_proposed} calendar cancellation(s) "
+                "for human approval"
+            )
         if processed == 0 and already_cached == 0 and too_short == 0:
             parts.append("nothing to do")
         summary = " · ".join(parts)
@@ -1040,34 +1219,77 @@ async def _auto_summarize_poller():
 
 
 def _scheduled_poll_once() -> dict:
-    """One pass of the scheduled-email queue: pick up any rows whose
-    `send_at` is past, deliver via SMTP, append to Sent, update status.
-    Returns a small summary dict — useful for the CLI wrapper. Safe to
-    invoke from a cron job (single-shot) or the long-running poller.
-    """
-    import sqlite3
-    sent = []
-    failed = []
-    try:
-        now_iso = datetime.utcnow().isoformat()
-        conn = sqlite3.connect(SCHEDULED_DB)
-        cols = [row[1] for row in conn.execute("PRAGMA table_info(scheduled_emails)").fetchall()]
-        kind_expr = "odysseus_kind" if "odysseus_kind" in cols else "'scheduled' AS odysseus_kind"
-        owner_expr = "owner" if "owner" in cols else "'' AS owner"
-        rows = conn.execute(f"""
-            SELECT id, to_addr, cc, bcc, subject, body, in_reply_to, references_hdr, attachments, account_id, {kind_expr}, {owner_expr}
-            FROM scheduled_emails
-            WHERE status = 'pending' AND send_at <= ?
-        """, (now_iso,)).fetchall()
-        conn.close()
+    """Drain approved and manual scheduled SQL delivery queues.
 
-        for r in rows:
-            sid = r[0]
+    This is the single worker hook shared by the in-process loop and the
+    ``odysseus-mail poll-scheduled`` command, so an approved agent email does
+    not depend on a request handler or a separately registered task. Returns a
+    small summary dict suitable for both callers.
+    """
+    sent: list[str] = []
+    failed: list[dict] = []
+    canonical: dict | None = None
+    try:
+        canonical = drain_email_outbox_once()
+        sent.extend(str(value) for value in canonical.get("delivered", []))
+        for key in ("retried", "failed", "incomplete"):
+            for value in canonical.get(key, []):
+                if isinstance(value, dict):
+                    failed.append(dict(value))
+    except Exception:
+        # A stable error keeps the CLI truthful without persisting/logging
+        # transport or credential details. The next poll will try again.
+        logger.error("Canonical email outbox drain failed")
+        failed.append({"id": "email_outbox", "error": "email_outbox_worker_failed"})
+
+    def _summary(*, error: str | None = None) -> dict:
+        result: dict = {"sent": sent, "failed": failed}
+        if canonical and (
+            canonical.get("attempted")
+            or canonical.get("delivered")
+            or canonical.get("retried")
+            or canonical.get("failed")
+            or canonical.get("incomplete")
+        ):
+            result["canonical"] = canonical
+        if error:
+            result["error"] = error
+        return result
+
+    try:
+        # Bounded, non-destructive compatibility import. The source sidecar is
+        # never claimed or mutated; all delivery decisions happen in SQL.
+        try:
+            from core.database import Account as _Account, SessionLocal as _SL
+            _db = _SL()
             try:
-                attachments = json.loads(r[8] or "[]")
-                row_account_id = r[9] if len(r) > 9 else None
-                odysseus_kind = r[10] if len(r) > 10 else "scheduled"
-                row_owner = (r[11] if len(r) > 11 else "") or _owner_for_email_account(row_account_id)
+                _owners = [
+                    row.username for row in _db.query(_Account).filter(
+                        _Account.status == "active"
+                    ).all()
+                ]
+            finally:
+                _db.close()
+            for _owner in _owners:
+                import_legacy_email_runtime(
+                    owner=_owner, sidecar_path=SCHEDULED_DB,
+                )
+        except Exception:
+            logger.error("Legacy email schedule import failed")
+
+        for _ in range(100):
+            claim = claim_due_scheduled_delivery(lease_seconds=15 * 60)
+            if claim is None:
+                break
+            sid = claim.row_id
+            try:
+                payload = dict(claim.payload or {})
+                attachments = payload.get("attachments") or []
+                if not isinstance(attachments, list):
+                    raise ValueError("invalid attachments")
+                row_account_id = claim.email_account_id
+                row_owner = claim.owner_username
+                odysseus_kind = str(payload.get("odysseus_kind") or "scheduled")
                 cfg = _get_email_config(row_account_id, owner=row_owner)
                 has_atts = bool(attachments)
                 if has_atts:
@@ -1077,29 +1299,32 @@ def _scheduled_poll_once() -> dict:
                     outer = MIMEMultipart("alternative")
                     body_container = outer
                 outer["From"] = cfg["from_address"]
-                outer["To"] = r[1]
-                if r[2]:
-                    outer["Cc"] = r[2]
-                outer["Subject"] = r[4] or ""
+                outer["To"] = str(payload.get("to") or "")
+                if payload.get("cc"):
+                    outer["Cc"] = str(payload.get("cc"))
+                outer["Subject"] = str(payload.get("subject") or "")
                 outer["Date"] = datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S +0000")
                 outer["X-Restia-Origin"] = "odysseus-ui"
                 outer["X-Restia-Kind"] = re.sub(r"[^A-Za-z0-9_.-]", "-", odysseus_kind or "scheduled")[:64]
                 outer["X-Restia-Ref"] = sid
-                if r[6]:
-                    outer["In-Reply-To"] = r[6]
-                if r[7]:
-                    outer["References"] = r[7]
-                body_container.attach(MIMEText(r[5] or "", "plain", "utf-8"))
-                html_body = html.escape(r[5] or "").replace("\n", "<br>\n")
+                if payload.get("in_reply_to"):
+                    outer["In-Reply-To"] = str(payload.get("in_reply_to"))
+                if payload.get("references"):
+                    outer["References"] = str(payload.get("references"))
+                body = str(payload.get("body") or "")
+                body_container.attach(MIMEText(body, "plain", "utf-8"))
+                html_body = html.escape(body).replace("\n", "<br>\n")
                 body_container.attach(MIMEText(f"<html><body>{html_body}</body></html>", "html", "utf-8"))
                 if has_atts:
                     outer.attach(body_container)
                     _attach_compose_uploads(outer, attachments)
-                recipients = [a.strip() for a in (r[1] or "").split(",") if a.strip()]
-                if r[2]:
-                    recipients.extend([a.strip() for a in r[2].split(",") if a.strip()])
-                if r[3]:
-                    recipients.extend([a.strip() for a in r[3].split(",") if a.strip()])
+                recipients = [a.strip() for a in str(payload.get("to") or "").split(",") if a.strip()]
+                if payload.get("cc"):
+                    recipients.extend([a.strip() for a in str(payload.get("cc")).split(",") if a.strip()])
+                if payload.get("bcc"):
+                    recipients.extend([a.strip() for a in str(payload.get("bcc")).split(",") if a.strip()])
+                if not recipients:
+                    raise ValueError("missing recipients")
 
                 _send_smtp_message(cfg, cfg["from_address"], recipients, outer.as_string())
 
@@ -1108,35 +1333,30 @@ def _scheduled_poll_once() -> dict:
                     with _imap(row_account_id, owner=row_owner) as imap:
                         sent_folder = _detect_sent_folder(imap)
                         imap.append(_q(sent_folder), "\\Seen", None, outer.as_bytes())
-                except Exception as e:
-                    logger.warning(f"Failed to append scheduled {sid} to Sent: {e}")
+                except Exception:
+                    logger.warning("Failed to append scheduled %s to Sent", sid)
 
+                if not complete_scheduled_delivery(claim):
+                    raise RuntimeError("scheduled delivery lease was lost")
                 _cleanup_compose_uploads(attachments)
-
-                conn2 = sqlite3.connect(SCHEDULED_DB)
-                conn2.execute("UPDATE scheduled_emails SET status='sent' WHERE id=?", (sid,))
-                conn2.commit()
-                conn2.close()
                 logger.info(f"Sent scheduled email {sid}")
                 sent.append(sid)
-            except Exception as e:
-                logger.error(f"Failed to send scheduled {sid}: {e}")
-                conn2 = sqlite3.connect(SCHEDULED_DB)
-                conn2.execute("UPDATE scheduled_emails SET status='failed', error=? WHERE id=?", (str(e), sid))
-                conn2.commit()
-                conn2.close()
-                failed.append({"id": sid, "error": str(e)})
-    except Exception as e:
-        logger.error(f"Scheduled poller error: {e}")
-        return {"sent": sent, "failed": failed, "error": str(e)}
-    return {"sent": sent, "failed": failed}
+            except Exception:
+                logger.error("Manual scheduled email delivery failed for id=%s", sid)
+                fail_scheduled_delivery(claim, error_code="smtp_failed")
+                failed.append({"id": sid, "error": "smtp_failed"})
+    except Exception:
+        logger.error("Scheduled poller failed")
+        return _summary(error="scheduled_email_worker_failed")
+    return _summary()
 
 
 async def _scheduled_email_poller():
-    """Background task that checks for due scheduled emails every 30
-    seconds. Each tick delegates to `_scheduled_poll_once`, which is
-    also exposed via the `odysseus-mail poll-scheduled` CLI for
-    cron-driven deployments."""
+    """Drain approved and scheduled email queues every 30 seconds.
+
+    Each tick delegates to ``_scheduled_poll_once``, also exposed via the
+    ``odysseus-mail poll-scheduled`` CLI for cron-driven deployments.
+    """
     import asyncio
 
     while True:
@@ -1147,17 +1367,37 @@ async def _scheduled_email_poller():
             logger.error(f"Scheduled poller error: {e}")
 
 
+async def _email_poller_leadership_loop():
+    """Run the poller locally or as the database-elected shared leader."""
+
+    from src.distributed_leadership import run_database_leased_worker
+
+    await run_database_leased_worker(
+        "email-poller",
+        _scheduled_email_poller,
+        lease_seconds=45,
+        poll_seconds=10,
+    )
+
+
 _poller_task = None
 _summarize_task = None
 
 def _inprocess_pollers_enabled() -> bool:
-    """Honour `ODYSSEUS_INPROCESS_POLLERS` — set to `0`/`false`/`no`/`off`
-    to disable the asyncio tasks so a cron / systemd-timer setup driving
-    `odysseus-mail poll-scheduled` is the sole external driver. The legacy
-    auto-summary/reply poller no longer starts here; scheduled Tasks own that
-    work so Email settings are only feature gates, not a second scheduler."""
+    """Honor the Restia poller gate and its legacy Odysseus alias.
+
+    Set ``RESTIA_INPROCESS_POLLERS`` (preferred) or the legacy
+    ``ODYSSEUS_INPROCESS_POLLERS`` to ``0``/``false``/``no``/``off`` so a
+    cron or systemd timer driving ``odysseus-mail poll-scheduled`` is the sole
+    external driver. The legacy auto-summary/reply poller no longer starts
+    here; scheduled Tasks own that work, so Email settings remain feature
+    gates rather than a second scheduler.
+    """
     import os
-    raw = os.environ.get("ODYSSEUS_INPROCESS_POLLERS", "1").strip().lower()
+    raw = os.environ.get("RESTIA_INPROCESS_POLLERS")
+    if raw is None:
+        raw = os.environ.get("ODYSSEUS_INPROCESS_POLLERS", "1")
+    raw = raw.strip().lower()
     return raw not in ("0", "false", "no", "off", "")
 
 
@@ -1165,12 +1405,12 @@ def _start_poller():
     """Start background pollers. Called at module load; if no event loop is
     running yet (common at import time), defer via a first-request hook.
 
-    Skipped entirely when `ODYSSEUS_INPROCESS_POLLERS=0` — use that when
+    Skipped entirely when `RESTIA_INPROCESS_POLLERS=0` — use that when
     you're driving polling from cron / systemd to avoid two copies of
     `_scheduled_poll_once` racing on the same SQLite."""
     if not _inprocess_pollers_enabled():
         logger.info(
-            "In-process email pollers disabled (ODYSSEUS_INPROCESS_POLLERS=0); "
+            "In-process email pollers disabled (RESTIA_INPROCESS_POLLERS=0); "
             "drive `odysseus-mail poll-scheduled` externally."
         )
         return
@@ -1179,8 +1419,11 @@ def _start_poller():
     def _launch():
         global _poller_task, _summarize_task
         loop = asyncio.get_running_loop()
-        if _poller_task is None:
-            _poller_task = loop.create_task(_scheduled_email_poller())
+        if _poller_task is None or _poller_task.done():
+            _poller_task = loop.create_task(
+                _email_poller_leadership_loop(),
+                name="restia-email-poller-leadership",
+            )
             logger.info("Started scheduled email poller")
         _summarize_task = None
 
@@ -1200,3 +1443,20 @@ def _start_poller():
 
         # Store for the router lifespan / first-request hook
         _start_poller._deferred = _deferred_start
+
+
+async def _stop_poller() -> None:
+    """Stop the local worker and release shared leadership before shutdown."""
+
+    global _poller_task, _summarize_task
+    tasks = [
+        task for task in (_poller_task, _summarize_task)
+        if task is not None and not task.done()
+    ]
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        import asyncio
+        await asyncio.gather(*tasks, return_exceptions=True)
+    _poller_task = None
+    _summarize_task = None

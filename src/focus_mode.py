@@ -13,10 +13,12 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 
+from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 
 from core.database import (
     Account,
+    EntityLink,
     FocusSession,
     LifeEntity,
     PlanningItem,
@@ -36,6 +38,10 @@ MAX_ENTRY_TEXT_LENGTH = 4_000
 MAX_ENTRY_METADATA_BYTES = 16 * 1024
 MAX_DEFINITION_OF_DONE_LENGTH = 20_000
 MAX_FOLLOW_UPS = 20
+MAX_FOCUS_CONTEXT = 12
+FOCUS_CONTEXT_ENTITY_TYPES = frozenset({
+    "note", "file", "project", "source", "workspace",
+})
 
 
 class FocusError(ValueError):
@@ -148,6 +154,7 @@ def serialize_focus_session(
     *,
     now: datetime | None = None,
     entity: LifeEntity | None = None,
+    context: Iterable[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "id": session.id,
@@ -174,8 +181,12 @@ def serialize_focus_session(
             "title": entity.title or "",
             "summary": entity.summary or "",
             "status": entity.status,
+            "properties": dict(entity.properties or {}),
+            "domain_ref_type": entity.domain_ref_type,
+            "domain_ref_id": entity.domain_ref_id,
             "version": int(entity.version or 1),
         }
+    payload["context"] = [dict(item) for item in (context or [])]
     return payload
 
 
@@ -374,6 +385,163 @@ def get_owned_focus_entities(
         .all()
     )
     return {row.id: row for row in rows}
+
+
+def get_focus_context(
+    db: Any,
+    *,
+    owner_id: str,
+    entity_id: str,
+    limit: int = MAX_FOCUS_CONTEXT,
+) -> list[dict[str, Any]]:
+    """Return bounded one-hop work context without crossing principals.
+
+    Focus deliberately shows only context-bearing Life nodes. The canonical
+    graph remains authoritative; no browser-side inference or duplicated
+    relationship store is introduced here.
+    """
+
+    entity = _owned_entity(db, owner_id, entity_id)
+    bounded = max(1, min(MAX_FOCUS_CONTEXT, int(limit)))
+    links = (
+        db.query(EntityLink)
+        .filter(
+            EntityLink.owner_id == owner_id,
+            EntityLink.deleted_at.is_(None),
+            EntityLink.source_type == "life_entity",
+            EntityLink.target_type == "life_entity",
+            or_(
+                EntityLink.source_id == entity.id,
+                EntityLink.target_id == entity.id,
+            ),
+        )
+        .order_by(EntityLink.created_at.asc(), EntityLink.id.asc())
+        .limit((bounded * 3) + 1)
+        .all()
+    )
+    related_ids = [
+        link.target_id if link.source_id == entity.id else link.source_id
+        for link in links
+    ]
+    related = get_owned_focus_entities(
+        db, owner_id=owner_id, entity_ids=related_ids
+    )
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for link in links:
+        related_id = (
+            link.target_id if link.source_id == entity.id else link.source_id
+        )
+        item = related.get(related_id)
+        if (
+            item is None
+            or item.deleted_at is not None
+            or item.entity_type not in FOCUS_CONTEXT_ENTITY_TYPES
+            or item.id in seen
+        ):
+            continue
+        seen.add(item.id)
+        rows.append({
+            "id": item.id,
+            "entity_type": item.entity_type,
+            "title": item.title or "",
+            "summary": item.summary or "",
+            "status": item.status,
+            "relation": link.relation,
+            "direction": "outgoing" if link.source_id == entity.id else "incoming",
+            "domain_ref_type": item.domain_ref_type,
+            "domain_ref_id": item.domain_ref_id,
+            "version": int(item.version or 1),
+        })
+        if len(rows) == bounded:
+            break
+    return rows
+
+
+def resolve_planning_focus_entity(
+    db: Any,
+    *,
+    account: Account,
+    planning_item_id: str,
+    expected_planning_version: int,
+) -> LifeEntity:
+    """Resolve a canonical Today Planning row into an actionable Life node.
+
+    Today remains read-only. The projection is created only when the principal
+    explicitly starts Focus, in the same transaction as the focus lease.
+    """
+
+    planning_owner = normalize_planning_owner(account.username)
+    item = (
+        db.query(PlanningItem)
+        .filter(
+            PlanningItem.id == str(planning_item_id),
+            PlanningItem.owner == planning_owner,
+        )
+        .first()
+    )
+    if item is None:
+        raise FocusNotFound("Planning item not found")
+    current_version = int(item.version or 1)
+    if current_version != int(expected_planning_version):
+        raise FocusConflict(
+            "Planning item changed in another client "
+            f"(current version {current_version})"
+        )
+    claimed = (
+        db.query(PlanningItem)
+        .filter(
+            PlanningItem.id == item.id,
+            PlanningItem.owner == planning_owner,
+            PlanningItem.version == current_version,
+            PlanningItem.status == "open",
+            PlanningItem.completed_at.is_(None),
+        )
+        .update(
+            {PlanningItem.updated_at: PlanningItem.updated_at},
+            synchronize_session=False,
+        )
+    )
+    if claimed != 1:
+        raise FocusConflict("Planning item is no longer actionable")
+
+    existing = (
+        db.query(LifeEntity)
+        .filter(
+            LifeEntity.owner_id == account.id,
+            LifeEntity.domain_ref_type == "planning_item",
+            LifeEntity.domain_ref_id == item.id,
+        )
+        .first()
+    )
+    if existing is not None:
+        if (
+            existing.deleted_at is not None
+            or existing.entity_type != "task"
+            or existing.status not in FOCUSABLE_ENTITY_STATUSES
+        ):
+            raise FocusConflict(
+                "Planning item's Life representation is no longer actionable"
+            )
+        return existing
+
+    task, _created = create_life_entity(
+        db,
+        account=account,
+        entity_type="task",
+        title=item.title,
+        summary=item.details or "",
+        status="open",
+        properties={"source": "planning"},
+        provenance={"source": "focus_today"},
+        confidence=100,
+        sensitivity="private",
+        domain_ref_type="planning_item",
+        domain_ref_id=item.id,
+        idempotency_key=f"focus-planning:{item.id}",
+        reason="Planning item represented in Life when Focus started",
+    )
+    return task
 
 
 def _check_version(session: FocusSession, expected_version: int) -> None:

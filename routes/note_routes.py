@@ -359,7 +359,11 @@ async def dispatch_reminder(
             from pathlib import Path as _P
             from src.reminder_delivery_claims import claim_reminder_delivery
 
-            claim_path = _P(DATA_DIR) / "reminder_delivery_claims.sqlite3"
+            claim_path = (
+                getattr(_scheduler_ref, "_reminder_claim_path", None)
+                if _scheduler_ref is not None
+                else _P(DATA_DIR) / "reminder_delivery_claims.sqlite3"
+            )
             claim = claim_reminder_delivery(
                 claim_path,
                 owner=owner,
@@ -399,7 +403,7 @@ async def dispatch_reminder(
             raise RuntimeError("Reminder delivery claim could not be recorded") from exc
 
     def _claim_still_active() -> bool:
-        if claim_path is None or not claim_token:
+        if not claim_token:
             return True
         from src.reminder_delivery_claims import reminder_claim_is_active
 
@@ -430,7 +434,7 @@ async def dispatch_reminder(
         }
 
     if not notification_topic_enabled(settings, topic):
-        if claim_path is not None and claim_token:
+        if claim_token:
             from src.reminder_delivery_claims import acknowledge_reminder_delivery
             acknowledge_reminder_delivery(
                 claim_path,
@@ -817,10 +821,7 @@ async def dispatch_reminder(
                         # The parent claim protects the occurrence as a whole;
                         # recipient claims remember which linked chats already
                         # succeeded so a partial outage retries only failures.
-                        if (
-                            claim_path is not None
-                            and cache_key
-                        ):
+                        if cache_key:
                             try:
                                 import hashlib as _hashlib
                                 from src.reminder_delivery_claims import claim_reminder_delivery
@@ -1006,7 +1007,7 @@ async def dispatch_reminder(
     # Complete the durable claim before updating the compatibility JSON cache.
     # A failed channel is persisted with retry backoff; it is never converted
     # into an acknowledgement merely because the in-app mirror was queued.
-    if claim_path is not None and claim_token:
+    if claim_token:
         try:
             if str(channel).strip().lower() == "browser" and browser_sent:
                 from src.reminder_delivery_claims import await_browser_ack

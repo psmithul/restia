@@ -144,6 +144,8 @@ def _shared_env(**overrides: str) -> dict[str, str]:
         "AUTH_ENABLED": "true",
         "LOCALHOST_BYPASS": "false",
         "RESTIA_ENCRYPTION_KEY": Fernet.generate_key().decode("ascii"),
+        "RESTIA_BLOB_STORE": "shared-filesystem",
+        "RESTIA_BLOB_ROOT": "/mnt/restia-blobs",
     }
     env.update(overrides)
     return env
@@ -285,9 +287,11 @@ def test_shared_mode_security_prerequisites_fail_closed(env, message):
         validate_database_mode(environ=env)
 
 
-def test_shared_mode_refuses_startup_until_alembic_is_authoritative():
-    with pytest.raises(DatabaseConfigurationError, match="not available yet"):
-        validate_database_mode(environ=_shared_env())
+def test_shared_mode_accepts_reviewed_schema_and_runtime_authority():
+    config = validate_database_mode(environ=_shared_env())
+    assert config.mode == "shared"
+    assert config.dialect == "postgresql"
+    assert config.schema_authority == database_runtime.SCHEMA_AUTHORITY
 
 
 def test_shared_mode_diagnostic_validation_can_report_prerequisites():
@@ -1044,8 +1048,10 @@ def test_0003_downgrade_wrong_key_fails_before_destructive_ddl(
             config.attributes["connection"] = connection
             command.downgrade(config, EXPLICIT_BASELINE_REVISION)
 
+    # Later additive revisions can downgrade cleanly before 0005 reaches the
+    # encrypted V3 payload and refuses its destructive step.
     assert schema_revision_status(engine).current_revisions == (
-        SCHEMA_HEAD_REVISION,
+        "20260720_0005",
     )
     tables = set(inspect(engine).get_table_names())
     assert {"focus_sessions", "action_proposals", "life_entities"} <= tables
@@ -1154,7 +1160,7 @@ def test_0003_planning_downgrade_wrong_key_preserves_encrypted_rows(
             command.downgrade(config, EXPLICIT_BASELINE_REVISION)
 
     assert schema_revision_status(engine).current_revisions == (
-        SCHEMA_HEAD_REVISION,
+        "20260720_0005",
     )
     assert {"focus_sessions", "action_proposals", "life_entities"} <= set(
         inspect(engine).get_table_names()

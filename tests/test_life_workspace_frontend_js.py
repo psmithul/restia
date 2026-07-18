@@ -78,6 +78,60 @@ def test_life_workspace_owns_every_required_contextual_destination():
         assert f'data-life-filter="{key}"' in html
         assert f">{label} <" in html
         assert f"{key}: Object.freeze(" in module
+    assert "money: Object.freeze(['finance_record', 'transaction', 'asset'])" in module
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node binary not on PATH")
+def test_automation_context_is_bounded_read_only_and_definition_specific():
+    source = f"""
+      import {{ normalizeAutomationProperties, __test }} from {json.dumps(MODULE.as_uri())};
+      const definition = normalizeAutomationProperties({{
+        type: 'automation',
+        provenance: {{ source_ids: ['source-1', 'source-2'] }},
+        properties: {{
+          schema_version: 1,
+          record_kind: 'automation_definition',
+          enabled: true,
+          trigger: {{ type: 'calendar', config: {{ event: 'meeting_ended' }} }},
+          actions: [
+            {{ type: 'briefing', external: false }},
+            {{ type: 'approved_send', external: true }},
+          ],
+        }},
+      }});
+      const run = normalizeAutomationProperties({{
+        type: 'action',
+        properties: {{ schema_version: 1, record_kind: 'automation_preparation' }},
+      }});
+      console.log(JSON.stringify({{
+        definition, run, workTypes: __test.FILTER_TYPES.work,
+      }}));
+    """
+    result = subprocess.run(
+        ["node", "--input-type=module", "-e", source],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    payload = json.loads(result.stdout)
+
+    assert payload["definition"] == {
+        "enabled": True,
+        "triggerType": "calendar",
+        "actionCount": 2,
+        "actionTypes": ["briefing", "approved_send"],
+        "externalReviewCount": 1,
+        "sourceCount": 2,
+    }
+    assert payload["run"] is None
+    assert "automation" in payload["workTypes"]
+
+    module = _read("static/js/lifeWorkspace.js")
+    assert "Automation definition context" in module
+    assert "Prepared only · no execution or send" in module
+    assert "/api/life/automations" not in module
 
 
 def test_life_workspace_shell_assets_and_accessible_states_are_registered():

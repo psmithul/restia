@@ -1,6 +1,7 @@
 """Calendar routes — local SQLite-backed calendar CRUD."""
 
 import logging
+import hashlib
 import json
 import re
 import uuid
@@ -8,12 +9,29 @@ from datetime import datetime, date, timedelta
 from typing import Optional, List
 
 from fastapi import APIRouter, HTTPException, Request, UploadFile, File, Query, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import or_, and_
 from dateutil.rrule import rrulestr
 
-from core.database import SessionLocal, CalendarCal, CalendarDeletedEvent, CalendarEvent
+from core.database import SessionLocal, CalendarCal, CalendarEvent
 from src.auth_helpers import DEFAULT_LOCAL_OWNER, require_user
+from src.calendar_service import (
+    CalendarConflict,
+    CalendarNotFound,
+    CalendarServiceError,
+    cancel_calendar_event,
+    create_local_calendar,
+    create_calendar_event,
+    delete_empty_calendar_collection,
+    ensure_default_calendar,
+    exclude_calendar_occurrence,
+    reschedule_calendar_event,
+    update_calendar_collection,
+    update_calendar_event,
+)
+from src.calendar_intelligence import calendar_time_report
+from src.life_graph import LifeGraphError
+from src.identity import request_account_transaction
 from src.upload_limits import read_upload_limited, ICS_MAX_BYTES
 
 logger = logging.getLogger(__name__)
@@ -152,53 +170,6 @@ def _resolve_base_uid(uid: str) -> str:
     return base
 
 
-async def _push_caldav_event_after_commit(owner: str, uid: str, action: str):
-    """Best-effort CalDAV write-through. Local writes stay authoritative if
-    the remote server is unreachable; pending flags let /sync retry later."""
-    try:
-        result = {"ok": True}
-        if action == "create":
-            from src.caldav_sync import push_event_create
-            result = await push_event_create(owner, uid)
-        elif action == "update":
-            from src.caldav_sync import push_event_update
-            result = await push_event_update(owner, uid)
-        elif action == "delete":
-            from src.caldav_sync import push_event_delete
-            result = await push_event_delete(owner, uid)
-        if result and not result.get("ok") and not result.get("skipped"):
-            raise RuntimeError(result.get("error") or result)
-    except Exception as e:
-        logger.warning("CalDAV %s push failed for uid=%s: %s", action, uid, e)
-        if action in {"create", "update"}:
-            db = SessionLocal()
-            try:
-                ev = _get_or_404_event(db, uid, owner)
-                ev.caldav_sync_pending = action
-                db.commit()
-            except Exception:
-                db.rollback()
-            finally:
-                db.close()
-
-
-def _record_caldav_delete_tombstone(db, ev: CalendarEvent, owner: str) -> None:
-    if not (ev.calendar and ev.calendar.source == "caldav"):
-        return
-    tombstone = db.query(CalendarDeletedEvent).filter(
-        CalendarDeletedEvent.uid == ev.uid,
-        CalendarDeletedEvent.owner == owner,
-    ).first()
-    if not tombstone:
-        tombstone = CalendarDeletedEvent(uid=ev.uid, owner=owner)
-        db.add(tombstone)
-    tombstone.calendar_id = ev.calendar_id
-    tombstone.remote_href = ev.remote_href
-    tombstone.remote_etag = ev.remote_etag
-    tombstone.caldav_base_url = getattr(ev.calendar, "caldav_base_url", None)
-    tombstone.summary = ev.summary or ""
-    tombstone.last_error = None
-
 # ── Pydantic models ──
 
 class EventCreate(BaseModel):
@@ -211,9 +182,14 @@ class EventCreate(BaseModel):
     calendar_href: Optional[str] = None  # calendar id
     rrule: Optional[str] = None
     color: Optional[str] = None  # per-event color override
+    importance: str = Field(default="normal", max_length=16)
+    event_type: Optional[str] = Field(default=None, max_length=32)
+    linked_entity_ids: List[str] = Field(default_factory=list, max_length=100)
+    idempotency_key: Optional[str] = None
 
 
 class EventUpdate(BaseModel):
+    version: int = Field(ge=1)
     summary: Optional[str] = None
     dtstart: Optional[str] = None
     dtend: Optional[str] = None
@@ -222,27 +198,20 @@ class EventUpdate(BaseModel):
     location: Optional[str] = None
     rrule: Optional[str] = None
     color: Optional[str] = None
+    importance: Optional[str] = Field(default=None, max_length=16)
+    event_type: Optional[str] = Field(default=None, max_length=32)
+    linked_entity_ids: Optional[List[str]] = Field(default=None, max_length=100)
+
+
+def _raise_calendar_service_error(exc: CalendarServiceError) -> None:
+    if isinstance(exc, CalendarNotFound):
+        raise HTTPException(404, str(exc)) from exc
+    if isinstance(exc, CalendarConflict):
+        raise HTTPException(409, str(exc)) from exc
+    raise HTTPException(400, str(exc)) from exc
 
 
 # ── Helpers ──
-
-def _ensure_default_calendar(db, owner: str = None) -> CalendarCal:
-    """Create default calendar if none exist for this owner."""
-    owner = owner or FALLBACK_OWNER
-    cal = db.query(CalendarCal).filter(CalendarCal.owner == owner).first()
-    if not cal:
-        cal = CalendarCal(
-            id=str(uuid.uuid4()),
-            owner=owner,
-            name="Personal",
-            color="#5b8abf",
-            source="local",
-        )
-        db.add(cal)
-        db.commit()
-        db.refresh(cal)
-    return cal
-
 
 # Per-request user time context. chat_routes sets this from browser timezone
 # headers so natural-language times the LLM emits ("today at 9pm") are parsed
@@ -554,6 +523,7 @@ def _event_to_dict(ev: CalendarEvent) -> dict:
         "color": ev.color or (ev.calendar.color if ev.calendar else ""),
         "event_type": getattr(ev, "event_type", None),
         "importance": getattr(ev, "importance", None) or "normal",
+        "version": int(getattr(ev, "version", 1) or 1),
     }
 
 
@@ -944,6 +914,106 @@ def _expand_rrule(
     return results
 
 
+def _list_events_for_owner(
+    db,
+    *,
+    owner_id: str,
+    start_dt: datetime,
+    end_dt: datetime,
+    calendar: str = "",
+) -> dict:
+    """Build the bounded calendar read model for one immutable Account.id."""
+
+    def scoped_events():
+        query = db.query(CalendarEvent).join(CalendarCal).filter(
+            CalendarEvent.status != "cancelled",
+            CalendarEvent.owner_id == owner_id,
+            CalendarCal.owner_id == owner_id,
+        )
+        if calendar:
+            query = query.filter(
+                (CalendarEvent.calendar_id == calendar)
+                | (CalendarCal.name == calendar)
+            )
+        return query
+
+    direct_events = (
+        scoped_events()
+        .filter(
+            or_(CalendarEvent.rrule == "", CalendarEvent.rrule.is_(None)),
+            CalendarEvent.dtstart < end_dt,
+            CalendarEvent.dtend > start_dt,
+        )
+        .order_by(CalendarEvent.dtstart.asc(), CalendarEvent.uid.asc())
+        .limit(_CALENDAR_LIST_OUTPUT_LIMIT + 1)
+        .all()
+    )
+    direct_overflow = len(direct_events) > _CALENDAR_LIST_OUTPUT_LIMIT
+    direct_events = [
+        event
+        for event in direct_events[:_CALENDAR_LIST_OUTPUT_LIMIT]
+        if not (event.rrule and event.rrule.strip())
+    ]
+
+    recurring_events = (
+        scoped_events()
+        .filter(
+            CalendarEvent.rrule.isnot(None),
+            CalendarEvent.rrule != "",
+            CalendarEvent.dtstart < end_dt,
+        )
+        .order_by(CalendarEvent.dtstart.desc(), CalendarEvent.uid.asc())
+        .limit(_CALENDAR_LIST_CANDIDATE_LIMIT + 1)
+        .all()
+    )
+    recurring_overflow = len(recurring_events) > _CALENDAR_LIST_CANDIDATE_LIMIT
+    recurring_events = [
+        event
+        for event in recurring_events[:_CALENDAR_LIST_CANDIDATE_LIMIT]
+        if event.rrule and event.rrule.strip()
+    ]
+
+    expanded = []
+    for event in direct_events:
+        expanded.extend(_expand_rrule(event, start_dt, end_dt))
+
+    truncated = direct_overflow or recurring_overflow
+    budget = _RecurrenceBudget(
+        work_limit=_CALENDAR_LIST_RECURRENCE_WORK_LIMIT,
+        output_limit=max(0, _CALENDAR_LIST_OUTPUT_LIMIT - len(direct_events)),
+    )
+    for event in recurring_events:
+        if budget.remaining_work < 1 or budget.remaining_output < 1:
+            truncated = True
+            break
+        occurrences = _expand_rrule(
+            event,
+            start_dt,
+            end_dt,
+            limit=max(1, min(_RRULE_EXPANSION_LIMIT, budget.remaining_output)),
+            work_limit=max(
+                1,
+                min(_RRULE_EXPANSION_WORK_LIMIT, budget.remaining_work),
+            ),
+            budget=budget,
+        )
+        truncated = truncated or bool(getattr(occurrences, "truncated", False))
+        expanded.extend(occurrences)
+        if budget.exhausted:
+            truncated = True
+            break
+
+    truncated = truncated or any(event.get("truncated") for event in expanded)
+    expanded.sort(key=lambda value: value["dtstart"])
+    if len(expanded) > _CALENDAR_LIST_OUTPUT_LIMIT:
+        truncated = True
+        expanded = expanded[:_CALENDAR_LIST_OUTPUT_LIMIT]
+    response: dict = {"events": expanded}
+    if truncated:
+        response["truncated"] = True
+    return response
+
+
 # ── Routes ──
 
 def setup_calendar_routes() -> APIRouter:
@@ -955,9 +1025,118 @@ def setup_calendar_routes() -> APIRouter:
         from src.caldav_sync import _load_caldav_accounts
         return _load_caldav_accounts(owner)
 
+    def _caldav_delivery_marker(account: dict) -> str:
+        """Hash only connector fields that can change remote delivery authority."""
+
+        material = {
+            "id": str(account.get("id") or ""),
+            "url": str(account.get("url") or "").strip(),
+            "username": str(account.get("username") or "").strip(),
+            "password": str(account.get("password") or ""),
+            "oauth_provider": str(account.get("oauth_provider") or ""),
+            "oauth_refresh_token": str(
+                account.get("oauth_refresh_token") or ""
+            ),
+        }
+        encoded = json.dumps(
+            material, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _fence_changed_caldav_accounts(
+        owner: str,
+        before: list,
+        after: list,
+    ) -> None:
+        """Advance collection generations before connector preferences change.
+
+        CalendarDelivery rows capture ``CalendarCal.config_version``.  A
+        credential, principal, or endpoint change must therefore advance every
+        bound collection before the new preference file becomes visible to a
+        worker.  If the later file write fails the extra generation is safe:
+        queued work conflicts instead of running against uncertain authority.
+        """
+
+        from src.identity import find_account
+        from src.life_core import append_action_audit
+
+        def markers(rows: list) -> dict[str, str]:
+            values: dict[str, str] = {}
+            for raw in rows:
+                if not isinstance(raw, dict):
+                    raise HTTPException(400, "CalDAV account configuration is invalid")
+                account_id = str(raw.get("id") or "").strip()
+                if not account_id or account_id in values:
+                    raise HTTPException(400, "CalDAV account IDs must be unique")
+                values[account_id] = _caldav_delivery_marker(raw)
+            return values
+
+        old = markers(before)
+        new = markers(after)
+        changed_ids = {
+            account_id
+            for account_id in set(old) | set(new)
+            if old.get(account_id) != new.get(account_id)
+        }
+        if not changed_ids:
+            return
+
+        db = SessionLocal()
+        try:
+            account = find_account(db, owner)
+            if account is None:
+                raise HTTPException(401, "Authenticated calendar account not found")
+            rows = db.query(CalendarCal).filter(
+                CalendarCal.owner_id == account.id,
+                CalendarCal.source == "caldav",
+            ).all()
+            # A legacy collection without an account_id selects the only saved
+            # connector. Any binding-set change can change that selection, so
+            # it is always fenced when at least one delivery-sensitive account
+            # changes.
+            for calendar in rows:
+                connector_id = str(calendar.account_id or "")
+                if connector_id and connector_id not in changed_ids:
+                    continue
+                expected = int(calendar.config_version or 1)
+                updated = db.query(CalendarCal).filter(
+                    CalendarCal.id == calendar.id,
+                    CalendarCal.owner_id == account.id,
+                    CalendarCal.config_version == expected,
+                ).update(
+                    {
+                        CalendarCal.config_version: expected + 1,
+                        CalendarCal.updated_at: datetime.utcnow(),
+                    },
+                    synchronize_session=False,
+                )
+                if updated != 1:
+                    raise CalendarConflict(
+                        "CalDAV configuration changed in another client"
+                    )
+                append_action_audit(
+                    db,
+                    owner_id=account.id,
+                    action="calendar.caldav.configuration_changed",
+                    entity_type="calendar",
+                    entity_id=calendar.id,
+                    reason="CalDAV delivery authority changed",
+                    before_state={"config_version": expected},
+                    after_state={"config_version": expected + 1},
+                    details={"connector_binding_changed": True},
+                )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
     def _save_caldav_accounts(owner: str, accounts: list) -> None:
         from routes.prefs_routes import _load_for_user, _save_for_user
         prefs = _load_for_user(owner) or {}
+        previous = list(prefs.get("caldav_accounts") or [])
+        _fence_changed_caldav_accounts(owner, previous, accounts)
         prefs["caldav_accounts"] = accounts
         prefs.pop("caldav", None)
         _save_for_user(owner, prefs)
@@ -1331,15 +1510,23 @@ def setup_calendar_routes() -> APIRouter:
 
 
     @router.delete("/calendars/{cal_id}")
-    async def delete_calendar(request: Request, cal_id: str):
-        owner = _require_user(request)
+    async def delete_calendar(
+        request: Request,
+        cal_id: str,
+        version: int = Query(..., ge=1),
+    ):
         db = SessionLocal()
         try:
-            cal = _get_or_404_calendar(db, cal_id, owner)
-            db.query(CalendarEvent).filter(CalendarEvent.calendar_id == cal_id).delete()
-            db.delete(cal)
-            db.commit()
-            return {"ok": True}
+            with request_account_transaction(db, request, write=True) as account:
+                delete_empty_calendar_collection(
+                    db,
+                    account=account,
+                    calendar_id=cal_id,
+                    expected_version=version,
+                )
+                return {"ok": True}
+        except CalendarServiceError as exc:
+            _raise_calendar_service_error(exc)
         except HTTPException:
             raise
         except Exception as e:
@@ -1352,15 +1539,26 @@ def setup_calendar_routes() -> APIRouter:
 
     @router.get("/calendars")
     async def list_calendars(request: Request):
-        owner = _require_user(request)
         db = SessionLocal()
         try:
-            _ensure_default_calendar(db, owner)
-            cals = db.query(CalendarCal).filter(CalendarCal.owner == owner).all()
-            return {"calendars": [
-                {"name": c.name, "href": c.id, "color": c.color, "source": c.source}
-                for c in cals
-            ]}
+            # The historical GET establishes the first Personal calendar. Keep
+            # that contract, but perform the lazy write behind the identity
+            # barrier and commit it as one V3 account-scoped transaction.
+            with request_account_transaction(db, request, write=True) as account:
+                ensure_default_calendar(db, account=account)
+                cals = db.query(CalendarCal).filter(
+                    CalendarCal.owner_id == account.id
+                ).order_by(CalendarCal.created_at.asc(), CalendarCal.id.asc()).all()
+                return {"calendars": [
+                    {
+                        "name": c.name,
+                        "href": c.id,
+                        "color": c.color,
+                        "source": c.source,
+                        "version": int(c.config_version or 1),
+                    }
+                    for c in cals
+                ]}
         except HTTPException:
             raise
         except Exception as e:
@@ -1371,7 +1569,6 @@ def setup_calendar_routes() -> APIRouter:
 
     @router.get("/events")
     async def list_events(request: Request, start: str, end: str, calendar: str = ""):
-        owner = _require_user(request)
         try:
             start_dt = _parse_dt(start)
             end_dt = _parse_dt(end)
@@ -1383,110 +1580,16 @@ def setup_calendar_routes() -> APIRouter:
             return {"events": []}
         db = SessionLocal()
         try:
-            # Scope events to calendars owned by the caller.
-            # Non-recurring events must overlap the query window; recurring
-            # events (with RRULE) whose base dtstart is before the window end
-            # are fetched so their actual occurrences can be expanded
-            # server-side and appear in every year they repeat, not just the
-            # DTSTART year.
-            def scoped_events():
-                query = db.query(CalendarEvent).join(CalendarCal).filter(
-                    CalendarEvent.status != "cancelled",
-                    CalendarCal.owner == owner,
+            with request_account_transaction(db, request, write=False) as account:
+                if account is None:
+                    return {"events": []}
+                return _list_events_for_owner(
+                    db,
+                    owner_id=account.id,
+                    start_dt=start_dt,
+                    end_dt=end_dt,
+                    calendar=calendar,
                 )
-                if calendar:
-                    query = query.filter(
-                        (CalendarEvent.calendar_id == calendar)
-                        | (CalendarCal.name == calendar)
-                    )
-                return query
-
-            # Bound direct and recurring candidates independently. Otherwise
-            # thousands of old series can consume one combined DTSTART-ordered
-            # cap and hide an overlapping one-off event that is happening now.
-            direct_events = (
-                scoped_events()
-                .filter(
-                    or_(CalendarEvent.rrule == "", CalendarEvent.rrule.is_(None)),
-                    CalendarEvent.dtstart < end_dt,
-                    CalendarEvent.dtend > start_dt,
-                )
-                .order_by(CalendarEvent.dtstart.asc(), CalendarEvent.uid.asc())
-                .limit(_CALENDAR_LIST_OUTPUT_LIMIT + 1)
-                .all()
-            )
-            direct_overflow = len(direct_events) > _CALENDAR_LIST_OUTPUT_LIMIT
-            direct_events = [
-                event
-                for event in direct_events[:_CALENDAR_LIST_OUTPUT_LIMIT]
-                if not (event.rrule and event.rrule.strip())
-            ]
-
-            recurring_events = (
-                scoped_events()
-                .filter(
-                    CalendarEvent.rrule.isnot(None),
-                    CalendarEvent.rrule != "",
-                    CalendarEvent.dtstart < end_dt,
-                )
-                .order_by(CalendarEvent.dtstart.desc(), CalendarEvent.uid.asc())
-                .limit(_CALENDAR_LIST_CANDIDATE_LIMIT + 1)
-                .all()
-            )
-            recurring_overflow = (
-                len(recurring_events) > _CALENDAR_LIST_CANDIDATE_LIMIT
-            )
-            recurring_events = [
-                event
-                for event in recurring_events[:_CALENDAR_LIST_CANDIDATE_LIMIT]
-                if event.rrule and event.rrule.strip()
-            ]
-
-            expanded = []
-            for event in direct_events:
-                expanded.extend(_expand_rrule(event, start_dt, end_dt))
-
-            truncated = direct_overflow or recurring_overflow
-            budget = _RecurrenceBudget(
-                work_limit=_CALENDAR_LIST_RECURRENCE_WORK_LIMIT,
-                output_limit=max(
-                    0,
-                    _CALENDAR_LIST_OUTPUT_LIMIT - len(direct_events),
-                ),
-            )
-            for event in recurring_events:
-                if budget.remaining_work < 1 or budget.remaining_output < 1:
-                    truncated = True
-                    break
-                occurrences = _expand_rrule(
-                    event,
-                    start_dt,
-                    end_dt,
-                    limit=max(1, min(_RRULE_EXPANSION_LIMIT, budget.remaining_output)),
-                    work_limit=max(
-                        1,
-                        min(_RRULE_EXPANSION_WORK_LIMIT, budget.remaining_work),
-                    ),
-                    budget=budget,
-                )
-                truncated = truncated or bool(
-                    getattr(occurrences, "truncated", False)
-                )
-                expanded.extend(occurrences)
-                if budget.exhausted:
-                    truncated = True
-                    break
-
-            # Sort by occurrence start time for consistent frontend ordering.
-            truncated = truncated or any(e.get("truncated") for e in expanded)
-            expanded.sort(key=lambda d: d["dtstart"])
-            if len(expanded) > _CALENDAR_LIST_OUTPUT_LIMIT:
-                truncated = True
-                expanded = expanded[:_CALENDAR_LIST_OUTPUT_LIMIT]
-            response: dict = {"events": expanded}
-            if truncated:
-                response["truncated"] = True
-            return response
         except HTTPException:
             raise
         except Exception as e:
@@ -1495,58 +1598,82 @@ def setup_calendar_routes() -> APIRouter:
         finally:
             db.close()
 
-    @router.post("/events")
-    async def create_event(request: Request, data: EventCreate):
-        owner = _require_user(request)
+    @router.get("/time-intelligence")
+    async def time_intelligence(
+        request: Request,
+        as_of: datetime = Query(...),
+        start: datetime = Query(...),
+        end: datetime = Query(...),
+        minimum_slot_minutes: int = Query(default=30, ge=15, le=480),
+        day_start_hour: int = Query(default=6, ge=0, le=22),
+        day_end_hour: int = Query(default=23, ge=1, le=24),
+        daily_capacity_minutes: int = Query(default=600, ge=30, le=1440),
+        travel_buffer_minutes: int = Query(default=30, ge=0, le=240),
+    ):
         db = SessionLocal()
         try:
-            cal = None
-            if data.calendar_href:
-                cal = db.query(CalendarCal).filter(CalendarCal.id == data.calendar_href).first()
-                # Reject calendars that aren't owned by the caller. The
-                # previous `if cal and cal.owner and ...` check silently
-                # passed null-owner (legacy) rows, letting any authenticated
-                # user write events into them. Same null-owner gate as
-                # `_get_or_404_calendar`.
-                if cal and (cal.owner is None or cal.owner != owner):
-                    raise HTTPException(404, "Calendar not found")
-            if not cal:
-                cal = _ensure_default_calendar(db, owner)
+            with request_account_transaction(db, request, write=False) as account:
+                if account is None:
+                    return {
+                        "events": [], "event_count": 0, "free_slots": [],
+                        "conflicts": [], "read_only": True,
+                        "can_reschedule_or_create": False, "truncated": False,
+                    }
+                return calendar_time_report(
+                    db,
+                    owner_id=account.id,
+                    as_of=as_of,
+                    window_start=start,
+                    window_end=end,
+                    minimum_slot_minutes=minimum_slot_minutes,
+                    day_start_hour=day_start_hour,
+                    day_end_hour=day_end_hour,
+                    daily_capacity_minutes=daily_capacity_minutes,
+                    travel_buffer_minutes=travel_buffer_minutes,
+                )
+        except LifeGraphError as exc:
+            db.rollback()
+            raise HTTPException(400, str(exc)) from exc
+        except HTTPException:
+            raise
+        except Exception:
+            db.rollback()
+            logger.exception("Failed to compute calendar time intelligence")
+            raise HTTPException(500, "Failed to compute calendar time intelligence")
+        finally:
+            db.close()
 
-            uid = str(uuid.uuid4())
-            # Use the tz-detecting parser so events posted with an offset
-            # (e.g. "2026-05-13T10:00:00+09:00" or "...Z") get stored as UTC
-            # and flagged for proper Z-suffix on read-back.
-            dtstart, _is_utc = _parse_dt_pair(data.dtstart)
-            if data.dtend:
-                dtend, _end_utc = _parse_dt_pair(data.dtend)
-                # If start was tz-aware but end was naive (or vice-versa),
-                # trust whichever flag is True — they should match.
-                _is_utc = _is_utc or _end_utc
-            elif data.all_day:
-                dtend = dtstart + timedelta(days=1)
-            else:
-                dtend = dtstart + timedelta(hours=1)
-
-            ev = CalendarEvent(
-                uid=uid,
-                calendar_id=cal.id,
-                summary=data.summary,
-                description=data.description,
-                location=data.location,
-                dtstart=dtstart,
-                dtend=dtend,
-                all_day=data.all_day,
-                is_utc=_is_utc and not data.all_day,
-                rrule=data.rrule or "",
-                color=data.color or None,
-                caldav_sync_pending="create" if cal.source == "caldav" else None,
-            )
-            db.add(ev)
-            db.commit()
-            if cal.source == "caldav":
-                await _push_caldav_event_after_commit(owner, uid, "create")
-            return {"ok": True, "uid": uid}
+    @router.post("/events")
+    async def create_event(request: Request, data: EventCreate):
+        db = SessionLocal()
+        try:
+            with request_account_transaction(db, request, write=True) as account:
+                result = create_calendar_event(
+                    db,
+                    account=account,
+                    summary=data.summary,
+                    dtstart=data.dtstart,
+                    dtend=data.dtend,
+                    all_day=data.all_day,
+                    calendar_id=data.calendar_href,
+                    description=data.description,
+                    location=data.location,
+                    rrule=data.rrule or "",
+                    color=data.color,
+                    importance=data.importance,
+                    event_type=data.event_type,
+                    linked_entity_ids=data.linked_entity_ids,
+                    idempotency_key=data.idempotency_key,
+                )
+                return {
+                    "ok": True,
+                    "uid": result.event.uid,
+                    "version": result.event_version,
+                    "created": result.created,
+                    "event": _event_to_dict(result.event),
+                }
+        except CalendarServiceError as exc:
+            _raise_calendar_service_error(exc)
         except HTTPException:
             raise
         except Exception as e:
@@ -1558,46 +1685,71 @@ def setup_calendar_routes() -> APIRouter:
 
     @router.put("/events/{uid}")
     async def update_event(request: Request, uid: str, data: EventUpdate):
-        owner = _require_user(request)
         try:
             base_uid = _resolve_base_uid(uid)
         except ValueError as e:
             raise HTTPException(400, str(e))
         db = SessionLocal()
         try:
-            ev = _get_or_404_event(db, base_uid, owner)
-            if data.summary is not None:
-                ev.summary = data.summary
-            if data.description is not None:
-                ev.description = data.description
-            if data.location is not None:
-                ev.location = data.location
-            if data.dtstart is not None:
-                ev.dtstart, _s_utc = _parse_dt_pair(data.dtstart)
-                # When the incoming payload carries tz info, mark the row as
-                # UTC-stored so the serializer adds Z. Don't flip the flag
-                # off if start arrives naive but end was UTC — only escalate.
-                if _s_utc:
-                    ev.is_utc = True
-            if data.dtend is not None:
-                ev.dtend, _e_utc = _parse_dt_pair(data.dtend)
-                if _e_utc:
-                    ev.is_utc = True
-            if data.all_day is not None:
-                ev.all_day = data.all_day
-                if data.all_day:
-                    ev.is_utc = False  # all-day stays date-only
-            if data.rrule is not None:
-                ev.rrule = data.rrule
-            if data.color is not None:
-                ev.color = data.color if data.color else None
-            is_caldav = ev.calendar and ev.calendar.source == "caldav"
-            if is_caldav:
-                ev.caldav_sync_pending = "update"
-            db.commit()
-            if is_caldav:
-                await _push_caldav_event_after_commit(owner, base_uid, "update")
-            return {"ok": True}
+            with request_account_transaction(db, request, write=True) as account:
+                metadata = {
+                    field: getattr(data, field)
+                    for field in (
+                        "summary", "description", "location", "color",
+                        "importance", "event_type",
+                    )
+                    if field in data.model_fields_set
+                }
+                schedule_fields = {
+                    field for field in ("dtstart", "dtend", "all_day", "rrule")
+                    if field in data.model_fields_set
+                }
+                result = update_calendar_event(
+                    db,
+                    account=account,
+                    uid=base_uid,
+                    expected_version=data.version,
+                    changes=metadata,
+                    linked_entity_ids=data.linked_entity_ids or (),
+                )
+                if schedule_fields:
+                    event = result.event
+                    serialized = _event_to_dict(event)
+                    if (
+                        "all_day" in schedule_fields
+                        and not {"dtstart", "dtend"}.issubset(schedule_fields)
+                    ):
+                        raise CalendarServiceError(
+                            "dtstart and dtend are required when all_day changes"
+                        )
+                    schedule_kwargs = {
+                        "account": account,
+                        "uid": base_uid,
+                        "expected_version": result.event_version,
+                        "dtstart": (
+                            data.dtstart
+                            if "dtstart" in schedule_fields
+                            else serialized["dtstart"]
+                        ),
+                        "dtend": (
+                            data.dtend
+                            if "dtend" in schedule_fields
+                            else serialized["dtend"]
+                        ),
+                    }
+                    if "all_day" in schedule_fields:
+                        schedule_kwargs["all_day"] = data.all_day
+                    if "rrule" in schedule_fields:
+                        schedule_kwargs["rrule"] = data.rrule or ""
+                    result = reschedule_calendar_event(db, **schedule_kwargs)
+                return {
+                    "ok": True,
+                    "uid": result.event.uid,
+                    "version": result.event_version,
+                    "event": _event_to_dict(result.event),
+                }
+        except CalendarServiceError as exc:
+            _raise_calendar_service_error(exc)
         except HTTPException:
             raise
         except Exception as e:
@@ -1608,38 +1760,71 @@ def setup_calendar_routes() -> APIRouter:
             db.close()
 
     @router.delete("/events/{uid}")
-    async def delete_event(request: Request, uid: str, scope: str = "series"):
-        owner = _require_user(request)
+    async def delete_event(
+        request: Request,
+        uid: str,
+        scope: str = "series",
+        version: int = Query(..., ge=1),
+    ):
+        normalized_scope = str(scope or "series").strip().lower()
+        if normalized_scope not in {"series", "occurrence", "instance"}:
+            raise HTTPException(400, "scope must be series or occurrence")
+        if normalized_scope in {"occurrence", "instance"} and "::" not in uid:
+            raise HTTPException(
+                400, "An occurrence scope requires a recurring occurrence uid"
+            )
         try:
             base_uid = _resolve_base_uid(uid)
         except ValueError as e:
             raise HTTPException(400, str(e))
         db = SessionLocal()
         try:
-            ev = _get_or_404_event(db, base_uid, owner)
-            is_occurrence_delete = scope in {"occurrence", "instance"} and "::" in uid and bool(ev.rrule)
-            is_caldav = ev.calendar and ev.calendar.source == "caldav"
-            if is_occurrence_delete:
-                key = _occurrence_exdate_key(uid, ev)
-                if not key:
-                    raise HTTPException(400, "Invalid recurring occurrence uid")
-                exdates = _recurrence_exdates(ev)
-                if key not in exdates:
-                    exdates.append(key)
-                ev.recurrence_exdates = json.dumps(sorted(exdates))
-                if is_caldav:
-                    ev.caldav_sync_pending = "update"
-                db.commit()
-                if is_caldav:
-                    await _push_caldav_event_after_commit(owner, base_uid, "update")
-                return {"ok": True, "scope": "occurrence", "exdate": key}
-            if is_caldav:
-                _record_caldav_delete_tombstone(db, ev, owner)
-            db.delete(ev)
-            db.commit()
-            if is_caldav:
-                await _push_caldav_event_after_commit(owner, base_uid, "delete")
-            return {"ok": True}
+            with request_account_transaction(db, request, write=True) as account:
+                is_occurrence_delete = (
+                    normalized_scope in {"occurrence", "instance"}
+                )
+                if is_occurrence_delete:
+                    event = db.query(CalendarEvent).filter(
+                        CalendarEvent.uid == base_uid,
+                        CalendarEvent.owner_id == account.id,
+                    ).first()
+                    if event is None:
+                        raise CalendarNotFound("Calendar event not found")
+                    key = _occurrence_exdate_key(uid, event)
+                    if not key:
+                        raise CalendarServiceError(
+                            "Invalid recurring occurrence uid"
+                        )
+                    result = exclude_calendar_occurrence(
+                        db,
+                        account=account,
+                        uid=base_uid,
+                        expected_version=version,
+                        occurrence_key=key,
+                    )
+                    return {
+                        "ok": True,
+                        "scope": "occurrence",
+                        "exdate": key,
+                        "uid": result.event.uid,
+                        "version": result.event_version,
+                        "event": _event_to_dict(result.event),
+                    }
+                result = cancel_calendar_event(
+                    db,
+                    account=account,
+                    uid=base_uid,
+                    expected_version=version,
+                )
+                return {
+                    "ok": True,
+                    "scope": "series",
+                    "uid": result.event.uid,
+                    "version": result.event_version,
+                    "event": _event_to_dict(result.event),
+                }
+        except CalendarServiceError as exc:
+            _raise_calendar_service_error(exc)
         except HTTPException:
             raise
         except Exception as e:
@@ -1651,19 +1836,26 @@ def setup_calendar_routes() -> APIRouter:
 
     @router.post("/calendars")
     async def create_calendar(request: Request, name: str = "Imported", color: str = "#5b8abf"):
-        owner = _require_user(request)
         db = SessionLocal()
         try:
-            cal = CalendarCal(
-                id=str(uuid.uuid4()),
-                owner=owner,
-                name=name,
-                color=color,
-                source="local",
-            )
-            db.add(cal)
-            db.commit()
-            return {"ok": True, "id": cal.id, "name": cal.name, "color": cal.color}
+            with request_account_transaction(db, request, write=True) as account:
+                cal = create_local_calendar(
+                    db,
+                    account=account,
+                    name=name,
+                    color=color,
+                )
+                return {
+                    "ok": True,
+                    "id": cal.id,
+                    "name": cal.name,
+                    "color": cal.color,
+                    "version": int(cal.config_version or 1),
+                }
+        except CalendarServiceError as exc:
+            _raise_calendar_service_error(exc)
+        except HTTPException:
+            raise
         except Exception as e:
             db.rollback()
             logger.error("Failed to create calendar: %s", e)
@@ -1672,17 +1864,27 @@ def setup_calendar_routes() -> APIRouter:
             db.close()
 
     @router.put("/calendars/{cal_id}")
-    async def update_calendar(request: Request, cal_id: str, name: str = None, color: str = None):
-        owner = _require_user(request)
+    async def update_calendar(
+        request: Request,
+        cal_id: str,
+        version: int = Query(..., ge=1),
+        name: str = None,
+        color: str = None,
+    ):
         db = SessionLocal()
         try:
-            cal = _get_or_404_calendar(db, cal_id, owner)
-            if name is not None:
-                cal.name = name
-            if color is not None:
-                cal.color = color
-            db.commit()
-            return {"ok": True}
+            with request_account_transaction(db, request, write=True) as account:
+                cal = update_calendar_collection(
+                    db,
+                    account=account,
+                    calendar_id=cal_id,
+                    expected_version=version,
+                    name=name,
+                    color=color,
+                )
+                return {"ok": True, "version": int(cal.config_version or 1)}
+        except CalendarServiceError as exc:
+            _raise_calendar_service_error(exc)
         except HTTPException:
             raise
         except Exception as e:
@@ -1702,7 +1904,6 @@ def setup_calendar_routes() -> APIRouter:
         """Import events from an .ics file (scoped to caller's account)."""
         from icalendar import Calendar as iCal
 
-        owner = _require_user(request)
         db = SessionLocal()
         try:
             content = await read_upload_limited(file, ICS_MAX_BYTES, "ICS file")
@@ -1715,129 +1916,194 @@ def setup_calendar_routes() -> APIRouter:
             raw_name = calendar_name.strip() or (file.filename or "").replace(".ics", "").replace("_", " ").strip() or "Imported"
             cal_display = "".join(c for c in raw_name if c.isprintable())[:120] or "Imported"
 
-            target_cal = db.query(CalendarCal).filter(
-                CalendarCal.name == cal_display,
-                CalendarCal.owner == owner,
-            ).first()
-            if not target_cal:
-                target_cal = CalendarCal(
-                    id=str(uuid.uuid4()),
-                    owner=owner,
-                    name=cal_display,
-                    color="#7c4dff",
-                    source="import",
-                )
-                db.add(target_cal)
-                db.commit()
-                db.refresh(target_cal)
-
-            imported = skipped = repaired = 0
-            for comp in cal_data.walk():
-                if comp.name != "VEVENT":
-                    continue
-                # Generate a fresh uid for each import. The old code reused
-                # the VEVENT uid from the file, which leaked across users:
-                # a uid present on ANY user's calendar caused this user's
-                # row to be silently skipped (and enabled enumeration).
-                # Using a fresh uuid scopes uniqueness per-row.
-                uid_val = str(uuid.uuid4())
-                dtstart = comp.get("dtstart")
-                if not dtstart:
-                    skipped += 1
-                    continue
-
-                # Dedup INSIDE this user's target calendar only — same
-                # source-uid + same dtstart in the same target = duplicate.
-                source_uid = str(comp.get("uid", "")) or None
-                if source_uid:
-                    src_dtstart = dtstart.dt
-                    # Normalize to the SAME naive form import_ics stores, so a
-                    # re-import of a tz-aware event matches the existing row.
-                    # The old code stripped tzinfo WITHOUT converting to UTC
-                    # (wall clock), while storage converts to UTC first, so
-                    # every re-import of a TZID event created a duplicate.
-                    naive_src = _ics_naive_dtstart(src_dtstart)
-                    existing = (
-                        db.query(CalendarEvent)
-                        .filter(
-                            CalendarEvent.calendar_id == target_cal.id,
-                            CalendarEvent.dtstart == naive_src,
-                            CalendarEvent.summary == str(comp.get("summary", "")),
-                        )
-                        .first()
+            with request_account_transaction(db, request, write=True) as account:
+                target_cal = db.query(CalendarCal).filter(
+                    CalendarCal.name == cal_display,
+                    CalendarCal.owner_id == account.id,
+                ).order_by(CalendarCal.created_at.asc(), CalendarCal.id.asc()).first()
+                if target_cal is None:
+                    target_cal = create_local_calendar(
+                        db,
+                        account=account,
+                        calendar_id=str(uuid.uuid5(
+                            uuid.NAMESPACE_URL,
+                            f"restia:ics-calendar:{account.id}:{cal_display}",
+                        )),
+                        name=cal_display,
+                        color="#7c4dff",
+                        source="import",
                     )
-                    if existing:
-                        # An import predating the clamp below may have stored
-                        # this same event with a non-positive duration, which
-                        # the list_events overlap filter hides. Re-importing
-                        # lands here and would skip without touching that row,
-                        # so the event would stay invisible. Backfill the clamp
-                        # onto the stored row before skipping it.
-                        fixed_end = _ensure_positive_duration(
-                            existing.dtstart, existing.dtend, bool(existing.all_day)
-                        )
-                        if fixed_end != existing.dtend:
-                            existing.dtend = fixed_end
-                            repaired += 1
+
+                imported = skipped = repaired = 0
+                for comp in cal_data.walk():
+                    if comp.name != "VEVENT":
+                        continue
+                    dtstart = comp.get("dtstart")
+                    if not dtstart:
                         skipped += 1
                         continue
 
-                dt_val = dtstart.dt
-                all_day = isinstance(dt_val, date) and not isinstance(dt_val, datetime)
-                # For timed events, preserve the source timezone by converting
-                # to UTC before stripping tzinfo (DB stores naive). We mark
-                # the row with is_utc=True so the serializer adds the Z
-                # suffix on output — without this, the frontend would parse
-                # the naive ISO as the user's CURRENT local, which is exactly
-                # the bug where imported events fire reminders at wrong times.
-                from datetime import timezone as _tz
-                row_is_utc = False
-                if all_day:
-                    start_dt = datetime(dt_val.year, dt_val.month, dt_val.day)
-                    dtend = comp.get("dtend")
-                    end_dt = datetime(dtend.dt.year, dtend.dt.month, dtend.dt.day) if dtend else start_dt + timedelta(days=1)
-                else:
-                    if hasattr(dt_val, 'tzinfo') and dt_val.tzinfo is not None:
-                        start_dt = dt_val.astimezone(_tz.utc).replace(tzinfo=None)
-                        row_is_utc = True
+                    dt_val = dtstart.dt
+                    all_day = isinstance(dt_val, date) and not isinstance(
+                        dt_val, datetime
+                    )
+                    from datetime import timezone as _tz
+                    if all_day:
+                        start_dt = datetime(dt_val.year, dt_val.month, dt_val.day)
+                        raw_end = comp.get("dtend")
+                        end_dt = (
+                            datetime(
+                                raw_end.dt.year, raw_end.dt.month, raw_end.dt.day
+                            )
+                            if raw_end else start_dt + timedelta(days=1)
+                        )
+                        start_value = start_dt.date().isoformat()
+                        end_value = end_dt.date().isoformat()
                     else:
-                        start_dt = dt_val
-                    dtend = comp.get("dtend")
-                    if dtend:
-                        d_end = dtend.dt
-                        if hasattr(d_end, 'tzinfo') and d_end.tzinfo is not None:
-                            end_dt = d_end.astimezone(_tz.utc).replace(tzinfo=None)
+                        if getattr(dt_val, "tzinfo", None) is not None:
+                            start_dt = dt_val.astimezone(_tz.utc).replace(tzinfo=None)
+                            start_value = start_dt.replace(
+                                tzinfo=_tz.utc
+                            ).isoformat().replace("+00:00", "Z")
                         else:
-                            end_dt = d_end
+                            start_dt = dt_val
+                            start_value = start_dt.isoformat()
+                        raw_end = comp.get("dtend")
+                        if raw_end:
+                            end_dt = raw_end.dt
+                            if getattr(end_dt, "tzinfo", None) is not None:
+                                end_dt = end_dt.astimezone(_tz.utc).replace(
+                                    tzinfo=None
+                                )
+                                end_value = end_dt.replace(
+                                    tzinfo=_tz.utc
+                                ).isoformat().replace("+00:00", "Z")
+                            else:
+                                end_value = end_dt.isoformat()
+                        else:
+                            end_dt = start_dt + timedelta(hours=1)
+                            end_value = (
+                                end_dt.replace(tzinfo=_tz.utc).isoformat().replace(
+                                    "+00:00", "Z"
+                                )
+                                if start_value.endswith("Z") else end_dt.isoformat()
+                            )
+
+                    end_dt = _ensure_positive_duration(start_dt, end_dt, all_day)
+                    if all_day:
+                        end_value = end_dt.date().isoformat()
+                    elif end_dt <= start_dt:
+                        # Kept for defensive readability; the clamp above makes
+                        # this branch unreachable.
+                        end_value = end_dt.isoformat()
+                    elif start_value.endswith("Z"):
+                        end_value = end_dt.replace(
+                            tzinfo=_tz.utc
+                        ).isoformat().replace("+00:00", "Z")
+
+                    summary = " ".join(
+                        str(comp.get("summary", "") or "").strip().split()
+                    )
+                    if not summary:
+                        skipped += 1
+                        continue
+                    description = str(comp.get("description", "") or "").strip()
+                    location = str(comp.get("location", "") or "").strip()
+                    recurrence = (
+                        comp.get("rrule").to_ical().decode()
+                        if comp.get("rrule") else ""
+                    )
+
+                    existing = db.query(CalendarEvent).filter(
+                        CalendarEvent.owner_id == account.id,
+                        CalendarEvent.calendar_id == target_cal.id,
+                        CalendarEvent.dtstart == start_dt,
+                        CalendarEvent.summary == summary,
+                    ).first()
+                    if existing is not None:
+                        fixed_end = _ensure_positive_duration(
+                            existing.dtstart,
+                            existing.dtend,
+                            bool(existing.all_day),
+                        )
+                        if fixed_end != existing.dtend:
+                            existing_wire = _event_to_dict(existing)
+                            repair_start = existing_wire["dtstart"]
+                            repair_end = (
+                                fixed_end.date().isoformat()
+                                if existing.all_day
+                                else (
+                                    fixed_end.isoformat() + "Z"
+                                    if existing.is_utc else fixed_end.isoformat()
+                                )
+                            )
+                            reschedule_calendar_event(
+                                db,
+                                account=account,
+                                uid=existing.uid,
+                                expected_version=int(existing.version or 1),
+                                dtstart=repair_start,
+                                dtend=repair_end,
+                                all_day=bool(existing.all_day),
+                                rrule=existing.rrule or "",
+                            )
+                            repaired += 1
+                        else:
+                            # Project legacy rows even when the import itself is
+                            # a no-op; the service remains the only event writer.
+                            update_calendar_event(
+                                db,
+                                account=account,
+                                uid=existing.uid,
+                                expected_version=int(existing.version or 1),
+                                changes={},
+                            )
+                        skipped += 1
+                        continue
+
+                    source_uid = str(comp.get("uid", "") or "").strip()
+                    identity_material = json.dumps(
+                        {
+                            "calendar_id": target_cal.id,
+                            "source_uid": source_uid,
+                            "summary": summary,
+                            "dtstart": start_value,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    import_key = "ics:" + hashlib.sha256(
+                        identity_material.encode("utf-8")
+                    ).hexdigest()
+                    result = create_calendar_event(
+                        db,
+                        account=account,
+                        calendar_id=target_cal.id,
+                        summary=summary,
+                        description=description,
+                        location=location,
+                        dtstart=start_value,
+                        dtend=end_value,
+                        all_day=all_day,
+                        rrule=recurrence,
+                        idempotency_key=import_key,
+                    )
+                    if result.created:
+                        imported += 1
                     else:
-                        end_dt = start_dt + timedelta(hours=1)
+                        skipped += 1
 
-                end_dt = _ensure_positive_duration(start_dt, end_dt, all_day)
-
-                ev = CalendarEvent(
-                    uid=uid_val,
-                    calendar_id=target_cal.id,
-                    summary=str(comp.get("summary", "")),
-                    description=str(comp.get("description", "")),
-                    location=str(comp.get("location", "")),
-                    dtstart=start_dt,
-                    dtend=end_dt,
-                    all_day=all_day,
-                    is_utc=row_is_utc,
-                    rrule=(comp.get("rrule").to_ical().decode() if comp.get("rrule") else ""),
-                )
-                db.add(ev)
-                imported += 1
-
-            db.commit()
-            return {
-                "ok": True,
-                "imported": imported,
-                "skipped": skipped,
-                "repaired": repaired,
-                "calendar": cal_display,
-                "calendar_id": target_cal.id,
-            }
+                return {
+                    "ok": True,
+                    "imported": imported,
+                    "skipped": skipped,
+                    "repaired": repaired,
+                    "calendar": cal_display,
+                    "calendar_id": target_cal.id,
+                }
+        except CalendarServiceError as exc:
+            _raise_calendar_service_error(exc)
         except HTTPException:
             raise
         except Exception as e:
@@ -1852,51 +2118,69 @@ def setup_calendar_routes() -> APIRouter:
         """Export a calendar as .ics file."""
         from fastapi.responses import Response
 
-        owner = _require_user(request)
         db = SessionLocal()
         try:
-            cal = _get_or_404_calendar(db, cal_id, owner)
-            events = db.query(CalendarEvent).filter(
-                CalendarEvent.calendar_id == cal_id,
-                CalendarEvent.status != "cancelled",
-            ).all()
+            with request_account_transaction(db, request, write=False) as account:
+                if account is None:
+                    raise HTTPException(404, "Calendar not found")
+                cal = db.query(CalendarCal).filter(
+                    CalendarCal.id == cal_id,
+                    CalendarCal.owner_id == account.id,
+                ).first()
+                if cal is None:
+                    raise HTTPException(404, "Calendar not found")
+                events = db.query(CalendarEvent).filter(
+                    CalendarEvent.calendar_id == cal_id,
+                    CalendarEvent.owner_id == account.id,
+                    CalendarEvent.status != "cancelled",
+                ).all()
 
-            lines = [
-                "BEGIN:VCALENDAR",
-                "VERSION:2.0",
-                "PRODID:-//Restia//Calendar//EN",
-                f"X-WR-CALNAME:{_ics_escape(cal.name)}",
-            ]
-            for ev in events:
-                lines.append("BEGIN:VEVENT")
-                lines.append(f"UID:{ev.uid}")
-                lines.append(f"SUMMARY:{_ics_escape(ev.summary or '')}")
-                if ev.all_day:
-                    lines.append(f"DTSTART;VALUE=DATE:{ev.dtstart.strftime('%Y%m%d')}")
-                    lines.append(f"DTEND;VALUE=DATE:{ev.dtend.strftime('%Y%m%d')}")
-                else:
-                    _dt_suffix = "Z" if getattr(ev, "is_utc", False) else ""
-                    lines.append(f"DTSTART:{ev.dtstart.strftime('%Y%m%dT%H%M%S')}{_dt_suffix}")
-                    lines.append(f"DTEND:{ev.dtend.strftime('%Y%m%dT%H%M%S')}{_dt_suffix}")
-                if ev.description:
-                    lines.append(f"DESCRIPTION:{_ics_escape(ev.description)}")
-                if ev.location:
-                    lines.append(f"LOCATION:{_ics_escape(ev.location)}")
-                if ev.rrule:
-                    lines.append(f"RRULE:{ev.rrule}")
-                lines.append("END:VEVENT")
-            lines.append("END:VCALENDAR")
+                lines = [
+                    "BEGIN:VCALENDAR",
+                    "VERSION:2.0",
+                    "PRODID:-//Restia//Calendar//EN",
+                    f"X-WR-CALNAME:{_ics_escape(cal.name)}",
+                ]
+                for ev in events:
+                    lines.append("BEGIN:VEVENT")
+                    lines.append(f"UID:{ev.uid}")
+                    lines.append(f"SUMMARY:{_ics_escape(ev.summary or '')}")
+                    if ev.all_day:
+                        lines.append(
+                            f"DTSTART;VALUE=DATE:{ev.dtstart.strftime('%Y%m%d')}"
+                        )
+                        lines.append(
+                            f"DTEND;VALUE=DATE:{ev.dtend.strftime('%Y%m%d')}"
+                        )
+                    else:
+                        suffix = "Z" if getattr(ev, "is_utc", False) else ""
+                        lines.append(
+                            f"DTSTART:{ev.dtstart.strftime('%Y%m%dT%H%M%S')}{suffix}"
+                        )
+                        lines.append(
+                            f"DTEND:{ev.dtend.strftime('%Y%m%dT%H%M%S')}{suffix}"
+                        )
+                    if ev.description:
+                        lines.append(f"DESCRIPTION:{_ics_escape(ev.description)}")
+                    if ev.location:
+                        lines.append(f"LOCATION:{_ics_escape(ev.location)}")
+                    if ev.rrule:
+                        lines.append(f"RRULE:{ev.rrule}")
+                    lines.append("END:VEVENT")
+                lines.append("END:VCALENDAR")
 
-            ics_data = "\r\n".join(lines)
-            download_name = _safe_ics_filename(cal.name)
-            return Response(
-                content=ics_data,
-                media_type="text/calendar",
-                headers={
-                    "Content-Disposition": f'attachment; filename="{download_name}"',
-                    "X-Content-Type-Options": "nosniff",
-                },
-            )
+                ics_data = "\r\n".join(lines)
+                download_name = _safe_ics_filename(cal.name)
+                return Response(
+                    content=ics_data,
+                    media_type="text/calendar",
+                    headers={
+                        "Content-Disposition": (
+                            f'attachment; filename="{download_name}"'
+                        ),
+                        "X-Content-Type-Options": "nosniff",
+                    },
+                )
         except HTTPException:
             raise
         except Exception as e:

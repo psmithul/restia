@@ -16,7 +16,7 @@ from typing import Any, Iterable, Optional
 
 import httpx
 
-from src.settings import load_settings, save_settings
+from src.settings import load_settings
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +114,9 @@ class TelegramConfig:
     owner: Optional[str]
     session_map: dict[str, str]
     chat_owners: dict[str, str] = field(default_factory=dict)
+    # Non-secret keyed scope used to query the canonical SQL authority. Empty
+    # is retained only for explicitly constructed compatibility/test configs.
+    bot_fingerprint: str = ""
 
 
 @dataclass(frozen=True)
@@ -156,25 +159,29 @@ def load_telegram_config() -> TelegramConfig:
     enabled = _as_bool(_env("TELEGRAM_ENABLED"), _as_bool(settings.get("telegram_enabled"), False))
     bot_token = _env("TELEGRAM_BOT_TOKEN") or str(settings.get("telegram_bot_token") or "").strip()
     webhook_secret = _env("TELEGRAM_WEBHOOK_SECRET") or str(settings.get("telegram_webhook_secret") or "").strip()
-    allowed_raw = _env("TELEGRAM_ALLOWED_CHAT_IDS")
-    allowed_chat_ids = _chat_ids(allowed_raw if allowed_raw is not None else settings.get("telegram_allowed_chat_ids"))
-    allow_all = _as_bool(_env("TELEGRAM_ALLOW_ALL_CHATS"), _as_bool(settings.get("telegram_allow_all_chats"), False))
-    owner = _env("TELEGRAM_OWNER") or str(settings.get("telegram_owner") or "").strip() or None
-    session_map = settings.get("telegram_session_map") or {}
-    if not isinstance(session_map, dict):
-        session_map = {}
-    chat_owners = settings.get("telegram_chat_owners") or {}
-    if not isinstance(chat_owners, dict):
-        chat_owners = {}
+    from src.telegram_identity import (
+        load_telegram_authority_projection,
+        telegram_bot_fingerprint,
+    )
+
+    bot_fingerprint = telegram_bot_fingerprint(
+        bot_id=settings.get("telegram_bot_id"),
+        bot_token=bot_token,
+    )
+    projection = load_telegram_authority_projection(bot_fingerprint)
     return TelegramConfig(
         enabled=enabled,
         bot_token=bot_token,
         webhook_secret=webhook_secret,
-        allowed_chat_ids=allowed_chat_ids,
-        allow_all_chats=allow_all,
-        owner=owner,
-        session_map={str(k): str(v) for k, v in session_map.items() if str(k).strip() and str(v).strip()},
-        chat_owners={str(k): str(v).strip().lower() for k, v in chat_owners.items() if str(k).strip() and str(v).strip()},
+        allowed_chat_ids=frozenset(projection.chat_owners),
+        # Pre-V3 allow-all/global-owner behavior could attribute an unseen chat
+        # without proof. It is intentionally import-only now; unlinked chats
+        # may send /link but cannot enter the assistant runtime.
+        allow_all_chats=False,
+        owner=None,
+        session_map=projection.session_map,
+        chat_owners=projection.chat_owners,
+        bot_fingerprint=bot_fingerprint,
     )
 
 
@@ -226,99 +233,47 @@ def telegram_chat_ids_for_owner(config: TelegramConfig, owner: str) -> list[str]
 
 
 _TELEGRAM_LINK_TTL_SECONDS = 10 * 60
-_telegram_link_lock = threading.RLock()
-
-
-def _link_code_digest(code: str) -> str:
-    return hashlib.sha256(str(code or "").strip().upper().encode("utf-8")).hexdigest()
 
 
 def create_telegram_link_code(owner: str, *, ttl_seconds: int = _TELEGRAM_LINK_TTL_SECONDS) -> tuple[str, int]:
-    """Create a short-lived, one-time code that links a Telegram chat."""
-    owner_key = str(owner or "").strip().lower()
-    if not owner_key:
-        raise ValueError("A Restia user is required")
-    ttl = max(60, min(int(ttl_seconds), 3600))
-    now = int(time.time())
-    code = secrets.token_hex(4).upper()
-    with _telegram_link_lock:
-        settings = load_settings()
-        raw_codes = settings.get("telegram_link_codes") or {}
-        codes = raw_codes if isinstance(raw_codes, dict) else {}
-        codes = {
-            str(digest): record
-            for digest, record in codes.items()
-            if isinstance(record, dict) and int(record.get("expires_at") or 0) > now
-        }
-        # A user needs at most one active code. Reissuing invalidates the old one.
-        codes = {digest: record for digest, record in codes.items() if str(record.get("owner") or "").lower() != owner_key}
-        codes[_link_code_digest(code)] = {"owner": owner_key, "expires_at": now + ttl}
-        settings["telegram_link_codes"] = codes
-        save_settings(settings)
-    return code, now + ttl
+    """Create a short-lived, one-time SQL-backed link credential."""
+
+    from src.telegram_identity import create_link_code_for_owner
+
+    config = load_telegram_config()
+    if not config.bot_fingerprint:
+        raise ValueError("Telegram bot identity is not configured")
+    return create_link_code_for_owner(
+        owner,
+        config.bot_fingerprint,
+        ttl_seconds=ttl_seconds,
+    )
 
 
 def consume_telegram_link_code(code: str, chat_id: str) -> Optional[str]:
-    """Consume a one-time link code and return the linked Restia username."""
-    digest = _link_code_digest(code)
-    chat_key = str(chat_id or "").strip()
-    if not chat_key or not str(code or "").strip():
+    """Atomically consume a SQL-backed code and return its Restia username."""
+
+    if not str(chat_id or "").strip() or not str(code or "").strip():
         return None
-    now = int(time.time())
-    with _telegram_link_lock:
-        settings = load_settings()
-        raw_codes = settings.get("telegram_link_codes") or {}
-        codes = raw_codes if isinstance(raw_codes, dict) else {}
-        record = codes.get(digest)
-        if not isinstance(record, dict) or int(record.get("expires_at") or 0) <= now:
-            return None
-        owner = str(record.get("owner") or "").strip().lower()
-        if not owner:
-            return None
-        codes.pop(digest, None)
-        codes = {
-            str(key): value
-            for key, value in codes.items()
-            if isinstance(value, dict) and int(value.get("expires_at") or 0) > now
-        }
-        chat_owners = settings.get("telegram_chat_owners") or {}
-        if not isinstance(chat_owners, dict):
-            chat_owners = {}
-        previous_owner = str(chat_owners.get(chat_key) or "").strip().lower()
-        chat_owners[chat_key] = owner
-        allowed = set(_chat_ids(settings.get("telegram_allowed_chat_ids")))
-        allowed.add(chat_key)
-        if previous_owner and previous_owner != owner:
-            session_map = settings.get("telegram_session_map") or {}
-            if isinstance(session_map, dict):
-                session_map.pop(chat_key, None)
-                settings["telegram_session_map"] = session_map
-        settings["telegram_link_codes"] = codes
-        settings["telegram_chat_owners"] = chat_owners
-        settings["telegram_allowed_chat_ids"] = sorted(allowed)
-        save_settings(settings)
-        return owner
+    from src.telegram_identity import consume_link_code_for_chat
+
+    config = load_telegram_config()
+    if not config.bot_fingerprint:
+        return None
+    return consume_link_code_for_chat(
+        code,
+        chat_id,
+        config.bot_fingerprint,
+    )
 
 
 def unlink_telegram_owner(owner: str) -> int:
-    """Remove every Telegram chat linked to a local user."""
-    owner_key = str(owner or "").strip().lower()
-    if not owner_key:
-        return 0
-    with _telegram_link_lock:
-        settings = load_settings()
-        raw_owners = settings.get("telegram_chat_owners") or {}
-        chat_owners = raw_owners if isinstance(raw_owners, dict) else {}
-        removed = {chat_id for chat_id, linked_owner in chat_owners.items() if str(linked_owner).strip().lower() == owner_key}
-        if not removed:
-            return 0
-        settings["telegram_chat_owners"] = {chat_id: linked_owner for chat_id, linked_owner in chat_owners.items() if chat_id not in removed}
-        settings["telegram_allowed_chat_ids"] = sorted(set(_chat_ids(settings.get("telegram_allowed_chat_ids"))) - removed)
-        session_map = settings.get("telegram_session_map") or {}
-        if isinstance(session_map, dict):
-            settings["telegram_session_map"] = {chat_id: session_id for chat_id, session_id in session_map.items() if chat_id not in removed}
-        save_settings(settings)
-        return len(removed)
+    """Revoke every active chat for one account in the current bot scope."""
+
+    from src.telegram_identity import unlink_owner_from_bot
+
+    config = load_telegram_config()
+    return unlink_owner_from_bot(owner, config.bot_fingerprint)
 
 
 def extract_telegram_message(update: dict[str, Any]) -> Optional[TelegramIncomingMessage]:
@@ -344,28 +299,27 @@ def extract_telegram_message(update: dict[str, Any]) -> Optional[TelegramIncomin
 
 
 def get_telegram_session_id(config: TelegramConfig, chat_id: str) -> Optional[str]:
+    if config.bot_fingerprint:
+        from src.telegram_identity import get_conversation_binding
+
+        return get_conversation_binding(config.bot_fingerprint, chat_id)
     return config.session_map.get(str(chat_id))
 
 
 def set_telegram_session_id(chat_id: str, session_id: str) -> None:
-    settings = load_settings()
-    session_map = settings.get("telegram_session_map") or {}
-    if not isinstance(session_map, dict):
-        session_map = {}
-    session_map[str(chat_id)] = str(session_id)
-    settings["telegram_session_map"] = session_map
-    save_settings(settings)
+    from src.telegram_identity import set_conversation_binding
+
+    config = load_telegram_config()
+    if not config.bot_fingerprint:
+        raise ValueError("Telegram bot identity is not configured")
+    set_conversation_binding(config.bot_fingerprint, chat_id, session_id)
 
 
 def clear_telegram_session_id(chat_id: str) -> None:
-    settings = load_settings()
-    session_map = settings.get("telegram_session_map") or {}
-    if not isinstance(session_map, dict):
-        return
-    if str(chat_id) in session_map:
-        session_map.pop(str(chat_id), None)
-        settings["telegram_session_map"] = session_map
-        save_settings(settings)
+    from src.telegram_identity import clear_conversation_binding
+
+    config = load_telegram_config()
+    clear_conversation_binding(config.bot_fingerprint, chat_id)
 
 
 def telegram_status_payload(config: TelegramConfig) -> dict[str, Any]:

@@ -423,6 +423,53 @@ def setup_auth_routes(
         response.delete_cookie(SESSION_COOKIE, path="/")
         return {"ok": True}
 
+    @router.get("/sessions")
+    async def list_auth_sessions(request: Request):
+        """List this account's active browser/native sessions, never tokens."""
+
+        user = _get_current_user(request)
+        if not user:
+            raise HTTPException(401, "Not authenticated")
+        list_sessions = getattr(auth_manager, "list_user_sessions", None)
+        if not callable(list_sessions):
+            raise HTTPException(503, "Session management is unavailable")
+        items = await asyncio.to_thread(
+            list_sessions,
+            user,
+            request.cookies.get(SESSION_COOKIE),
+        )
+        return {"sessions": items, "count": len(items)}
+
+    @router.delete("/sessions/{session_id}")
+    async def revoke_auth_session(
+        session_id: str,
+        request: Request,
+        response: Response,
+    ):
+        """Revoke one active session owned by the signed-in account."""
+
+        user = _get_current_user(request)
+        if not user:
+            raise HTTPException(401, "Not authenticated")
+        if not session_id or len(session_id) > 128:
+            raise HTTPException(404, "Session not found")
+        list_sessions = getattr(auth_manager, "list_user_sessions", None)
+        revoke_session = getattr(auth_manager, "revoke_user_session", None)
+        if not callable(list_sessions) or not callable(revoke_session):
+            raise HTTPException(503, "Session management is unavailable")
+        current_token = request.cookies.get(SESSION_COOKIE)
+        items = await asyncio.to_thread(list_sessions, user, current_token)
+        target = next((item for item in items if item.get("id") == session_id), None)
+        if target is None:
+            raise HTTPException(404, "Session not found")
+        revoked = await asyncio.to_thread(revoke_session, user, session_id)
+        if not revoked:
+            raise HTTPException(409, "Session changed in another client")
+        current = bool(target.get("current"))
+        if current:
+            response.delete_cookie(SESSION_COOKIE, path="/")
+        return {"ok": True, "revoked_session_id": session_id, "current": current}
+
     @router.get("/status")
     async def auth_status(request: Request):
         token = request.cookies.get(SESSION_COOKIE)
@@ -1118,11 +1165,11 @@ def setup_auth_routes(
         if not user or not auth_manager.is_admin(user):
             raise HTTPException(403, "Admin only")
         body = await request.json()
-        current = _load_features()
+        current = _load_features(owner=user)
         for key in current:
             if key in body and isinstance(body[key], bool):
                 current[key] = body[key]
-        _save_features(current)
+        _save_features(current, owner=user)
         return current
 
     # ---- App settings (admin-managed) ----
@@ -1133,7 +1180,7 @@ def setup_auth_routes(
         a scrubbed copy with secret keys blanked. The frontend uses this
         for keybinds + TTS prefs, so it stays callable without admin."""
         user = _get_current_user(request)
-        settings = _load_settings()
+        settings = _load_settings(owner=user)
         if user and auth_manager.is_admin(user):
             return settings
         return scrub_settings(settings)
@@ -1145,7 +1192,7 @@ def setup_auth_routes(
         if not user or not auth_manager.is_admin(user):
             raise HTTPException(403, "Admin only")
         body = await request.json()
-        current = _load_settings()
+        current = _load_settings(owner=user)
         # Per-key validation for numeric settings: coerce to int and clamp to a
         # sane range so a bad value can't disable the agent or let it run away.
         _INT_RANGES = {
@@ -1164,7 +1211,7 @@ def setup_auth_routes(
                     raise HTTPException(400, f"{key} must be an integer")
                 val = max(lo, min(val, hi))
             current[key] = val
-        _save_settings(current)
+        _save_settings(current, owner=user)
         return current
 
     # ---- Integrations CRUD ----
@@ -1178,7 +1225,7 @@ def setup_auth_routes(
         user = _get_current_user(request)
         if not user or not auth_manager.is_admin(user):
             raise HTTPException(403, "Admin only")
-        items = load_integrations()
+        items = load_integrations(owner=user)
         # Mask API keys for frontend display
         safe = [mask_integration_secret(item) for item in items]
         return {"integrations": safe}
@@ -1195,7 +1242,7 @@ def setup_auth_routes(
         if not user or not auth_manager.is_admin(user):
             raise HTTPException(403, "Admin only")
         body = await request.json()
-        item = add_integration(body)
+        item = add_integration(body, owner=user)
         return {"ok": True, "integration": mask_integration_secret(item)}
 
     @router.put("/integrations/{integration_id}")
@@ -1205,7 +1252,7 @@ def setup_auth_routes(
         if not user or not auth_manager.is_admin(user):
             raise HTTPException(403, "Admin only")
         body = await request.json()
-        item = update_integration(integration_id, body)
+        item = update_integration(integration_id, body, owner=user)
         if not item:
             raise HTTPException(404, "Integration not found")
         return {"ok": True, "integration": mask_integration_secret(item)}
@@ -1216,7 +1263,7 @@ def setup_auth_routes(
         user = _get_current_user(request)
         if not user or not auth_manager.is_admin(user):
             raise HTTPException(403, "Admin only")
-        ok = delete_integration(integration_id)
+        ok = delete_integration(integration_id, owner=user)
         if not ok:
             raise HTTPException(404, "Integration not found")
         return {"ok": True}
@@ -1227,7 +1274,7 @@ def setup_auth_routes(
         user = _get_current_user(request)
         if not user or not auth_manager.is_admin(user):
             raise HTTPException(403, "Admin only")
-        integ = get_integration(integration_id)
+        integ = get_integration(integration_id, owner=user)
         if not integ:
             raise HTTPException(404, "Integration not found")
         preset = (integ.get("preset") or integ.get("name", "")).lower()
@@ -1250,7 +1297,7 @@ def setup_auth_routes(
             raw_base = (integ.get("base_url") or "").strip()
             parsed = urlparse(raw_base)
             base = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else raw_base.rstrip("/")
-            settings = _load_settings()
+            settings = _load_settings(owner=user)
             topic = (settings.get("reminder_ntfy_topic") or "reminders").strip() or "reminders"
             full_url = f"{base}/{topic}"
             api_key = integ.get("api_key", "")
@@ -1324,7 +1371,7 @@ def setup_auth_routes(
             "home assistant": "/api/",
         }
         path = health_paths.get(preset, "/")
-        result = await execute_api_call(integration_id, "GET", path)
+        result = await execute_api_call(integration_id, "GET", path, owner=user)
         if result.get("exit_code", 1) == 0:
             return {"ok": True, "message": "Connection successful"}
         return {"ok": False, "message": (result.get("error") or "Connection failed")[:300]}

@@ -263,9 +263,12 @@ def cmd_accounts(args) -> None:
 # ─── poll-scheduled ──────────────────────────────────────────────────
 
 def cmd_poll_scheduled(args) -> None:
-    """One pass of the scheduled-email queue. Cron-friendly: idempotent,
-    exits 0 on success even if zero rows were due. Output: {sent: [ids],
-    failed: [{id, error}]}."""
+    """Drain approved SQL email and legacy scheduled queues once.
+
+    Cron-friendly: exits 0 on success even if zero rows were due. SMTP is
+    at-least-once; the canonical worker replays the same Message-ID if a claim
+    expires after provider acceptance but before the completion commit.
+    """
     result = _scheduled_poll_once()
     emit(result, args)
     if result.get("failed"):

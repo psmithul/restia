@@ -72,7 +72,7 @@ def _connect(path: str | Path) -> sqlite3.Connection:
 
 
 def enqueue_browser_notification(
-    path: str | Path,
+    path: str | Path | None,
     owner: str,
     payload: dict,
     *,
@@ -80,6 +80,15 @@ def enqueue_browser_notification(
     reminder_claim: dict | None = None,
 ) -> dict:
     """Persist a notification before it is reported as browser-deliverable."""
+    if path is None:
+        from src.notification_delivery_authority import enqueue_browser
+
+        return enqueue_browser(
+            owner,
+            payload,
+            dedupe_key=dedupe_key,
+            reminder_claim=reminder_claim,
+        )
     normalized_owner = str(owner or "").strip().lower()
     if not normalized_owner:
         raise ValueError("browser notification owner is required")
@@ -192,8 +201,12 @@ def enqueue_browser_notification(
         conn.close()
 
 
-def pending_browser_notifications(path: str | Path, owner: str, limit: int = 200) -> list[dict]:
+def pending_browser_notifications(path: str | Path | None, owner: str, limit: int = 200) -> list[dict]:
     """Read without draining; only an explicit owner-scoped ack removes it."""
+    if path is None:
+        from src.notification_delivery_authority import pending_browser
+
+        return pending_browser(owner, limit=limit)
     normalized_owner = str(owner or "").strip().lower()
     if not normalized_owner:
         return []
@@ -222,7 +235,7 @@ def pending_browser_notifications(path: str | Path, owner: str, limit: int = 200
 
 
 def cancel_browser_notifications_for_reminder(
-    path: str | Path,
+    path: str | Path | None,
     owner: str,
     note_id: str,
     *,
@@ -234,6 +247,11 @@ def cancel_browser_notifications_for_reminder(
     this catches rows created before claim linkage was added as well as V2 rows.
     A write transaction serializes cancellation with a concurrent client ACK.
     """
+
+    if path is None:
+        from src.notification_delivery_authority import cancel_browser
+
+        return cancel_browser(owner, note_id, occurrence=occurrence)
 
     normalized_owner = str(owner or "").strip().lower()
     normalized_note = str(note_id or "").strip()
@@ -313,13 +331,18 @@ def cancel_browser_notifications_for_reminder(
 
 
 def rearm_browser_notifications_for_reminder(
-    path: str | Path,
+    path: str | Path | None,
     owner: str,
     note_id: str,
     *,
     occurrence: str | None = None,
 ) -> int:
     """Clear cancellation state when a user intentionally restores a reminder."""
+
+    if path is None:
+        from src.notification_delivery_authority import rearm_browser
+
+        return rearm_browser(owner, note_id, occurrence=occurrence)
 
     normalized_owner = str(owner or "").strip().lower()
     normalized_note = str(note_id or "").strip()
@@ -351,8 +374,12 @@ def rearm_browser_notifications_for_reminder(
         conn.close()
 
 
-def acknowledge_browser_notifications(path: str | Path, owner: str, ids: list[str]) -> int:
+def acknowledge_browser_notifications(path: str | Path | None, owner: str, ids: list[str]) -> int:
     """Acknowledge only rows owned by the authenticated profile."""
+    if path is None:
+        from src.notification_delivery_authority import acknowledge_browser
+
+        return acknowledge_browser(owner, ids)
     normalized_owner = str(owner or "").strip().lower()
     normalized_ids = list(dict.fromkeys(str(value or "").strip() for value in ids if str(value or "").strip()))
     if not normalized_owner or not normalized_ids:
@@ -374,8 +401,12 @@ def acknowledge_browser_notifications(path: str | Path, owner: str, ids: list[st
         conn.close()
 
 
-def browser_notification_ack_candidates(path: str | Path, owner: str, ids: list[str]) -> list[dict]:
+def browser_notification_ack_candidates(path: str | Path | None, owner: str, ids: list[str]) -> list[dict]:
     """Return owner-scoped pending rows and their internal claim linkage."""
+    if path is None:
+        from src.notification_delivery_authority import browser_ack_candidates
+
+        return browser_ack_candidates(owner, ids)
     normalized_owner = str(owner or "").strip().lower()
     normalized_ids = list(dict.fromkeys(str(value or "").strip() for value in ids if str(value or "").strip()))
     if not normalized_owner or not normalized_ids:

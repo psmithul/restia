@@ -16,6 +16,7 @@ Google account is required.
 import sys
 import tempfile
 import types
+import ipaddress
 from datetime import datetime, timedelta
 
 import pytest
@@ -115,6 +116,13 @@ def _install_fake_caldav(monkeypatch):
     monkeypatch.setitem(sys.modules, "caldav.lib.error", err)
     monkeypatch.setattr(caldav_sync, "SessionLocal", _TS, raising=False)
     monkeypatch.setattr(cdb, "SessionLocal", _TS, raising=False)
+    # The sync revalidates discovered collection URLs. Keep that SSRF control
+    # active while making this no-network fake deterministic in sandboxes.
+    monkeypatch.setattr(
+        caldav_sync,
+        "_resolve_caldav_host_ips",
+        lambda _host: [ipaddress.ip_address("142.250.1.1")],
+    )
 
 
 def _clear_db():

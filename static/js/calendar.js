@@ -229,6 +229,7 @@ async function _syncCaldav(interactive, direction = 'pull') {
 function _optimisticEvent(data, uid) {
   const cal = _calendars.find(c => c.href === data.calendar_href) || _calendars[0];
   return {
+    ...data,
     uid,
     summary: data.summary || '',
     dtstart: data.dtstart,
@@ -242,7 +243,19 @@ function _optimisticEvent(data, uid) {
     // Per-event color override (including the bg:<url> sentinel for custom
     // backgrounds) wins over the parent calendar's default hex.
     color: (data.color !== undefined && data.color !== null) ? data.color : (cal?.color || ''),
+    version: Number.isInteger(Number(data.version)) && Number(data.version) > 0
+      ? Number(data.version) : 1,
   };
+}
+
+async function _calendarApiPayload(response, fallbackMessage) {
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(payload.detail || payload.error || fallbackMessage || `HTTP ${response.status}`);
+    error.status = response.status;
+    throw error;
+  }
+  return payload;
 }
 
 // v2 review error-handling MEDs: every fetch here previously checked
@@ -252,30 +265,36 @@ function _optimisticEvent(data, uid) {
 // state + surface a toast on the failure path.
 async function _createEvent(data) {
   const tempUid = 'temp-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
-  _allEvents[tempUid] = _optimisticEvent(data, tempUid);
-  fetch(`${API_BASE}/api/calendar/events`, {
-    method: 'POST', credentials: 'same-origin',
-    headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data),
-  }).then(async r => {
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    return r.json();
-  }).then(d => {
+  const requestData = { ...data, idempotency_key: data.idempotency_key || tempUid };
+  _allEvents[tempUid] = _optimisticEvent(requestData, tempUid);
+  try {
+    const response = await fetch(`${API_BASE}/api/calendar/events`, {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(requestData),
+    });
+    const d = await _calendarApiPayload(response, 'Failed to create event');
     if (d.uid) {
       delete _allEvents[tempUid];
-      _allEvents[d.uid] = _optimisticEvent(data, d.uid);
+      _allEvents[d.uid] = _optimisticEvent(d.event || { ...requestData, version: d.version }, d.uid);
       _saveCache && _saveCache();
       if (_open) _render();
     }
-  }).catch((e) => {
+    return d;
+  } catch (e) {
     delete _allEvents[tempUid];
     if (_open) _render();
     if (window.uiModule) window.uiModule.showError('Failed to create event: ' + (e?.message || 'unknown'));
-  });
-  return { uid: tempUid };
+    throw e;
+  }
 }
 
 async function _updateEvent(uid, data) {
-  const merged = { ...(_allEvents[uid] || {}), ...data };
+  const masterUid = uid.includes('::') ? uid.split('::')[0] : uid;
+  const current = _allEvents[uid]
+    || _allEvents[masterUid]
+    || Object.values(_allEvents).find(ev => ev?.series_uid === masterUid);
+  const expectedVersion = Math.max(1, Number(current?.version) || 1);
+  const merged = { ...(current || {}), ...data, version: expectedVersion };
   const _preMergeBackup = _allEvents[uid];
   _allEvents[uid] = _optimisticEvent(merged, uid);
   // For recurring events the uid is a compound "{base_uid}::{date}" —
@@ -283,24 +302,39 @@ async function _updateEvent(uid, data) {
   // other occurrences of the same series are stale. Wipe the cache so
   // a re-fetch picks up fresh data (next render + prefetch handles it).
   const isRecurring = uid.includes('::');
-  fetch(`${API_BASE}/api/calendar/events/${encodeURIComponent(uid)}`, {
-    method: 'PUT', credentials: 'same-origin',
-    headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data),
-  }).then(r => {
-    if (!r.ok) throw new Error('HTTP ' + r.status);
+  try {
+    const response = await fetch(`${API_BASE}/api/calendar/events/${encodeURIComponent(uid)}`, {
+      method: 'PUT', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...data, version: expectedVersion }),
+    });
+    const result = await _calendarApiPayload(response, 'Failed to update event');
+    const canonical = result.event || { ...merged, version: result.version };
     if (isRecurring) {
+      for (const event of Object.values(_allEvents)) {
+        if (event && (event.uid === masterUid || event.series_uid === masterUid || event.uid?.startsWith(masterUid + '::'))) {
+          event.version = result.version;
+        }
+      }
       _fetchedRanges = [];
       localStorage.removeItem(LS_KEY);
     } else {
+      _allEvents[uid] = _optimisticEvent(canonical, uid);
       _saveCache && _saveCache();
     }
-  }).catch((e) => {
+    if (_open) _render();
+    return result;
+  } catch (e) {
     if (_preMergeBackup) _allEvents[uid] = _preMergeBackup;
     else delete _allEvents[uid];
+    if (e?.status === 409) {
+      _fetchedRanges = [];
+      try { localStorage.removeItem(LS_KEY); } catch (_) {}
+    }
     if (_open) _render();
     if (window.uiModule) window.uiModule.showError('Failed to update event: ' + (e?.message || 'unknown'));
-  });
-  return { ok: true };
+    throw e;
+  }
 }
 
 async function _deleteEvent(uid, { scope = 'series' } = {}) {
@@ -316,6 +350,10 @@ async function _deleteEvent(uid, { scope = 'series' } = {}) {
   //      expansion (same prefix scan).
   const deleteOccurrenceOnly = scope === 'occurrence' && uid.includes('::');
   const masterUid = uid.includes('::') ? uid.split('::')[0] : uid;
+  const current = _allEvents[uid]
+    || _allEvents[masterUid]
+    || Object.values(_allEvents).find(ev => ev?.series_uid === masterUid);
+  const expectedVersion = Math.max(1, Number(current?.version) || 1);
   const backups = {};
   const _matches = deleteOccurrenceOnly
     ? (k) => k === uid
@@ -333,22 +371,34 @@ async function _deleteEvent(uid, { scope = 'series' } = {}) {
   if (_open) _render();
   _updateBadge && _updateBadge();
   const isRecurring = uid.includes('::');
-  const scopeParam = deleteOccurrenceOnly ? '?scope=occurrence' : '';
-  fetch(`${API_BASE}/api/calendar/events/${encodeURIComponent(uid)}${scopeParam}`, {
-    method: 'DELETE', credentials: 'same-origin',
-  }).then(r => {
+  const params = new URLSearchParams({ version: String(expectedVersion) });
+  if (deleteOccurrenceOnly) params.set('scope', 'occurrence');
+  try {
+    const response = await fetch(`${API_BASE}/api/calendar/events/${encodeURIComponent(uid)}?${params}`, {
+      method: 'DELETE', credentials: 'same-origin',
+    });
     // 404 = the event was already deleted by another session/device. That's
     // exactly the state we want, so treat it as success — don't restore the
     // row, otherwise the user can never clear stale cached events that were
     // deleted from desktop while mobile was open (and vice versa).
-    if (!r.ok && r.status !== 404) throw new Error('HTTP ' + r.status);
+    const result = response.status === 404
+      ? { ok: true, already_missing: true }
+      : await _calendarApiPayload(response, 'Failed to delete event');
     if (isRecurring) {
+      if (deleteOccurrenceOnly && result.version) {
+        for (const event of Object.values(_allEvents)) {
+          if (event && (event.uid === masterUid || event.series_uid === masterUid || event.uid?.startsWith(masterUid + '::'))) {
+            event.version = result.version;
+          }
+        }
+      }
       _fetchedRanges = [];
       localStorage.removeItem(LS_KEY);
     } else {
       _saveCache && _saveCache();
     }
-  }).catch((e) => {
+    return result;
+  } catch (e) {
     // Server rejected — restore every uid we optimistically stripped.
     for (const [k, ev] of Object.entries(backups)) {
       _allEvents[k] = ev;
@@ -356,8 +406,8 @@ async function _deleteEvent(uid, { scope = 'series' } = {}) {
     }
     if (window.uiModule) window.uiModule.showError('Failed to delete event: ' + (e?.message || 'unknown'));
     if (_open) _render();
-  });
-  return { ok: true };
+    throw e;
+  }
 }
 
 // ── Date helpers ──
@@ -2626,7 +2676,10 @@ async function _showCalSettings() {
       const r = await fetch(`${API_BASE}/api/calendar/calendars?name=${encodeURIComponent('New calendar')}&color=${encodeURIComponent(color)}`, { method: 'POST', credentials: 'same-origin' });
       const d = await r.json().catch(() => ({}));
       if (!r.ok || !d.ok) throw new Error(d.error || 'Failed to create calendar');
-      _calendars.push({ name: d.name, href: d.id, color: d.color });
+      _calendars.push({
+        name: d.name, href: d.id, color: d.color, source: 'local',
+        version: Math.max(1, Number(d.version) || 1),
+      });
       _allEvents = {}; _fetchedRanges = []; localStorage.removeItem(LS_KEY);
       _render();
       cleanup();
@@ -2653,24 +2706,42 @@ async function _showCalSettings() {
     const delBtn = row.querySelector('.cal-s-del');
 
     let saveTimer;
+    let saveChain = Promise.resolve();
     const save = () => {
       clearTimeout(saveTimer);
-      saveTimer = setTimeout(async () => {
-        await fetch(`${API_BASE}/api/calendar/calendars/${id}?name=${encodeURIComponent(nameInput.value)}&color=${encodeURIComponent(colorInput.value)}`, { method: 'PUT' });
-        if (uiModule?.showToast) uiModule.showToast(`Saved “${nameInput.value || 'calendar'}”`);
-        // Update local calendar list
-        const c = _calendars.find(c => c.href === id);
-        if (c) { c.name = nameInput.value; c.color = colorInput.value; }
-        // Update colors on cached events
-        for (const uid of Object.keys(_allEvents)) {
-          if (_allEvents[uid].calendar_href === id) {
-            _allEvents[uid].color = colorInput.value;
-            _allEvents[uid].calendar = nameInput.value;
+      saveTimer = setTimeout(() => {
+        saveChain = saveChain.then(async () => {
+          const c = _calendars.find(calendar => calendar.href === id);
+          const expectedVersion = Math.max(1, Number(c?.version) || 1);
+          const params = new URLSearchParams({
+            name: nameInput.value,
+            color: colorInput.value,
+            version: String(expectedVersion),
+          });
+          const response = await fetch(`${API_BASE}/api/calendar/calendars/${id}?${params}`, {
+            method: 'PUT', credentials: 'same-origin',
+          });
+          const result = await _calendarApiPayload(response, 'Failed to update calendar');
+          if (uiModule?.showToast) uiModule.showToast(`Saved “${nameInput.value || 'calendar'}”`);
+          if (c) {
+            c.name = nameInput.value;
+            c.color = colorInput.value;
+            c.version = Math.max(expectedVersion, Number(result.version) || expectedVersion);
           }
-        }
-        localStorage.removeItem(LS_KEY);
-        _fetchedRanges = [];
-        _render();
+          // Update colors on cached events
+          for (const uid of Object.keys(_allEvents)) {
+            if (_allEvents[uid].calendar_href === id) {
+              _allEvents[uid].color = colorInput.value;
+              _allEvents[uid].calendar = nameInput.value;
+            }
+          }
+          localStorage.removeItem(LS_KEY);
+          _fetchedRanges = [];
+          _render();
+        }).catch(async (error) => {
+          await _fetchCalendars();
+          if (uiModule?.showError) uiModule.showError(error?.message || 'Failed to update calendar');
+        });
       }, 300);
     };
     colorInput.addEventListener('input', save);
@@ -2680,12 +2751,23 @@ async function _showCalSettings() {
 
     delBtn.addEventListener('click', async () => {
       const name = nameInput.value;
-      if (!await window.styledConfirm(`Delete calendar "${name}" and all its events?`, { confirmText: 'Delete', danger: true })) return;
-      await fetch(`${API_BASE}/api/calendar/calendars/${id}`, { method: 'DELETE' });
-      row.remove();
-      _allEvents = {}; _fetchedRanges = []; localStorage.removeItem(LS_KEY);
-      _calendars = _calendars.filter(c => c.href !== id);
-      _render();
+      if (!await window.styledConfirm(`Delete empty calendar "${name}"?`, { confirmText: 'Delete', danger: true })) return;
+      try {
+        clearTimeout(saveTimer);
+        await saveChain;
+        const calendar = _calendars.find(item => item.href === id);
+        const expectedVersion = Math.max(1, Number(calendar?.version) || 1);
+        const response = await fetch(`${API_BASE}/api/calendar/calendars/${id}?version=${expectedVersion}`, {
+          method: 'DELETE', credentials: 'same-origin',
+        });
+        await _calendarApiPayload(response, 'Failed to delete calendar');
+        row.remove();
+        _allEvents = {}; _fetchedRanges = []; localStorage.removeItem(LS_KEY);
+        _calendars = _calendars.filter(c => c.href !== id);
+        _render();
+      } catch (error) {
+        uiModule.showToast(error?.message || 'Failed to delete calendar');
+      }
     });
   });
 

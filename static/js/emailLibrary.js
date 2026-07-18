@@ -25,7 +25,9 @@ import {
 import { state } from './emailLibrary/state.js';
 import { collapseSidebarToRail } from './modalSnap.js';
 import { emailApiUrl } from './emailShared.js';
-import { EMAIL_TAG_FILTERS } from './emailTagTaxonomy.js';
+import {
+  clearAnsweredEmailTags, EMAIL_TAG_FILTERS, normalizeEmailTagsForRender,
+} from './emailTagTaxonomy.js';
 import { bindMenuDismiss, dismissOrRemove } from './escMenuStack.js';
 import { closeSidebar, SIDEBAR_STATES } from './sidebar-layout.js';
 
@@ -127,17 +129,12 @@ function _emailTagGroupHtml(tags, em) {
   return `${visible[0]}${extra}<button type="button" class="email-tags-more" data-email-tags-more aria-expanded="false" title="Show all tags">+${visible.length - 1}<svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"></polyline></svg></button>`;
 }
 
-const _DONE_RESPONSE_TAGS = new Set(['urgent', 'reply-soon', 'action-needed']);
-
 function _visibleEmailTagsForRender(em) {
-  const tags = Array.isArray(em?.tags) ? em.tags : [];
-  if (!em?.is_answered) return tags;
-  return tags.filter(t => !_DONE_RESPONSE_TAGS.has(String(t || '').trim().toLowerCase().replace(/_/g, '-')));
+  return normalizeEmailTagsForRender(em?.tags, { answered: Boolean(em?.is_answered) });
 }
 
 function _clearDoneResponseTagsLocal(em) {
-  if (!em || !Array.isArray(em.tags)) return;
-  em.tags = em.tags.filter(t => !_DONE_RESPONSE_TAGS.has(String(t || '').trim().toLowerCase().replace(/_/g, '-')));
+  clearAnsweredEmailTags(em);
 }
 
 // Stash the email identity (uid + folder + account) on the reader element

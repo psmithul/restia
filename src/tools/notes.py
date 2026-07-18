@@ -262,10 +262,9 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
                 except Exception:
                     due_iso = due_raw  # fall through; trust the model
             if due_iso and title:
-                # Calendar event reminders are represented as Notes. If the
-                # model creates a calendar event with reminder_minutes and then
-                # also creates a separate note reminder for the same title/time,
-                # keep the existing note so the user gets only one dispatch.
+                # Reminder Notes are explicit actions. Keep the existing Note
+                # when a retry targets the same title/time so the user gets one
+                # dispatch without relying on a hidden calendar side effect.
                 existing_q = db.query(Note).filter(
                     Note.archived == False,  # noqa: E712
                     Note.due_date == due_iso,

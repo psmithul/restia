@@ -14,11 +14,13 @@ from typing import Any
 from sqlalchemy import case
 
 from core.database import (
+    Account,
     CalendarCal,
     CalendarEvent,
     PlanningItem,
     utcnow_naive,
 )
+from src.identity import ensure_account
 from src.progression import award_progression_event
 from src.auth_helpers import DEFAULT_LOCAL_OWNER
 
@@ -230,6 +232,7 @@ def update_planning_item(
     details: Any = _UNSET,
     priority: Any = _UNSET,
     due_date: Any = _UNSET,
+    account: Account | None = None,
 ) -> PlanningItem:
     item = _owned_item(db, owner, item_id)
     _reserve_next_version(db, item, expected_version)
@@ -242,18 +245,34 @@ def update_planning_item(
     if due_date is not _UNSET:
         item.due_date = _clean_due_date(due_date)
     if item.calendar_event_uid:
+        from src.calendar_service import CalendarServiceError, update_calendar_event
+
+        resolved_account = _planning_account(db, item.owner, account)
         event = (
             db.query(CalendarEvent)
-            .join(CalendarCal, CalendarCal.id == CalendarEvent.calendar_id)
             .filter(
                 CalendarEvent.uid == item.calendar_event_uid,
-                CalendarCal.owner == item.owner,
+                CalendarEvent.owner_id == resolved_account.id,
             )
             .first()
         )
         if event is not None:
-            event.summary = item.title
-            event.description = item.details
+            try:
+                update_calendar_event(
+                    db,
+                    account=resolved_account,
+                    uid=event.uid,
+                    expected_version=int(event.version or 1),
+                    changes={
+                        "summary": item.title,
+                        "description": item.details,
+                    },
+                    idempotency_key=(
+                        f"planning:{item.id}:metadata:{int(item.version or 1)}"
+                    ),
+                )
+            except CalendarServiceError as exc:
+                raise PlanningConflict(str(exc)) from exc
     db.flush()
     return item
 
@@ -306,25 +325,33 @@ def reopen_planning_item(
     return item
 
 
-def _owner_calendar(db: Any, owner: str, calendar_id: str | None) -> CalendarCal:
-    query = db.query(CalendarCal).filter(CalendarCal.owner == owner)
+def _planning_account(
+    db: Any,
+    owner: str,
+    account: Account | None,
+) -> Account:
+    normalized_owner = normalize_planning_owner(owner)
+    if account is None:
+        return ensure_account(db, normalized_owner)
+    if str(account.username or "").strip().lower() != normalized_owner:
+        raise PlanningNotFound("Planning item not found")
+    return account
+
+
+def _owner_calendar(
+    db: Any,
+    account: Account,
+    calendar_id: str | None,
+) -> CalendarCal:
+    from src.calendar_service import ensure_default_calendar
+
+    query = db.query(CalendarCal).filter(CalendarCal.owner_id == account.id)
     if calendar_id:
         calendar = query.filter(CalendarCal.id == str(calendar_id)).first()
         if calendar is None:
             raise PlanningNotFound("Calendar not found")
         return calendar
-    calendar = query.order_by(CalendarCal.created_at.asc(), CalendarCal.id.asc()).first()
-    if calendar is None:
-        calendar = CalendarCal(
-            id=str(uuid.uuid4()),
-            owner=owner,
-            name="Personal",
-            color="#5b8abf",
-            source="local",
-        )
-        db.add(calendar)
-        db.flush()
-    return calendar
+    return ensure_default_calendar(db, account=account)
 
 
 def schedule_planning_item(
@@ -338,8 +365,19 @@ def schedule_planning_item(
     due_date: str | None = None,
     add_to_calendar: bool = True,
     calendar_id: str | None = None,
+    account: Account | None = None,
 ) -> PlanningItem:
+    from src.calendar_service import (
+        CalendarServiceError,
+        cancel_calendar_event,
+        create_calendar_event,
+        reschedule_calendar_event,
+        restore_calendar_event,
+        update_calendar_event,
+    )
+
     item = _owned_item(db, owner, item_id)
+    resolved_account = _planning_account(db, item.owner, account)
     _reserve_next_version(db, item, expected_version)
     start_utc = _as_naive_utc(start)
     end_utc = _as_naive_utc(end) if end is not None else start_utc + timedelta(minutes=30)
@@ -356,44 +394,110 @@ def schedule_planning_item(
     if item.calendar_event_uid:
         linked_event = (
             db.query(CalendarEvent)
-            .join(CalendarCal, CalendarCal.id == CalendarEvent.calendar_id)
             .filter(
                 CalendarEvent.uid == item.calendar_event_uid,
-                CalendarCal.owner == item.owner,
+                CalendarEvent.owner_id == resolved_account.id,
             )
             .first()
         )
 
     if not add_to_calendar:
         if linked_event is not None:
-            db.delete(linked_event)
+            try:
+                cancel_calendar_event(
+                    db,
+                    account=resolved_account,
+                    uid=linked_event.uid,
+                    expected_version=int(linked_event.version or 1),
+                    idempotency_key=(
+                        f"planning:{item.id}:unschedule:{int(item.version or 1)}"
+                    ),
+                )
+            except CalendarServiceError as exc:
+                raise PlanningConflict(str(exc)) from exc
         item.calendar_id = None
         item.calendar_event_uid = None
     else:
-        calendar = _owner_calendar(db, item.owner, calendar_id or item.calendar_id)
+        calendar = _owner_calendar(
+            db,
+            resolved_account,
+            calendar_id or item.calendar_id,
+        )
         if linked_event is None:
-            linked_event = CalendarEvent(
-                uid=str(uuid.uuid4()),
-                calendar_id=calendar.id,
-                summary=item.title,
-                description=item.details,
-                dtstart=start_utc,
-                dtend=end_utc,
-                all_day=False,
-                is_utc=True,
-                origin="local",
-                event_type="work",
-                importance="high" if item.priority in {"high", "critical"} else "normal",
-            )
-            db.add(linked_event)
+            try:
+                mutation = create_calendar_event(
+                    db,
+                    account=resolved_account,
+                    calendar_id=calendar.id,
+                    summary=item.title,
+                    description=item.details,
+                    dtstart=start.replace(tzinfo=start.tzinfo),
+                    dtend=end if end is not None else start + timedelta(minutes=30),
+                    all_day=False,
+                    event_type="work",
+                    importance=(
+                        "high"
+                        if item.priority in {"high", "critical"}
+                        else "normal"
+                    ),
+                    idempotency_key=f"planning:{item.id}:calendar-event",
+                )
+            except CalendarServiceError as exc:
+                raise PlanningConflict(str(exc)) from exc
+            linked_event = mutation.event
         else:
-            linked_event.calendar_id = calendar.id
-            linked_event.summary = item.title
-            linked_event.description = item.details
-            linked_event.dtstart = start_utc
-            linked_event.dtend = end_utc
-            linked_event.is_utc = True
-            linked_event.status = "confirmed"
+            if linked_event.calendar_id != calendar.id:
+                raise PlanningConflict(
+                    "A linked planning event cannot move between calendars"
+                )
+            try:
+                version = int(linked_event.version or 1)
+                metadata = update_calendar_event(
+                    db,
+                    account=resolved_account,
+                    uid=linked_event.uid,
+                    expected_version=version,
+                    changes={
+                        "summary": item.title,
+                        "description": item.details,
+                        "event_type": "work",
+                        "importance": (
+                            "high"
+                            if item.priority in {"high", "critical"}
+                            else "normal"
+                        ),
+                    },
+                    idempotency_key=(
+                        f"planning:{item.id}:metadata:{int(item.version or 1)}"
+                    ),
+                )
+                version = int(metadata.event_version)
+                if metadata.event.status == "cancelled":
+                    restored = restore_calendar_event(
+                        db,
+                        account=resolved_account,
+                        uid=linked_event.uid,
+                        expected_version=version,
+                        idempotency_key=(
+                            f"planning:{item.id}:restore:{int(item.version or 1)}"
+                        ),
+                    )
+                    version = int(restored.event_version)
+                mutation = reschedule_calendar_event(
+                    db,
+                    account=resolved_account,
+                    uid=linked_event.uid,
+                    expected_version=version,
+                    dtstart=start,
+                    dtend=end if end is not None else start + timedelta(minutes=30),
+                    all_day=False,
+                    idempotency_key=(
+                        f"planning:{item.id}:schedule:{int(item.version or 1)}"
+                    ),
+                )
+            except CalendarServiceError as exc:
+                raise PlanningConflict(str(exc)) from exc
+            linked_event = mutation.event
         item.calendar_id = calendar.id
         item.calendar_event_uid = linked_event.uid
 

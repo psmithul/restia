@@ -707,6 +707,8 @@ async def do_manage_settings(content: str, owner: Optional[str] = None) -> Dict:
                 "tasks": ["manage_tasks"],
                 "notes": ["manage_notes"],
                 "calendar": ["manage_calendar"],
+                "life": ["query_life"],
+                "life_os": ["query_life"],
                 # The full built-in email tool set, in BOTH spellings: the
                 # qualified mcp__email__* names drive MCP schema hiding, the
                 # bare names drive function-schema hiding, and the runtime

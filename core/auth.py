@@ -14,6 +14,7 @@ import threading
 import time
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -1097,6 +1098,67 @@ class AuthManager:
             if revoked:
                 self._save_sessions()
         return revoked
+
+    def list_user_sessions(
+        self,
+        username: str,
+        current_token: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Return active session metadata without exposing bearer tokens."""
+
+        if self._auth_load_failed:
+            return []
+        normalized = str(username or "").strip().lower()
+        current_keys = {
+            value for value in (
+                current_token,
+                _session_key(current_token) if current_token else None,
+            ) if value
+        }
+        now = time.time()
+        expired = False
+        result: list[dict[str, Any]] = []
+        with self._sessions_lock:
+            for session_id, session in list(self._sessions.items()):
+                if not isinstance(session, dict) or session.get("username") != normalized:
+                    continue
+                expiry = float(session.get("expiry") or 0)
+                if expiry <= now:
+                    self._sessions.pop(session_id, None)
+                    expired = True
+                    continue
+                result.append({
+                    "id": session_id,
+                    "interface": "web",
+                    "auth_method": "local",
+                    "created_at": None,
+                    "last_seen_at": None,
+                    "expires_at": datetime.fromtimestamp(
+                        expiry, timezone.utc,
+                    ).isoformat().replace("+00:00", "Z"),
+                    "current": session_id in current_keys,
+                })
+        if expired:
+            self._save_sessions()
+        return sorted(
+            result,
+            key=lambda item: (not item["current"], item["expires_at"], item["id"]),
+        )
+
+    def revoke_user_session(self, username: str, session_id: str) -> bool:
+        """Revoke one session only when it belongs to ``username``."""
+
+        if self._auth_load_failed:
+            return False
+        normalized = str(username or "").strip().lower()
+        identifier = str(session_id or "").strip()
+        with self._sessions_lock:
+            session = self._sessions.get(identifier)
+            if not isinstance(session, dict) or session.get("username") != normalized:
+                return False
+            self._sessions.pop(identifier, None)
+        self._save_sessions()
+        return True
 
     def status(self, token: Optional[str]) -> Dict[str, Any]:
         username = self.get_username_for_token(token)

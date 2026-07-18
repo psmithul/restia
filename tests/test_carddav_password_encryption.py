@@ -46,7 +46,9 @@ def test_carddav_password_encrypted_at_rest(tmp_path, monkeypatch):
     password = "my-carddav-secret"
     from src.secret_storage import encrypt
     settings["carddav_password"] = encrypt(password)
-    contacts._save_settings(settings)
+    # Legacy settings are rollback-only now; model the already-shipped file
+    # directly and verify the recovery reader can still decrypt it.
+    (tmp_path / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
 
     raw_text = (tmp_path / "settings.json").read_text(encoding="utf-8")
     assert password not in raw_text
@@ -146,10 +148,11 @@ def test_double_save_encrypted_value_not_corrupted(tmp_path, monkeypatch):
     encrypted = encrypt(password)
 
     settings = {"carddav_password": encrypted}
-    contacts._save_settings(settings)
+    (tmp_path / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
 
     settings2 = contacts._load_settings()
-    contacts._save_settings(settings2)
+    with pytest.raises(RuntimeError, match="rollback-only"):
+        contacts._save_settings(settings2)
 
     cfg = contacts._get_carddav_config()
     assert cfg["password"] == password
@@ -163,11 +166,12 @@ def test_double_save_re_encrypts_already_encrypted_is_noop(tmp_path, monkeypatch
 
     settings = contacts._load_settings()
     settings["carddav_password"] = encrypt(password)
-    contacts._save_settings(settings)
+    (tmp_path / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
 
     settings2 = contacts._load_settings()
     settings2["carddav_password"] = encrypt(settings2["carddav_password"])
-    contacts._save_settings(settings2)
+    with pytest.raises(RuntimeError, match="rollback-only"):
+        contacts._save_settings(settings2)
 
     raw = json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))
     assert raw["carddav_password"].startswith("enc:")

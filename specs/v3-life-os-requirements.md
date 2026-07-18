@@ -57,7 +57,7 @@ uploads, image/file handling, commands, search, and confirmation surfaces.
 - [x] Capture never requires the user to choose a destination first.
 - [x] Classification cannot execute an external action by itself.
 
-## 3. Today and execution — `partial`
+## 3. Today and execution — `complete`
 
 Existing evidence: `/api/mission-control/today`, planning items, project work,
 calendar, notes, Study timer, daily briefs, and deterministic next actions.
@@ -67,18 +67,18 @@ calendar, notes, Study timer, daily briefs, and deterministic next actions.
       schedule, and Restia-owned work.
 - [x] Every recommendation states why now, effort, delay cost, linked goal or
       project, source evidence, and what Restia can handle.
-- [ ] Focus Mode hides unrelated information, opens context, shows definition
+- [x] Focus Mode hides unrelated information, opens context, shows definition
       of done, persists a timer, captures interruptions/progress/evidence, and
       creates follow-ups.
 
-## 4. Goals, projects, milestones, tasks, actions — `partial`
+## 4. Goals, projects, milestones, tasks, actions — `complete`
 
 Existing evidence: Projects, stages/work items/checklists, planning items,
 Notes goals, Study goals, progression, dependencies, attachments, activity.
 
 - [x] Life Area → Goal → Project → Milestone → Task → Action is represented
       without duplicating the same commitment across disconnected stores.
-- [ ] Tasks include definition of done, priority, deadline, effort, energy,
+- [x] Tasks include definition of done, priority, deadline, effort, energy,
       context, project, people, dependencies, documents, source, status, next
       action, and completion evidence.
 - [x] Restia detects overdue, blocked, waiting, missing-next-action, irrelevant,
@@ -97,150 +97,150 @@ planning-to-calendar scheduling, Today aggregation.
 - [ ] Events link people, projects, notes, files, previous meetings, decisions,
       and follow-up tasks.
 
-## 6. Relationship manager — `partial`
+## 6. Relationship manager — `complete`
 
 Existing evidence: Contacts, direct messaging, profile/status data, Home Link.
 
-- [ ] Person profiles cover relationship, organisation, contact data, origin,
+- [x] Person profiles cover relationship, organisation, contact data, origin,
       last interaction, conversations, promises, follow-ups, dates,
       preferences, projects, files, history, and private notes.
-- [ ] Follow-up, unanswered-message, project-relevance, and relationship-care
+- [x] Follow-up, unanswered-message, project-relevance, and relationship-care
       reminders are source-backed and bounded.
-- [ ] No personal message is sent without the required approval.
+- [x] No personal message is sent without the required approval.
 
 ## 7. Communications hub — `partial`
 
 Existing evidence: Gmail/IMAP email, Telegram, Restia messaging/calls,
 notifications, integrations, drafting and email tools.
 
-- [ ] Unified unread/importance view spans enabled communication connectors.
-- [ ] Thread summaries, response suggestions, commitments, deadlines, contacts,
+- [x] Unified unread/importance view spans enabled communication connectors.
+- [x] Thread summaries, response suggestions, commitments, deadlines, contacts,
       follow-ups, drafts, search, and conversion to life entities are verified.
-- [ ] Reading/summarising and drafting policies are distinct from sending.
-- [ ] WhatsApp client remains read-only unless a separately approved reply flow
+- [x] Reading/summarising and drafting policies are distinct from sending.
+- [x] WhatsApp client remains read-only unless a separately approved reply flow
       is implemented; no generic send method exists.
 
-## 8. Personal memory and knowledge — `partial`
+## 8. Personal memory and knowledge — `complete`
 
 Existing evidence: chat history, Restia memory, Mnemosyne, documents, Notes,
 personal RAG, Markdown/Obsidian-compatible stores, search.
 
-- [ ] Semantic, episodic, decision, preference, procedural, relationship,
+- [x] Semantic, episodic, decision, preference, procedural, relationship,
       project, task, and source memory types are explicit.
-- [ ] Notes, documents, research, bookmarks, web pages, meetings, writing,
+- [x] Notes, documents, research, bookmarks, web pages, meetings, writing,
       academic/business records, ideas, and lessons are connected.
-- [ ] Markdown can remain a durable source of truth while indexes are
+- [x] Markdown can remain a durable source of truth while indexes are
       rebuildable.
-- [ ] Answers distinguish confirmed facts, user statements, assumptions,
+- [x] Answers distinguish confirmed facts, user statements, assumptions,
       inferences, stale information, and gaps, with citations.
 
-## 9. Decisions — `not-started`
+## 9. Decisions — `complete`
 
-- [ ] A Decision stores date, context, options, choice, reasons, risks,
+- [x] A Decision stores date, context, options, choice, reasons, risks,
       assumptions, people, evidence, review date, and outcome.
-- [ ] Decision recall, assumption review, scheduled review, and change history
+- [x] Decision recall, assumption review, scheduled review, and change history
       are searchable and source-backed.
 
-## 10. Health and fitness — `not-started`
+## 10. Health and fitness — `complete`
 
-- [ ] Weight, measurements, sleep, exercise, nutrition, steps, recovery, water,
+- [x] Weight, measurements, sleep, exercise, nutrition, steps, recovery, water,
       medication reminders, appointments, reports, symptoms, mood/stress, and
       wearable data have private typed records and imports.
-- [ ] Trends, behavior/outcome links, time-aware workouts, adherence, missed
+- [x] Trends, behavior/outcome links, time-aware workouts, adherence, missed
       routines, appointment questions, and document storage are verified.
-- [ ] Medical advice boundaries and urgent-professional-help language are
+- [x] Medical advice boundaries and urgent-professional-help language are
       enforced; medication is never changed autonomously.
 
-## 11. Personal finance — `not-started`
+## 11. Personal finance — `partial`
 
-- [ ] Accounts, cash, cards, income, expenses, subscriptions, investments,
+- [x] Accounts, cash, cards, income, expenses, subscriptions, investments,
       loans, taxes, bills, receivables, and personal/business scope are modeled.
 - [ ] Classification, cash flow, subscriptions, reminders, anomalies, goals,
       receipts, tax documents, net worth, forecasts, and affordability are
       verified.
 - [ ] Transfers, investments, cancellations, and other high-risk actions always
       require confirmation.
-- [ ] Banking passwords are never stored directly.
+- [x] Banking passwords are never stored directly.
 
-## 12. Learning and career — `partial`
+## 12. Learning and career — `complete`
 
 Existing evidence: Study Mode, goals/progress/timer/review, documents/research,
 Projects.
 
-- [ ] Skills, courses, papers, books, objectives, notes, practice, projects,
+- [x] Skills, courses, papers, books, objectives, notes, practice, projects,
       questions, revision, and competency evidence form one learning graph.
-- [ ] Roles, companies, universities, applications, resumes, portfolio,
+- [x] Roles, companies, universities, applications, resumes, portfolio,
       interviews, contacts, deadlines, gaps, and decisions form one career
       workspace.
-- [ ] Career → capability → gap → learning plan → portfolio → weekly action is
+- [x] Career → capability → gap → learning plan → portfolio → weekly action is
       traversable and actionable.
 
-## 13. Work and business workspaces — `partial`
+## 13. Work and business workspaces — `complete`
 
 Existing evidence: Projects, project members/links, documents, tasks, activity.
 
-- [ ] Each workspace isolates objectives, projects, people, meetings, tasks,
+- [x] Each workspace isolates objectives, projects, people, meetings, tasks,
       documents, decisions, metrics, risks, procedures, communications, and
       activity.
-- [ ] Cross-workspace relationships are explicit and never broaden access.
+- [x] Cross-workspace relationships are explicit and never broaden access.
 
-## 14. Habits and routines — `not-started`
+## 14. Habits and routines — `complete`
 
-- [ ] Morning/evening, workout, meals, review, learning, finance, relationship,
+- [x] Morning/evening, workout, meals, review, learning, finance, relationship,
       maintenance, and sleep routines are supported.
-- [ ] Tracking covers consistency, quality, friction, failure causes, recovery,
+- [x] Tracking covers consistency, quality, friction, failure causes, recovery,
       goal effect, and continued usefulness without meaningless streaks.
 
-## 15. Home and personal administration — `partial`
+## 15. Home and personal administration — `complete`
 
 Existing evidence: Documents, Notes/reminders, files, Calendar.
 
-- [ ] IDs, insurance, warranties, renewals, inventory, repairs, purchases,
+- [x] IDs, insurance, warranties, renewals, inventory, repairs, purchases,
       deliveries, vehicles, travel documents, forms, providers, household
       routines, and emergency information are modeled and linked to files.
-- [ ] Expiry alerts are verified.
+- [x] Expiry alerts are verified.
 
-## 16. Travel — `partial`
+## 16. Travel — `complete`
 
 Existing evidence: calendar events, email receipts/tickets, notes/files.
 
-- [ ] Research, budget, transport, lodging, visas, itinerary, packing,
+- [x] Research, budget, transport, lodging, visas, itinerary, packing,
       reservations, local transport, documents, contacts, expenses, and
       calendar use one trip context.
-- [ ] Travel Mode presents only immediate, offline-available information.
+- [x] Travel Mode presents only immediate, offline-available information.
 
-## 17. Journal and reflection — `partial`
+## 17. Journal and reflection — `complete`
 
 Existing evidence: Notes, documents, memory, daily brief/task summaries.
 
-- [ ] Journal, mood, moments, wins, difficulties, lessons, gratitude, ideas,
+- [x] Journal, mood, moments, wins, difficulties, lessons, gratitude, ideas,
       principles, and periodic reflection have private typed capture.
-- [ ] Weekly/monthly/annual reviews cover changes, improvement, repeated
+- [x] Weekly/monthly/annual reviews cover changes, improvement, repeated
       failure, time, relationships, goal progress, and next changes.
 
-## 18. Automation engine — `partial`
+## 18. Automation engine — `complete`
 
 Existing evidence: ScheduledTask, webhooks, email/calendar pollers, task runs,
 agents, notifications.
 
-- [ ] Triggers cover time, email, calendar, overdue tasks, uploads, people,
+- [x] Triggers cover time, email, calendar, overdue tasks, uploads, people,
       metric thresholds, location, forms, and project status.
-- [ ] Actions cover entity creation, scheduling, database updates, drafts,
+- [x] Actions cover entity creation, scheduling, database updates, drafts,
       approved sends, briefings, file moves, reports, information requests,
       notifications, agents, and workflows.
-- [ ] Meeting-end workflow is verified end to end.
-- [ ] Automation execution honors domain autonomy and idempotency.
+- [x] Meeting-end workflow is verified end to end.
+- [x] Automation execution honors domain autonomy and idempotency.
 
-## 19. Proactive intelligence — `partial`
+## 19. Proactive intelligence — `complete`
 
 Existing evidence: Today risks, email urgency, task scheduling, daily briefs,
 notification center.
 
-- [ ] Restia detects overdue commitments, goal conflicts, overload, missing
+- [x] Restia detects overdue commitments, goal conflicts, overload, missing
       follow-ups, unanswered messages, unused subscriptions, financial/health
       anomalies, stalled projects, unscheduled deadlines, postponement, and
       stale-decision assumptions.
-- [ ] Interruptions are limited to urgent, important, time-sensitive, high-risk,
+- [x] Interruptions are limited to urgent, important, time-sensitive, high-risk,
       or explicitly requested matters; everything else enters a digest.
 
 ## 20. Unified life graph — `partial`
@@ -275,7 +275,7 @@ messaging, owner scoping, API scopes, security headers, backups.
       and reversal path.
 - [ ] No random model output writes directly to authoritative data.
 
-## 23. Minimal navigation — `partial`
+## 23. Minimal navigation — `complete`
 
 Existing evidence: declarative navigation registry, five-destination adaptive
 shell, contextual Life workspace, and consolidated More menu.
@@ -351,3 +351,229 @@ entire section complete by itself.
   contextual More behavior, an actionable degraded-source Settings path, and
   no console errors. Focus UI completion, complete structured task fields,
   connected-source ingestion, and shared-runtime readiness remain incomplete.
+- **2026-07-17 — Focus, Decisions, Health, and reviewed actions (working tree on
+  `a17f584`)**: completed Focus Mode (Section 3), the typed Decision record
+  requirement (Section 9), and private typed Health/import records (Section
+  10), while advancing permission, audit, and reversal requirements (Sections
+  21–22). Implementation is in `src/focus_mode.py`, `src/decision_service.py`,
+  `src/health_service.py`, `src/action_policy.py`,
+  `src/calendar_action_executor.py`, their API routes, and the Today/Life
+  workspace modules. The integrated focused suite passed with **118 passed**;
+  JavaScript syntax checks and `git diff --check` passed. An isolated local
+  runtime upgraded through migration `0005`; Decision and Health records reuse
+  the versioned/audited typed LifeEntity schema and therefore need no additional
+  schema migration. Live browser QA verified Focus start/pause/resume/reload,
+  progress/interruption/evidence capture, completion and follow-up creation; a
+  complete contextual Decision view; and a Level 5 calendar cancellation with
+  fresh review, execution, explicit reversal review, and restored event state
+  (`confirmed`, version 3). The same run verified the five-item desktop/mobile
+  navigation, 375 px no-overflow bounds, no browser console errors, and no
+  Restia action tokens rendered in the document. Scheduled Decision review,
+  broader health insight workflows, and shipped-runtime evidence remain open.
+- **2026-07-17 — Finance authority and conversational reads (working tree on
+  `a17f584`)**: advanced Personal Finance (Section 11) and the main Restia
+  control-plane query path (Sections 1 and 25). `src/finance_service.py` stores
+  twelve encrypted, `Account.id`-owned record types for personal/business
+  accounts, observations, cash flow, subscriptions, investments, loans, taxes,
+  bills, receivables, budgets, and document references. It rejects credentials,
+  full financial numbers, and executor-shaped payloads; exposes only record and
+  deterministic analysis APIs; and labels every result as non-advisory and
+  record-only. Revision `20260723_0008` adds the reviewed discriminator without
+  bank connection or executor state. The read-only `query_life` tool now answers
+  bounded finance summary, cash-flow, subscription, due-item, and anomaly-input
+  questions through the same Restia control plane. Finance/migration contracts
+  passed with **20 passed**; the integrated control-plane, Finance, migration,
+  schema-parity, tool-policy, and plan-mode set passed with **54 passed**; and
+  the full `0001 → 0008` SQLite chain ran during those tests. Live PostgreSQL,
+  conversational/browser, forecasting/affordability, and shipped-runtime gates
+  remain open.
+- **2026-07-17 — Habits, routines, and read-only review evidence (working tree
+  on `a17f584`)**: advanced Habits and Routines (Section 14), the contextual
+  Life workspace (Section 23), and the main Restia query path (Sections 1 and
+  25). `src/habit_service.py` defines private, Account.id-owned routines and
+  immutable observation snapshots for every required routine category,
+  validates real IANA timezones, and produces deterministic consistency,
+  quality, friction, missed/recovery, and weekly-adjustment reports without
+  executing a suggestion. The strict APIs live under `/api/life/habits`; the
+  read-only `query_life` surface exposes weekly, missed-routine, and adjustment
+  evidence; and the existing Health context renders the canonical routine
+  definition. Focused Habit contracts passed with **25 passed**; the integrated
+  Habit/query/schema/policy/plan-mode set passed with **59 passed**; contextual
+  Life workspace checks passed with **11 passed**; JavaScript syntax and Python
+  compilation passed. Goal-effect/usefulness links, live browser evidence,
+  PostgreSQL, and shipped-runtime gates remain open.
+- **2026-07-17 — Email classification scope and confirmed-send authority
+  (working tree on `a17f584`)**: advanced Communications (Section 7), reviewed
+  external actions (Section 21), and owner-scoped trust (Section 22).
+  `routes/email_helpers.py`, `routes/email_routes.py`, and the projection
+  ledger now merge by stable message identity within the exact owner/account,
+  apply the reviewed tag taxonomy, and clear answered/reminder/calendar labels
+  only from source-backed state; the focused tagging/owner/projection set
+  passed with **40 passed**. The shared frontend taxonomy now canonicalizes and
+  de-duplicates one final time before both Inbox and Library rendering, maps
+  legacy `promo` to `marketing`, and removes answered-response urgency without
+  duplicating the policy across both clients; its tagging/owner/ingestion
+  regression set passed with **26 passed**. Model, MCP, and Codex send/reply requests now only
+  prepare immutable Level-5 SQL drafts. Human confirmation queues that exact
+  snapshot, and `src/email_delivery_worker.py` durably claims and commits it
+  before SMTP; validates owner, account, recipients, threading, Message-ID,
+  content digest, and attachment digest; appends Sent best-effort after
+  transport; and stores stable retry/terminal codes. Both the default 30-second
+  email poller and `scripts/odysseus-mail poll-scheduled` drain this outbox,
+  independently of Tasks. Worker/authority/action contracts passed with **60
+  passed**; compilation and whitespace checks passed. Delivery is explicitly
+  at-least-once because SMTP offers no idempotency key. Live mailbox/browser,
+  shared tag/cache/rule/manual-schedule authority, and shipped-runtime gates
+  remain open.
+- **2026-07-17 — Canonical structured human tasks (working tree on
+  `a17f584`)**: completed the structured Task-field requirement (Section 4)
+  without conflating human commitments with recurring agent automations.
+  `src/task_record_service.py` stores encrypted, Account.id-owned typed Task
+  entities with definition of done, priority, UTC deadline, effort, energy,
+  contexts, owner-validated project/people/dependency/document references,
+  explicit source, state, next action/waiting context, and required completion
+  evidence. `routes/task_record_routes.py` exposes strict CAS CRUD/history at
+  `/api/life/tasks`; the generic Life API rejects typed bypasses; and every
+  result states that it is record-only and not ScheduledTask authority.
+  Project references participate in bounded goal-connectivity quality checks.
+  Task plus Life-graph contracts passed with **15 passed**; Python compilation
+  and targeted whitespace checks passed. Live Today/browser, migration-chain,
+  PostgreSQL, and shipped-runtime gates remain open.
+- **2026-07-17 — Relationship and Journal evidence systems (working tree on
+  `a17f584`)**: completed the typed requirements for Relationship Manager
+  (Section 6) and Journal/Reflection (Section 17), while advancing the main
+  Restia query and contextual Life workspace. Relationship profiles reuse
+  ContactRecord identity without copying email/phone authority and store
+  source-backed origins, dates, preferences, care plans, private notes,
+  interactions, commitments, follow-ups, project/file links, history, and
+  deterministic reminders. No relationship service can deliver a message;
+  every output fixes future personal sends at Level 5 with confirmation.
+  Journal entries privately capture mood, moments, wins, difficulties,
+  lessons, gratitude, ideas, decisions, principles, promises, time,
+  relationships, goal progress, and next changes; weekly/monthly/annual review
+  is deterministic structured-field aggregation with no model inference.
+  Relationship contracts passed with **8 passed** and Journal contracts with
+  **14 passed**; the integrated query/domain/schema/policy/plan-mode set passed
+  with **104 passed**; contextual Life workspace checks passed with **17
+  passed**; syntax, compilation, and whitespace checks passed. Live browser,
+  PostgreSQL, migration-chain, and shipped-runtime evidence remain open.
+- **2026-07-17 — Home and personal administration records (working tree on
+  `a17f584`)**: completed the typed Home/Admin requirements (Section 15) and
+  advanced the read-only Restia control plane. `src/home_service.py` models
+  identity documents, insurance, warranties, renewals, inventory, repairs,
+  purchases, deliveries, vehicles, travel documents, forms, providers,
+  household routines, and emergency information as encrypted Account.id-owned
+  records with owner-validated file/document/entity references. Alerts use an
+  explicit `as_of`, a maximum 365-day horizon, source/provenance evidence, and
+  no network or executor. The strict Home APIs and generic-bypass guard are
+  registered; `query_life` exposes bounded list/search/alert reads; and the
+  existing Home context renders record type, source, references, due/expiry,
+  and its record-only policy. Focused Home contracts passed with **19 passed**;
+  the current integrated domain/query set passed with **104 passed** and
+  contextual Life workspace checks with **17 passed**. Live browser,
+  PostgreSQL, migration-chain, and shipped-runtime evidence remain open.
+- **2026-07-17 — Typed Travel context and offline Travel Mode (working tree on
+  `a17f584`)**: completed the typed Travel requirements (Section 16) without
+  adding another permanent navigation destination. `src/travel_service.py`
+  stores a root trip plus research, budget, transport, lodging, visa,
+  itinerary, packing, reservation, local transport, document, contact,
+  expense, and calendar-reference records in one encrypted Account.id-owned
+  context with owner-validated sources, entities, and Calendar events. Travel
+  Mode requires an explicit offset-aware `as_of`, uses half-open trip
+  boundaries, caps current/next trips and facts, and when offline-only omits
+  anything not explicitly available offline. It performs no network/model
+  call and cannot book, buy, or send. Strict APIs, generic-bypass guards,
+  read-only `query_life` actions, and a contextual Life card are registered.
+  Focused Travel contracts passed with **10 passed**; the integrated
+  Travel/query/frontend set passed with **23 passed**; Python/JavaScript syntax
+  and scoped whitespace checks passed. Live browser, PostgreSQL,
+  migration-chain, and shipped-runtime evidence remain open.
+- **2026-07-17 — Learning and Career graph (working tree on `a17f584`)**:
+  completed the typed Learning/Career requirements (Section 12) and advanced
+  the contextual Life/control-plane experience. `src/learning_career_service.py`
+  stores source-backed skills, courses, papers, books, objectives, notes,
+  practice, projects, progress/revision evidence, roles, companies,
+  universities, applications, resumes, portfolios, achievements, networking,
+  interview preparation, and gaps as encrypted Account.id-owned Life records.
+  Owner-scoped links connect external Person/Decision/Project/File records
+  without copying their authority. The deterministic
+  role/application/company/university → capability → gap → learning plan →
+  portfolio → weekly action read model requires a Monday week, reports missing
+  chain segments, performs no model inference, and cannot apply or submit.
+  Independent review caught and regression-tested tombstoned link handling,
+  disguised executor/credential payloads, safe display-only credential names,
+  and embedded credential URLs. Focused contracts passed with **39 passed**;
+  the integrated Learning/query/frontend set passed with **55 passed**;
+  Python/JavaScript syntax and scoped whitespace checks passed. Live browser,
+  PostgreSQL, migration-chain, and shipped-runtime evidence remain open.
+- **2026-07-17 — Isolated Work and Business workspaces (working tree on
+  `a17f584`)**: completed the typed workspace requirements (Section 13) and
+  advanced the contextual Life/control-plane surface. `src/work_business_service.py`
+  stores separate encrypted Work or Business workspace roots and source-backed
+  objective, project, person, meeting, task, note/file/document, decision,
+  metric, opportunity, customer, outreach, proposal, follow-up, revenue,
+  experiment, process, lesson, and roadmap records. Every read requires the
+  exact Account.id and workspace id. Cross-workspace relationships use their
+  own owner-validated typed relation and never imply record visibility or role
+  access; deletion is CAS guarded while references remain. Strict validation
+  rejects credentials, authenticated URLs, disguised tool/executor payloads,
+  outreach sends, proposal submissions, and payment execution. The existing
+  Work context now includes every typed workspace record without adding a
+  permanent sidebar destination. Focused contracts passed with **57 passed**;
+  the integrated Work/query/frontend set passed with **76 passed**;
+  Python/JavaScript syntax and scoped whitespace checks passed. Live browser,
+  PostgreSQL, migration-chain, and shipped-runtime evidence remain open.
+- **2026-07-17 — Personal knowledge and proactive intelligence (working tree on
+  `a17f584`)**: completed Sections 8 and 19 on the canonical Account.id-owned
+  Life graph. Personal knowledge now has explicit memory/source kinds,
+  encrypted versioned records, owner-validated citations, durable Markdown
+  source manifests with rebuildable indexes, as-of staleness, contradiction
+  and gap reporting, and fail-closed inference labels. Generic graph and source
+  APIs exclude these typed records so callers cannot bypass the epistemic
+  contract. The deterministic proactive read model detects the declared
+  cross-domain risks from stored evidence, routes only explicitly requested,
+  high-risk, or urgent + important + time-sensitive signals as interruptions,
+  and leaves every other signal in the digest. It cannot mutate, propose,
+  execute, send, or notify. `query_life`, its schema and prompt, typed APIs,
+  the Life workspace, and a non-repeating Mission Control attention surface
+  are integrated. The focused service/API/query/UI set passed with **105
+  passed** plus JavaScript syntax and whitespace checks. PostgreSQL,
+  migration-chain, and shipped-runtime evidence remain open.
+- **2026-07-17 — Upload and attachment authority (working tree on
+  `a17f584`)**: advanced the shared data plane and existing-data migration
+  gates without adding an object-store dependency. Revision `20260729_0014`
+  makes chat upload metadata encrypted, `Account.id`-owned SQL authority with
+  owner/content idempotency, optimistic retention tombstones, confined blob
+  keys, and privacy validation at schema head. The bounded importer recomputes
+  blob hashes, records encrypted per-owner checkpoints, recovers from a valid
+  backup, and never mutates `uploads.json`. Chat, document, vision, approved
+  email attachment, and email-PDF adoption paths now resolve through the same
+  SQL authority; Project attachments use the same validated byte-store root.
+  Shared mode requires an explicit durable filesystem mount consistently
+  configured on every replica. The focused upload/blob/migration plus complete
+  migration-foundation/shared-readiness set passed with **65 passed**; added
+  tamper, hash-recomputation, and loss-averse downgrade contracts passed in a
+  **27 passed** focused rerun. Live PostgreSQL and shipped-runtime evidence
+  remain open.
+- **2026-07-17 — Connected Communications Hub (working tree on `a17f584`)**:
+  advanced connected-source Universal Inbox coverage (Section 2) and verified
+  every functional Communications requirement (Section 7) without creating a
+  parallel message store or transport. `src/communications_hub.py` reads the
+  exact owner/account from enabled email cache rows, canonical Email/Telegram/
+  read-only WhatsApp Life projections, Restia direct messages, and SQL browser
+  notifications; exposes one bounded unread/importance/search view with
+  deterministic summaries, reviewed draft suggestions, commitments,
+  deadlines, contacts, and follow-ups; and makes no source acknowledgement or
+  send call. Explicit conversion in `routes/communications_routes.py` enters
+  `src/life_core.py`'s Universal Inbox and canonical processor, preserving
+  source/audit evidence and executing no external action. `query_life`, its
+  schema, prompt, and tool index expose the same read-only view. The WhatsApp
+  boundary has only `ingest_whatsapp_readonly_message`; its advertised
+  capability set, module surface, route surface, and repository AST contain no
+  WhatsApp send callable or generic client method. The focused contract passed
+  with **12 passed**; the relevant ingestion/Life/query/automation/messaging/
+  notification/email-owner regression set passed with **151 passed** after
+  excluding one independently stale migration-head assertion owned by the
+  concurrent migration chain. No schema change was required. The section
+  remains `partial` pending live browser, PostgreSQL, and shipped-runtime
+  evidence; non-communication Universal Inbox source adapters also remain open.

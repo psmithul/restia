@@ -1,0 +1,50 @@
+# Shared, multi-device Restia deployment backed by PostgreSQL.
+#
+# One-time setup (use a URL-safe hex password because it is embedded in the
+# SQLAlchemy URL below):
+#   mkdir -p secrets data/blobs
+#   python3 -c 'from cryptography.fernet import Fernet; from pathlib import Path; Path("secrets/restia_fernet_key").write_bytes(Fernet.generate_key())'
+#   chmod 600 secrets/restia_fernet_key
+#   export RESTIA_POSTGRES_PASSWORD="$(openssl rand -hex 32)"
+#   docker compose -f docker-compose.yml -f docker/shared-postgres.yml up -d
+
+services:
+  odysseus:
+    environment:
+      DATABASE_URL: postgresql+psycopg://restia:${RESTIA_POSTGRES_PASSWORD:?set RESTIA_POSTGRES_PASSWORD to a URL-safe secret}@postgres:5432/restia
+      RESTIA_DATABASE_MODE: shared
+      AUTH_ENABLED: "true"
+      LOCALHOST_BYPASS: "false"
+      RESTIA_ENCRYPTION_KEY: ""
+      RESTIA_ENCRYPTION_KEY_FILE: /run/secrets/restia_fernet_key
+      RESTIA_BLOB_STORE: shared-filesystem
+      RESTIA_BLOB_ROOT: /app/blobs
+    secrets:
+      - source: restia_encryption_key
+        target: restia_fernet_key
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: restia
+      POSTGRES_USER: restia
+      POSTGRES_PASSWORD: ${RESTIA_POSTGRES_PASSWORD:?set RESTIA_POSTGRES_PASSWORD to a URL-safe secret}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U restia -d restia"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+
+secrets:
+  restia_encryption_key:
+    file: ${RESTIA_ENCRYPTION_KEY_FILE_HOST:-./secrets/restia_fernet_key}

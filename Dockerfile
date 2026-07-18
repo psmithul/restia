@@ -95,10 +95,12 @@ COPY . .
 
 # Bake in the commit hash for the update checker
 ARG BUILD_COMMIT="unknown"
+ARG BUILD_CHANNEL="source"
 ENV BUILD_COMMIT=$BUILD_COMMIT
+ENV BUILD_CHANNEL=$BUILD_CHANNEL
 
 # Create data directory (mount a volume here for persistence)
-RUN mkdir -p data logs services/cache/search
+RUN mkdir -p data logs blobs services/cache/search
 
 # Entrypoint that drops to PUID/PGID (default 1000:1000) and repairs
 # ownership on the bind-mounted /app/data and /app/logs. Without this,

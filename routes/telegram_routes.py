@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from core.middleware import require_admin
 from src.auth_helpers import require_user, resolved_request_owner
 from src.external_chat import ExternalChatError, send_external_chat_message
+from src.life_ingestion import ingest_telegram_message
 from src.notification_preferences import (
     NotificationPreferenceError,
     load_notification_preferences,
@@ -51,6 +52,7 @@ from src.telegram_runtime import (
     telegram_polling_service,
     telegram_runtime_mode,
 )
+from src.telegram_identity import revoke_bot_authority
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +83,19 @@ def _link_code(text: str) -> str:
     if len(parts) != 2:
         return ""
     return parts[1].strip() if _command(parts[0]) in {"/link", "/start"} else ""
+
+
+def _chat_log_ref(config, chat_id: str) -> str:
+    """Return a bounded keyed reference; never place a chat ID in logs."""
+
+    try:
+        from src.telegram_identity import telegram_chat_digest
+
+        if config.bot_fingerprint:
+            return telegram_chat_digest(config.bot_fingerprint, chat_id)[:12]
+    except Exception:
+        pass
+    return "unlinked"
 
 
 async def _reply(config, incoming, text: str) -> None:
@@ -151,53 +166,160 @@ async def _process_message(session_manager, webhook_manager, config, incoming) -
     await _reply(config, incoming, reply)
 
 
+def _ingest_telegram_incoming(
+    config,
+    incoming,
+    *,
+    fingerprint: str,
+    update_id: int | None,
+    expected_owner_id: str | None = None,
+):
+    """Project one ordinary linked message; commands remain control traffic."""
+
+    if _command(incoming.text).startswith("/"):
+        return None
+    owner = telegram_owner_for_chat(config, incoming.chat_id)
+    if not owner:
+        return None
+    return ingest_telegram_message(
+        owner=owner,
+        bot_fingerprint=fingerprint,
+        chat_id=incoming.chat_id,
+        text=incoming.text,
+        message_id=incoming.message_id,
+        update_id=update_id,
+        expected_owner_id=expected_owner_id,
+    )
+
+
+def _telegram_owner_account_id(config, incoming) -> str:
+    """Resolve the immutable first-claim principal for one Telegram update."""
+
+    # A one-time link command intentionally starts without an owner and may
+    # create that link while processing. Keep its claim unbound; commands are
+    # control traffic and never enter the Life graph.
+    if _link_code(incoming.text):
+        return ""
+    owner = telegram_owner_for_chat(config, incoming.chat_id)
+    if not owner:
+        return ""
+    from core.database import SessionLocal
+    from src.identity import find_account
+
+    db = SessionLocal()
+    try:
+        account = find_account(db, owner)
+        if account is None:
+            raise RuntimeError("Telegram linked account is unavailable")
+        return str(account.id)
+    finally:
+        db.close()
+
+
 async def _process_update_durably(session_manager, webhook_manager, config, update: dict) -> None:
     """Process an update once and retry only its durably stored reply."""
 
-    from pathlib import Path
     from src.constants import DATA_DIR
     from src.telegram_inbound_ledger import (
+        bot_fingerprint as legacy_bot_fingerprint,
+    )
+    from src.telegram_delivery import (
         TelegramInboundInFlight,
         TelegramReplyPending,
-        bot_fingerprint,
-        claim_inbound_processing,
-        mark_inbound_delivered,
-        store_inbound_reply,
+        telegram_runtime_authority,
+    )
+    from src.telegram_identity import (
+        telegram_bot_fingerprint,
     )
 
     incoming = extract_telegram_message(update)
     if incoming is None:
         return
     raw_update_id = update.get("update_id")
+    owner_account_id = _telegram_owner_account_id(config, incoming)
+    runtime_fingerprint = (
+        str(config.bot_fingerprint or "")
+        or telegram_bot_fingerprint(bot_token=config.bot_token)
+    )
+    ingestion_fingerprint = legacy_bot_fingerprint(config.bot_token)
     try:
         update_id = int(raw_update_id)
     except (TypeError, ValueError):
+        _ingest_telegram_incoming(
+            config,
+            incoming,
+            fingerprint=ingestion_fingerprint,
+            update_id=None,
+            expected_owner_id=owner_account_id or None,
+        )
         await _process_message(session_manager, webhook_manager, config, incoming)
         return
 
-    ledger_path = Path(DATA_DIR) / "telegram_inbound_ledger.sqlite3"
-    fingerprint = bot_fingerprint(config.bot_token)
-    acquired, record = claim_inbound_processing(
-        ledger_path,
-        fingerprint=fingerprint,
+    # This is an idempotent marker read after the first successful cutover.
+    # The retired sidecars are never a runtime fallback.
+    telegram_runtime_authority.adopt_legacy_sidecars(
+        bot_fingerprint=runtime_fingerprint,
+        bot_token=config.bot_token,
+        data_dir=DATA_DIR,
+    )
+    worker_id = "inbound:" + uuid.uuid4().hex
+    acquired, record = telegram_runtime_authority.claim_inbound_processing(
+        bot_fingerprint=runtime_fingerprint,
         update_id=update_id,
         chat_id=incoming.chat_id,
+        owner_account_id=owner_account_id,
+        worker_id=worker_id,
     )
     if not acquired:
         status = str((record or {}).get("status") or "")
-        if status == "delivered":
+        if status in {"delivered", "discarded"}:
             return
         if status == "reply_pending" and (record or {}).get("reply_text"):
             if str(record.get("chat_id") or "") != str(incoming.chat_id):
                 raise RuntimeError("Telegram update replay chat does not match its durable record")
+            claimed, delivery = telegram_runtime_authority.claim_reply_delivery(
+                bot_fingerprint=runtime_fingerprint,
+                update_id=update_id,
+                chat_id=incoming.chat_id,
+                owner_account_id=owner_account_id,
+                worker_id=worker_id,
+            )
+            if not claimed or delivery is None:
+                if str((delivery or {}).get("status") or "") in {
+                    "delivered", "discarded",
+                }:
+                    return
+                raise TelegramReplyPending()
             try:
-                await _reply(config, incoming, str(record["reply_text"]))
+                await _reply(config, incoming, str(delivery["reply_text"]))
             except Exception as exc:
+                telegram_runtime_authority.release_reply_delivery(
+                    bot_fingerprint=runtime_fingerprint,
+                    update_id=update_id,
+                    reply_claim_token=delivery["reply_claim_token"],
+                )
                 raise TelegramReplyPending() from exc
-            mark_inbound_delivered(ledger_path, fingerprint, update_id)
+            if not telegram_runtime_authority.mark_inbound_delivered(
+                bot_fingerprint=runtime_fingerprint,
+                update_id=update_id,
+                reply_claim_token=delivery["reply_claim_token"],
+            ):
+                raise TelegramReplyPending()
             return
         raise TelegramInboundInFlight()
 
+    # Ingestion happens only for the durable owner of this update and before
+    # reply generation.  Its exception intentionally sits outside the broad
+    # reply catch below: the ledger keeps the processing lease, so a later
+    # retry can re-run this idempotent projection instead of marking the update
+    # delivered without its Life evidence.
+    _ingest_telegram_incoming(
+        config,
+        incoming,
+        fingerprint=ingestion_fingerprint,
+        update_id=update_id,
+        expected_owner_id=owner_account_id or None,
+    )
     try:
         reply_text = await _build_message_reply(
             session_manager, webhook_manager, config, incoming,
@@ -205,18 +327,31 @@ async def _process_update_durably(session_manager, webhook_manager, config, upda
     except Exception:
         logger.exception("Telegram message processing failed")
         reply_text = "Restia hit an internal error while processing that message."
-    store_inbound_reply(
-        ledger_path,
-        fingerprint=fingerprint,
+    delivery = telegram_runtime_authority.store_inbound_reply(
+        bot_fingerprint=runtime_fingerprint,
         update_id=update_id,
         chat_id=incoming.chat_id,
         reply_text=reply_text,
+        owner_account_id=owner_account_id,
+        processing_claim_token=str(
+            (record or {}).get("processing_claim_token") or ""
+        ),
     )
     try:
         await _reply(config, incoming, reply_text)
     except Exception as exc:
+        telegram_runtime_authority.release_reply_delivery(
+            bot_fingerprint=runtime_fingerprint,
+            update_id=update_id,
+            reply_claim_token=delivery["reply_claim_token"],
+        )
         raise TelegramReplyPending() from exc
-    mark_inbound_delivered(ledger_path, fingerprint, update_id)
+    if not telegram_runtime_authority.mark_inbound_delivered(
+        bot_fingerprint=runtime_fingerprint,
+        update_id=update_id,
+        reply_claim_token=delivery["reply_claim_token"],
+    ):
+        raise TelegramReplyPending()
 
 
 def _telegram_setup_payload() -> dict:
@@ -315,7 +450,10 @@ def setup_telegram_routes(session_manager, webhook_manager=None) -> APIRouter:
         if incoming is None:
             return
         if not is_chat_allowed(config, incoming.chat_id) and not _link_code(incoming.text):
-            logger.warning("Ignoring Telegram update from unauthorized chat_id=%s", incoming.chat_id)
+            logger.warning(
+                "Ignoring Telegram update from unauthorized chat_ref=%s",
+                _chat_log_ref(config, incoming.chat_id),
+            )
             return
         await _process_update_durably(
             session_manager,
@@ -353,7 +491,9 @@ def setup_telegram_routes(session_manager, webhook_manager=None) -> APIRouter:
         mode = str(body.mode or "polling").strip().lower()
         public_url = str(body.public_url or settings.get("app_public_url") or "").strip().rstrip("/")
         webhook_secret = str(settings.get("telegram_webhook_secret") or "").strip() or secrets.token_urlsafe(32)
-        old_token = load_telegram_config().bot_token
+        old_config = load_telegram_config()
+        old_token = old_config.bot_token
+        old_bot_fingerprint = old_config.bot_fingerprint
         old_registered = str(settings.get("telegram_registered_webhook_url") or "")
         replacement_previous_url = ""
         try:
@@ -368,8 +508,12 @@ def setup_telegram_routes(session_manager, webhook_manager=None) -> APIRouter:
             raise HTTPException(400, "Webhook mode requires this instance's public HTTPS URL")
         previous_bot_id = str(settings.get("telegram_bot_id") or "")
         bot_changed = bool(
-            (old_token and old_token != token)
-            or (previous_bot_id and previous_bot_id != identity["id"])
+            (previous_bot_id and previous_bot_id != identity["id"])
+            or (
+                not previous_bot_id
+                and old_token
+                and old_token != token
+            )
         )
         expected_webhook_url = f"{public_url}/api/telegram/webhook" if mode == "webhook" else ""
         replacement_owned = bool(
@@ -493,6 +637,11 @@ def setup_telegram_routes(session_manager, webhook_manager=None) -> APIRouter:
             except TelegramAPIError:
                 cleanup_warning = "The new bot is active, but the old bot webhook could not be detached automatically."
                 logger.warning("Telegram old-bot webhook cleanup failed after replacement")
+        if bot_changed and old_bot_fingerprint:
+            # SQL is the identity authority. A replacement bot must not regain
+            # the previous bot's chat principals if its old credential is
+            # configured again later.
+            revoke_bot_authority(old_bot_fingerprint)
         telegram_polling_service.wake()
         # Drop every local reference to the plaintext credential before return.
         token = ""
@@ -509,6 +658,7 @@ def setup_telegram_routes(session_manager, webhook_manager=None) -> APIRouter:
         if os.getenv("TELEGRAM_BOT_TOKEN"):
             raise HTTPException(409, "Remove TELEGRAM_BOT_TOKEN from the instance environment to disconnect this bot")
         settings = load_settings()
+        old_config = load_telegram_config()
         token = str(settings.get("telegram_bot_token") or "").strip()
         registered = str(settings.get("telegram_registered_webhook_url") or "")
         candidate = dict(settings)
@@ -555,6 +705,8 @@ def setup_telegram_routes(session_manager, webhook_manager=None) -> APIRouter:
                         "Telegram webhook removal failed and the previous local configuration could not be restored",
                     ) from None
                 raise HTTPException(502, f"Could not safely disconnect the registered Telegram webhook: {exc}") from None
+        if old_config.bot_fingerprint:
+            revoke_bot_authority(old_config.bot_fingerprint)
         token = ""
         telegram_polling_service.wake()
         return {"ok": True}
@@ -687,7 +839,10 @@ def setup_telegram_routes(session_manager, webhook_manager=None) -> APIRouter:
         # Unlinked chats may submit only a one-time /link (or /start CODE)
         # command. Every other message still obeys the allowlist.
         if not is_chat_allowed(config, incoming.chat_id) and not _link_code(incoming.text):
-            logger.warning("Ignoring Telegram update from unauthorized chat_id=%s", incoming.chat_id)
+            logger.warning(
+                "Ignoring Telegram update from unauthorized chat_ref=%s",
+                _chat_log_ref(config, incoming.chat_id),
+            )
             return {"ok": True, "ignored": "unauthorized_chat"}
 
         # Acknowledge Telegram only after Restia has accepted and processed the

@@ -5,6 +5,7 @@
 import logging
 import os
 import re
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastapi import HTTPException, Request
@@ -177,10 +178,17 @@ def _locate_upload(
 ):
     """Find an upload by its filename ID via UploadHandler.resolve_upload."""
     if upload_handler is None:
-        from src.upload_handler import UploadHandler
+        from src.blob_store import resolve_blob_store_config
+        from src.upload_handler import UploadHandler, create_production_upload_handler
 
         base_dir = os.path.dirname(os.path.abspath(upload_dir))
-        upload_handler = UploadHandler(base_dir, upload_dir)
+        configured = resolve_blob_store_config(create=False).chat_root
+        if Path(upload_dir).resolve(strict=False) == configured:
+            upload_handler = create_production_upload_handler(base_dir)
+        else:
+            upload_handler = UploadHandler(
+                base_dir, upload_dir, legacy_compat=True,
+            )
     return _resolve_user_upload_path(upload_handler, file_id, owner, auth_manager)
 
 

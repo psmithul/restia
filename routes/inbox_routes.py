@@ -9,6 +9,11 @@ from pydantic import BaseModel, Field
 
 from core.database import SessionLocal
 from src.identity import request_account_transaction
+from src.life_ingestion import (
+    LifeIngestionError,
+    capture_ingestion_metadata,
+    normalize_capture_source_category,
+)
 from src.inbox_pagination import (
     InboxCursorError,
     decode_inbox_cursor,
@@ -35,7 +40,7 @@ class InboxCreate(BaseModel):
     title: str = Field(default="", max_length=240)
     content: str = Field(default="", max_length=100_000)
     kind: str | None = None
-    source_type: str = Field(default="user", max_length=48)
+    source_type: str = Field(default="text", max_length=48)
     source_ref: str | None = Field(default=None, max_length=500)
     metadata: dict[str, Any] = Field(default_factory=dict)
     idempotency_key: str | None = Field(default=None, max_length=128)
@@ -169,18 +174,25 @@ def setup_inbox_routes(
             with request_account_transaction(
                 db, request, required_scopes=("todos:write",), write=True
             ) as account:
+                source_type = normalize_capture_source_category(body.source_type)
                 item, created = create_inbox_item(
                     db,
                     account=account,
                     title=body.title,
                     content=body.content,
                     kind=body.kind,
-                    source_type=body.source_type,
+                    source_type=source_type,
                     source_ref=body.source_ref,
-                    metadata=body.metadata,
+                    metadata=capture_ingestion_metadata(
+                        source_type=source_type,
+                        metadata=body.metadata,
+                    ),
                     idempotency_key=body.idempotency_key,
                 )
                 return {"item": serialize_inbox_item(item), "created": created}
+        except LifeIngestionError as exc:
+            db.rollback()
+            raise HTTPException(400, str(exc)) from exc
         except LifeCoreError as exc:
             db.rollback()
             _raise_domain_error(exc)
@@ -227,6 +239,14 @@ def setup_inbox_routes(
             with request_account_transaction(
                 db, request, required_scopes=("todos:write",), write=True
             ) as account:
+                if "metadata" in kwargs:
+                    current = get_inbox_item(
+                        db, owner_id=account.id, item_id=item_id
+                    )
+                    kwargs["metadata"] = capture_ingestion_metadata(
+                        source_type=current.source_type,
+                        metadata=kwargs["metadata"],
+                    )
                 item = update_inbox_item(
                     db,
                     owner_id=account.id,

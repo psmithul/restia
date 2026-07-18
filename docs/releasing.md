@@ -19,8 +19,7 @@ Examples:
   `:3.2.1`.
 
 The historical `v2.0.0` and `v2.1.0` releases predate this policy. They remain
-unchanged as compatibility history; do not retag them or change the current
-`APP_VERSION = "2.1.0"` merely to rewrite that history.
+unchanged as compatibility history; do not retag them or rewrite that history.
 
 ## Preflight
 

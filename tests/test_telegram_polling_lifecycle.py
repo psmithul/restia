@@ -185,6 +185,95 @@ async def test_only_one_local_process_service_polls_and_standby_takes_over(
         await asyncio.gather(first_task, second_task, return_exceptions=True)
 
 
+@pytest.mark.asyncio
+async def test_database_lease_coordinates_two_hosts_and_standby_takes_over(
+    monkeypatch, tmp_path,
+):
+    import hashlib
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    import src.telegram_runtime as runtime
+    from core.database import Base
+    from src.telegram_delivery import TelegramRuntimeAuthority
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'shared-runtime.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, autoflush=False)
+    authority = TelegramRuntimeAuthority(factory)
+    fingerprint = hashlib.sha256(b"shared-bot").hexdigest()
+    first = runtime.TelegramPollingService(
+        process_lock_path=tmp_path / "host-a.lock",
+        runtime_authority=authority,
+        worker_id="host-a",
+    )
+    second = runtime.TelegramPollingService(
+        process_lock_path=tmp_path / "host-b.lock",
+        runtime_authority=authority,
+        worker_id="host-b",
+    )
+    first.configure(lambda _update: asyncio.sleep(0))
+    second.configure(lambda _update: asyncio.sleep(0))
+    first.OWNERSHIP_RETRY_SECONDS = 0.01
+    second.OWNERSHIP_RETRY_SECONDS = 0.01
+
+    monkeypatch.setattr(runtime, "load_settings", lambda: {})
+    monkeypatch.setattr(
+        runtime,
+        "load_telegram_config",
+        lambda: SimpleNamespace(
+            enabled=True,
+            bot_token="123456:abcdefghijklmnopqrstuvwxyz",
+            bot_fingerprint=fingerprint,
+        ),
+    )
+
+    calls: list[str] = []
+    hold_call = asyncio.Event()
+
+    async def blocking_api_call(*_args, **_kwargs):
+        task = asyncio.current_task()
+        calls.append(task.get_name() if task is not None else "unknown")
+        await hold_call.wait()
+        return {"ok": True, "result": []}
+
+    monkeypatch.setattr(runtime, "telegram_api_call", blocking_api_call)
+    first_task = first.start()
+    second_task = second.start()
+    try:
+        for _ in range(150):
+            statuses = (first.status(), second.status())
+            if len(calls) == 1 and sum(s["poller_standby"] for s in statuses) == 1:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("database lease did not select exactly one polling host")
+
+        assert sum(s["database_leased"] for s in statuses) == 1
+        owner, standby = (
+            (first, second)
+            if first.status()["database_leased"]
+            else (second, first)
+        )
+        await owner.stop()
+        for _ in range(150):
+            if standby.status()["database_leased"] and len(calls) == 2:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("database standby did not take over after lease release")
+        assert standby.status()["poller_standby"] is False
+    finally:
+        hold_call.set()
+        await first.stop()
+        await second.stop()
+        await asyncio.gather(first_task, second_task, return_exceptions=True)
+
+
 def test_process_lease_rejects_symlink_lock_path(tmp_path):
     import src.telegram_runtime as runtime
 

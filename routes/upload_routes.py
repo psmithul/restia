@@ -11,14 +11,29 @@ from typing import List, Optional
 import logging
 from core.middleware import require_admin
 from core.database import SessionLocal, GalleryImage, Session as DbSession
-from src.auth_helpers import effective_user
+from src.auth_helpers import effective_user, resolved_runtime_owner
 from src.constants import GENERATED_IMAGES_DIR
+from src.life_ingestion import LifeIngestionError, ingest_inbox_capture
 from src.upload_handler import count_recent_uploads
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/upload", tags=["upload"])
 UPLOAD_RESPONSE_HEADERS = {"X-Content-Type-Options": "nosniff"}
+
+
+def _upload_capture_source(meta: dict) -> str:
+    """Classify the capture surface, never the item's eventual destination."""
+
+    name = str(meta.get("name") or "").strip().lower()
+    mime = str(meta.get("mime") or "").strip().lower()
+    if mime.startswith("audio/"):
+        return "voice"
+    if mime.startswith("image/"):
+        if any(token in name for token in ("screenshot", "screen shot", "screen-shot", "capture")):
+            return "screenshot"
+        return "image"
+    return "file"
 
 def setup_upload_routes(upload_handler):
     """Setup upload routes with the provided handler"""
@@ -33,28 +48,77 @@ def setup_upload_routes(upload_handler):
         except Exception:
             return False
 
-    def _resolve_upload_path(file_id: str) -> str:
-        from src.constants import UPLOAD_DIR
-        upload_root = getattr(upload_handler, "upload_dir", UPLOAD_DIR)
-        direct = os.path.join(upload_root, file_id)
-        if os.path.lexists(direct):
-            if not _path_inside_upload_dir(direct):
-                raise HTTPException(403, "Access denied")
-            if os.path.isfile(direct):
-                return direct
-            raise HTTPException(404, "File not found")
+    def _request_upload(request: Request, file_id: str) -> tuple[dict, str]:
+        """Resolve bytes only through the canonical owner-scoped metadata row."""
 
-        for root, _dirs, files in os.walk(upload_root, followlinks=False):
-            if file_id not in files:
-                continue
-            path = os.path.join(root, file_id)
-            if not _path_inside_upload_dir(path):
-                raise HTTPException(403, "Access denied")
-            if os.path.isfile(path):
-                return path
+        app_state = getattr(getattr(request, "app", None), "state", None)
+        auth_mgr = getattr(app_state, "auth_manager", None)
+        auth_configured = bool(auth_mgr and auth_mgr.is_configured)
+        current_user = effective_user(request)
+        if auth_configured and not current_user:
+            raise HTTPException(403, "Access denied")
+        if (
+            not auth_configured
+            and not current_user
+            and not bool(getattr(upload_handler, "uses_sql_metadata", False))
+        ):
+            # The compatibility adapter preserves the old auth-disabled route:
+            # corrupt/missing JSON degrades to a confined filename lookup. SQL
+            # production never reaches this discovery path.
+            legacy = upload_handler.get_upload_info(file_id)
+            if isinstance(legacy, dict):
+                legacy_path = str(legacy.get("path") or "")
+                if legacy_path and not _path_inside_upload_dir(legacy_path):
+                    raise HTTPException(403, "Access denied")
+                if legacy_path and os.path.isfile(legacy_path):
+                    return legacy, legacy_path
+            for root, _dirs, files in os.walk(_upload_root(), followlinks=False):
+                if file_id not in files:
+                    continue
+                candidate = os.path.join(root, file_id)
+                if not _path_inside_upload_dir(candidate):
+                    raise HTTPException(403, "Access denied")
+                if os.path.isfile(candidate):
+                    return {
+                        "id": file_id,
+                        "path": candidate,
+                        "name": file_id,
+                        "mime": "application/octet-stream",
+                        "owner": None,
+                    }, candidate
             raise HTTPException(404, "File not found")
-
-        raise HTTPException(404, "File not found")
+        owner = (
+            str(current_user)
+            if current_user else resolved_runtime_owner(None)
+        )
+        info = upload_handler.resolve_upload(
+            file_id,
+            owner=owner,
+            auth_manager=auth_mgr,
+            allow_admin=True,
+        )
+        if not isinstance(info, dict):
+            # Explicit legacy adapter compatibility: retain the historical 403
+            # for an owned row whose path escapes the configured root, while
+            # keeping cross-owner rows indistinguishable from missing files.
+            if not bool(getattr(upload_handler, "uses_sql_metadata", False)):
+                legacy = upload_handler.get_upload_info(file_id)
+                is_admin = bool(
+                    auth_mgr and current_user and auth_mgr.is_admin(current_user)
+                )
+                same_owner = (
+                    isinstance(legacy, dict)
+                    and str(legacy.get("owner") or "").lower() == owner.lower()
+                )
+                if isinstance(legacy, dict) and (same_owner or is_admin):
+                    legacy_path = str(legacy.get("path") or "")
+                    if legacy_path and not _path_inside_upload_dir(legacy_path):
+                        raise HTTPException(403, "Access denied")
+            raise HTTPException(404, "File not found")
+        path = str(info.get("path") or "")
+        if not path or not _path_inside_upload_dir(path) or not os.path.isfile(path):
+            raise HTTPException(404, "File not found")
+        return info, path
 
     def _valid_session_id_for_owner(db, session_id: str | None, owner: str | None) -> str | None:
         if not session_id:
@@ -163,9 +227,52 @@ def setup_upload_routes(upload_handler):
         
         for u in files:
             try:
-                owner = effective_user(request)
+                current_user = effective_user(request)
+                app_state = getattr(getattr(request, "app", None), "state", None)
+                auth_mgr = getattr(app_state, "auth_manager", None)
+                if bool(auth_mgr and auth_mgr.is_configured) and not current_user:
+                    raise HTTPException(403, "Access denied")
+                owner = resolved_runtime_owner(current_user)
                 meta = upload_handler.save_upload(u, client_ip, owner=owner)
                 gallery_id = _promote_chat_image_to_gallery(meta, owner, session_id)
+                try:
+                    capture = ingest_inbox_capture(
+                        owner=owner,
+                        source_type=_upload_capture_source(meta),
+                        title=str(meta.get("name") or "Uploaded file")[:240],
+                        content=(
+                            f"Uploaded {meta.get('name') or 'file'} "
+                            f"({meta.get('mime') or 'application/octet-stream'}, "
+                            f"{int(meta.get('size') or 0)} bytes)"
+                        ),
+                        source_ref=f"upload:{meta.get('id')}",
+                        metadata={
+                            "upload": {
+                                "file_id": str(meta.get("id") or ""),
+                                "name": str(meta.get("name") or "")[:240],
+                                "mime": str(meta.get("mime") or "")[:200],
+                                "size": int(meta.get("size") or 0),
+                                "content_sha256": str(meta.get("hash") or ""),
+                                "gallery_id": gallery_id,
+                            }
+                        },
+                        idempotency_key=f"upload-capture:{meta.get('id')}",
+                        audit_interface="web",
+                    )
+                except LifeIngestionError as exc:
+                    # The blob/metadata save may already be durable.  Fail
+                    # loudly so the client retries; the stable upload id makes
+                    # that retry converge instead of silently losing Inbox
+                    # provenance.
+                    logger.error(
+                        "Upload %s stored but Universal Inbox ingestion failed",
+                        meta.get("id"),
+                        exc_info=True,
+                    )
+                    raise HTTPException(
+                        500,
+                        "Upload stored but Universal Inbox ingestion failed; retry safely",
+                    ) from exc
                 item = {
                     "id": meta["id"],
                     "name": meta["name"],
@@ -177,6 +284,9 @@ def setup_upload_routes(upload_handler):
                     "height": meta.get("height"),
                     "is_duplicate": meta.get("is_duplicate", False)
                 }
+                item["inbox_item_id"] = capture.inbox_id
+                item["capture_created"] = capture.created
+                item["capture_source_type"] = capture.source_type
                 if gallery_id:
                     item["gallery_id"] = gallery_id
                 out.append(item)
@@ -216,25 +326,8 @@ def setup_upload_routes(upload_handler):
         if not upload_handler.validate_upload_id(file_id):
             raise HTTPException(400, "Invalid file ID")
         import mimetypes as _mt
-        # Look up original filename and owner from uploads.json
-        original_name = file_id
-        # _load_upload_index() tolerates a missing/corrupt uploads.json (it falls
-        # back to the .bak sibling, then to {}), so a truncated DB degrades to
-        # "no metadata" instead of a 500 from an unhandled JSONDecodeError.
-        db = upload_handler._load_upload_index()
-        info = next((fi for fi in db.values() if fi.get("id") == file_id), None)
-        if info:
-            original_name = info.get("name", file_id)
-        auth_mgr = getattr(request.app.state, "auth_manager", None)
-        auth_configured = bool(auth_mgr and auth_mgr.is_configured)
-        current_user = effective_user(request)
-        file_owner = info.get("owner") if info else None
-        if auth_configured:
-            if not current_user:
-                raise HTTPException(403, "Access denied")
-            if file_owner != current_user and not auth_mgr.is_admin(current_user):
-                raise HTTPException(404, "File not found")
-        path = _resolve_upload_path(file_id)
+        info, path = _request_upload(request, file_id)
+        original_name = info.get("name", file_id)
         mime = (info or {}).get("mime") or _mt.guess_type(path)[0] or "application/octet-stream"
         from fastapi.responses import FileResponse
         # Downscaled thumbnail for image previews — generated once and cached.
@@ -267,13 +360,6 @@ def setup_upload_routes(upload_handler):
             filename=original_name,
             headers=UPLOAD_RESPONSE_HEADERS,
         )
-
-    def _load_upload_info(file_id: str):
-        """Look up the uploads.json record for a file_id, with owner/auth checks."""
-        # Corruption-tolerant load (see download_file): a bad uploads.json yields
-        # {} rather than raising JSONDecodeError out of the vision path.
-        db = upload_handler._load_upload_index()
-        return next((fi for fi in db.values() if fi.get("id") == file_id), None)
 
     def _vision_cache_path(file_id: str) -> str:
         cache_dir = os.path.join(_upload_root(), ".vision")
@@ -313,17 +399,9 @@ def setup_upload_routes(upload_handler):
         subsequent loads are instant. Pass force=1 to recompute."""
         if not upload_handler.validate_upload_id(file_id):
             raise HTTPException(400, "Invalid file ID")
-        info = _load_upload_info(file_id)
-        auth_mgr = getattr(request.app.state, "auth_manager", None)
-        auth_configured = bool(auth_mgr and auth_mgr.is_configured)
-        current_user = effective_user(request)
-        file_owner = info.get("owner") if info else None
-        if auth_configured:
-            if not current_user:
-                raise HTTPException(403, "Access denied")
-            if file_owner != current_user and not auth_mgr.is_admin(current_user):
-                raise HTTPException(404, "File not found")
-        path = _resolve_upload_path(file_id)
+        info, path = _request_upload(request, file_id)
+        current_user = effective_user(request) or resolved_runtime_owner(None)
+        file_owner = info.get("owner")
         import mimetypes as _mt
         mime = (info or {}).get("mime") or _mt.guess_type(path)[0] or ""
         if not mime.startswith("image/"):
@@ -357,19 +435,9 @@ def setup_upload_routes(upload_handler):
         the same cache file so the chat send picks it up as the override."""
         if not upload_handler.validate_upload_id(file_id):
             raise HTTPException(400, "Invalid file ID")
-        info = _load_upload_info(file_id)
-        if not info:
-            raise HTTPException(404, "File not found")
-        auth_mgr = getattr(request.app.state, "auth_manager", None)
-        auth_configured = bool(auth_mgr and auth_mgr.is_configured)
-        current_user = effective_user(request)
+        info, _path = _request_upload(request, file_id)
+        current_user = effective_user(request) or resolved_runtime_owner(None)
         file_owner = info.get("owner")
-        if auth_configured:
-            if not current_user:
-                raise HTTPException(403, "Access denied")
-            if file_owner != current_user and not auth_mgr.is_admin(current_user):
-                raise HTTPException(404, "File not found")
-        _resolve_upload_path(file_id)
         try:
             body = await request.json()
         except json.JSONDecodeError:

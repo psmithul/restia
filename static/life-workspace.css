@@ -1,4 +1,4 @@
-/* Restia V3 read-only Life workspace. */
+/* Restia V3 owner-scoped Life workspace. */
 
 body.life-view .chat-container {
   visibility: hidden;
@@ -179,6 +179,45 @@ body.hamburger-right .life-workspace {
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 4;
 }
+.life-decision-context {
+  min-width: 0;
+  margin-top: 13px;
+  padding: 11px 12px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--border) 88%, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--fg) 3%, transparent);
+}
+.life-decision-context.is-review-needed {
+  border-inline-start: 3px solid var(--accent, var(--red));
+}
+.life-decision-context h4 {
+  margin: 0 0 8px;
+  color: color-mix(in srgb, var(--fg) 74%, transparent);
+  font-size: 11px;
+  font-weight: 750;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+.life-decision-context dl { margin: 0; }
+.life-decision-row {
+  display: grid;
+  grid-template-columns: minmax(72px, .32fr) minmax(0, 1fr);
+  gap: 6px 10px;
+  padding-block: 4px;
+  font-size: 12px;
+  line-height: 1.4;
+}
+.life-decision-row dt {
+  color: color-mix(in srgb, var(--fg) 58%, transparent);
+  font-weight: 650;
+}
+.life-decision-row dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: color-mix(in srgb, var(--fg) 82%, transparent);
+}
 .life-entity-meta {
   flex-wrap: wrap;
   margin-top: 14px;
@@ -186,6 +225,17 @@ body.hamburger-right .life-workspace {
   font-size: 11px;
 }
 .life-entity-meta span:not(:last-child)::after { content: "·"; margin-left: 8px; }
+.life-entity-actions {
+  display: flex;
+  margin-top: 14px;
+  justify-content: flex-end;
+}
+.life-focus-button {
+  min-width: 88px;
+  color: var(--fg);
+  border-color: color-mix(in srgb, var(--accent, var(--red)) 56%, var(--border));
+  background: color-mix(in srgb, var(--accent, var(--red)) 10%, var(--panel));
+}
 
 @media (max-width: 768px) {
   .life-workspace,
@@ -207,6 +257,7 @@ body.hamburger-right .life-workspace {
   .life-subtitle { display: none; }
   .life-topbar-actions { gap: 5px; }
   .life-button { padding-inline: 11px; }
+  .life-decision-row { grid-template-columns: 1fr; gap: 1px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

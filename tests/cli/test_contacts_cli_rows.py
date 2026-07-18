@@ -1,5 +1,6 @@
 import sys
 import types
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from tests.helpers.cli_loader import load_script
@@ -22,3 +23,28 @@ def test_contact_rows_skips_invalid_rows(monkeypatch):
         "bad-row",
         None,
     ]) == [{"name": "Ada", "email": "ada@example.test"}]
+
+
+def test_search_matches_every_email_not_only_the_first(monkeypatch):
+    cli = _load_cli(monkeypatch)
+    rows = [
+        {
+            "name": "Ada Lovelace",
+            "emails": ["primary@example.test", "secondary@example.test"],
+        },
+        {
+            "name": "Grace Hopper",
+            "emails": ["grace@example.test"],
+        },
+    ]
+    emitted = []
+    monkeypatch.setattr(
+        cli,
+        "_with_owner",
+        lambda _args, _operation, **_kwargs: rows,
+    )
+    monkeypatch.setattr(cli, "emit", lambda value, _args: emitted.append(value))
+
+    cli.cmd_search(SimpleNamespace(query="secondary", pretty=False))
+
+    assert emitted == [rows[:1]]

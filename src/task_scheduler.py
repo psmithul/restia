@@ -288,17 +288,22 @@ def _digest_windows(now):
 def _checkin_calendar_events(db, owner, start, end):
     """Calendar events in [start, end] for ONE owner, for the check-in digest.
 
-    Ownership lives on CalendarCal.owner; events inherit it via calendar_id.
-    The digest query had no owner scope, so it pulled EVERY user's events into
-    one user's check-in (a cross-tenant leak of summaries/locations). Scope it
-    by joining CalendarCal, mirroring routes/calendar_routes.list_events.
+    Calendar ownership is the immutable Account.id. The owner argument remains
+    the scheduler's compatibility login alias and must resolve before any
+    private calendar rows are selected.
     """
     from core.database import CalendarEvent as _CE, CalendarCal as _CC
+    from src.identity import find_account
+
+    account = find_account(db, owner)
+    if account is None:
+        return []
     return (
         db.query(_CE)
         .join(_CC, _CE.calendar_id == _CC.id)
         .filter(
-            _CC.owner == owner,
+            _CC.owner_id == account.id,
+            _CE.owner_id == account.id,
             _CE.dtstart >= start,
             _CE.dtstart <= end,
             _CE.status != "cancelled",
@@ -358,8 +363,11 @@ class TaskScheduler:
         self._pending_notifications = []  # completed task notifications
         from pathlib import Path
         from src.constants import DATA_DIR
-        self._notification_outbox_path = Path(DATA_DIR) / "browser_notification_outbox.sqlite3"
-        self._reminder_claim_path = Path(DATA_DIR) / "reminder_delivery_claims.sqlite3"
+        # ``None`` selects the canonical Account.id-owned SQL authority. Tests
+        # and the one-time legacy importer can still supply explicit SQLite
+        # sidecar paths through the compatibility wrappers.
+        self._notification_outbox_path = None
+        self._reminder_claim_path = None
         # Non-destructive copy of recent notifications for the notification
         # command center (pop_notifications drains the pending queue for the
         # popup poller, so history must live separately).
@@ -373,6 +381,11 @@ class TaskScheduler:
         self._concurrency_cap = 1
         self._task_handles = {}
         self._scheduler_disabled_reason = None
+        self._leadership_enabled = False
+        self._leadership_task = None
+        self._leadership_token = None
+        self._leadership_authority = None
+        self._leadership_holder_id = None
 
     def _set_run_progress(self, run_id: str, message: str):
         """Persist short live progress text for Activity while a run is active."""
@@ -441,14 +454,13 @@ class TaskScheduler:
             "timestamp": _utcnow().isoformat() + "Z",
         }
         outbox_path = getattr(self, "_notification_outbox_path", None)
-        if outbox_path is not None:
-            from src.browser_notification_outbox import enqueue_browser_notification
-            item = enqueue_browser_notification(
-                outbox_path, normalized_owner, item, dedupe_key=dedupe_key,
-                reminder_claim=reminder_claim,
-            )
-            if item.get("_outbox_cancelled"):
-                return item
+        from src.browser_notification_outbox import enqueue_browser_notification
+        item = enqueue_browser_notification(
+            outbox_path, normalized_owner, item, dedupe_key=dedupe_key,
+            reminder_claim=reminder_claim,
+        )
+        if item.get("_outbox_cancelled"):
+            return item
         self._pending_notifications.append(item)
         # Cap at 50 to avoid unbounded growth
         if len(self._pending_notifications) > 50:
@@ -541,6 +553,96 @@ class TaskScheduler:
         return take
 
     async def start(self):
+        """Start locally, or join the shared-mode fenced leadership election."""
+
+        database_mode = str(
+            os.getenv("RESTIA_DATABASE_MODE")
+            or os.getenv("ODYSSEUS_DATABASE_MODE")
+            or "local-single"
+        ).strip().lower()
+        if database_mode != "shared":
+            return await self._start_leader_tasks()
+
+        if getattr(self, "_leadership_enabled", False):
+            return True
+        from core.database import SessionLocal
+        from src.distributed_leadership import (
+            RuntimeLeadershipAuthority,
+            new_runtime_holder_id,
+        )
+
+        self._leadership_enabled = True
+        self._leadership_authority = RuntimeLeadershipAuthority(SessionLocal)
+        self._leadership_holder_id = new_runtime_holder_id("task-scheduler")
+        token = self._leadership_authority.acquire(
+            lease_name="task-scheduler",
+            holder_id=self._leadership_holder_id,
+        )
+        if token is not None:
+            started = await self._start_leader_tasks()
+            if not started:
+                self._leadership_enabled = False
+                self._leadership_authority.release(token)
+                return False
+            self._leadership_token = token
+        else:
+            self._running = False
+            self._scheduler_disabled_reason = "leadership_standby"
+            logger.info("Task scheduler is a shared-mode leadership standby")
+        self._leadership_task = asyncio.create_task(
+            self._leadership_loop(), name="restia-task-scheduler-leadership"
+        )
+        return True
+
+    async def _leadership_loop(self):
+        """Renew leadership, stop on lease loss, and take over after expiry."""
+
+        while getattr(self, "_leadership_enabled", False):
+            await asyncio.sleep(10)
+            authority = self._leadership_authority
+            token = self._leadership_token
+            if authority is None:
+                logger.error("Task scheduler leadership authority disappeared")
+                return
+            if token is not None:
+                try:
+                    renewed = authority.renew(token)
+                except Exception:
+                    renewed = None
+                    logger.exception("Task scheduler leadership renewal failed")
+                if renewed is not None:
+                    self._leadership_token = renewed
+                    continue
+                logger.error(
+                    "Task scheduler lost its database-fenced leadership; "
+                    "cancelling in-flight background work"
+                )
+                self._leadership_token = None
+                await self._stop_leader_tasks(
+                    reason="Task scheduler leadership lease was lost"
+                )
+                self._scheduler_disabled_reason = "leadership_standby"
+                continue
+            try:
+                acquired = authority.acquire(
+                    lease_name="task-scheduler",
+                    holder_id=self._leadership_holder_id,
+                )
+            except Exception:
+                logger.exception("Task scheduler leadership acquisition failed")
+                continue
+            if acquired is None:
+                continue
+            started = await self._start_leader_tasks()
+            if started:
+                self._leadership_token = acquired
+                logger.info("Task scheduler acquired shared-mode leadership")
+            else:
+                authority.release(acquired)
+                self._leadership_enabled = False
+                return
+
+    async def _start_leader_tasks(self):
         # Scheduled jobs can call external systems. Never start those side
         # effects when SQLite cannot prove its own integrity: a corrupt task
         # ledger can otherwise leave ``next_run`` overdue after a successful
@@ -709,20 +811,51 @@ class TaskScheduler:
         return True
 
     async def stop(self):
+        """Stop the leadership watcher and every leader-owned task."""
+
+        self._leadership_enabled = False
+        leadership_task = getattr(self, "_leadership_task", None)
+        if leadership_task and leadership_task is not asyncio.current_task():
+            leadership_task.cancel()
+            try:
+                await leadership_task
+            except asyncio.CancelledError:
+                pass
+        self._leadership_task = None
+        await self._stop_leader_tasks(reason="Task scheduler stopped")
+        token = getattr(self, "_leadership_token", None)
+        authority = getattr(self, "_leadership_authority", None)
+        self._leadership_token = None
+        if token is not None and authority is not None:
+            try:
+                if not authority.release(token):
+                    logger.warning(
+                        "Task scheduler leadership release was fenced by a newer holder"
+                    )
+            except Exception:
+                logger.exception("Task scheduler leadership release failed")
+        logger.info("Task scheduler stopped")
+
+    async def _stop_leader_tasks(self, *, reason: str):
         self._running = False
+        try:
+            await self.stop_background_tasks_for_foreground(reason=reason)
+        except Exception:
+            logger.exception("Failed to cancel scheduler executions during stop")
         if self._task:
             self._task.cancel()
             try:
                 await self._task
             except asyncio.CancelledError:
                 pass
+            self._task = None
         for attr in ("_note_pings_task", "_event_pings_task"):
             t = getattr(self, attr, None)
             if t:
                 t.cancel()
                 try: await t
                 except asyncio.CancelledError: pass
-        logger.info("Task scheduler stopped")
+                setattr(self, attr, None)
 
     async def _note_pings_loop(self):
         """Built-in note-due scanner — ticks every 60s inside the scheduler.
@@ -2734,6 +2867,19 @@ class TaskScheduler:
                 CrewMember.is_default_assistant == True,  # noqa: E712
             ).first()
             if existing:
+                # V3 adds one read-only canonical Life graph query tool.  It is
+                # safe to backfill for the built-in assistant because it cannot
+                # mutate records or bypass reviewed domain actions.
+                try:
+                    enabled = json.loads(existing.enabled_tools or "[]")
+                except (TypeError, ValueError):
+                    enabled = None
+                if isinstance(enabled, list):
+                    enabled = [name for name in enabled if name != "manage_life"]
+                    if "query_life" not in enabled:
+                        enabled.append("query_life")
+                    existing.enabled_tools = json.dumps(enabled)
+                    db.commit()
                 return  # already seeded
 
             # Resolve a default model/endpoint from any existing session so the
@@ -2746,6 +2892,7 @@ class TaskScheduler:
 
                 "CORE RULE: You MUST use your tools to take action — do not describe what you would do. "
                 "Never say 'I would check your calendar' — actually call manage_calendar. "
+                "For cross-domain Life OS questions, actually call read-only query_life. "
                 "Never say 'I can look that up' — actually call web_search or search_chats. "
                 "If you have a tool for it, use it. No hypotheticals, no promises, only actions and results.\n\n"
 
@@ -2826,7 +2973,7 @@ class TaskScheduler:
                 endpoint_url=endpoint_url,
                 greeting=None,
                 enabled_tools=json.dumps([
-                    "manage_calendar", "manage_notes", "manage_tasks", "manage_memory",
+                    "manage_calendar", "manage_notes", "manage_tasks", "manage_memory", "query_life",
                     "list_email_accounts", "list_emails", "read_email", "send_email", "reply_to_email", "archive_email",
                     "mark_email_read", "delete_email", "resolve_contact",
                     "search_chats", "web_search", "web_fetch", "read_file",

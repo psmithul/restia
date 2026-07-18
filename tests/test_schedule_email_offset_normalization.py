@@ -8,10 +8,14 @@ late) and a "13:00:00-05:00" schedule (18:00 UTC) fired at 13:00 UTC (5h
 early).
 """
 
-import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from cryptography.fernet import Fernet
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from core.database import Account, Base, EmailAccount, EmailScheduledDelivery
 
 
 def _route_endpoint(router, path: str, method: str):
@@ -24,23 +28,41 @@ def _route_endpoint(router, path: str, method: str):
 
 @pytest.fixture
 def schedule(tmp_path, monkeypatch):
-    import routes.email_helpers as email_helpers
     import routes.email_routes as email_routes
+    import src.email_runtime_authority as email_runtime_authority
+    import src.secret_storage as secret_storage
 
-    db_path = tmp_path / "scheduled_emails.db"
-    monkeypatch.setattr(email_helpers, "SCHEDULED_DB", db_path)
-    monkeypatch.setattr(email_routes, "SCHEDULED_DB", db_path)
-    email_helpers._init_scheduled_db()
+    monkeypatch.setenv("RESTIA_ENCRYPTION_KEY", Fernet.generate_key().decode("ascii"))
+    monkeypatch.setattr(secret_storage, "_fernet", None)
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'email-authority.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    db = factory()
+    db.add(Account(id="owner-alice", username="alice"))
+    db.add(EmailAccount(
+        id="mail-alice", owner="alice", name="Alice Mail",
+        enabled=True, is_default=True,
+    ))
+    db.commit()
+    db.close()
+    monkeypatch.setattr(email_runtime_authority, "SessionLocal", factory)
+    monkeypatch.setattr(email_routes, "_start_poller", lambda: None)
     router = email_routes.setup_email_routes()
     endpoint = _route_endpoint(router, "/api/email/schedule", "POST")
 
     def _stored(sid):
-        row = sqlite3.connect(db_path).execute(
-            "SELECT send_at FROM scheduled_emails WHERE id = ?", (sid,)
-        ).fetchone()
-        return row[0]
+        query = factory()
+        try:
+            row = query.get(EmailScheduledDelivery, sid)
+            return row.scheduled_for.isoformat()
+        finally:
+            query.close()
 
-    return endpoint, _stored
+    yield endpoint, _stored
+    engine.dispose()
 
 
 @pytest.mark.asyncio

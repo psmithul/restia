@@ -663,7 +663,7 @@ async def do_app_api(content: str, owner: Optional[str] = None) -> Dict:
         if "/api/notes" in path:
             return {"error": "Don't hit /api/notes via app_api — use the `manage_notes` tool. It accepts natural-language due_date ('11pm today', 'tomorrow at 9am'), fires reminders from the due_date itself (no separate calendar event), and uses the caller's timezone. The raw endpoint requires ISO-UTC + a separate calendar event, both of which the agent tends to get wrong.", "exit_code": 1}
         if "/api/calendar/events" in path:
-            return {"error": "Don't hit /api/calendar/events via app_api — use the `manage_calendar` tool. It handles tz-aware natural-language datetimes and reminder_minutes correctly. If the user wants a note + reminder, prefer `manage_notes` with due_date — it bundles both.", "exit_code": 1}
+            return {"error": "Don't hit /api/calendar/events via app_api — use `manage_calendar` for owner-scoped events. For updates or cancellation proposals, pass the exact uid + version returned by list_events. cancel_event requires later human approval and delete_event stays manual-only. Calendar reminders are a separate explicit `manage_notes` action with due_date.", "exit_code": 1}
         return {"error": f"{method} {path} is blocked — it overwrites the whole cookbook state file. Use list_serve_presets / serve_preset / serve_model instead.", "exit_code": 1}
 
     body = args.get("body")

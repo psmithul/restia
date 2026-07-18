@@ -9,14 +9,13 @@ from urllib.parse import urljoin, urlparse, urlunparse
 import httpx
 from fastapi import HTTPException
 
-from core.atomic_io import atomic_write_json
-from core.platform_compat import safe_chmod
-from src.secret_storage import decrypt, encrypt, is_encrypted
-from src.constants import DATA_DIR, INTEGRATIONS_FILE, SETTINGS_FILE
+from src.integration_permissions import (
+    IntegrationPermissionError,
+    integration_request_allowed,
+    normalize_integration_permissions,
+)
 
 log = logging.getLogger(__name__)
-
-DATA_FILE = INTEGRATIONS_FILE
 
 # ---------------------------------------------------------------------------
 # Presets
@@ -155,43 +154,8 @@ INTEGRATION_PRESETS: Dict[str, Dict[str, Any]] = {
 }
 
 # ---------------------------------------------------------------------------
-# Storage
+# Canonical Account.id-owned SQL storage
 # ---------------------------------------------------------------------------
-
-
-def _ensure_data_dir() -> None:
-    os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
-
-
-def _encrypt_integration_secrets(integrations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Return storage-safe copies with API keys encrypted at rest."""
-    safe: List[Dict[str, Any]] = []
-    for item in integrations:
-        copy = dict(item)
-        api_key = copy.get("api_key", "")
-        if api_key:
-            copy["api_key"] = encrypt(str(api_key))
-        safe.append(copy)
-    return safe
-
-
-def _decrypt_integration_secrets(integrations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Return runtime copies with API keys decrypted for callers."""
-    decoded: List[Dict[str, Any]] = []
-    for item in integrations:
-        copy = dict(item)
-        api_key = copy.get("api_key", "")
-        if api_key:
-            copy["api_key"] = decrypt(str(api_key))
-        decoded.append(copy)
-    return decoded
-
-
-def _has_plaintext_api_key(integrations: List[Dict[str, Any]]) -> bool:
-    return any(
-        bool(item.get("api_key")) and not is_encrypted(str(item.get("api_key")))
-        for item in integrations
-    )
 
 
 def mask_integration_secret(integration: Dict[str, Any]) -> Dict[str, Any]:
@@ -226,44 +190,113 @@ def _join_integration_url(base_url: str, path: str) -> str:
     return urljoin(base + "/", rel)
 
 
-def load_integrations() -> List[Dict[str, Any]]:
-    """Load all integrations from disk with secrets decrypted for runtime use."""
-    if not os.path.exists(DATA_FILE):
-        return []
+def _configuration_account(db, owner: str | None, *, write: bool):
+    from src.identity import ensure_account, find_account
+    from src.settings import _runtime_owner
+
+    username = _runtime_owner(owner)
+    return ensure_account(db, username) if write else find_account(db, username)
+
+
+def load_integrations(owner: str | None = None) -> List[Dict[str, Any]]:
+    """Load decrypted runtime values from canonical encrypted SQL rows."""
+
+    from core.database import SessionLocal
+    from src.profile_configuration_adapters import profile_integrations
+
+    db = SessionLocal()
     try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            integrations = json.load(f)
-        if not isinstance(integrations, list):
-            log.error("Invalid integrations file shape: expected a list")
-            return []
-        valid_integrations = [item for item in integrations if isinstance(item, dict)]
-        if len(valid_integrations) != len(integrations):
-            log.error("Invalid integrations file rows: ignored non-object entries")
-        integrations = valid_integrations
-        if _has_plaintext_api_key(integrations):
-            save_integrations(_decrypt_integration_secrets(integrations))
-        return _decrypt_integration_secrets(integrations)
-    except (json.JSONDecodeError, IOError) as exc:
-        log.error("Failed to load integrations: %s", exc)
-        return []
+        account = _configuration_account(db, owner, write=False)
+        result = (
+            profile_integrations(db, owner_id=account.id)
+            if account is not None else []
+        )
+        db.rollback()
+        return result
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
-def save_integrations(integrations: List[Dict[str, Any]]) -> None:
-    """Persist integrations list to disk with API keys encrypted at rest."""
-    _ensure_data_dir()
-    atomic_write_json(DATA_FILE, _encrypt_integration_secrets(integrations), indent=2)
-    safe_chmod(DATA_FILE, 0o600)
+def save_integrations(
+    integrations: List[Dict[str, Any]], owner: str | None = None,
+) -> None:
+    """Replace one profile's integration set through versioned SQL rows."""
+
+    if not isinstance(integrations, list) or len(integrations) > 500:
+        raise ValueError("integrations must be a bounded list")
+    from core.database import SessionLocal
+    from src.profile_configuration_service import (
+        delete_configuration,
+        list_configurations,
+        put_configuration,
+        serialize_configuration,
+    )
+
+    db = SessionLocal()
+    try:
+        account = _configuration_account(db, owner, write=True)
+        rows, truncated = list_configurations(
+            db, owner_id=account.id, namespace="integration", limit=500,
+        )
+        if truncated:
+            raise RuntimeError("Canonical integration count exceeds the adapter limit")
+        existing = {row.key: row for row in rows}
+        seen: set[str] = set()
+        for item in integrations:
+            if not isinstance(item, dict):
+                raise ValueError("integration rows must be objects")
+            integration_id = str(item.get("id") or "").strip()
+            if not integration_id or integration_id in seen:
+                raise ValueError("integration ids must be non-empty and unique")
+            seen.add(integration_id)
+            current = existing.pop(integration_id, None)
+            if (
+                current is not None
+                and serialize_configuration(current)["value"] == item
+            ):
+                continue
+            put_configuration(
+                db,
+                account=account,
+                namespace="integration",
+                key=integration_id,
+                value=item,
+                expected_version=int(current.version) if current is not None else None,
+                source="domain_service",
+            )
+        for integration_id, current in existing.items():
+            delete_configuration(
+                db,
+                account=account,
+                namespace="integration",
+                key=integration_id,
+                expected_version=int(current.version),
+                source="domain_service",
+            )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
-def get_integration(integration_id: str) -> Optional[Dict[str, Any]]:
+def get_integration(
+    integration_id: str, owner: str | None = None,
+) -> Optional[Dict[str, Any]]:
     """Get a single integration by id."""
-    for item in load_integrations():
+    for item in load_integrations(owner=owner):
         if item.get("id") == integration_id:
             return item
     return None
 
 
-def add_integration(data: Dict[str, Any]) -> Dict[str, Any]:
+def add_integration(
+    data: Dict[str, Any], owner: str | None = None,
+) -> Dict[str, Any]:
     """Add a new integration. If 'preset' is given, merge preset defaults first."""
     integration: Dict[str, Any] = {}
 
@@ -282,6 +315,12 @@ def add_integration(data: Dict[str, Any]) -> Dict[str, Any]:
     integration.setdefault("api_key", "")
     integration.setdefault("name", "")
     integration.setdefault("base_url", "")
+    try:
+        integration["permissions"] = normalize_integration_permissions(
+            integration.get("permissions")
+        )
+    except IntegrationPermissionError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
     if not isinstance(integration.get("name"), str) or not integration["name"].strip():
         raise HTTPException(400, "Integration name is required")
@@ -290,13 +329,15 @@ def add_integration(data: Dict[str, Any]) -> Dict[str, Any]:
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
-    integrations = load_integrations()
+    integrations = load_integrations(owner=owner)
     integrations.append(integration)
-    save_integrations(integrations)
+    save_integrations(integrations, owner=owner)
     return integration
 
 
-def update_integration(integration_id: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def update_integration(
+    integration_id: str, data: Dict[str, Any], owner: str | None = None,
+) -> Optional[Dict[str, Any]]:
     """Update fields on an existing integration. Returns updated integration or None."""
     data = dict(data)
     if "name" in data and (not isinstance(data["name"], str) or not data["name"].strip()):
@@ -306,24 +347,31 @@ def update_integration(integration_id: str, data: Dict[str, Any]) -> Optional[Di
             data["base_url"] = _normalize_integration_base_url(data["base_url"])
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+    if "permissions" in data:
+        try:
+            data["permissions"] = normalize_integration_permissions(
+                data.get("permissions")
+            )
+        except IntegrationPermissionError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
-    integrations = load_integrations()
+    integrations = load_integrations(owner=owner)
     for item in integrations:
         if item.get("id") == integration_id:
             data.pop("id", None)  # prevent id change
             item.update(data)
-            save_integrations(integrations)
+            save_integrations(integrations, owner=owner)
             return item
     return None
 
 
-def delete_integration(integration_id: str) -> bool:
+def delete_integration(integration_id: str, owner: str | None = None) -> bool:
     """Delete an integration by id. Returns True if found and deleted."""
-    integrations = load_integrations()
+    integrations = load_integrations(owner=owner)
     original_len = len(integrations)
     integrations = [i for i in integrations if i.get("id") != integration_id]
     if len(integrations) < original_len:
-        save_integrations(integrations)
+        save_integrations(integrations, owner=owner)
         return True
     return False
 
@@ -339,9 +387,11 @@ def _strip_html_tags(html: str) -> str:
     return text
 
 
-def _find_integration(identifier: str) -> Optional[Dict[str, Any]]:
+def _find_integration(
+    identifier: str, owner: str | None = None,
+) -> Optional[Dict[str, Any]]:
     """Find integration by id or name (case-insensitive)."""
-    integrations = load_integrations()
+    integrations = load_integrations(owner=owner)
     # try id first
     for item in integrations:
         if item.get("id") == identifier:
@@ -361,15 +411,27 @@ async def execute_api_call(
     params: Optional[Dict[str, Any]] = None,
     body: Optional[Any] = None,
     extra_headers: Optional[Dict[str, str]] = None,
+    owner: str | None = None,
+    approved_external_action: bool = False,
 ) -> Dict[str, Any]:
     """Execute an HTTP request against a registered integration."""
 
-    integration = _find_integration(integration_id)
+    integration = _find_integration(integration_id, owner=owner)
     if not integration:
         return {"error": f"Integration not found: {integration_id}", "exit_code": 1}
 
     if not integration.get("enabled", True):
         return {"error": f"Integration '{integration.get('name')}' is disabled", "exit_code": 1}
+
+    try:
+        integration_request_allowed(
+            integration,
+            method=method,
+            path=path,
+            approved_external_action=approved_external_action,
+        )
+    except IntegrationPermissionError as exc:
+        return {"error": str(exc), "exit_code": 1}
 
     try:
         base_url = _normalize_integration_base_url(integration.get("base_url", ""))
@@ -567,12 +629,12 @@ async def execute_api_call(
 # System prompt helper
 # ---------------------------------------------------------------------------
 
-def get_integrations_prompt() -> str:
+def get_integrations_prompt(owner: str | None = None) -> str:
     """Return a string describing all enabled integrations for system prompt injection.
 
     Returns empty string if no integrations are enabled.
     """
-    integrations = load_integrations()
+    integrations = load_integrations(owner=owner)
     enabled = [i for i in integrations if i.get("enabled", True)]
     if not enabled:
         return ""
@@ -594,41 +656,6 @@ def get_integrations_prompt() -> str:
 # ---------------------------------------------------------------------------
 
 def migrate_from_settings() -> None:
-    """If data/settings.json has miniflux_url and miniflux_api_key, create a
-    Miniflux integration and clear those keys from settings."""
-    settings_path = SETTINGS_FILE
-    if not os.path.exists(settings_path):
-        return
+    """Compatibility no-op; startup adoption owns all legacy file reads."""
 
-    try:
-        with open(settings_path, "r", encoding="utf-8") as f:
-            settings = json.load(f)
-    except (json.JSONDecodeError, IOError):
-        return
-
-    miniflux_url = settings.get("miniflux_url", "")
-    miniflux_key = settings.get("miniflux_api_key", "")
-
-    if not miniflux_url or not miniflux_key:
-        return
-
-    # Check if a miniflux integration already exists
-    existing = load_integrations()
-    for item in existing:
-        if item.get("preset") == "miniflux":
-            log.info("Miniflux integration already exists, skipping migration")
-            return
-
-    add_integration({
-        "preset": "miniflux",
-        "base_url": miniflux_url.rstrip("/"),
-        "api_key": miniflux_key,
-    })
-
-    # Clear migrated keys
-    settings.pop("miniflux_url", None)
-    settings.pop("miniflux_api_key", None)
-    with open(settings_path, "w", encoding="utf-8") as f:
-        json.dump(settings, f, indent=2)
-
-    log.info("Migrated Miniflux integration from settings.json")
+    return None

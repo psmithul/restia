@@ -1,146 +1,173 @@
 #!/usr/bin/env python3
-"""odysseus-contacts — Unix-style CLI for the contacts feature.
+"""Owner-explicit CLI for Restia's database-backed contacts authority.
 
-Talks to the same CardDAV server the web UI does, using credentials
-from `data/settings.json` (set via the Settings → Connections panel).
-Output is JSON on stdout, errors on stderr, non-zero exit on failure.
-
-    odysseus-contacts list | jq -r '.[] | .name + "\\t" + .email'
-    odysseus-contacts search alice
-    odysseus-contacts add --name "Alice Doe" --email alice@example.com
-
-Subcommands:
-    list      List all contacts
-    search    Filter contacts by case-insensitive substring match
-    add       Add a new contact (name + email)
-    config    Show the current CardDAV config (URL/user; password masked)
+    odysseus-contacts --owner alice list
+    odysseus-contacts --owner alice search example.com
+    odysseus-contacts --owner alice add --name "Alice" --email alice@example.com
 """
 
-
 from __future__ import annotations
-import sys
-import os, sys
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "_lib"))
-from cli import quiet_logs, emit, fail, common_parser, run, REPO_ROOT as _REPO_ROOT
-quiet_logs()
-
 
 import argparse
-import json
-import logging
 import os
 import sys
-from pathlib import Path
 
-def quiet_logs() -> None:
-    level_name = os.environ.get("LOG_LEVEL", "WARNING").upper()
-    level = getattr(logging, level_name, logging.WARNING)
-    root = logging.getLogger()
-    root.setLevel(level)
-    for handler in root.handlers:
-        handler.setLevel(level)
-
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "_lib"))
+from cli import emit, fail, quiet_logs, run  # noqa: E402
 
 quiet_logs()
 
 try:
-    from routes.contacts_routes import (
-        _get_carddav_config,
-        _fetch_contacts,
-        _create_contact,
+    from core.database import SessionLocal
+    from src.audit_context import bind_service_audit_context
+    from src.contact_delivery import drain_contact_deliveries
+    from src.contact_legacy_import import (
+        ContactLegacyImportError,
+        adopt_legacy_contacts,
     )
+    from src.contact_service import (
+        create_contact,
+        get_contact_config,
+        list_contacts,
+    )
+    from src.database_runtime import initialize_database
+    from src.identity import find_account
     quiet_logs()
-except ModuleNotFoundError as e:
-    sys.stderr.write(f"error: {e}\nhint: run from repo root with venv active.\n")
-    sys.exit(2)
-
-
-def fail(msg: str, code: int = 1) -> None:
-    sys.stderr.write(f"error: {msg}\n")
-    sys.exit(code)
+except ModuleNotFoundError as exc:
+    fail(f"{exc}\nhint: run from the Restia checkout or installed package.", code=2)
 
 
 def _contact_rows(contacts):
-    return [c for c in contacts or [] if isinstance(c, dict)]
+    return [row for row in contacts or [] if isinstance(row, dict)]
 
 
-# ─── list ────────────────────────────────────────────────────────────
+def _with_owner(args, operation, *, write: bool = False):
+    _initialize()
+    owner = str(getattr(args, "owner", "") or "").strip().lower()
+    if not owner:
+        fail("--owner is required (or set RESTIA_OWNER)")
+    db = SessionLocal()
+    try:
+        account = find_account(db, owner)
+        if account is None:
+            fail("owner is not linked to a Restia account")
+        owner_id = account.id
+        db.rollback()
+        drain_contact_deliveries(SessionLocal, owner_id=owner_id, limit=1)
+        bind_service_audit_context(
+            db,
+            account_id=owner_id,
+            interface="cli",
+            actor_type="account",
+            credential_type="local_cli",
+        )
+        result = operation(db, owner_id)
+        db.commit()
+        if write:
+            drain_contact_deliveries(SessionLocal, owner_id=owner_id, limit=1)
+        return result
+    except SystemExit:
+        db.rollback()
+        raise
+    except Exception as exc:
+        db.rollback()
+        fail(f"contact operation failed: {type(exc).__name__}")
+    finally:
+        db.close()
+
 
 def cmd_list(args) -> None:
-    cfg = _get_carddav_config()
-    if not cfg["url"]:
-        fail("CardDAV not configured. Set carddav_url/username/password in the web UI.")
-    contacts = _contact_rows(_fetch_contacts(force=args.refresh))
-    emit(contacts, args)
+    rows = _contact_rows(_with_owner(
+        args,
+        lambda db, owner_id: list_contacts(
+            db,
+            owner_id=owner_id,
+            refresh=args.refresh,
+            create_local=False,
+        ),
+    ))
+    emit(rows, args)
 
-
-# ─── search ──────────────────────────────────────────────────────────
 
 def cmd_search(args) -> None:
-    cfg = _get_carddav_config()
-    if not cfg["url"]:
-        fail("CardDAV not configured.")
-    q = args.query.lower()
-    contacts = _contact_rows(_fetch_contacts())
+    needle = args.query.lower()
+    rows = _contact_rows(_with_owner(
+        args,
+        lambda db, owner_id: list_contacts(
+            db, owner_id=owner_id, refresh=False, create_local=False,
+        ),
+    ))
     matches = [
-        c for c in contacts
-        if q in (c.get("name") or "").lower() or q in (c.get("email") or "").lower()
+        row for row in rows
+        if needle in str(row.get("name") or "").lower()
+        or any(
+            needle in str(email or "").lower()
+            for email in row.get("emails") or []
+        )
     ]
     emit(matches, args)
 
 
-# ─── add ─────────────────────────────────────────────────────────────
-
 def cmd_add(args) -> None:
-    cfg = _get_carddav_config()
-    if not cfg["url"]:
-        fail("CardDAV not configured.")
-    ok = _create_contact(args.name, args.email)
-    if not ok:
-        fail("CardDAV PUT failed (see LOG_LEVEL=DEBUG for detail)")
-    emit({"ok": True, "name": args.name, "email": args.email}, args)
+    contact = _with_owner(
+        args,
+        lambda db, owner_id: create_contact(
+            db, owner_id=owner_id, name=args.name, email=args.email,
+        ),
+        write=True,
+    )
+    emit({"ok": True, "contact": contact}, args)
 
-
-# ─── config ──────────────────────────────────────────────────────────
 
 def cmd_config(args) -> None:
-    cfg = _get_carddav_config()
-    safe = dict(cfg)
-    if safe.get("password"):
-        safe["password"] = "***"
-    emit(safe, args)
+    emit(_with_owner(
+        args,
+        lambda db, owner_id: get_contact_config(db, owner_id=owner_id),
+    ), args)
 
-
-# ─── argparse ────────────────────────────────────────────────────────
 
 def _build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--pretty", action="store_true", help="Pretty-print JSON")
-
-    p = argparse.ArgumentParser(
+    common.add_argument(
+        "--owner",
+        default=os.environ.get("RESTIA_OWNER", ""),
+        help="Restia account username (or set RESTIA_OWNER)",
+    )
+    parser = argparse.ArgumentParser(
         prog="odysseus-contacts",
-        description="Shell-friendly wrapper around the Restia contacts (CardDAV) feature.",
+        description="Owner-scoped Restia contacts CLI.",
         parents=[common],
     )
-    sub = p.add_subparsers(dest="cmd", required=True)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    list_parser = sub.add_parser("list", parents=[common])
+    list_parser.add_argument("--refresh", action="store_true")
+    list_parser.set_defaults(func=cmd_list)
+    search_parser = sub.add_parser("search", parents=[common])
+    search_parser.add_argument("query")
+    search_parser.set_defaults(func=cmd_search)
+    add_parser = sub.add_parser("add", parents=[common])
+    add_parser.add_argument("--name", required=True)
+    add_parser.add_argument("--email", required=True)
+    add_parser.set_defaults(func=cmd_add)
+    config_parser = sub.add_parser("config", parents=[common])
+    config_parser.set_defaults(func=cmd_config)
+    return parser
 
-    pl = sub.add_parser("list", help="list all contacts", parents=[common])
-    pl.add_argument("--refresh", action="store_true", help="bypass cache and re-fetch")
-    pl.set_defaults(func=cmd_list)
 
-    ps = sub.add_parser("search", help="filter by name/email substring", parents=[common])
-    ps.add_argument("query")
-    ps.set_defaults(func=cmd_search)
+_initialized = False
 
-    pa = sub.add_parser("add", help="add a new contact", parents=[common])
-    pa.add_argument("--name", required=True)
-    pa.add_argument("--email", required=True)
-    pa.set_defaults(func=cmd_add)
 
-    pc = sub.add_parser("config", help="show CardDAV config (password masked)", parents=[common])
-    pc.set_defaults(func=cmd_config)
-
-    return p
+def _initialize() -> None:
+    global _initialized
+    if _initialized:
+        return
+    initialize_database()
+    try:
+        adopt_legacy_contacts()
+    except ContactLegacyImportError as exc:
+        fail(f"contacts database cutover is locked: {exc.code}", code=2)
+    _initialized = True
 
 
 if __name__ == "__main__":

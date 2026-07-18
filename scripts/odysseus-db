@@ -9,6 +9,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "_lib"))
 from cli import common_parser, emit, run  # noqa: E402
 from src.database_migrations import database_status, stamp_legacy_baseline
+from src.shared_database_gate import check_shared_database_gate
 
 
 def cmd_status(args) -> None:
@@ -17,6 +18,12 @@ def cmd_status(args) -> None:
 
 def cmd_stamp_legacy(args) -> None:
     emit(stamp_legacy_baseline().as_dict(), args)
+
+
+def cmd_shared_gate(args) -> None:
+    report = check_shared_database_gate(migration_smoke=bool(args.migration_smoke))
+    emit(report, args)
+    raise SystemExit(0 if report.get("passed") else 1)
 
 
 def _build_parser():
@@ -29,6 +36,17 @@ def _build_parser():
 
     stamp = sub.add_parser("stamp-legacy", parents=[common])
     stamp.set_defaults(func=cmd_stamp_legacy)
+
+    shared_gate = sub.add_parser("shared-gate", parents=[common])
+    shared_gate.add_argument(
+        "--migration-smoke",
+        action="store_true",
+        help=(
+            "create a random temporary PostgreSQL schema, run Alembic to head, "
+            "validate it, and drop it"
+        ),
+    )
+    shared_gate.set_defaults(func=cmd_shared_gate)
     return parser
 
 

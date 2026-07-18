@@ -1,26 +1,26 @@
-"""load_features() must degrade to defaults if features.json is unreadable.
+"""The pre-SQL cache reset convention remains safe during the cutover."""
 
-load_settings() already catches PermissionError, but load_features() did not, so
-an unreadable data/features.json (e.g. root-owned after a deploy) raised instead
-of falling back to DEFAULT_FEATURES, taking down GET /api/auth/features.
-"""
-import builtins
+import uuid
 
-import src.settings as settings
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+import core.database as database
+from core.database import Account, Base
+from src import settings
+from src.profile_configuration_models import ProfileConfiguration  # noqa: F401
 
 
-def test_load_features_degrades_on_permission_error(monkeypatch):
-    # Ensure the cache does not short-circuit the read.
-    monkeypatch.setattr(settings, "_features_cache", None, raising=False)
+def test_load_features_recovers_from_legacy_none_cache(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite:///{tmp_path / 'features-cache.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, autoflush=False)
+    db = factory()
+    db.add(Account(id=str(uuid.uuid4()), username="alice", status="active"))
+    db.commit()
+    db.close()
+    monkeypatch.setattr(database, "SessionLocal", factory)
+    monkeypatch.setattr(settings, "_features_cache", None)
 
-    real_open = builtins.open
-
-    def deny(path, *args, **kwargs):
-        if str(path) == str(settings.FEATURES_FILE):
-            raise PermissionError("denied")
-        return real_open(path, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "open", deny)
-
-    result = settings.load_features()
-    assert result == dict(settings.DEFAULT_FEATURES)
+    assert settings.load_features(owner="alice") == dict(settings.DEFAULT_FEATURES)
+    engine.dispose()

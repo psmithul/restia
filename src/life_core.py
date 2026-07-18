@@ -178,6 +178,7 @@ def append_action_audit(
     idempotency_ref: object | None = None,
     reversible: bool = False,
     undo_ref: object | None = None,
+    outcome: str = "success",
 ) -> ActionAudit:
     audit = ActionAudit(
         id=str(uuid.uuid4()),
@@ -191,6 +192,7 @@ def append_action_audit(
             db,
             owner_id=owner_id,
             reason=reason,
+            outcome=outcome,
             idempotency_ref=idempotency_ref,
             reversible=reversible,
             undo_ref=undo_ref,

@@ -4,7 +4,7 @@ import os
 
 from src.runtime_paths import get_app_root, get_default_data_dir
 
-APP_VERSION = "2.1.0"
+APP_VERSION = "3.0.0"
 
 # Validate the single internal version at import time. Public release tags use
 # scope precision (X.0.0 -> vX, X.Y.0 -> vX.Y, X.Y.Z -> vX.Y.Z); see
@@ -36,6 +36,15 @@ def _resolve_build_commit() -> str:
         return "unknown"
 
 BUILD_COMMIT = _resolve_build_commit()
+
+# Release images must not advertise rolling dev-branch commits as updates.
+# Docker bakes one of release/stable/dev; native checkouts default to source.
+_BUILD_CHANNELS = frozenset({"source", "dev", "stable", "release"})
+BUILD_CHANNEL = str(os.getenv("BUILD_CHANNEL") or "source").strip().lower()
+if BUILD_CHANNEL not in _BUILD_CHANNELS:
+    raise RuntimeError(
+        "BUILD_CHANNEL must be one of: dev, release, source, stable"
+    )
 
 # GitHub repo used for update checks. The /api/update-check endpoint compares
 # BUILD_COMMIT against the latest commit on the default branch of this repo.

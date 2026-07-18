@@ -1,11 +1,9 @@
-"""do_manage_calendar must honour abbreviated reminder phrasings like "mins"/"hrs".
+"""Calendar reminder requests must never become hidden Note side effects.
 
-`_reminder_minutes` parsed the reminder offset with regexes anchored on
-`(?:m|min|minute|minutes)\b` / `(?:h|hr|hour|hours)\b`. The trailing `\b`
-made the very common plural abbreviations "mins" and "hrs" fail to match
-(after "min" the next char "s" is a word char, so no boundary), so a request
-like ``reminder_minutes: "5 mins"`` silently produced no reminder at all —
-even though the sibling duration parser (no `\b`) already accepted them.
+Calendar action undo currently covers the event, Life projection, links, and
+connector outbox only. Until reminders have their own reviewed proposal and
+reversal path, ``manage_calendar`` fails loudly and directs the caller to an
+explicit ``manage_notes`` action.
 """
 
 import json
@@ -20,7 +18,7 @@ from tests.helpers.sqlite_db import make_temp_sqlite
 clear_fake_database_modules()
 
 import core.database as cdb
-from core.database import Note
+from core.database import Account, Note
 
 _TS, _ENGINE, _TMPDB = make_temp_sqlite(cdb.Base.metadata)
 
@@ -56,20 +54,18 @@ async def _create_with_reminder(reminder, owner):
     ("15 minutes", 15),   # regression: long form still works
     ("30m", 30),          # regression: bare unit still works
 ])
-async def test_reminder_minutes_accepts_abbreviations(reminder, expected):
+async def test_reminder_minutes_requires_separate_explicit_action(reminder, expected):
     owner = "tester-" + uuid.uuid4().hex[:6]
     res = await _create_with_reminder(reminder, owner)
-    assert res.get("exit_code") == 0, res
-    assert f"reminder {expected} min before" in res.get("response", ""), res
+    assert expected > 0  # Keep every historical accepted spelling in the matrix.
+    assert res.get("exit_code") == 1, res
+    assert res.get("reminder_requires_separate_action") is True
+    assert "manage_notes" in res.get("error", "")
 
     db = _TS()
     try:
-        note = (
-            db.query(Note)
-            .filter(Note.owner == owner, Note.title == "Reminder: Dentist")
-            .first()
-        )
-        assert note is not None, "reminder note should have been created"
+        assert db.query(Note).filter(Note.owner == owner).count() == 0
+        assert db.query(Account).filter(Account.username == owner).count() == 0
     finally:
         db.close()
 

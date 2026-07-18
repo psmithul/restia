@@ -27,7 +27,6 @@ from pathlib import Path, PurePosixPath
 
 from fastapi import HTTPException, UploadFile
 
-from src.constants import PROJECT_FILES_DIR
 from src.upload_limits import PROJECT_ATTACHMENT_MAX_BYTES, format_byte_limit, read_upload_limited
 
 
@@ -305,7 +304,11 @@ async def write_project_attachment_cancellation_safe(
 class ProjectFileStore:
     """Atomic durable file operations beneath one private storage root."""
 
-    def __init__(self, root: str | os.PathLike[str] = PROJECT_FILES_DIR):
+    def __init__(self, root: str | os.PathLike[str] | None = None):
+        if root is None:
+            from src.blob_store import resolve_blob_store_config
+
+            root = resolve_blob_store_config(create=True).project_root
         self.root = Path(root).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         try:

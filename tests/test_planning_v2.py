@@ -8,9 +8,11 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from core.database import (
+    Account,
     Base,
     CalendarCal,
     CalendarEvent,
+    LifeEntity,
     PlanningItem,
     ProgressionEvent,
 )
@@ -20,7 +22,8 @@ from src.auth_helpers import DEFAULT_LOCAL_OWNER, _local_owner_from_env
 
 
 @pytest.fixture()
-def planning_env():
+def planning_env(monkeypatch):
+    monkeypatch.setenv("AUTH_ENABLED", "false")
     engine = create_engine(
         "sqlite://",
         connect_args={"check_same_thread": False},
@@ -132,11 +135,21 @@ async def test_planning_schedule_links_one_owned_calendar_event(planning_env):
 
     db = factory()
     try:
-        assert db.query(CalendarCal).filter(CalendarCal.owner == "alice").count() == 1
+        account = db.query(Account).filter(Account.username == "alice").one()
+        assert db.query(CalendarCal).filter(
+            CalendarCal.owner_id == account.id
+        ).count() == 1
         assert db.query(CalendarEvent).count() == 1
         event = db.query(CalendarEvent).one()
+        assert event.owner_id == account.id
         assert event.summary == "Run controls experiment"
         assert event.is_utc is True
+        projection = db.query(LifeEntity).filter(
+            LifeEntity.owner_id == account.id,
+            LifeEntity.entity_type == "event",
+            LifeEntity.domain_ref_id == event.uid,
+        ).one()
+        assert projection.properties["event_version"] == event.version
     finally:
         db.close()
 

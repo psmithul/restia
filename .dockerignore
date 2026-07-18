@@ -20,6 +20,11 @@ secrets.env~
 .secrets.env.swo
 **/#secrets.env#
 !secrets.env.example
+/secrets/
+/.restia-update-state
+/.restia-update-state.json
+/.restia-update-state.tmp.*
+/.restia-update-state.json.tmp.*
 /data/
 /logs/
 .git/

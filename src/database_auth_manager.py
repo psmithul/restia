@@ -1602,6 +1602,85 @@ class DatabaseAuthManager:
                     revoked += 1
             return revoked
 
+    @staticmethod
+    def _session_time(value: datetime | None) -> str | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        else:
+            value = value.astimezone(timezone.utc)
+        return value.isoformat().replace("+00:00", "Z")
+
+    def list_user_sessions(
+        self,
+        username: str,
+        current_token: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List active device/session records without token digests."""
+
+        if self._auth_load_failed:
+            return []
+        current = self.resolve_session(current_token) if current_token else None
+        now = self._time()
+        with self._db() as db:
+            account = db.query(Account).filter(
+                Account.username == _normal_username(username),
+                Account.status == ACTIVE_ACCOUNT,
+            ).first()
+            if account is None:
+                return []
+            rows = db.query(AuthSession).filter(
+                AuthSession.account_id == account.id,
+                AuthSession.revoked_at.is_(None),
+                AuthSession.expires_at > now,
+                AuthSession.auth_epoch == account.auth_epoch,
+            ).order_by(
+                AuthSession.last_seen_at.desc(),
+                AuthSession.created_at.desc(),
+                AuthSession.id.desc(),
+            ).all()
+            current_id = (
+                current.credential_id
+                if current is not None and current.account_id == account.id
+                else None
+            )
+            return [{
+                "id": row.id,
+                "interface": row.interface,
+                "auth_method": row.auth_method,
+                "created_at": self._session_time(row.created_at),
+                "last_seen_at": self._session_time(row.last_seen_at),
+                "expires_at": self._session_time(row.expires_at),
+                "current": row.id == current_id,
+            } for row in rows]
+
+    def revoke_user_session(self, username: str, session_id: str) -> bool:
+        """Revoke one owner session; a foreign ID is indistinguishable from missing."""
+
+        if self._auth_load_failed:
+            return False
+        identifier = str(session_id or "").strip()
+        if not identifier or len(identifier) > 64:
+            return False
+        now = self._time()
+        with self._db(write=True) as db:
+            account = db.query(Account).filter(
+                Account.username == _normal_username(username),
+                Account.status == ACTIVE_ACCOUNT,
+            ).first()
+            if account is None:
+                return False
+            updated = db.query(AuthSession).filter(
+                AuthSession.id == identifier,
+                AuthSession.account_id == account.id,
+                AuthSession.revoked_at.is_(None),
+            ).update(
+                {AuthSession.revoked_at: now},
+                synchronize_session=False,
+            )
+            return updated == 1
+
     def resolve_api_token(self, token: str | None) -> DatabasePrincipal | None:
         if self._auth_load_failed:
             return None

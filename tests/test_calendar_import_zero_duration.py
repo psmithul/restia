@@ -13,6 +13,7 @@ from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
+from cryptography.fernet import Fernet
 
 pytest.importorskip("sqlalchemy")
 pytest.importorskip("icalendar")
@@ -26,15 +27,25 @@ import core.database as cdb  # noqa: E402
 import routes.calendar_routes as cr  # noqa: E402
 from core.database import CalendarCal, CalendarEvent  # noqa: E402
 from routes.calendar_routes import _ensure_positive_duration  # noqa: E402
+from src.identity import ensure_account  # noqa: E402
 
 _TS, _ENGINE, _TMPDB = make_temp_sqlite(cdb.Base.metadata)
+_ENCRYPTION_KEY = Fernet.generate_key().decode("ascii")
 
 
 @pytest.fixture(autouse=True)
 def _bind_temp_db(monkeypatch):
+    from src import secret_storage
+
+    monkeypatch.setenv("AUTH_ENABLED", "false")
+    monkeypatch.setenv("RESTIA_ENCRYPTION_KEY", _ENCRYPTION_KEY)
+    monkeypatch.setattr(secret_storage, "_fernet", None)
+    monkeypatch.setattr(secret_storage, "_digest_key", None)
     monkeypatch.setattr(cdb, "SessionLocal", _TS)
     monkeypatch.setattr(cr, "SessionLocal", _TS)
-    monkeypatch.setattr(cr, "require_user", lambda request: "tester")
+    with _TS() as db:
+        ensure_account(db, "tester")
+        db.commit()
     yield
 
 
@@ -91,7 +102,11 @@ def _endpoints():
 
 
 def _request():
-    return SimpleNamespace(state=SimpleNamespace(current_user="tester"))
+    return SimpleNamespace(
+        state=SimpleNamespace(current_user="tester"),
+        app=SimpleNamespace(state=SimpleNamespace(auth_manager=None)),
+        headers={},
+    )
 
 
 def test_single_day_all_day_event_with_same_date_end_appears_in_list():
@@ -129,10 +144,18 @@ def test_reimport_repairs_legacy_zero_duration_row():
     eps = _endpoints()
     db = cr.SessionLocal()
     try:
-        cal = CalendarCal(id="legacy-cal", owner="tester", name="C", source="import")
+        account = ensure_account(db, "tester")
+        cal = CalendarCal(
+            id="legacy-cal",
+            owner_id=account.id,
+            owner="tester",
+            name="C",
+            source="import",
+        )
         db.add(cal)
         db.add(CalendarEvent(
             uid="legacy-row",
+            owner_id=account.id,
             calendar_id="legacy-cal",
             summary="Public Holiday",
             dtstart=datetime(2026, 8, 1),

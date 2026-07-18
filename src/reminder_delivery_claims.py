@@ -77,7 +77,7 @@ def _connect(path: str | Path) -> sqlite3.Connection:
 
 
 def claim_reminder_delivery(
-    path: str | Path,
+    path: str | Path | None,
     *,
     owner: str,
     note_id: str,
@@ -93,6 +93,24 @@ def claim_reminder_delivery(
     deduplicated after acknowledgement.  Callers without an occurrence retain
     the legacy rolling 25-minute dedupe window.
     """
+
+    if path is None:
+        from src.notification_delivery_authority import claim_reminder
+
+        result = claim_reminder(
+            owner=owner,
+            note_id=note_id,
+            occurrence=occurrence,
+            channel=channel,
+            dedupe_seconds=dedupe_seconds,
+            lease_seconds=lease_seconds,
+            now=now,
+        )
+        return ReminderClaim(
+            acquired=result.acquired,
+            token=result.token,
+            reason=result.reason,
+        )
 
     current = (now or _utcnow()).astimezone(timezone.utc)
     normalized_owner = str(owner or "").strip().lower()
@@ -183,7 +201,7 @@ def claim_reminder_delivery(
 
 
 def acknowledge_reminder_delivery(
-    path: str | Path,
+    path: str | Path | None,
     *,
     owner: str,
     note_id: str,
@@ -193,6 +211,18 @@ def acknowledge_reminder_delivery(
     now: datetime | None = None,
 ) -> bool:
     """Mark a claimed delivery successful if the caller still owns it."""
+
+    if path is None:
+        from src.notification_delivery_authority import acknowledge_reminder
+
+        return acknowledge_reminder(
+            owner=owner,
+            note_id=note_id,
+            occurrence=occurrence,
+            channel=channel,
+            token=token,
+            now=now,
+        )
 
     if not note_id or not token:
         return False
@@ -236,7 +266,7 @@ def acknowledge_reminder_delivery(
 
 
 def reminder_claim_is_active(
-    path: str | Path,
+    path: str | Path | None,
     *,
     owner: str,
     note_id: str,
@@ -245,6 +275,17 @@ def reminder_claim_is_active(
     token: str,
 ) -> bool:
     """Revalidate claim ownership immediately before an irreversible send."""
+
+    if path is None:
+        from src.notification_delivery_authority import reminder_claim_active
+
+        return reminder_claim_active(
+            owner=owner,
+            note_id=note_id,
+            occurrence=occurrence,
+            channel=channel,
+            token=token,
+        )
 
     if not note_id or not token:
         return False
@@ -271,7 +312,7 @@ def reminder_claim_is_active(
 
 
 def await_browser_ack(
-    path: str | Path,
+    path: str | Path | None,
     *,
     owner: str,
     note_id: str,
@@ -280,6 +321,16 @@ def await_browser_ack(
     token: str,
 ) -> bool:
     """Keep a browser-primary claim pending until its outbox row is acked."""
+    if path is None:
+        from src.notification_delivery_authority import await_reminder_browser_ack
+
+        return await_reminder_browser_ack(
+            owner=owner,
+            note_id=note_id,
+            occurrence=occurrence,
+            channel=channel,
+            token=token,
+        )
     if not note_id or not token:
         return False
     conn = _connect(path)
@@ -306,7 +357,7 @@ def await_browser_ack(
 
 
 def fail_reminder_delivery(
-    path: str | Path,
+    path: str | Path | None,
     *,
     owner: str,
     note_id: str,
@@ -318,6 +369,20 @@ def fail_reminder_delivery(
     now: datetime | None = None,
 ) -> bool:
     """Release a claim into a durable retry-backoff state."""
+
+    if path is None:
+        from src.notification_delivery_authority import fail_reminder
+
+        return fail_reminder(
+            owner=owner,
+            note_id=note_id,
+            occurrence=occurrence,
+            channel=channel,
+            token=token,
+            error=error,
+            retry_seconds=retry_seconds,
+            now=now,
+        )
 
     if not note_id or not token:
         return False
@@ -348,13 +413,22 @@ def fail_reminder_delivery(
 
 
 def cancel_reminder_deliveries(
-    path: str | Path,
+    path: str | Path | None,
     *,
     owner: str,
     note_id: str,
     occurrence: str | None = None,
 ) -> int:
     """Cancel unfinished claims after a note is changed, archived, or deleted."""
+
+    if path is None:
+        from src.notification_delivery_authority import cancel_reminders
+
+        return cancel_reminders(
+            owner=owner,
+            note_id=note_id,
+            occurrence=occurrence,
+        )
 
     normalized_owner = str(owner or "").strip().lower()
     normalized_note = str(note_id or "").strip()
@@ -407,13 +481,22 @@ def cancel_reminder_deliveries(
 
 
 def rearm_reminder_deliveries(
-    path: str | Path,
+    path: str | Path | None,
     *,
     owner: str,
     note_id: str,
     occurrence: str | None = None,
 ) -> int:
     """Clear unfinished delivery state for an intentionally restored reminder."""
+
+    if path is None:
+        from src.notification_delivery_authority import rearm_reminders
+
+        return rearm_reminders(
+            owner=owner,
+            note_id=note_id,
+            occurrence=occurrence,
+        )
 
     normalized_owner = str(owner or "").strip().lower()
     normalized_note = str(note_id or "").strip()

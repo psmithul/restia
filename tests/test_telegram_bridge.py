@@ -75,29 +75,39 @@ def test_per_user_chat_ownership_is_scoped():
     assert telegram_chat_ids_for_owner(config, "admin") == ["111"]
 
 
-def test_one_time_link_code_claims_chat_without_storing_plain_code(monkeypatch):
-    state = {
-        "telegram_allowed_chat_ids": [],
-        "telegram_session_map": {},
-        "telegram_chat_owners": {},
-        "telegram_link_codes": {},
-    }
+def test_one_time_link_code_uses_canonical_sql_authority(monkeypatch):
+    import src.telegram_bot as telegram
+    import src.telegram_identity as authority
 
-    monkeypatch.setattr("src.telegram_bot.load_settings", lambda: dict(state))
+    bot_fingerprint = "a" * 64
+    monkeypatch.setattr(
+        telegram,
+        "load_telegram_config",
+        lambda: _config(bot_fingerprint=bot_fingerprint),
+    )
+    issued = []
+    consumed = []
 
-    def save(updated):
-        state.clear()
-        state.update(updated)
+    def create(owner, fingerprint, *, ttl_seconds):
+        issued.append((owner, fingerprint, ttl_seconds))
+        return "PRIVATE1", 123456
 
-    monkeypatch.setattr("src.telegram_bot.save_settings", save)
+    def consume(code, chat_id, fingerprint):
+        consumed.append((code, chat_id, fingerprint))
+        return "alice" if len(consumed) == 1 else None
+
+    monkeypatch.setattr(authority, "create_link_code_for_owner", create)
+    monkeypatch.setattr(authority, "consume_link_code_for_chat", consume)
 
     code, expires_at = create_telegram_link_code("Alice", ttl_seconds=600)
-    assert expires_at > 0
-    assert code not in str(state["telegram_link_codes"])
+    assert (code, expires_at) == ("PRIVATE1", 123456)
+    assert issued == [("Alice", bot_fingerprint, 600)]
     assert consume_telegram_link_code(code, "987") == "alice"
-    assert state["telegram_chat_owners"] == {"987": "alice"}
-    assert state["telegram_allowed_chat_ids"] == ["987"]
     assert consume_telegram_link_code(code, "987") is None
+    assert consumed == [
+        ("PRIVATE1", "987", bot_fingerprint),
+        ("PRIVATE1", "987", bot_fingerprint),
+    ]
 
 
 def test_telegram_html_formatter_escapes_before_adding_tags():
@@ -344,6 +354,14 @@ async def test_telegram_webhook_processes_authorized_message_before_ack(monkeypa
         processed.append(args[-1].chat_id)
 
     monkeypatch.setattr("routes.telegram_routes._process_message", process)
+    monkeypatch.setattr(
+        "routes.telegram_routes._ingest_telegram_incoming",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "routes.telegram_routes._telegram_owner_account_id",
+        lambda *args: "account-alice",
+    )
     endpoint = _webhook_endpoint(monkeypatch, _config())
     tasks = BackgroundTasks()
 

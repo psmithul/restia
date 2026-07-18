@@ -154,6 +154,11 @@ def _events_upcoming(owner: str) -> list[dict]:
     broad_end = max(local_end, utc_end) + timedelta(days=1)
     db = SessionLocal()
     try:
+        from src.identity import find_account
+
+        account = find_account(db, owner) if owner else None
+        if account is None:
+            return []
         q = (
             db.query(CalendarEvent)
             .join(CalendarCal, CalendarEvent.calendar_id == CalendarCal.id)
@@ -166,10 +171,10 @@ def _events_upcoming(owner: str) -> list[dict]:
                     ),
                 ),
                 CalendarEvent.status != "cancelled",
+                CalendarEvent.owner_id == account.id,
+                CalendarCal.owner_id == account.id,
             )
         )
-        if owner:
-            q = q.filter(CalendarCal.owner == owner)
         out = []
         for ev in q.order_by(CalendarEvent.dtstart.desc()).limit(2500).all():
             range_start, range_end = (

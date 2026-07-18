@@ -63,6 +63,7 @@ async def test_update_event_dtstart_anchored_to_user_tz(tokyo_offset):
     updated = await do_manage_calendar(json.dumps({
         "action": "update_event",
         "uid": uid,
+        "version": created["version"],
         "dtstart": naive,
     }), owner=owner)
     assert updated.get("exit_code", 0) == 0, updated

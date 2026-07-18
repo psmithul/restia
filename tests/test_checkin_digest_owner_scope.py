@@ -16,6 +16,7 @@ from sqlalchemy.pool import NullPool
 
 import core.database as cdb
 from core.database import CalendarEvent, CalendarCal
+from src.identity import ensure_account
 from src.task_scheduler import _checkin_calendar_events
 
 _TMPDB = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
@@ -28,12 +29,14 @@ def _seed():
     db = _TS()
     try:
         db.query(CalendarEvent).delete(); db.query(CalendarCal).delete()
-        db.add(CalendarCal(id="calA", owner="alice", name="A"))
-        db.add(CalendarCal(id="calB", owner="bob", name="B"))
-        db.add(CalendarEvent(uid="a1", calendar_id="calA", summary="Alice mtg",
+        alice = ensure_account(db, "alice")
+        bob = ensure_account(db, "bob")
+        db.add(CalendarCal(id="calA", owner_id=alice.id, owner="alice", name="A"))
+        db.add(CalendarCal(id="calB", owner_id=bob.id, owner="bob", name="B"))
+        db.add(CalendarEvent(uid="a1", owner_id=alice.id, calendar_id="calA", summary="Alice mtg",
                              dtstart=datetime(2026, 6, 10, 9, 0),
                              dtend=datetime(2026, 6, 10, 10, 0), status="confirmed"))
-        db.add(CalendarEvent(uid="b1", calendar_id="calB", summary="Bob secret",
+        db.add(CalendarEvent(uid="b1", owner_id=bob.id, calendar_id="calB", summary="Bob secret",
                              dtstart=datetime(2026, 6, 10, 10, 0),
                              dtend=datetime(2026, 6, 10, 11, 0), status="confirmed"))
         db.commit()
@@ -59,7 +62,8 @@ def test_cancelled_excluded_and_window_respected():
     db = _TS()
     try:
         db2 = _TS()
-        db2.add(CalendarEvent(uid="a2", calendar_id="calA", summary="cancelled",
+        alice = ensure_account(db2, "alice")
+        db2.add(CalendarEvent(uid="a2", owner_id=alice.id, calendar_id="calA", summary="cancelled",
                               dtstart=datetime(2026, 6, 11),
                               dtend=datetime(2026, 6, 11, 1, 0), status="cancelled"))
         db2.commit(); db2.close()

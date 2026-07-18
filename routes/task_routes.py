@@ -660,30 +660,45 @@ def setup_task_routes(task_scheduler) -> APIRouter:
             "summarize_emails": ("email_summaries",),
             "draft_email_replies": ("email_ai_replies",),
             "email_auto_translate": ("email_translations",),
-            "extract_email_events": ("email_calendar_extractions",),
+            # Calendar/idempotency results are canonical SQL rows. The old
+            # sidecar table is a read-only import source and must never be
+            # cleared in place.
+            "extract_email_events": (),
             "learn_sender_signatures": ("sender_signatures",),
-            "check_email_urgency": ("email_tags", "email_urgency_alerts"),
+            # Urgency's JSON classifier cache is cleared below; canonical tag
+            # and automation rows are cleared through the SQL authority.
+            "check_email_urgency": (),
         }
-        tables = cache_tables.get(action)
-        if not tables:
+        if action not in cache_tables:
             raise HTTPException(400, "This task has no clearable cache")
+        tables = cache_tables[action]
 
         import sqlite3
         from pathlib import Path
         from routes.email_helpers import SCHEDULED_DB, OWNER_SCOPED_EMAIL_CACHE_TABLES, _email_cache_owner_clause
+        from src.email_runtime_authority import clear_email_runtime_results
+
+        authority_ops = {
+            "summarize_emails": ("summary",),
+            "draft_email_replies": ("reply",),
+            "extract_email_events": ("calendar",),
+            "check_email_urgency": ("classify",),
+        }.get(action, ())
+        authority_cleared = (
+            clear_email_runtime_results(
+                owner=user, operations=authority_ops,
+                clear_tags=(action == "check_email_urgency"),
+            )
+            if user and (authority_ops or action == "check_email_urgency")
+            else {"tags": 0, "automation": 0}
+        )
 
         cleared = {}
         conn = sqlite3.connect(SCHEDULED_DB)
         try:
             for table in tables:
                 try:
-                    if table == "email_tags" and user:
-                        before = conn.execute(
-                            "SELECT COUNT(*) FROM email_tags WHERE owner = ? OR owner = ''",
-                            (user,),
-                        ).fetchone()[0]
-                        conn.execute("DELETE FROM email_tags WHERE owner = ? OR owner = ''", (user,))
-                    elif table in OWNER_SCOPED_EMAIL_CACHE_TABLES and user:
+                    if table in OWNER_SCOPED_EMAIL_CACHE_TABLES and user:
                         owner_clause, owner_params = _email_cache_owner_clause(user)
                         before = conn.execute(
                             f"SELECT COUNT(*) FROM {table} WHERE {owner_clause}",
@@ -736,7 +751,10 @@ def setup_task_routes(task_scheduler) -> APIRouter:
                 except Exception:
                     pass
 
-        return {"ok": True, "action": action, "cleared": cleared, "files": removed_files}
+        return {
+            "ok": True, "action": action, "cleared": cleared,
+            "authority_cleared": authority_cleared, "files": removed_files,
+        }
 
     @router.get("/{task_id}")
     async def get_task(request: Request, task_id: str):

@@ -9,21 +9,18 @@ from src.auth_helpers import resolved_runtime_owner
 from src.constants import DATA_DIR
 
 
-def _paths(scheduler: Any = None) -> tuple[Path, Path]:
-    outbox = Path(
-        getattr(
-            scheduler,
-            "_notification_outbox_path",
-            Path(DATA_DIR) / "browser_notification_outbox.sqlite3",
-        )
-    )
-    claims = Path(
-        getattr(
-            scheduler,
-            "_reminder_claim_path",
-            Path(DATA_DIR) / "reminder_delivery_claims.sqlite3",
-        )
-    )
+def _paths(scheduler: Any = None) -> tuple[Path | None, Path | None]:
+    # An initialized scheduler deliberately sets both values to ``None`` to
+    # select the canonical SQL authority.  The explicit paths remain only for
+    # isolated legacy-compatibility tests and the bounded migration importer.
+    if scheduler is not None:
+        outbox_value = getattr(scheduler, "_notification_outbox_path", None)
+        claims_value = getattr(scheduler, "_reminder_claim_path", None)
+        outbox = Path(outbox_value) if outbox_value is not None else None
+        claims = Path(claims_value) if claims_value is not None else None
+        return outbox, claims
+    outbox = Path(DATA_DIR) / "browser_notification_outbox.sqlite3"
+    claims = Path(DATA_DIR) / "reminder_delivery_claims.sqlite3"
     return outbox, claims
 
 

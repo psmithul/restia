@@ -23,6 +23,8 @@ from src.identity import ensure_account
 
 _PEER = ("203.0.113.52", 54321)
 _NOW = datetime(2026, 7, 15, 6, 30, tzinfo=timezone.utc)
+_ALICE_ACCOUNT_ID = "00000000-0000-0000-0000-0000000000a1"
+_BOB_ACCOUNT_ID = "00000000-0000-0000-0000-0000000000b0"
 
 
 class _Identity:
@@ -112,15 +114,26 @@ def mission_env(monkeypatch, tmp_path):
     engine.dispose()
 
 
+def _seed_calendar_accounts(db) -> None:
+    if db.query(cdb.Account).filter(cdb.Account.id == _ALICE_ACCOUNT_ID).first() is None:
+        db.add(cdb.Account(id=_ALICE_ACCOUNT_ID, username="alice"))
+    if db.query(cdb.Account).filter(cdb.Account.id == _BOB_ACCOUNT_ID).first() is None:
+        db.add(cdb.Account(id=_BOB_ACCOUNT_ID, username="bob"))
+    db.flush()
+
+
 def _seed_snapshot(factory, data_dir: Path) -> None:
     now = _NOW.replace(tzinfo=None)
     db = factory()
     try:
+        _seed_calendar_accounts(db)
         alice_cal = cdb.CalendarCal(
-            id="cal-alice", owner="alice", name="Alice calendar", color="#123456"
+            id="cal-alice", owner_id=_ALICE_ACCOUNT_ID, owner="alice",
+            name="Alice calendar", color="#123456"
         )
         bob_cal = cdb.CalendarCal(
-            id="cal-bob", owner="bob", name="Bob calendar", color="#654321"
+            id="cal-bob", owner_id=_BOB_ACCOUNT_ID, owner="bob",
+            name="Bob calendar", color="#654321"
         )
         db.add_all([alice_cal, bob_cal])
         db.add_all([
@@ -548,13 +561,17 @@ async def test_today_snapshot_is_owner_scoped_deterministic_and_redacted(mission
         "daily_brief": 1,
         "progression": 0,
         "next_actions": 3,
+        "proactive_interruptions": 0,
+        "proactive_digest": 0,
+        "recent_changes": 6,
         "health": "degraded",
     }
 
     sources = body["sources"]
     assert set(sources) == {
         "calendar", "project_work", "planning", "inbox", "goals", "tasks", "study_reviews",
-        "important_mail", "notes_today", "daily_brief", "progression", "health"
+        "important_mail", "notes_today", "daily_brief", "progression",
+        "proactive", "recent_activity", "health"
     }
     assert {row["id"] for row in sources["calendar"]["items"]} == {
         "event-local", "event-utc-boundary"
@@ -855,6 +872,7 @@ async def test_today_inbox_empty_state_is_read_only(mission_env):
 async def test_today_inbox_is_owner_scoped_and_omits_encrypted_content(mission_env):
     app, factory, _data_dir = mission_env
     db = factory()
+    _seed_calendar_accounts(db)
     try:
         alice = ensure_account(db, "alice")
         bob = ensure_account(db, "bob")
@@ -935,6 +953,7 @@ async def test_today_inbox_is_owner_scoped_and_omits_encrypted_content(mission_e
 async def test_today_inbox_preview_and_kind_breakdown_are_bounded(mission_env):
     app, factory, _data_dir = mission_env
     db = factory()
+    _seed_calendar_accounts(db)
     try:
         alice = ensure_account(db, "alice")
         for index in range(7):
@@ -978,7 +997,10 @@ async def test_today_inbox_preview_and_kind_breakdown_are_bounded(mission_env):
 async def test_today_snapshot_bounds_calendar_items(mission_env):
     app, factory, _data_dir = mission_env
     db = factory()
-    calendar = cdb.CalendarCal(id="many-cal", owner="alice", name="Many")
+    _seed_calendar_accounts(db)
+    calendar = cdb.CalendarCal(
+        id="many-cal", owner_id=_ALICE_ACCOUNT_ID, owner="alice", name="Many"
+    )
     db.add(calendar)
     db.add_all([
         cdb.CalendarEvent(
@@ -1012,7 +1034,11 @@ async def test_today_snapshot_bounds_calendar_items(mission_env):
 async def test_recurring_calendar_scan_does_not_let_expired_history_hide_today(mission_env):
     app, factory, _data_dir = mission_env
     db = factory()
-    calendar = cdb.CalendarCal(id="recurring-cal", owner="alice", name="Recurring")
+    _seed_calendar_accounts(db)
+    calendar = cdb.CalendarCal(
+        id="recurring-cal", owner_id=_ALICE_ACCOUNT_ID,
+        owner="alice", name="Recurring",
+    )
     db.add(calendar)
     db.add_all([
         cdb.CalendarEvent(
@@ -1055,7 +1081,10 @@ async def test_recurring_calendar_expansion_is_bounded_per_series(
 ):
     app, factory, _data_dir = mission_env
     db = factory()
-    calendar = cdb.CalendarCal(id="dense-cal", owner="alice", name="Dense")
+    _seed_calendar_accounts(db)
+    calendar = cdb.CalendarCal(
+        id="dense-cal", owner_id=_ALICE_ACCOUNT_ID, owner="alice", name="Dense"
+    )
     db.add(calendar)
     db.add(cdb.CalendarEvent(
         uid="dense-series",
@@ -1093,7 +1122,10 @@ async def test_recurring_calendar_expansion_is_bounded_per_series(
 
 
 def test_rrule_work_limit_counts_excluded_occurrences_and_reports_truncation():
-    calendar = cdb.CalendarCal(id="excluded-cal", owner="alice", name="Excluded")
+    calendar = cdb.CalendarCal(
+        id="excluded-cal", owner_id=_ALICE_ACCOUNT_ID,
+        owner="alice", name="Excluded",
+    )
     event = cdb.CalendarEvent(
         uid="excluded-series",
         calendar=calendar,
@@ -1121,7 +1153,10 @@ def test_rrule_work_limit_counts_excluded_occurrences_and_reports_truncation():
 
 
 def test_old_dense_rrule_is_rebased_before_dateutil_seeks(monkeypatch):
-    calendar = cdb.CalendarCal(id="old-dense-cal", owner="alice", name="Old dense")
+    calendar = cdb.CalendarCal(
+        id="old-dense-cal", owner_id=_ALICE_ACCOUNT_ID,
+        owner="alice", name="Old dense",
+    )
     event = cdb.CalendarEvent(
         uid="old-dense-series",
         calendar=calendar,
@@ -1153,7 +1188,10 @@ def test_old_dense_rrule_is_rebased_before_dateutil_seeks(monkeypatch):
 
 
 def test_old_large_count_rrule_fails_bounded_before_dateutil(monkeypatch):
-    calendar = cdb.CalendarCal(id="finite-cal", owner="alice", name="Finite")
+    calendar = cdb.CalendarCal(
+        id="finite-cal", owner_id=_ALICE_ACCOUNT_ID,
+        owner="alice", name="Finite",
+    )
     event = cdb.CalendarEvent(
         uid="finite-dense-series",
         calendar=calendar,
@@ -1404,6 +1442,7 @@ async def test_auth_disabled_single_profile_matches_each_source_owner_convention
     local_account = ensure_account(db, "alice")
     calendar = cdb.CalendarCal(
         id="local-calendar",
+        owner_id=local_account.id,
         owner=mission.CALENDAR_FALLBACK_OWNER,
         name="Local calendar",
     )
@@ -1544,6 +1583,9 @@ async def test_auth_disabled_single_profile_matches_each_source_owner_convention
         "daily_brief": 1,
         "progression": 0,
         "next_actions": 3,
+        "proactive_interruptions": 0,
+        "proactive_digest": 0,
+        "recent_changes": 1,
         "health": "degraded",
     }
     assert response.json()["sources"]["inbox"]["items"] == [{

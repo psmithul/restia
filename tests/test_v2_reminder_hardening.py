@@ -143,6 +143,7 @@ def test_legacy_telegram_allowlist_migrates_to_one_owner_only(monkeypatch):
 async def test_inbound_reply_is_built_once_and_retried_from_ledger(monkeypatch, tmp_path):
     import routes.telegram_routes as routes
     import src.constants as constants
+    from core.database import Account, SessionLocal
     from src.telegram_bot import TelegramConfig
     from src.telegram_inbound_ledger import TelegramReplyPending
 
@@ -152,8 +153,18 @@ async def test_inbound_reply_is_built_once_and_retried_from_ledger(monkeypatch, 
         allowed_chat_ids=frozenset({"111"}), allow_all_chats=False,
         owner="alice", session_map={}, chat_owners={},
     )
+    db = SessionLocal()
+    try:
+        if db.query(Account).filter(Account.id == "account-alice").first() is None:
+            db.add(Account(
+                id="account-alice", username="telegram-test-alice", status="active"
+            ))
+            db.commit()
+    finally:
+        db.close()
     builds = []
     replies = []
+    ingestions = []
 
     async def build(*args):
         builds.append(1)
@@ -166,6 +177,14 @@ async def test_inbound_reply_is_built_once_and_retried_from_ledger(monkeypatch, 
 
     monkeypatch.setattr(routes, "_build_message_reply", build)
     monkeypatch.setattr(routes, "_reply", reply)
+    monkeypatch.setattr(
+        routes, "_telegram_owner_account_id", lambda *args: "account-alice",
+    )
+    monkeypatch.setattr(
+        routes,
+        "_ingest_telegram_incoming",
+        lambda *args, **kwargs: ingestions.append(1),
+    )
     update = {
         "update_id": 55,
         "message": {"message_id": 7, "chat": {"id": 111}, "text": "hello"},
@@ -176,18 +195,35 @@ async def test_inbound_reply_is_built_once_and_retried_from_ledger(monkeypatch, 
     await routes._process_update_durably(object(), None, config, update)
 
     assert builds == [1]
+    assert ingestions == [1]
     assert replies == ["durable answer", "durable answer"]
 
 
 @pytest.mark.asyncio
 async def test_reply_pending_does_not_consume_poller_poison_attempts(tmp_path):
+    import hashlib
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from core.database import Base, TelegramPollingState
+    from src.telegram_delivery import TelegramRuntimeAuthority
     from src.telegram_inbound_ledger import TelegramReplyPending
     from src.telegram_runtime import TelegramPollingService
 
-    service = TelegramPollingService()
-    service._dead_letter_path = tmp_path / "dead.json"
-    service._offset_state_path = tmp_path / "offset.json"
-    service._token_fingerprint = "bot"
+    engine = create_engine(f"sqlite:///{tmp_path / 'poller.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, autoflush=False)
+    authority = TelegramRuntimeAuthority(factory)
+    fingerprint = hashlib.sha256(b"pending-bot").hexdigest()
+    service = TelegramPollingService(
+        runtime_authority=authority,
+        worker_id="pending-worker",
+        process_lock_path=tmp_path / "poller.lock",
+    )
+    service._token_fingerprint = fingerprint
+    service._database_lease = authority.acquire_polling_lease(
+        bot_fingerprint=fingerprint, worker_id="pending-worker"
+    )
 
     async def pending(update):
         raise TelegramReplyPending()
@@ -197,9 +233,15 @@ async def test_reply_pending_does_not_consume_poller_poison_attempts(tmp_path):
     for _ in range(5):
         with pytest.raises(TelegramReplyPending):
             await service._process_updates([update])
-    assert service._update_failures == {}
     assert service._offset is None
-    assert not service._dead_letter_path.exists()
+    assert authority.dead_letter_count(fingerprint) == 0
+    db = factory()
+    try:
+        state = db.query(TelegramPollingState).one()
+        assert state.failure_attempts == 0
+        assert state.failure_update_id is None
+    finally:
+        db.close()
 
 
 def test_stale_inbound_processing_lease_recovers(tmp_path):
@@ -239,6 +281,10 @@ async def test_missing_update_id_is_processed_once_without_recursion(monkeypatch
         calls.append(args[-1].chat_id)
 
     monkeypatch.setattr(routes, "_process_message", process)
+    monkeypatch.setattr(routes, "_ingest_telegram_incoming", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        routes, "_telegram_owner_account_id", lambda *args: "account-alice",
+    )
     await routes._process_update_durably(
         object(), None, config,
         {"message": {"chat": {"id": 111}, "text": "hello"}},
@@ -558,15 +604,20 @@ def test_notification_center_expands_old_recurring_calendar_event(monkeypatch):
     import src.notification_preferences as preferences
 
     engine = create_engine("sqlite:///:memory:")
-    database.CalendarCal.__table__.create(engine)
-    database.CalendarEvent.__table__.create(engine)
+    database.Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine)
     next_hour = datetime.now(timezone.utc).replace(second=0, microsecond=0) + timedelta(hours=1)
     original = next_hour.replace(tzinfo=None) - timedelta(days=7)
     db = factory()
-    db.add(database.CalendarCal(id="cal", owner="alice", name="Calendar"))
+    from src.identity import ensure_account
+
+    account = ensure_account(db, "alice")
+    db.add(database.CalendarCal(
+        id="cal", owner_id=account.id, owner="alice", name="Calendar"
+    ))
     db.add(database.CalendarEvent(
-        uid="daily", calendar_id="cal", summary="Daily stand-up",
+        uid="daily", owner_id=account.id, calendar_id="cal",
+        summary="Daily stand-up",
         dtstart=original, dtend=original + timedelta(minutes=30),
         is_utc=True, rrule="FREQ=DAILY", status="confirmed",
     ))

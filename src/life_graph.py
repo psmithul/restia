@@ -17,17 +17,21 @@ from collections import Counter, defaultdict
 from datetime import date, datetime, time, timezone
 from typing import Any, Mapping
 
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import aliased
 
 from core.database import (
     LIFE_ENTITY_TYPES,
     Account,
+    CalendarCal,
+    CalendarEvent,
+    Document,
     EntityLink,
     LifeEntity,
     LifeEntityVersion,
     LifeSource,
+    Note,
     PlanningItem,
     Project,
     ProjectMember,
@@ -92,6 +96,13 @@ def _bounded_text(value: object, *, limit: int, required: bool = False) -> str:
 
 def _long_text(value: object, *, limit: int) -> str:
     return str(value or "").strip()[:limit]
+
+
+def _domain_ref_id(value: object) -> str:
+    ref_id = str(value or "").strip()
+    if len(ref_id) > 255:
+        raise LifeGraphError("domain_ref_id must not exceed 255 characters")
+    return ref_id
 
 
 def _token(value: object, *, field: str, limit: int) -> str:
@@ -371,9 +382,49 @@ def _claim_domain_reference(
             {ProjectMember.role: ProjectMember.role},
             synchronize_session=False,
         )
+    elif ref_type == "note":
+        claimed = db.query(Note).filter(
+            Note.id == ref_id,
+            Note.owner == account.username,
+        ).update(
+            {Note.updated_at: Note.updated_at},
+            synchronize_session=False,
+        )
+    elif ref_type == "document":
+        claimed = db.query(Document).filter(
+            Document.id == ref_id,
+            Document.owner == account.username,
+        ).update(
+            {Document.updated_at: Document.updated_at},
+            synchronize_session=False,
+        )
+    elif ref_type == "calendar_event":
+        # CalendarEvent is keyed by (uid, owner_id). Calendar list views
+        # synthesize occurrence ids as ``{base_uid}::{start}``, but those
+        # occurrences are not authoritative rows and must never be silently
+        # promoted to a claim on the series. Keep owner_id and calendar
+        # ownership inside the UPDATE so no cross-account event can pass
+        # between a read and the claim.
+        if "::" in str(ref_id or ""):
+            raise LifeGraphError(
+                "calendar_event domain_ref_id must reference a base event, "
+                "not a generated recurrence occurrence"
+            )
+        owned_calendar_ids = select(CalendarCal.id).where(
+            CalendarCal.owner_id == account.id
+        )
+        claimed = db.query(CalendarEvent).filter(
+            CalendarEvent.uid == ref_id,
+            CalendarEvent.owner_id == account.id,
+            CalendarEvent.calendar_id.in_(owned_calendar_ids),
+        ).update(
+            {CalendarEvent.updated_at: CalendarEvent.updated_at},
+            synchronize_session=False,
+        )
     else:
         raise LifeGraphError(
-            "domain_ref_type must be life_source, planning_item, or project"
+            "domain_ref_type must be life_source, planning_item, project, "
+            "note, document, or calendar_event"
         )
     if claimed != 1:
         raise LifeGraphNotFound("Domain record not found")
@@ -594,7 +645,7 @@ def create_life_entity(
         if domain_ref_type is not None else None
     )
     ref_id = (
-        _long_text(domain_ref_id, limit=255) if domain_ref_id is not None else None
+        _domain_ref_id(domain_ref_id) if domain_ref_id is not None else None
     )
     if bool(ref_type) != bool(ref_id):
         raise LifeGraphError("domain_ref_type and domain_ref_id must be supplied together")
@@ -1171,7 +1222,7 @@ def traverse_life_graph(
     limit: int = 100,
 ) -> dict[str, Any]:
     root = _owned_entity(db, owner_id, entity_id, include_deleted=False)
-    bounded_depth = max(1, min(4, int(depth)))
+    bounded_depth = max(1, min(8, int(depth)))
     bounded_limit = max(1, min(200, int(limit)))
     entities: dict[str, LifeEntity] = {root.id: root}
     links: dict[str, EntityLink] = {}
@@ -1349,10 +1400,18 @@ def task_quality_report(
     # Follow only the declared upward relation direction. Querying the whole
     # owner's edge table and then taking its first N rows made unrelated edges
     # crowd out a task's actual Project -> Goal path.
+    property_project_ids = {
+        value
+        for task in tasks
+        for value in (
+            _values((task.properties or {}).get("project_id"))
+            + _values((task.properties or {}).get("project_ids"))
+        )
+    }
     goal_links: list[EntityLink] = []
     goal_link_truncated = False
-    frontier = set(task_ids)
-    visited_goal_nodes = set(task_ids)
+    frontier = set(task_ids) | property_project_ids
+    visited_goal_nodes = set(frontier)
     for _ in range(5):
         if not frontier:
             break
@@ -1392,6 +1451,8 @@ def task_quality_report(
         props = task.properties or {}
         endpoint_ids.update(_values(props.get("goal_id")))
         endpoint_ids.update(_values(props.get("goal_ids")))
+        endpoint_ids.update(_values(props.get("project_id")))
+        endpoint_ids.update(_values(props.get("project_ids")))
         endpoint_ids.update(_values(props.get("duplicate_of")))
     owned_entities = {
         row.id: row
@@ -1413,9 +1474,9 @@ def task_quality_report(
         if link.relation in _GOAL_RELATIONS:
             goal_adjacency[link.source_id].add(link.target_id)
 
-    def reaches_goal(task_id: str) -> bool:
-        frontier = {task_id}
-        visited = {task_id}
+    def reaches_goal(task_id: str, property_projects: set[str]) -> bool:
+        frontier = {task_id, *property_projects}
+        visited = set(frontier)
         for _ in range(5):
             next_frontier: set[str] = set()
             for current_id in frontier:
@@ -1512,7 +1573,15 @@ def task_quality_report(
             if value in owned_entities
             and owned_entities[value].entity_type == "goal"
         }
-        linked_goal = reaches_goal(task.id)
+        property_projects = {
+            value for value in (
+                _values(props.get("project_id"))
+                + _values(props.get("project_ids"))
+            )
+            if value in owned_entities
+            and owned_entities[value].entity_type == "project"
+        }
+        linked_goal = reaches_goal(task.id, property_projects)
         if not property_goals and not linked_goal and not goal_link_truncated:
             flags.append("goal_disconnected")
 

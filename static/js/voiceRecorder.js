@@ -149,6 +149,42 @@ function insertTranscription(text, showToast) {
   window.dispatchEvent(new CustomEvent('odysseus:stt-result', { detail: { text } }));
 }
 
+async function captureBrowserVoiceTranscript(text) {
+  const normalized = String(text || '').trim();
+  if (!normalized) return null;
+  let key = `browser-voice-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      key = `browser-voice-${crypto.randomUUID()}`;
+    }
+  } catch (_) {}
+  const response = await fetch('/api/inbox', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({
+      title: normalized.split(/\r?\n/, 1)[0].slice(0, 240) || 'Voice note',
+      content: normalized,
+      source_type: 'voice',
+      source_ref: key,
+      metadata: {
+        voice: { provider: 'browser', transcribed: true },
+        ingestion_contract: {
+          version: 1,
+          source_type: 'voice',
+          owner_scoped: true,
+          destination_required: false,
+          classification_can_execute_external_action: false,
+          model_output_has_write_authority: false,
+        },
+      },
+      idempotency_key: key,
+    }),
+  });
+  if (!response.ok) throw new Error(`Voice Inbox capture failed (${response.status})`);
+  return response.json();
+}
+
 /**
  * Start voice recording
  */
@@ -187,6 +223,12 @@ export function startRecording(onFileCreated, showToast, showError) {
         if (provider === 'browser') {
           const transcript = stopBrowserSTT();
           if (transcript) {
+            try {
+              await captureBrowserVoiceTranscript(transcript);
+            } catch (e) {
+              console.error('Browser voice Inbox capture error:', e);
+              if (showError) showError('Voice was transcribed but Inbox capture failed: ' + e.message);
+            }
             insertTranscription(transcript, showToast);
           } else {
             if (showToast) showToast('No speech detected');

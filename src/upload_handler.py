@@ -10,10 +10,18 @@ import shutil
 import tempfile
 import threading
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Dict, Any, Optional
 from fastapi import HTTPException, UploadFile
 
+from src.auth_helpers import resolved_runtime_owner
+from src.blob_store import FileSystemBlobStore, resolve_blob_store_config
+from src.legacy_upload_index import LegacyUploadIndexAdapter
 from src.upload_limits import format_byte_limit, get_chat_upload_max_bytes
+from src.upload_metadata_authority import (
+    SQLUploadMetadataAuthority,
+    UploadMetadataAuthorityError,
+)
 
 
 def secure_filename(filename: str) -> str:
@@ -57,7 +65,7 @@ def _build_upload_id(safe_filename: str) -> str:
     extension to the single-alnum shape the id contract requires.
     """
     _, ext = os.path.splitext(safe_filename or "")
-    ext = re.sub(r"[^A-Za-z0-9]", "", ext)
+    ext = re.sub(r"[^A-Za-z0-9]", "", ext)[:16]
     return uuid.uuid4().hex + (("." + ext) if ext else "")
 
 
@@ -73,10 +81,33 @@ def count_recent_uploads(timestamps, now: float, window: float = 10.0) -> int:
     return sum(1 for t in timestamps if t > cutoff)
 
 
+def create_production_upload_handler(base_dir: str) -> "UploadHandler":
+    """Build the production handler from the validated shared blob contract."""
+
+    config = resolve_blob_store_config(create=True)
+    store = FileSystemBlobStore(config.chat_root)
+    authority = SQLUploadMetadataAuthority(store)
+    return UploadHandler(
+        base_dir,
+        str(config.chat_root),
+        metadata_authority=authority,
+        blob_store=store,
+        legacy_compat=False,
+    )
+
+
 class UploadHandler:
-    def __init__(self, base_dir: str, upload_dir: str):
+    def __init__(
+        self,
+        base_dir: str,
+        upload_dir: str,
+        *,
+        metadata_authority: SQLUploadMetadataAuthority | None = None,
+        blob_store: FileSystemBlobStore | None = None,
+        legacy_compat: bool | None = None,
+    ):
         self.base_dir = base_dir
-        self.upload_dir = upload_dir
+        self.upload_dir = os.path.realpath(upload_dir)
         self.max_upload_size = get_chat_upload_max_bytes()
         self.max_concurrent_uploads = 3
         self.cleanup_days = 30
@@ -94,15 +125,33 @@ class UploadHandler:
         self._upload_rate_lock = threading.Lock()
         self._upload_rate_counter = 0
         self._upload_rate_max_entries = 1000
-        # Serialise the read-modify-write of uploads.json within one
-        # Python process. Scope: single FastAPI worker (the default
-        # uvicorn deployment). Cross-process / multi-worker deployments
-        # need an additional file-level lock (flock) or a database;
-        # the atomic-rename write below keeps on-disk state consistent
-        # on its own but does not serialise writers across processes.
-        self._index_lock = threading.Lock()
-        
-        # Create upload directory
+        canonical_root = resolve_blob_store_config(create=False).chat_root
+        if legacy_compat is None:
+            legacy_compat = (
+                metadata_authority is None
+                and Path(self.upload_dir).resolve(strict=False) != canonical_root
+            )
+        self._legacy_index: LegacyUploadIndexAdapter | None = None
+        if metadata_authority is not None:
+            self.metadata_authority = metadata_authority
+            self.blob_store = blob_store or metadata_authority.blob_store
+        elif legacy_compat:
+            self.metadata_authority = None
+            self.blob_store = blob_store or FileSystemBlobStore(self.upload_dir)
+            self._legacy_index = LegacyUploadIndexAdapter(self.upload_dir)
+        else:
+            self.blob_store = blob_store or FileSystemBlobStore(self.upload_dir)
+            self.metadata_authority = SQLUploadMetadataAuthority(
+                self.blob_store,
+                retention_days=self.cleanup_days,
+            )
+        # Compatibility tests/callers retain the historical lock surface; SQL
+        # production uses database uniqueness and CAS instead of this lock.
+        self._index_lock = (
+            self._legacy_index.lock
+            if self._legacy_index is not None else threading.Lock()
+        )
+
         os.makedirs(self.upload_dir, exist_ok=True)
         
         # Initialize file detector
@@ -116,6 +165,20 @@ class UploadHandler:
         # In-memory index cache to avoid O(N) disk I/O on every request
         self._index_cache: Optional[Dict[str, Any]] = None
         self._index_mtime: float = 0.0
+
+        if self.metadata_authority is not None:
+            result = self.metadata_authority.import_legacy_index(
+                os.path.join(self.upload_dir, "uploads.json"),
+                max_blob_bytes=self.max_upload_size,
+            )
+            if result.failed:
+                logger.error(
+                    "Legacy upload metadata could not be imported; source was preserved"
+                )
+
+    @property
+    def uses_sql_metadata(self) -> bool:
+        return self.metadata_authority is not None
     
     def inside_base_dir(self, path: str) -> bool:
         """Check if path is inside base directory"""
@@ -251,6 +314,8 @@ class UploadHandler:
     
     def cleanup_old_uploads(self):
         """Remove uploaded files older than CLEANUP_DAYS days."""
+        if self.metadata_authority is not None:
+            return self.metadata_authority.cleanup_expired()
         try:
             cutoff_date = datetime.now() - timedelta(days=self.cleanup_days)
             cleaned_count = 0
@@ -306,76 +371,51 @@ class UploadHandler:
         guarantees `os.replace` is atomic on POSIX, so a reader either
         sees the old contents or the new contents, never a half-written
         file. Also keeps a `.bak` sibling of the previous good state.
+
+        The explicit adapter performs this with ``tempfile.mkstemp`` followed
+        by ``os.replace``; SQL production never writes the JSON sidecar.
         """
-        directory = os.path.dirname(path) or "."
-        fd, tmp = tempfile.mkstemp(prefix=".uploads-", suffix=".tmp", dir=directory)
+        if self._legacy_index is None:
+            raise UploadMetadataAuthorityError(
+                "uploads.json writes are disabled under SQL metadata authority"
+            )
+        self._legacy_index.write(path, data)
+        self._index_cache = data
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            if os.path.exists(path):
-                bak = path + ".bak"
-                try:
-                    shutil.copy2(path, bak)
-                except OSError:
-                    pass
-            os.replace(tmp, path)
-            # Update cache if this is the main index
-            if path.endswith("uploads.json"):
-                self._index_cache = data
-                try:
-                    self._index_mtime = os.path.getmtime(path)
-                except OSError:
-                    self._index_mtime = time.time()
-        except Exception:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+            self._index_mtime = os.path.getmtime(path)
+        except OSError:
+            self._index_mtime = time.time()
 
     def _load_upload_index(self) -> Dict[str, Any]:
         """Load the upload index from disk/cache. Uses mtime-based validation
         to avoid redundant parsing on hot paths.
         """
-        uploads_db_path = os.path.join(self.upload_dir, "uploads.json")
-        if not os.path.exists(uploads_db_path):
-            self._index_cache = {}
-            self._index_mtime = 0.0
+        if self.metadata_authority is not None:
+            return self.metadata_authority.list_index()
+        if self._legacy_index is None:
             return {}
+        data = self._legacy_index.load()
+        self._index_cache = data
+        return data
 
-        # Check cache validity
-        try:
-            mtime = os.path.getmtime(uploads_db_path)
-            if self._index_cache is not None and mtime <= self._index_mtime:
-                return self._index_cache
-        except OSError:
-            mtime = 0.0
-
-        # Try the live file first, fall back to the .bak sibling if the
-        # live file is truncated/corrupted.
-        for candidate in (uploads_db_path, uploads_db_path + ".bak"):
-            if not os.path.exists(candidate):
-                continue
-            try:
-                with open(candidate, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    self._index_cache = data
-                    self._index_mtime = mtime
-                    return data
-            except Exception as e:
-                logger.warning(f"Failed to read uploads database ({candidate}): {e}")
-                continue
-
-        self._index_cache = {}
-        return {}
-
-    def get_upload_info(self, upload_id: str) -> Optional[Dict[str, Any]]:
-        """Return the uploads.json metadata row for an upload ID, if present."""
+    def get_upload_info(
+        self,
+        upload_id: str,
+        *,
+        owner: Optional[str] = None,
+        unscoped: bool = False,
+        require_blob: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """Return canonical metadata for one upload, when in the given scope."""
         if not self.validate_upload_id(upload_id):
             return None
+        if self.metadata_authority is not None:
+            return self.metadata_authority.get(
+                upload_id,
+                owner=owner,
+                unscoped=unscoped,
+                require_blob=require_blob,
+            )
         for info in self._load_upload_index().values():
             if isinstance(info, dict) and info.get("id") == upload_id:
                 return dict(info)
@@ -425,6 +465,10 @@ class UploadHandler:
         carry an `owner` field for access checks. Both must move together when
         usernames change.
         """
+        if self.metadata_authority is not None:
+            # Canonical rows reference immutable Account.id. The surrounding
+            # identity transaction updates only the username alias.
+            return 0
         old_owner_normalized = str(old_owner or "").strip().lower()
         new_owner = str(new_owner or "").strip()
         if not old_owner_normalized or not new_owner:
@@ -474,6 +518,9 @@ class UploadHandler:
         """Find an upload file by ID while staying inside upload_dir."""
         if not self.validate_upload_id(upload_id):
             return None
+        if self.metadata_authority is not None:
+            # SQL metadata is authoritative; never discover unindexed bytes.
+            return None
 
         direct = os.path.join(self.upload_dir, upload_id)
         if os.path.exists(direct) and self._inside_upload_dir(direct):
@@ -507,7 +554,6 @@ class UploadHandler:
         if auth_configured and not owner:
             return None
 
-        info = self.get_upload_info(upload_id) or {}
         is_admin = False
         if allow_admin and owner and auth_manager and hasattr(auth_manager, "is_admin"):
             try:
@@ -515,8 +561,26 @@ class UploadHandler:
             except Exception:
                 is_admin = False
 
+        if self.metadata_authority is not None:
+            if not owner and not is_admin:
+                return None
+            info = self.metadata_authority.resolve_for_access(
+                upload_id,
+                owner=owner,
+                unscoped=is_admin,
+            ) or {}
+        else:
+            info = self.get_upload_info(
+                upload_id,
+                owner=owner,
+                unscoped=is_admin,
+                require_blob=True,
+            ) or {}
+        if self.metadata_authority is not None and not info:
+            return None
+
         if owner and not is_admin:
-            if info.get("owner") != owner:
+            if str(info.get("owner") or "").lower() != str(owner).lower():
                 logger.warning("Upload %s denied for owner %s", upload_id, owner)
                 return None
         if not owner and info.get("owner") is not None:
@@ -576,6 +640,8 @@ class UploadHandler:
     
     def get_upload_stats(self) -> Dict[str, Any]:
         """Get statistics about uploaded files."""
+        if self.metadata_authority is not None:
+            return self.metadata_authority.stats()
         try:
             total_files = 0
             total_size = 0
@@ -601,6 +667,178 @@ class UploadHandler:
             return {"error": str(e)}
     
     def save_upload(self, u: UploadFile, client_ip: str, owner: str = None) -> dict:
+        """Persist one upload through SQL authority or the explicit adapter."""
+
+        if self.metadata_authority is not None:
+            return self._save_upload_sql(u, client_ip, owner=owner)
+        return self._save_upload_legacy(u, client_ip, owner=owner)
+
+    def _save_upload_sql(
+        self,
+        u: UploadFile,
+        client_ip: str,
+        *,
+        owner: str | None,
+    ) -> dict:
+        now = time.time()
+        with self._upload_rate_lock:
+            timestamps = self.upload_rate_log.setdefault(client_ip, [])
+            timestamps = [
+                timestamp for timestamp in timestamps
+                if now - timestamp < self.upload_rate_window
+            ]
+            if len(timestamps) >= self.upload_rate_limit:
+                raise HTTPException(
+                    status_code=429,
+                    detail="Upload rate limit exceeded. Please try again later.",
+                )
+            timestamps.append(now)
+            self.upload_rate_log[client_ip] = timestamps
+            self._upload_rate_counter += 1
+        if self._upload_rate_counter % 100 == 0:
+            self.cleanup_rate_limits()
+
+        file_obj = u.file
+        file_obj.seek(0, 2)
+        file_size = file_obj.tell()
+        file_obj.seek(0)
+        if file_size == 0:
+            raise HTTPException(400, "File is empty")
+        if file_size > self.max_upload_size:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "File size exceeds "
+                    f"{format_byte_limit(self.max_upload_size)} limit"
+                ),
+            )
+
+        original_filename = u.filename or f"upload_{int(time.time())}"
+        safe_filename = secure_filename(original_filename)
+        content_type = self.detect_content_type(file_obj, safe_filename)
+        if not self.is_safe_file_type(content_type, safe_filename):
+            raise HTTPException(
+                status_code=400,
+                detail=f"File type not allowed: {content_type}",
+            )
+        file_hash = self.calculate_file_hash(file_obj)
+        owner_scope = resolved_runtime_owner(owner)
+        assert self.metadata_authority is not None
+        descriptor = self.metadata_authority.find_content_row(
+            owner_scope, file_hash
+        )
+        if descriptor is not None and descriptor["state"] == "active":
+            if descriptor["blob_exists"] and descriptor["info"] is None:
+                raise UploadMetadataAuthorityError(
+                    "Stored upload metadata failed integrity validation"
+                )
+            if descriptor["blob_exists"] and descriptor["info"] is not None:
+                self.metadata_authority.touch(
+                    descriptor["id"], owner=owner_scope
+                )
+                duplicate = dict(descriptor["info"])
+                duplicate["last_accessed"] = datetime.now().isoformat()
+                duplicate["is_duplicate"] = True
+                return duplicate
+
+        if descriptor is None:
+            file_id = _build_upload_id(safe_filename)
+            instant = datetime.now()
+            blob_key = (
+                f"{instant.strftime('%Y')}/{instant.strftime('%m')}/"
+                f"{instant.strftime('%d')}/{file_id}"
+            )
+            expected_version = None
+        else:
+            file_id = str(descriptor["id"])
+            if descriptor["state"] == "tombstoned":
+                # Cleanup has already committed the old key for deletion. A
+                # fresh key prevents its post-commit delete from racing with
+                # this reactivation on another replica.
+                instant = datetime.now()
+                blob_key = (
+                    f"{instant.strftime('%Y')}/{instant.strftime('%m')}/"
+                    f"{instant.strftime('%d')}/{uuid.uuid4().hex}-{file_id}"
+                )
+            else:
+                blob_key = str(descriptor["blob_key"])
+            expected_version = int(descriptor["version"])
+
+        try:
+            file_path = self.blob_store.write_stream(blob_key, file_obj)
+        except Exception as exc:
+            raise HTTPException(500, "Failed to save upload bytes") from exc
+
+        uploaded_at = datetime.now().isoformat()
+        metadata: dict[str, Any] = {
+            "id": file_id,
+            "path": str(file_path),
+            "mime": content_type,
+            "size": file_size,
+            "name": safe_filename,
+            "hash": file_hash,
+            "original_name": original_filename,
+            "uploaded_at": uploaded_at,
+            "last_accessed": uploaded_at,
+            "client_ip": client_ip,
+            "owner": owner_scope,
+        }
+        if content_type.startswith("image/"):
+            try:
+                from PIL import Image, ImageOps
+
+                with Image.open(file_path) as image:
+                    image = ImageOps.exif_transpose(image)
+                    metadata["width"] = image.width
+                    metadata["height"] = image.height
+            except Exception:
+                logger.warning(
+                    "Failed to read uploaded image dimensions",
+                    exc_info=True,
+                )
+
+        if expected_version is not None:
+            try:
+                restored = self.metadata_authority.restore_metadata(
+                    owner_scope,
+                    file_id,
+                    metadata,
+                    blob_key=blob_key,
+                    expected_version=expected_version,
+                )
+            except Exception:
+                try:
+                    self.blob_store.delete(blob_key)
+                except Exception:
+                    logger.exception("Failed to roll back restored upload blob")
+                raise
+            if restored.get("blob_key") != blob_key:
+                try:
+                    self.blob_store.delete(blob_key)
+                except Exception:
+                    logger.exception("Failed to remove losing restore blob")
+            restored["is_duplicate"] = True
+            return restored
+
+        try:
+            stored, created = self.metadata_authority.insert(
+                owner_scope, metadata, blob_key=blob_key
+            )
+        except Exception:
+            try:
+                self.blob_store.delete(blob_key)
+            except Exception:
+                logger.exception("Failed to roll back uncommitted upload blob")
+            raise
+        if not created and stored.get("blob_key") != blob_key:
+            try:
+                self.blob_store.delete(blob_key)
+            except Exception:
+                logger.exception("Failed to remove duplicate upload blob")
+        stored["is_duplicate"] = not created
+        return stored
+
+    def _save_upload_legacy(self, u: UploadFile, client_ip: str, owner: str = None) -> dict:
         """Save uploaded file with enhanced security and organization."""
         # Rate limiting
         now = time.time()

@@ -1,47 +1,43 @@
-import json
+"""Preference replacement is transactional and non-destructive across owners."""
+
+import uuid
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 import routes.prefs_routes as prefs_routes
+from core.database import Account, Base
 
 
-def test_save_replaces_prefs_file_atomically(monkeypatch, tmp_path):
-    calls = []
-    real_replace = prefs_routes.os.replace
-
-    def fake_replace(src, dst):
-        calls.append((src, dst))
-        real_replace(src, dst)
-
-    prefs_file = tmp_path / "data" / "user_prefs.json"
-    monkeypatch.setattr(prefs_routes, "PREFS_FILE", str(prefs_file))
-    monkeypatch.setattr(prefs_routes.os, "replace", fake_replace)
-
-    prefs_routes._save({"theme": "dark"})
-
-    assert len(calls) == 1
-    src, dst = calls[0]
-    assert dst == str(prefs_file)
-    assert src.startswith(str(prefs_file) + ".tmp.")
-    assert json.loads(prefs_file.read_text(encoding="utf-8")) == {"theme": "dark"}
-    assert not list(prefs_file.parent.glob("*.tmp.*"))
+@pytest.fixture()
+def prefs_db(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite:///{tmp_path / 'prefs-atomic.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, autoflush=False)
+    db = factory()
+    db.add(Account(id=str(uuid.uuid4()), username="alice", status="active"))
+    db.commit()
+    db.close()
+    monkeypatch.setattr(prefs_routes, "SessionLocal", factory)
+    yield
+    engine.dispose()
 
 
-def test_save_for_user_preserves_scoped_user_prefs(monkeypatch, tmp_path):
-    prefs_file = tmp_path / "data" / "user_prefs.json"
-    monkeypatch.setattr(prefs_routes, "PREFS_FILE", str(prefs_file))
-
+def test_replace_removes_only_stale_keys_for_same_profile(prefs_db):
+    prefs_routes._save_for_user("alice", {"theme": "light", "layout": "wide"})
     prefs_routes._save_for_user("alice", {"theme": "dark"})
 
-    data = json.loads(prefs_file.read_text(encoding="utf-8"))
-    assert data == {"_users": {"alice": {"theme": "dark"}}}
     assert prefs_routes._load_for_user("alice") == {"theme": "dark"}
 
 
-def test_save_for_user_preserves_flat_prefs_when_auth_disabled(monkeypatch, tmp_path):
-    prefs_file = tmp_path / "data" / "user_prefs.json"
-    monkeypatch.setattr(prefs_routes, "PREFS_FILE", str(prefs_file))
+def test_invalid_replacement_rolls_back_partial_changes(prefs_db):
+    prefs_routes._save_for_user("alice", {"theme": "light"})
 
-    prefs_routes._save_for_user(None, {"theme": "dark"})
+    with pytest.raises(Exception):
+        prefs_routes._save_for_user("alice", {
+            "theme": "dark",
+            "invalid key with spaces": True,
+        })
 
-    data = json.loads(prefs_file.read_text(encoding="utf-8"))
-    assert data == {"theme": "dark"}
-    assert prefs_routes._load_for_user(None) == {"theme": "dark"}
+    assert prefs_routes._load_for_user("alice") == {"theme": "light"}

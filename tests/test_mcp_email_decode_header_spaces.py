@@ -215,7 +215,7 @@ async def test_mcp_email_owner_cannot_use_other_owner_account_for_list_read_send
 
 
 @pytest.mark.asyncio
-async def test_mcp_send_email_stages_with_visible_owner_account_id(tmp_path, monkeypatch):
+async def test_mcp_send_email_refuses_partial_legacy_db_without_canonical_owner(tmp_path, monkeypatch):
     import src.constants as constants
 
     app_db_path = tmp_path / "app.db"
@@ -236,19 +236,12 @@ async def test_mcp_send_email_stages_with_visible_owner_account_id(tmp_path, mon
         },
     )
 
-    assert "Draft staged for approval" in out[0].text
-    conn = sqlite3.connect(scheduled_path)
-    try:
-        row = conn.execute(
-            "SELECT owner, status, account_id FROM scheduled_emails"
-        ).fetchone()
-    finally:
-        conn.close()
-    assert row == ("alice", "agent_draft", "acct-alice")
+    assert "Authenticated email owner does not exist" in out[0].text
+    assert not scheduled_path.exists()
 
 
 @pytest.mark.asyncio
-async def test_mcp_send_email_stages_owner_scoped_pending_draft(tmp_path, monkeypatch):
+async def test_mcp_send_email_refuses_missing_canonical_account_and_sidecar(tmp_path, monkeypatch):
     import src.constants as constants
 
     db_path = tmp_path / "scheduled_emails.db"
@@ -266,16 +259,8 @@ async def test_mcp_send_email_stages_owner_scoped_pending_draft(tmp_path, monkey
         },
     )
 
-    assert "Draft staged for approval" in out[0].text
-    assert "Nothing has been sent yet" in out[0].text
-    conn = sqlite3.connect(db_path)
-    try:
-        row = conn.execute(
-            "SELECT owner, status, to_addr, subject FROM scheduled_emails"
-        ).fetchone()
-    finally:
-        conn.close()
-    assert row == ("alice", "agent_draft", "recipient@example.com", "Review")
+    assert "configured owner-scoped email account is required" in out[0].text
+    assert not db_path.exists()
 
 
 @pytest.mark.asyncio

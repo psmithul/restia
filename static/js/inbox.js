@@ -177,6 +177,11 @@ function captureKey() {
   return `inbox-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
+export function quickCaptureSourceType(content) {
+  const value = text(content);
+  return /^https?:\/\/\S+$/i.test(value) ? 'link' : 'text';
+}
+
 export async function createInboxCapture(content, { idempotencyKey = '' } = {}) {
   const value = text(content);
   if (!value) throw new Error('Enter something to capture.');
@@ -188,7 +193,20 @@ export async function createInboxCapture(content, { idempotencyKey = '' } = {}) 
   const payload = await requestJSON('', {
     method: 'POST',
     body: {
-      title, content: value, source_type: 'user', idempotency_key: key,
+      title,
+      content: value,
+      source_type: quickCaptureSourceType(value),
+      metadata: {
+        ingestion_contract: {
+          version: 1,
+          source_type: quickCaptureSourceType(value),
+          owner_scoped: true,
+          destination_required: false,
+          classification_can_execute_external_action: false,
+          model_output_has_write_authority: false,
+        },
+      },
+      idempotency_key: key,
     },
   });
   const item = unwrapInboxItem(payload);

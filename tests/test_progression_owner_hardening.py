@@ -27,7 +27,6 @@ from core.database import (
 )
 from routes.planning_routes import setup_planning_routes
 from routes.progression_routes import setup_progression_routes
-from src.auth_helpers import DEFAULT_LOCAL_OWNER
 from src.note_progression import (
     advance_recurring_note,
     normalize_created_items,
@@ -405,7 +404,17 @@ async def test_auth_disabled_planner_and_legacy_note_xp_use_single_profile(
         generated = db.query(Note).filter(Note.label == "planner").all()
         assert generated and {note.owner for note in generated} == {"alice"}
         assert db.query(PlanningItem).one().owner == "alice"
-        assert db.query(CalendarCal).one().owner == DEFAULT_LOCAL_OWNER
+        account = db.query(cdb.Account).filter(cdb.Account.username == "alice").one()
+        calendar = db.query(CalendarCal).one()
+        assert calendar.owner == "alice"
+        assert calendar.owner_id == account.id
+        proposal = db.query(cdb.ActionProposal).filter(
+            cdb.ActionProposal.owner_id == account.id,
+            cdb.ActionProposal.domain == "calendar",
+            cdb.ActionProposal.action == "create_event",
+        ).one()
+        assert proposal.state == "completed"
+        assert proposal.undo_ref
         assert {event.owner for event in db.query(ProgressionEvent).all()} == {"alice"}
     finally:
         db.close()

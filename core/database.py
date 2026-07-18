@@ -14,6 +14,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     Integer,
+    BigInteger,
     ForeignKey,
     ForeignKeyConstraint,
     JSON,
@@ -464,6 +465,1013 @@ class AuthImportRun(TimestampMixin, Base):
     )
 
 
+class RuntimeWorkerLease(TimestampMixin, Base):
+    """Database-time lease and fencing token for one singleton runtime role."""
+
+    __tablename__ = "runtime_worker_leases"
+
+    lease_name = Column(String(128), primary_key=True)
+    holder_id = Column(String(128), nullable=True, index=True)
+    fencing_token = Column(BigInteger, nullable=False, default=0)
+    lease_expires_at = Column(DateTime, nullable=True, index=True)
+    heartbeat_at = Column(DateTime, nullable=True)
+    version = Column(Integer, nullable=False, default=1)
+
+    __table_args__ = (
+        CheckConstraint(
+            "fencing_token >= 0 AND version >= 1",
+            name="ck_runtime_worker_leases_fencing",
+        ),
+        CheckConstraint(
+            "(holder_id IS NULL AND lease_expires_at IS NULL) OR "
+            "(holder_id IS NOT NULL AND lease_expires_at IS NOT NULL)",
+            name="ck_runtime_worker_leases_holder",
+        ),
+    )
+
+
+class TelegramPrincipal(TimestampMixin, Base):
+    """One Telegram chat principal linked to an immutable Restia account.
+
+    Telegram chat identifiers are sensitive cross-interface correlation data.
+    The exact identifier is encrypted while the keyed digest supports exact,
+    bot-scoped lookup without placing the plaintext identifier in an index.
+    """
+
+    __tablename__ = "telegram_principals"
+
+    id = Column(String(36), primary_key=True)
+    account_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    bot_fingerprint = Column(String(64), nullable=False)
+    chat_id = Column(EncryptedContentText, nullable=False)
+    chat_id_digest = Column(String(64), nullable=False)
+    state = Column(String(24), nullable=False, default="linked")
+    linked_at = Column(DateTime, nullable=False, default=utcnow_naive)
+    revoked_at = Column(DateTime, nullable=True)
+    version = Column(Integer, nullable=False, default=1)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "id", "account_id", name="uq_telegram_principals_id_account",
+        ),
+        UniqueConstraint(
+            "bot_fingerprint", "chat_id_digest",
+            name="uq_telegram_principals_bot_chat",
+        ),
+        CheckConstraint(
+            "state IN ('linked', 'unlinked')",
+            name="ck_telegram_principals_state",
+        ),
+        CheckConstraint(
+            "length(bot_fingerprint) = 64 AND length(chat_id_digest) = 64",
+            name="ck_telegram_principals_digests",
+        ),
+        CheckConstraint("version >= 1", name="ck_telegram_principals_version"),
+        Index(
+            "ix_telegram_principals_account_bot_state",
+            "account_id", "bot_fingerprint", "state",
+        ),
+    )
+
+
+class TelegramConversationBinding(TimestampMixin, Base):
+    """The active Restia conversation bound to one linked Telegram chat."""
+
+    __tablename__ = "telegram_conversation_bindings"
+
+    id = Column(String(36), primary_key=True)
+    principal_id = Column(String(36), nullable=False, unique=True, index=True)
+    account_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    session_id = Column(EncryptedContentText, nullable=False)
+    version = Column(Integer, nullable=False, default=1)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["principal_id", "account_id"],
+            ["telegram_principals.id", "telegram_principals.account_id"],
+            ondelete="CASCADE",
+            name="fk_telegram_binding_principal_account",
+        ),
+        CheckConstraint(
+            "version >= 1", name="ck_telegram_conversation_bindings_version",
+        ),
+    )
+
+
+class TelegramLinkCode(TimestampMixin, Base):
+    """Short-lived, one-time Telegram link credential.
+
+    Only keyed digests are written for newly issued codes.  The legacy digest
+    scheme exists solely so an already-issued pre-V3 code can survive the
+    verified settings import and be consumed once before expiry.
+    """
+
+    __tablename__ = "telegram_link_codes"
+
+    id = Column(String(36), primary_key=True)
+    account_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    bot_fingerprint = Column(String(64), nullable=False)
+    code_digest = Column(String(64), nullable=False)
+    digest_scheme = Column(String(32), nullable=False, default="hmac_sha256_v1")
+    expires_at = Column(DateTime, nullable=False, index=True)
+    consumed_at = Column(DateTime, nullable=True, index=True)
+    invalidated_at = Column(DateTime, nullable=True, index=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "bot_fingerprint", "code_digest",
+            name="uq_telegram_link_codes_bot_digest",
+        ),
+        CheckConstraint(
+            "digest_scheme IN ('hmac_sha256_v1', 'legacy_sha256_v1')",
+            name="ck_telegram_link_codes_digest_scheme",
+        ),
+        CheckConstraint(
+            "length(bot_fingerprint) = 64 AND length(code_digest) = 64",
+            name="ck_telegram_link_codes_digests",
+        ),
+        Index(
+            "ix_telegram_link_codes_account_active",
+            "account_id", "bot_fingerprint", "consumed_at", "invalidated_at",
+        ),
+        Index(
+            "uq_telegram_link_codes_account_live",
+            "account_id", "bot_fingerprint",
+            unique=True,
+            sqlite_where=text(
+                "consumed_at IS NULL AND invalidated_at IS NULL"
+            ),
+            postgresql_where=text(
+                "consumed_at IS NULL AND invalidated_at IS NULL"
+            ),
+        ),
+    )
+
+
+class TelegramIdentityImportRun(TimestampMixin, Base):
+    """Redacted status for the one legacy Telegram settings cutover."""
+
+    __tablename__ = "telegram_identity_import_runs"
+
+    id = Column(String(36), primary_key=True)
+    source_kind = Column(String(64), nullable=False, unique=True)
+    state = Column(String(24), nullable=False, default="pending")
+    source_sha256 = Column(String(64), nullable=False)
+    source_path = Column(EncryptedContentText, nullable=True)
+    details = Column(EncryptedJSON, nullable=False, default=dict)
+    completed_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('pending', 'completed', 'failed')",
+            name="ck_telegram_identity_import_runs_state",
+        ),
+        CheckConstraint(
+            "length(source_sha256) = 64",
+            name="ck_telegram_identity_import_runs_digest",
+        ),
+    )
+
+
+class TelegramPollingState(TimestampMixin, Base):
+    """Database-fenced singleton poller state for one Telegram bot."""
+
+    __tablename__ = "telegram_polling_states"
+
+    bot_fingerprint = Column(String(64), primary_key=True)
+    next_offset = Column(BigInteger, nullable=True)
+    failure_update_id = Column(BigInteger, nullable=True)
+    failure_attempts = Column(Integer, nullable=False, default=0)
+    lease_owner = Column(String(128), nullable=True)
+    lease_token = Column(Integer, nullable=False, default=0)
+    lease_expires_at = Column(DateTime, nullable=True, index=True)
+    version = Column(Integer, nullable=False, default=1)
+
+    __table_args__ = (
+        CheckConstraint(
+            "length(bot_fingerprint) = 64",
+            name="ck_telegram_polling_states_fingerprint",
+        ),
+        CheckConstraint(
+            "next_offset IS NULL OR next_offset >= 0",
+            name="ck_telegram_polling_states_offset",
+        ),
+        CheckConstraint(
+            "failure_attempts >= 0",
+            name="ck_telegram_polling_states_attempts",
+        ),
+        CheckConstraint(
+            "lease_token >= 0 AND version >= 1",
+            name="ck_telegram_polling_states_fencing",
+        ),
+    )
+
+
+class TelegramDeadLetter(TimestampMixin, Base):
+    """Safe metadata for one poison update resolved by the poller."""
+
+    __tablename__ = "telegram_dead_letters"
+
+    id = Column(String(36), primary_key=True)
+    bot_fingerprint = Column(
+        String(64),
+        ForeignKey("telegram_polling_states.bot_fingerprint", ondelete="CASCADE"),
+        nullable=False,
+    )
+    update_id = Column(BigInteger, nullable=False)
+    error_type = Column(String(64), nullable=False)
+    attempts = Column(Integer, nullable=False)
+    failed_at = Column(DateTime, nullable=False, default=utcnow_naive)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "bot_fingerprint", "update_id",
+            name="uq_telegram_dead_letters_bot_update",
+        ),
+        CheckConstraint(
+            "update_id >= 0 AND attempts >= 1",
+            name="ck_telegram_dead_letters_resolution",
+        ),
+        Index(
+            "ix_telegram_dead_letters_bot_failed_at",
+            "bot_fingerprint", "failed_at",
+        ),
+    )
+
+
+class TelegramInboundUpdate(TimestampMixin, Base):
+    """One owner-bound inbound update and its at-least-once reply outbox."""
+
+    __tablename__ = "telegram_inbound_updates"
+
+    id = Column(String(36), primary_key=True)
+    bot_fingerprint = Column(
+        String(64),
+        ForeignKey("telegram_polling_states.bot_fingerprint", ondelete="CASCADE"),
+        nullable=False,
+    )
+    update_id = Column(BigInteger, nullable=False)
+    chat_id = Column(EncryptedContentText, nullable=False)
+    owner_account_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=True, index=True,
+    )
+    reply_text = Column(EncryptedContentText, nullable=True)
+    status = Column(String(24), nullable=False, default="processing")
+    processing_claim_digest = Column(String(64), nullable=True)
+    processing_lease_expires_at = Column(DateTime, nullable=True)
+    reply_claim_digest = Column(String(64), nullable=True)
+    reply_lease_expires_at = Column(DateTime, nullable=True)
+    version = Column(Integer, nullable=False, default=1)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "bot_fingerprint", "update_id",
+            name="uq_telegram_inbound_updates_bot_update",
+        ),
+        CheckConstraint(
+            "status IN ('processing', 'reply_pending', 'delivered', 'discarded')",
+            name="ck_telegram_inbound_updates_status",
+        ),
+        CheckConstraint(
+            "update_id >= 0 AND version >= 1",
+            name="ck_telegram_inbound_updates_version",
+        ),
+        Index(
+            "ix_telegram_inbound_updates_status_lease",
+            "bot_fingerprint", "status", "processing_lease_expires_at",
+            "reply_lease_expires_at",
+        ),
+    )
+
+
+class TelegramRuntimeImportRun(TimestampMixin, Base):
+    """Idempotent adoption marker for the retired Telegram sidecars."""
+
+    __tablename__ = "telegram_runtime_import_runs"
+
+    id = Column(String(36), primary_key=True)
+    bot_fingerprint = Column(
+        String(64),
+        ForeignKey("telegram_polling_states.bot_fingerprint", ondelete="CASCADE"),
+        nullable=False,
+    )
+    source_kind = Column(String(64), nullable=False)
+    state = Column(String(24), nullable=False, default="pending")
+    source_sha256 = Column(String(64), nullable=False)
+    details = Column(EncryptedJSON, nullable=False, default=dict)
+    completed_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "bot_fingerprint", "source_kind",
+            name="uq_telegram_runtime_import_bot_source",
+        ),
+        CheckConstraint(
+            "state IN ('pending', 'completed', 'failed')",
+            name="ck_telegram_runtime_import_runs_state",
+        ),
+        CheckConstraint(
+            "length(bot_fingerprint) = 64 AND length(source_sha256) = 64",
+            name="ck_telegram_runtime_import_runs_digests",
+        ),
+    )
+
+
+class ReminderDeliveryClaim(TimestampMixin, Base):
+    """Database-fenced delivery state for one reminder occurrence/channel."""
+
+    __tablename__ = "reminder_delivery_claims"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    note_id = Column(String(255), nullable=False)
+    occurrence = Column(String(255), nullable=False, default="")
+    channel = Column(String(64), nullable=False, default="browser")
+    status = Column(String(32), nullable=False, default="claimed")
+    claim_token_digest = Column(String(64), nullable=True)
+    claimed_at = Column(DateTime, nullable=True)
+    retry_after = Column(DateTime, nullable=True, index=True)
+    delivered_at = Column(DateTime, nullable=True)
+    last_error_code = Column(String(64), nullable=True)
+    version = Column(Integer, nullable=False, default=1)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_id", "note_id", "occurrence", "channel",
+            name="uq_reminder_delivery_occurrence_channel",
+        ),
+        CheckConstraint(
+            "status IN ('claimed', 'awaiting_browser_ack', 'delivered', "
+            "'failed', 'cancelled')",
+            name="ck_reminder_delivery_claims_status",
+        ),
+        CheckConstraint(
+            "version >= 1", name="ck_reminder_delivery_claims_version",
+        ),
+        Index(
+            "ix_reminder_delivery_claims_ready",
+            "owner_id", "status", "retry_after", "claimed_at",
+        ),
+    )
+
+
+class ReminderCancellation(TimestampMixin, Base):
+    """Shared cancel-before-enqueue barrier for reminder side effects."""
+
+    __tablename__ = "reminder_cancellations"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    note_id = Column(String(255), nullable=False)
+    scope = Column(String(24), nullable=False)
+    occurrence = Column(String(255), nullable=False, default="")
+    cancelled_at = Column(DateTime, nullable=False, default=utcnow_naive)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_id", "note_id", "scope", "occurrence",
+            name="uq_reminder_cancellations_scope",
+        ),
+        CheckConstraint(
+            "scope IN ('all', 'occurrence')",
+            name="ck_reminder_cancellations_scope",
+        ),
+        Index(
+            "ix_reminder_cancellations_lookup",
+            "owner_id", "note_id", "scope", "occurrence",
+        ),
+    )
+
+
+class BrowserNotification(TimestampMixin, Base):
+    """Owner-scoped browser outbox retained until explicit acknowledgement."""
+
+    __tablename__ = "browser_notifications"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    payload = Column(EncryptedJSON, nullable=False)
+    dedupe_key_digest = Column(String(64), nullable=True)
+    claim_owner_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    claim_note_id = Column(String(255), nullable=False, default="")
+    claim_occurrence = Column(String(255), nullable=False, default="")
+    claim_channel = Column(String(64), nullable=False, default="")
+    claim_token = Column(EncryptedContentText, nullable=True)
+    acknowledged_at = Column(DateTime, nullable=True, index=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_id", "dedupe_key_digest",
+            name="uq_browser_notifications_owner_dedupe",
+        ),
+        Index(
+            "ix_browser_notifications_pending",
+            "owner_id", "acknowledged_at", "created_at",
+        ),
+        Index(
+            "ix_browser_notifications_claim",
+            "owner_id", "claim_note_id", "claim_occurrence",
+        ),
+    )
+
+
+class NotificationRuntimeImportRun(TimestampMixin, Base):
+    """Idempotent adoption marker for retired reminder/browser sidecars."""
+
+    __tablename__ = "notification_runtime_import_runs"
+
+    id = Column(String(36), primary_key=True)
+    source_kind = Column(String(64), nullable=False)
+    source_sha256 = Column(String(64), nullable=False)
+    state = Column(String(24), nullable=False, default="pending")
+    details = Column(EncryptedJSON, nullable=False, default=dict)
+    completed_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "source_kind", "source_sha256",
+            name="uq_notification_runtime_import_source",
+        ),
+        CheckConstraint(
+            "state IN ('pending', 'completed', 'failed')",
+            name="ck_notification_runtime_import_runs_state",
+        ),
+        CheckConstraint(
+            "length(source_sha256) = 64",
+            name="ck_notification_runtime_import_runs_digest",
+        ),
+    )
+
+
+class EmailLifeProjection(TimestampMixin, Base):
+    """Encrypted, Account.id-owned email-to-Life projection outbox.
+
+    Email index/cache state remains rebuildable connector data.  This row is
+    the canonical durable handoff into the Life graph and therefore lives in
+    the configured SQL authority.  ``version`` plus the opaque claim digest
+    fence stale workers after a lease expires.
+    """
+
+    __tablename__ = "email_life_projection_ledger"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    account_key = Column(String(255), nullable=False)
+    folder = Column(String(255), nullable=False)
+    message_uid = Column(String(255), nullable=False)
+    header_sha256 = Column(String(64), nullable=False)
+    payload = Column(EncryptedJSON, nullable=True)
+    state = Column(String(24), nullable=False, default="pending")
+    claim_token_digest = Column(String(64), nullable=True, unique=True)
+    claimed_at = Column(DateTime, nullable=True)
+    lease_expires_at = Column(DateTime, nullable=True, index=True)
+    next_attempt_at = Column(DateTime, nullable=True, index=True)
+    attempt_count = Column(Integer, nullable=False, default=0)
+    last_error_code = Column(String(64), nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    version = Column(Integer, nullable=False, default=1)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_id", "account_key", "folder", "message_uid",
+            "header_sha256", name="uq_email_life_projection_identity",
+        ),
+        CheckConstraint(
+            "state IN ('pending', 'processing', 'failed', 'completed')",
+            name="ck_email_life_projection_state",
+        ),
+        CheckConstraint(
+            "attempt_count >= 0", name="ck_email_life_projection_attempts",
+        ),
+        CheckConstraint(
+            "length(header_sha256) = 64",
+            name="ck_email_life_projection_header_digest",
+        ),
+        CheckConstraint(
+            "length(account_key) >= 1 AND length(folder) >= 1 "
+            "AND length(message_uid) >= 1",
+            name="ck_email_life_projection_routing_identity",
+        ),
+        CheckConstraint(
+            "claim_token_digest IS NULL OR length(claim_token_digest) = 64",
+            name="ck_email_life_projection_claim_digest",
+        ),
+        CheckConstraint(
+            "(state = 'completed' AND payload IS NULL "
+            "AND completed_at IS NOT NULL) OR "
+            "(state <> 'completed' AND payload IS NOT NULL)",
+            name="ck_email_life_projection_payload_lifecycle",
+        ),
+        CheckConstraint(
+            "(state = 'processing' AND claim_token_digest IS NOT NULL "
+            "AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL) OR "
+            "(state <> 'processing' AND claim_token_digest IS NULL "
+            "AND claimed_at IS NULL AND lease_expires_at IS NULL)",
+            name="ck_email_life_projection_lease_lifecycle",
+        ),
+        CheckConstraint(
+            "version >= 1", name="ck_email_life_projection_version",
+        ),
+        Index(
+            "ix_email_life_projection_ready", "owner_id", "account_key",
+            "folder", "state", "next_attempt_at", "lease_expires_at",
+        ),
+    )
+
+
+class EmailLifeProjectionImportRun(TimestampMixin, Base):
+    """Encrypted progress marker for bounded, non-destructive sidecar import."""
+
+    __tablename__ = "email_life_projection_import_runs"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    source_kind = Column(String(64), nullable=False)
+    source_sha256 = Column(String(64), nullable=False)
+    state = Column(String(24), nullable=False, default="pending")
+    details = Column(EncryptedJSON, nullable=False, default=dict)
+    completed_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_id", "source_kind", "source_sha256",
+            name="uq_email_life_projection_import_source",
+        ),
+        CheckConstraint(
+            "state IN ('pending', 'completed', 'failed')",
+            name="ck_email_life_projection_import_state",
+        ),
+        CheckConstraint(
+            "length(source_sha256) = 64",
+            name="ck_email_life_projection_import_digest",
+        ),
+    )
+
+
+class EmailTagState(TimestampMixin, Base):
+    """Canonical encrypted tag/spam state for one mailbox message."""
+
+    __tablename__ = "email_tag_states"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    account_key = Column(String(255), nullable=False)
+    message_digest = Column(String(64), nullable=False)
+    location_digest = Column(String(64), nullable=False)
+    payload = Column(EncryptedJSON, nullable=False, default=dict)
+    version = Column(Integer, nullable=False, default=1)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_id", "account_key", "message_digest",
+            name="uq_email_tag_states_message",
+        ),
+        UniqueConstraint(
+            "owner_id", "account_key", "location_digest",
+            name="uq_email_tag_states_location",
+        ),
+        CheckConstraint(
+            "length(message_digest) = 64 AND length(location_digest) = 64",
+            name="ck_email_tag_states_digests",
+        ),
+        CheckConstraint("version >= 1", name="ck_email_tag_states_version"),
+        Index(
+            "ix_email_tag_states_owner_account",
+            "owner_id", "account_key", "updated_at",
+        ),
+    )
+
+
+class EmailAutomationRule(TimestampMixin, Base):
+    """Owner-scoped email automation flags shared by every interface."""
+
+    __tablename__ = "email_automation_rules"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    account_key = Column(String(255), nullable=False, default="*")
+    rules = Column(EncryptedJSON, nullable=False, default=dict)
+    version = Column(Integer, nullable=False, default=1)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_id", "account_key", name="uq_email_automation_rules_scope",
+        ),
+        CheckConstraint(
+            "length(account_key) >= 1", name="ck_email_automation_rules_scope",
+        ),
+        CheckConstraint(
+            "version >= 1", name="ck_email_automation_rules_version",
+        ),
+    )
+
+
+class EmailScheduledDelivery(TimestampMixin, Base):
+    """Durable manual email schedule with a fenced, database-time lease."""
+
+    __tablename__ = "email_scheduled_deliveries"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    email_account_id = Column(
+        String, ForeignKey("email_accounts.id", ondelete="RESTRICT"),
+        nullable=False, index=True,
+    )
+    idempotency_key = Column(String(128), nullable=False)
+    payload = Column(EncryptedJSON, nullable=False, default=dict)
+    payload_sha256 = Column(String(64), nullable=False)
+    scheduled_for = Column(DateTime, nullable=False, index=True)
+    state = Column(String(24), nullable=False, default="queued", index=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    next_attempt_at = Column(DateTime, nullable=True, index=True)
+    claim_token_digest = Column(String(64), nullable=True, unique=True)
+    claimed_at = Column(DateTime, nullable=True)
+    lease_expires_at = Column(DateTime, nullable=True, index=True)
+    completed_at = Column(DateTime, nullable=True)
+    last_error_code = Column(String(64), nullable=True)
+    provider_message_id = Column(EncryptedContentText, nullable=True)
+    version = Column(Integer, nullable=False, default=1)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_id", "idempotency_key",
+            name="uq_email_scheduled_deliveries_idempotency",
+        ),
+        CheckConstraint(
+            "state IN ('queued', 'claimed', 'retry', 'delivered', 'failed', "
+            "'cancelled')",
+            name="ck_email_scheduled_deliveries_state",
+        ),
+        CheckConstraint(
+            "attempts >= 0", name="ck_email_scheduled_deliveries_attempts",
+        ),
+        CheckConstraint(
+            "length(payload_sha256) = 64",
+            name="ck_email_scheduled_deliveries_payload_digest",
+        ),
+        CheckConstraint(
+            "claim_token_digest IS NULL OR length(claim_token_digest) = 64",
+            name="ck_email_scheduled_deliveries_claim_digest",
+        ),
+        CheckConstraint(
+            "(state = 'claimed' AND claim_token_digest IS NOT NULL "
+            "AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL) OR "
+            "(state <> 'claimed' AND claim_token_digest IS NULL "
+            "AND claimed_at IS NULL AND lease_expires_at IS NULL)",
+            name="ck_email_scheduled_deliveries_lease_lifecycle",
+        ),
+        CheckConstraint(
+            "version >= 1", name="ck_email_scheduled_deliveries_version",
+        ),
+        Index(
+            "ix_email_scheduled_deliveries_ready", "state", "scheduled_for",
+            "next_attempt_at", "lease_expires_at",
+        ),
+    )
+
+
+class EmailAutomationRun(TimestampMixin, Base):
+    """Idempotency record and fenced claim for one email automation action."""
+
+    __tablename__ = "email_automation_runs"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    account_key = Column(String(255), nullable=False)
+    operation = Column(String(32), nullable=False)
+    message_digest = Column(String(64), nullable=False)
+    payload = Column(EncryptedJSON, nullable=False, default=dict)
+    state = Column(String(24), nullable=False, default="pending", index=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    next_attempt_at = Column(DateTime, nullable=True, index=True)
+    claim_token_digest = Column(String(64), nullable=True, unique=True)
+    claimed_at = Column(DateTime, nullable=True)
+    lease_expires_at = Column(DateTime, nullable=True, index=True)
+    completed_at = Column(DateTime, nullable=True)
+    last_error_code = Column(String(64), nullable=True)
+    version = Column(Integer, nullable=False, default=1)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_id", "account_key", "operation", "message_digest",
+            name="uq_email_automation_runs_identity",
+        ),
+        CheckConstraint(
+            "operation IN ('summary', 'reply', 'classify', 'calendar', "
+            "'email_received')",
+            name="ck_email_automation_runs_operation",
+        ),
+        CheckConstraint(
+            "state IN ('pending', 'claimed', 'retry', 'completed', 'failed')",
+            name="ck_email_automation_runs_state",
+        ),
+        CheckConstraint(
+            "attempts >= 0", name="ck_email_automation_runs_attempts",
+        ),
+        CheckConstraint(
+            "length(message_digest) = 64",
+            name="ck_email_automation_runs_message_digest",
+        ),
+        CheckConstraint(
+            "claim_token_digest IS NULL OR length(claim_token_digest) = 64",
+            name="ck_email_automation_runs_claim_digest",
+        ),
+        CheckConstraint(
+            "(state = 'claimed' AND claim_token_digest IS NOT NULL "
+            "AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL) OR "
+            "(state <> 'claimed' AND claim_token_digest IS NULL "
+            "AND claimed_at IS NULL AND lease_expires_at IS NULL)",
+            name="ck_email_automation_runs_lease_lifecycle",
+        ),
+        CheckConstraint(
+            "version >= 1", name="ck_email_automation_runs_version",
+        ),
+        Index(
+            "ix_email_automation_runs_ready", "state", "next_attempt_at",
+            "lease_expires_at",
+        ),
+    )
+
+
+class EmailRuntimeImportRun(TimestampMixin, Base):
+    """Encrypted non-destructive import marker for legacy email sidecars."""
+
+    __tablename__ = "email_runtime_import_runs"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    source_kind = Column(String(64), nullable=False)
+    source_sha256 = Column(String(64), nullable=False)
+    state = Column(String(24), nullable=False, default="pending")
+    details = Column(EncryptedJSON, nullable=False, default=dict)
+    completed_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_id", "source_kind", "source_sha256",
+            name="uq_email_runtime_import_runs_source",
+        ),
+        CheckConstraint(
+            "state IN ('pending', 'completed', 'failed')",
+            name="ck_email_runtime_import_runs_state",
+        ),
+        CheckConstraint(
+            "length(source_sha256) = 64",
+            name="ck_email_runtime_import_runs_digest",
+        ),
+    )
+
+
+class ContactSource(TimestampMixin, Base):
+    """One owner-scoped local or CardDAV contact authority.
+
+    CardDAV configuration is private user data as well as a credential, so the
+    URL and username use the content envelope while the password uses the
+    credential envelope.  ``(id, owner_id)`` is deliberately unique so child
+    rows can enforce matching ownership with a composite foreign key.
+    """
+
+    __tablename__ = "contact_sources"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    kind = Column(String(24), nullable=False, default="local")
+    label = Column(EncryptedContentText, nullable=False, default="Contacts")
+    base_url = Column(EncryptedContentText, nullable=True)
+    username = Column(EncryptedContentText, nullable=True)
+    password = Column(EncryptedText, nullable=True)
+    enabled = Column(Boolean, nullable=False, default=True)
+    last_sync_at = Column(DateTime, nullable=True)
+    sync_state = Column(String(24), nullable=False, default="idle")
+    last_error = Column(EncryptedContentText, nullable=True)
+    config_version = Column(Integer, nullable=False, default=1)
+    version = Column(Integer, nullable=False, default=1)
+
+    __table_args__ = (
+        UniqueConstraint("id", "owner_id", name="uq_contact_sources_id_owner"),
+        CheckConstraint(
+            "kind IN ('local', 'carddav')", name="ck_contact_sources_kind",
+        ),
+        CheckConstraint(
+            "sync_state IN ('idle', 'syncing', 'ready', 'error', 'disabled')",
+            name="ck_contact_sources_sync_state",
+        ),
+        CheckConstraint("version >= 1", name="ck_contact_sources_version"),
+        CheckConstraint(
+            "config_version >= 1", name="ck_contact_sources_config_version",
+        ),
+        Index(
+            "uq_contact_sources_owner_local",
+            "owner_id",
+            unique=True,
+            sqlite_where=text("kind = 'local'"),
+            postgresql_where=text("kind = 'local'"),
+        ),
+        Index(
+            "uq_contact_sources_owner_carddav",
+            "owner_id",
+            unique=True,
+            sqlite_where=text("kind = 'carddav'"),
+            postgresql_where=text("kind = 'carddav'"),
+        ),
+        Index(
+            "ix_contact_sources_owner_kind_enabled",
+            "owner_id", "kind", "enabled",
+        ),
+    )
+
+
+class ContactRecord(TimestampMixin, Base):
+    """Materialized owner-scoped contact data for one source."""
+
+    __tablename__ = "contact_records"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    source_id = Column(String(36), nullable=False, index=True)
+    remote_uid = Column(EncryptedContentText, nullable=False)
+    remote_uid_digest = Column(String(64), nullable=False)
+    remote_href = Column(EncryptedContentText, nullable=True)
+    remote_etag = Column(EncryptedContentText, nullable=True)
+    payload = Column(EncryptedJSON, nullable=False, default=dict)
+    raw_vcard = Column(EncryptedContentText, nullable=True)
+    deleted_at = Column(DateTime, nullable=True, index=True)
+    version = Column(Integer, nullable=False, default=1)
+
+    __table_args__ = (
+        UniqueConstraint("id", "owner_id", name="uq_contact_records_id_owner"),
+        ForeignKeyConstraint(
+            ["source_id", "owner_id"],
+            ["contact_sources.id", "contact_sources.owner_id"],
+            ondelete="CASCADE",
+            name="fk_contact_records_source_owner",
+        ),
+        UniqueConstraint(
+            "source_id", "remote_uid_digest",
+            name="uq_contact_records_source_uid_digest",
+        ),
+        CheckConstraint("version >= 1", name="ck_contact_records_version"),
+        Index(
+            "ix_contact_records_owner_source_deleted",
+            "owner_id", "source_id", "deleted_at",
+        ),
+    )
+
+
+@event.listens_for(ContactRecord, "before_insert")
+@event.listens_for(ContactRecord, "before_update")
+def _derive_contact_remote_uid_digest(_mapper, _connection, target):
+    from src.secret_storage import private_digest
+
+    uid = str(target.remote_uid or "").strip()
+    if not uid:
+        raise ValueError("Contact remote UID is required")
+    target.remote_uid_digest = private_digest("contact-remote-uid-v1", uid)
+
+
+class ContactDelivery(TimestampMixin, Base):
+    """Durable, owner-scoped CardDAV mutation outbox.
+
+    The encrypted payload contains the exact vCard and remote precondition
+    needed to replay a connector write after a crash.  Business mutations and
+    this row commit together; network delivery is never the authority commit.
+    """
+
+    __tablename__ = "contact_deliveries"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    source_id = Column(String(36), nullable=False, index=True)
+    record_id = Column(String(36), nullable=False, index=True)
+    operation = Column(String(16), nullable=False)
+    idempotency_key = Column(String(96), nullable=False)
+    payload = Column(EncryptedJSON, nullable=False, default=dict)
+    state = Column(String(24), nullable=False, default="pending")
+    attempts = Column(Integer, nullable=False, default=0)
+    next_attempt_at = Column(DateTime, nullable=True, index=True)
+    claim_token = Column(String(36), nullable=True)
+    claimed_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    last_error_code = Column(String(64), nullable=True)
+    version = Column(Integer, nullable=False, default=1)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["source_id", "owner_id"],
+            ["contact_sources.id", "contact_sources.owner_id"],
+            ondelete="CASCADE",
+            name="fk_contact_deliveries_source_owner",
+        ),
+        ForeignKeyConstraint(
+            ["record_id", "owner_id"],
+            ["contact_records.id", "contact_records.owner_id"],
+            ondelete="CASCADE",
+            name="fk_contact_deliveries_record_owner",
+        ),
+        UniqueConstraint(
+            "owner_id", "idempotency_key",
+            name="uq_contact_deliveries_owner_idempotency",
+        ),
+        CheckConstraint(
+            "operation IN ('create', 'update', 'delete')",
+            name="ck_contact_deliveries_operation",
+        ),
+        CheckConstraint(
+            "state IN ('pending', 'processing', 'retry', 'conflict', 'completed')",
+            name="ck_contact_deliveries_state",
+        ),
+        CheckConstraint("attempts >= 0", name="ck_contact_deliveries_attempts"),
+        CheckConstraint("version >= 1", name="ck_contact_deliveries_version"),
+        Index(
+            "ix_contact_deliveries_owner_state_due",
+            "owner_id", "state", "next_attempt_at", "created_at",
+        ),
+        Index(
+            "ix_contact_deliveries_record_order",
+            "owner_id", "record_id", "created_at", "id",
+        ),
+    )
+
+
+class ContactImportRun(TimestampMixin, Base):
+    """Redacted status for the one legacy contacts JSON cutover."""
+
+    __tablename__ = "contact_import_runs"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    source_kind = Column(String(64), nullable=False, unique=True)
+    state = Column(String(24), nullable=False, default="pending")
+    settings_sha256 = Column(String(64), nullable=True)
+    contacts_sha256 = Column(String(64), nullable=True)
+    backup_settings_path = Column(EncryptedContentText, nullable=True)
+    backup_contacts_path = Column(EncryptedContentText, nullable=True)
+    details = Column(EncryptedJSON, nullable=False, default=dict)
+    completed_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('pending', 'completed', 'failed')",
+            name="ck_contact_import_runs_state",
+        ),
+    )
+
+
 class InboxItem(TimestampMixin, Base):
     """Owner-scoped universal capture awaiting or recording triage."""
 
@@ -610,6 +1618,7 @@ LIFE_ENTITY_TYPES = (
     "place", "asset", "reminder", "automation", "source",
     "journal_entry", "workspace", "trip", "interaction", "commitment",
     "period_review", "learning_record", "career_item", "home_record",
+    "finance_record",
 )
 
 
@@ -824,6 +1833,9 @@ class ActionProposal(TimestampMixin, Base):
     version = Column(Integer, nullable=False, default=1)
 
     __table_args__ = (
+        Index(
+            "uq_action_proposals_id_owner", "id", "owner_id", unique=True,
+        ),
         UniqueConstraint(
             "owner_id", "idempotency_key", name="uq_action_proposals_owner_idempotency",
         ),
@@ -842,6 +1854,127 @@ class ActionProposal(TimestampMixin, Base):
             name="ck_action_proposals_approver_owner",
         ),
         CheckConstraint("version >= 1", name="ck_action_proposals_version"),
+    )
+
+
+class EmailOutboundDraft(TimestampMixin, Base):
+    """Exact encrypted agent-authored email awaiting human review."""
+
+    __tablename__ = "email_outbound_drafts"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    proposal_id = Column(String(36), nullable=False, index=True)
+    email_account_id = Column(
+        String, ForeignKey("email_accounts.id", ondelete="RESTRICT"),
+        nullable=False, index=True,
+    )
+    kind = Column(String(16), nullable=False)
+    content = Column(EncryptedJSON, nullable=False, default=dict)
+    content_sha256 = Column(String(64), nullable=False, index=True)
+    source = Column(EncryptedJSON, nullable=False, default=dict)
+    state = Column(String(24), nullable=False, default="pending_review", index=True)
+    version = Column(Integer, nullable=False, default=1)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "id", "owner_id", name="uq_email_outbound_drafts_id_owner",
+        ),
+        UniqueConstraint(
+            "owner_id", "proposal_id",
+            name="uq_email_outbound_drafts_owner_proposal",
+        ),
+        ForeignKeyConstraint(
+            ("proposal_id", "owner_id"),
+            ("action_proposals.id", "action_proposals.owner_id"),
+            ondelete="CASCADE",
+            name="fk_email_outbound_drafts_proposal_owner",
+        ),
+        Index(
+            "ix_email_outbound_drafts_owner_state_created",
+            "owner_id", "state", "created_at",
+        ),
+        CheckConstraint(
+            "kind IN ('new', 'reply')",
+            name="ck_email_outbound_drafts_kind",
+        ),
+        CheckConstraint(
+            "state IN ('pending_review', 'queued', 'delivered', 'failed', "
+            "'rejected')",
+            name="ck_email_outbound_drafts_state",
+        ),
+        CheckConstraint("version >= 1", name="ck_email_outbound_drafts_version"),
+    )
+
+
+class EmailOutboundDelivery(TimestampMixin, Base):
+    """Durable worker-owned email delivery outbox; never a request-path send."""
+
+    __tablename__ = "email_outbound_deliveries"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    draft_id = Column(String(36), nullable=False, index=True)
+    proposal_id = Column(String(36), nullable=False, index=True)
+    email_account_id = Column(
+        String, ForeignKey("email_accounts.id", ondelete="RESTRICT"),
+        nullable=False, index=True,
+    )
+    idempotency_key = Column(String(128), nullable=False)
+    payload = Column(EncryptedJSON, nullable=False, default=dict)
+    content_sha256 = Column(String(64), nullable=False, index=True)
+    state = Column(String(24), nullable=False, default="queued", index=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    next_attempt_at = Column(DateTime, nullable=True, index=True)
+    claim_token_digest = Column(String(64), nullable=True, unique=True)
+    claimed_at = Column(DateTime, nullable=True)
+    lease_expires_at = Column(DateTime, nullable=True, index=True)
+    completed_at = Column(DateTime, nullable=True)
+    last_error_code = Column(String(64), nullable=True)
+    provider_message_id = Column(EncryptedContentText, nullable=True)
+    version = Column(Integer, nullable=False, default=1)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "id", "owner_id", name="uq_email_outbound_deliveries_id_owner",
+        ),
+        UniqueConstraint(
+            "owner_id", "proposal_id",
+            name="uq_email_outbound_deliveries_owner_proposal",
+        ),
+        UniqueConstraint(
+            "owner_id", "idempotency_key",
+            name="uq_email_outbound_deliveries_owner_idempotency",
+        ),
+        ForeignKeyConstraint(
+            ("draft_id", "owner_id"),
+            ("email_outbound_drafts.id", "email_outbound_drafts.owner_id"),
+            ondelete="CASCADE",
+            name="fk_email_outbound_deliveries_draft_owner",
+        ),
+        ForeignKeyConstraint(
+            ("proposal_id", "owner_id"),
+            ("action_proposals.id", "action_proposals.owner_id"),
+            ondelete="CASCADE",
+            name="fk_email_outbound_deliveries_proposal_owner",
+        ),
+        Index(
+            "ix_email_outbound_deliveries_ready",
+            "state", "next_attempt_at", "lease_expires_at",
+        ),
+        CheckConstraint(
+            "state IN ('queued', 'claimed', 'retry', 'delivered', 'failed', "
+            "'cancelled')",
+            name="ck_email_outbound_deliveries_state",
+        ),
+        CheckConstraint("attempts >= 0", name="ck_email_outbound_deliveries_attempts"),
+        CheckConstraint("version >= 1", name="ck_email_outbound_deliveries_version"),
     )
 
 
@@ -1428,15 +2561,22 @@ class PlanningItem(TimestampMixin, Base):
     calendar_id = Column(
         String, ForeignKey("calendars.id", ondelete="SET NULL"), nullable=True,
     )
-    calendar_event_uid = Column(
-        String, ForeignKey("calendar_events.uid", ondelete="SET NULL"), nullable=True,
-        unique=True,
-    )
+    calendar_event_uid = Column(String, nullable=True)
     completed_at = Column(DateTime, nullable=True, index=True)
     source = Column(String(24), nullable=False, default="user")
     version = Column(Integer, nullable=False, default=1)
 
     __table_args__ = (
+        ForeignKeyConstraint(
+            ("calendar_event_uid", "calendar_id"),
+            ("calendar_events.uid", "calendar_events.calendar_id"),
+            ondelete="SET NULL",
+            name="fk_planning_items_calendar_event",
+        ),
+        UniqueConstraint(
+            "calendar_event_uid", "calendar_id",
+            name="uq_planning_items_calendar_event",
+        ),
         Index("ix_planning_owner_status_due", "owner", "status", "due_date"),
         Index("ix_planning_owner_updated", "owner", "updated_at"),
     )
@@ -4163,6 +5303,12 @@ class CalendarCal(TimestampMixin, Base):
     __tablename__ = "calendars"
 
     id    = Column(String, primary_key=True, index=True)
+    # Stable cross-interface authority. ``owner`` remains only as the legacy
+    # mutable username alias during the additive V3 cutover.
+    owner_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
     owner = Column(String, nullable=True, index=True)
     name  = Column(String, nullable=False)
     color = Column(String, default="#5b8abf")
@@ -4172,6 +5318,14 @@ class CalendarCal(TimestampMixin, Base):
     # multi-account support was added (treated as "use any configured account").
     account_id = Column(String, nullable=True, index=True)
     caldav_base_url = Column(String, nullable=True)
+    config_version = Column(Integer, nullable=False, default=1)
+
+    __table_args__ = (
+        UniqueConstraint("id", "owner_id", name="uq_calendars_id_owner"),
+        CheckConstraint(
+            "config_version >= 1", name="ck_calendars_config_version",
+        ),
+    )
 
     events = relationship("CalendarEvent", back_populates="calendar", cascade="all, delete-orphan")
 
@@ -4181,7 +5335,11 @@ class CalendarEvent(TimestampMixin, Base):
     __tablename__ = "calendar_events"
 
     uid         = Column(String, primary_key=True, index=True)
-    calendar_id = Column(String, ForeignKey("calendars.id"), nullable=False, index=True)
+    owner_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        primary_key=True, nullable=False, index=True,
+    )
+    calendar_id = Column(String, nullable=False, index=True)
     summary     = Column(String, nullable=False, default="")
     description = Column(Text, default="")
     location    = Column(String, default="")
@@ -4206,8 +5364,172 @@ class CalendarEvent(TimestampMixin, Base):
     remote_href = Column(String, nullable=True)        # CalDAV object URL for updates/deletes
     remote_etag = Column(String, nullable=True)        # Last seen CalDAV ETag, when available
     caldav_sync_pending = Column(String, nullable=True) # create | update | delete retry marker
+    version = Column(Integer, nullable=False, default=1)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ("calendar_id", "owner_id"),
+            ("calendars.id", "calendars.owner_id"),
+            ondelete="CASCADE",
+            name="fk_calendar_events_calendar_owner",
+        ),
+        UniqueConstraint(
+            "uid", "owner_id", name="uq_calendar_events_uid_owner",
+        ),
+        UniqueConstraint(
+            "uid", "calendar_id", name="uq_calendar_events_uid_calendar",
+        ),
+        CheckConstraint("version >= 1", name="ck_calendar_events_version"),
+    )
 
     calendar = relationship("CalendarCal", back_populates="events")
+
+
+class CalendarActionUndo(TimestampMixin, Base):
+    """Server-owned, version-fenced reversal state for one calendar proposal.
+
+    Private event snapshots and graph-link identifiers use the content
+    encryption envelope.  The indexed identifiers remain structural routing
+    keys so the executor can claim a row without decrypting unrelated content.
+    """
+
+    __tablename__ = "calendar_action_undos"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    proposal_id = Column(String(36), nullable=False, index=True)
+    event_uid = Column(String, nullable=False, index=True)
+    operation = Column(String(16), nullable=False)
+    before_state = Column(EncryptedJSON, nullable=False, default=dict)
+    # These are filled after the local mutation and before the surrounding
+    # authority transaction commits. They remain nullable while the undo row
+    # is flushed first to establish the Level-4 reversal path.
+    result_event_version = Column(Integer, nullable=True)
+    life_entity_id = Column(String(36), nullable=True)
+    result_graph_version = Column(Integer, nullable=True)
+    created_link_ids = Column(EncryptedJSON, nullable=False, default=dict)
+    state = Column(String(16), nullable=False, default="ready")
+    used_at = Column(DateTime, nullable=True)
+    version = Column(Integer, nullable=False, default=1)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ("proposal_id", "owner_id"),
+            ("action_proposals.id", "action_proposals.owner_id"),
+            name="fk_calendar_action_undos_proposal_owner",
+        ),
+        UniqueConstraint(
+            "id", "owner_id", name="uq_calendar_action_undos_id_owner",
+        ),
+        UniqueConstraint(
+            "owner_id", "proposal_id",
+            name="uq_calendar_action_undos_owner_proposal",
+        ),
+        Index(
+            "ix_calendar_action_undos_owner_state_created",
+            "owner_id", "state", "created_at",
+        ),
+        Index(
+            "ix_calendar_action_undos_owner_event_created",
+            "owner_id", "event_uid", "created_at",
+        ),
+        CheckConstraint(
+            "operation IN ('create', 'update', 'reschedule')",
+            name="ck_calendar_action_undos_operation",
+        ),
+        CheckConstraint(
+            "state IN ('ready', 'used')",
+            name="ck_calendar_action_undos_state",
+        ),
+        CheckConstraint(
+            "result_event_version IS NULL OR result_event_version >= 1",
+            name="ck_calendar_action_undos_event_version",
+        ),
+        CheckConstraint(
+            "result_graph_version IS NULL OR result_graph_version >= 1",
+            name="ck_calendar_action_undos_graph_version",
+        ),
+        CheckConstraint("version >= 1", name="ck_calendar_action_undos_version"),
+    )
+
+
+class CalendarDelivery(TimestampMixin, Base):
+    """Encrypted, replay-safe CalDAV operation committed with local state."""
+
+    __tablename__ = "calendar_deliveries"
+
+    id = Column(String(36), primary_key=True)
+    owner_id = Column(
+        String(36), ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    calendar_id = Column(String, nullable=False, index=True)
+    # Event/proposal identifiers deliberately remain durable references rather
+    # than cascading child rows: delete compensation and delivery audit must
+    # survive a later event/proposal lifecycle change.
+    event_uid = Column(String, nullable=False, index=True)
+    proposal_id = Column(String(36), nullable=True, index=True)
+    operation = Column(String(16), nullable=False)
+    idempotency_key = Column(String(96), nullable=False)
+    payload = Column(EncryptedJSON, nullable=False, default=dict)
+    expected_event_version = Column(Integer, nullable=False)
+    expected_config_version = Column(Integer, nullable=False)
+    state = Column(String(24), nullable=False, default="pending")
+    attempts = Column(Integer, nullable=False, default=0)
+    next_attempt_at = Column(DateTime, nullable=True, index=True)
+    claim_token = Column(String(36), nullable=True)
+    claimed_at = Column(DateTime, nullable=True)
+    lease_expires_at = Column(DateTime, nullable=True, index=True)
+    completed_at = Column(DateTime, nullable=True)
+    last_error_code = Column(String(64), nullable=True)
+    version = Column(Integer, nullable=False, default=1)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ("calendar_id", "owner_id"),
+            ("calendars.id", "calendars.owner_id"),
+            name="fk_calendar_deliveries_calendar_owner",
+        ),
+        ForeignKeyConstraint(
+            ("proposal_id", "owner_id"),
+            ("action_proposals.id", "action_proposals.owner_id"),
+            name="fk_calendar_deliveries_proposal_owner",
+        ),
+        UniqueConstraint(
+            "owner_id", "idempotency_key",
+            name="uq_calendar_deliveries_owner_idempotency",
+        ),
+        Index(
+            "ix_calendar_deliveries_owner_state_due",
+            "owner_id", "state", "next_attempt_at", "created_at",
+        ),
+        Index(
+            "ix_calendar_deliveries_event_order",
+            "owner_id", "event_uid", "created_at", "id",
+        ),
+        CheckConstraint(
+            "operation IN ('create', 'update', 'delete')",
+            name="ck_calendar_deliveries_operation",
+        ),
+        CheckConstraint(
+            "state IN ('pending', 'processing', 'retry', 'conflict', "
+            "'completed', 'cancelled')",
+            name="ck_calendar_deliveries_state",
+        ),
+        CheckConstraint("attempts >= 0", name="ck_calendar_deliveries_attempts"),
+        CheckConstraint(
+            "expected_event_version >= 1",
+            name="ck_calendar_deliveries_event_version",
+        ),
+        CheckConstraint(
+            "expected_config_version >= 1",
+            name="ck_calendar_deliveries_config_version",
+        ),
+        CheckConstraint("version >= 1", name="ck_calendar_deliveries_version"),
+    )
 
 
 class CalendarDeletedEvent(TimestampMixin, Base):
@@ -4311,7 +5633,7 @@ def _migrate_seed_email_account():
 # Any future migrations or schema changes that temporarily violate foreign-key
 # constraints will fail. To perform such operations, foreign_keys must be
 # temporarily disabled around the migration workflow.
-def init_db():
+def init_db(*, legacy_principal_initializer=None):
     """
     Initialize the database by creating all tables.
     Should be called when starting the application.
@@ -4319,8 +5641,17 @@ def init_db():
     harden_database_permissions()
     _migrate_model_endpoints()
     Base.metadata.create_all(bind=engine)
+    legacy_calendar_authority_pending = (
+        _prepare_legacy_calendar_authority_for_fk_validation()
+    )
     _migrate_add_unified_auth_columns()
+    if (
+        legacy_calendar_authority_pending
+        and legacy_principal_initializer is not None
+    ):
+        legacy_principal_initializer()
     _migrate_life_planning_spine()
+    _migrate_calendar_authority()
     _migrate_action_audit_guards()
     harden_database_permissions()
     _migrate_add_study_review_columns()
@@ -4583,6 +5914,185 @@ def _migrate_life_planning_spine():
                 SELECT RAISE(ABORT, 'ActionAudit rows are append-only');
             END
         """))
+
+
+_CALENDAR_AUTHORITY_CHILD_TABLES = (
+    "email_outbound_deliveries",
+    "email_outbound_drafts",
+    "calendar_deliveries",
+    "calendar_action_undos",
+)
+
+
+def _legacy_calendar_authority_state():
+    """Return whether legacy calendar tables need the reviewed 0005 repair."""
+
+    from sqlalchemy import inspect as sa_inspect
+
+    schema = sa_inspect(engine)
+    if not schema.has_table("calendars") or not schema.has_table("calendar_events"):
+        return None
+    calendar_columns = {
+        str(column["name"]) for column in schema.get_columns("calendars")
+    }
+    event_columns = {
+        str(column["name"])
+        for column in schema.get_columns("calendar_events")
+    }
+    calendar_new = {"owner_id", "config_version"} & calendar_columns
+    event_new = {"owner_id", "version"} & event_columns
+    complete = (
+        calendar_new == {"owner_id", "config_version"}
+        and event_new == {"owner_id", "version"}
+    )
+    if bool(calendar_new or event_new) and not complete:
+        raise RuntimeError("Refusing a partial legacy calendar-authority schema")
+    return not complete
+
+
+def _drop_empty_calendar_authority_children():
+    """Remove only empty V3 children that cannot reference legacy parents yet."""
+
+    with engine.begin() as connection:
+        for table_name in _CALENDAR_AUTHORITY_CHILD_TABLES:
+            if not connection.dialect.has_table(connection, table_name):
+                continue
+            retained = int(connection.execute(text(
+                f'SELECT COUNT(*) FROM "{table_name}"'
+            )).scalar() or 0)
+            if retained:
+                raise RuntimeError(
+                    "Refusing legacy calendar/action adoption with existing "
+                    "authority data"
+                )
+            connection.execute(text(f'DROP TABLE "{table_name}"'))
+
+
+def _prepare_legacy_calendar_authority_for_fk_validation():
+    """Make a create_all retry structurally valid before strict FK checks.
+
+    ``create_all`` can add V3 child tables to a V2.1 database while leaving the
+    legacy calendar parents unchanged. SQLite then raises a schema-level foreign
+    key mismatch before the unified-auth bridge can establish the principals
+    required by revision 0005. Drop only those provably-empty new children; the
+    reviewed calendar migration recreates them after parent repair.
+    """
+
+    if engine.dialect.name != "sqlite":
+        return False
+    needs_repair = _legacy_calendar_authority_state()
+    if not needs_repair:
+        return False
+    _drop_empty_calendar_authority_children()
+    return True
+
+
+def _migrate_calendar_authority():
+    """Complete the additive 0005 shape during pre-Alembic adoption.
+
+    Fresh and already-versioned databases execute Alembic 0005. The guarded,
+    backed-up pre-Alembic SQLite path first runs ``create_all``; that creates
+    the new undo/outbox tables but cannot alter existing calendar tables. Reuse
+    the reviewed migration's exact owner preflight, backfill, and batch-table
+    constraints before the runtime is permitted to stamp the current head.
+    """
+
+    if engine.dialect.name != "sqlite":
+        return
+
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+    from migrations.versions import calendar_authority_20260720_0005 as revision
+
+    needs_repair = _legacy_calendar_authority_state()
+    if needs_repair is None:
+        return
+
+    if needs_repair:
+        # ``create_all`` has already created new empty calendar/email action
+        # child tables. Their composite foreign keys cannot become valid until
+        # calendars and action_proposals have reviewed owner uniqueness, and
+        # SQLite rejects even the owner backfill while a mismatched child
+        # exists. Preflight first, then remove only provably-empty new tables
+        # and recreate them below.
+        with engine.connect() as connection:
+            context = MigrationContext.configure(connection)
+            with Operations.context(context):
+                revision._preflight_owner_mapping()
+        _drop_empty_calendar_authority_children()
+
+        with engine.connect() as connection:
+            connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+            try:
+                context = MigrationContext.configure(connection)
+                with Operations.context(context):
+                    revision.op.add_column(
+                        "calendars",
+                        Column("owner_id", String(length=36), nullable=True),
+                    )
+                    revision.op.add_column(
+                        "calendars",
+                        Column(
+                            "config_version", Integer(), nullable=False,
+                            server_default="1",
+                        ),
+                    )
+                    revision.op.add_column(
+                        "calendar_events",
+                        Column("owner_id", String(length=36), nullable=True),
+                    )
+                    revision.op.add_column(
+                        "calendar_events",
+                        Column(
+                            "version", Integer(), nullable=False,
+                            server_default="1",
+                        ),
+                    )
+                    revision._backfill_owner_ids()
+                    revision._upgrade_existing_tables(
+                        manage_sqlite_foreign_keys=False
+                    )
+                if connection.in_transaction():
+                    connection.commit()
+            except Exception:
+                if connection.in_transaction():
+                    connection.rollback()
+                raise
+            finally:
+                connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+                enabled = int(connection.exec_driver_sql(
+                    "PRAGMA foreign_keys"
+                ).scalar() or 0)
+                if enabled != 1:
+                    raise RuntimeError(
+                        "Could not restore SQLite foreign-key enforcement"
+                    )
+
+    # ``create_all`` does not add indexes to pre-existing tables. These exact
+    # indexes are the only remaining 0005 objects not installed by the batch
+    # rebuild above; IF NOT EXISTS keeps retry and already-current adoption
+    # idempotent without weakening head validation.
+    with engine.begin() as connection:
+        connection.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_action_proposals_id_owner "
+            "ON action_proposals (id, owner_id)"
+        ))
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_calendars_owner_id "
+            "ON calendars (owner_id)"
+        ))
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_calendar_events_owner_id "
+            "ON calendar_events (owner_id)"
+        ))
+
+    for table_name in (
+        "calendar_action_undos",
+        "calendar_deliveries",
+        "email_outbound_drafts",
+        "email_outbound_deliveries",
+    ):
+        Base.metadata.tables[table_name].create(bind=engine, checkfirst=True)
 
 
 def _migrate_backfill_task_folders():
@@ -5142,27 +6652,36 @@ def get_session_by_id(session_id: str):
         return db.query(Session).filter(Session.id == session_id).first()
 
 def get_upcoming_events(owner, horizon_days: int = 60, limit: int = 40):
-    """Upcoming, non-cancelled events as {uid, title, start} dicts, soonest first.
+    """Upcoming events for one concrete login alias, soonest first.
 
-    owner=None means NO owner scoping (single-user / legacy). Multi-user callers
-    MUST pass the owning username — otherwise they read every tenant's events.
-    The autonomous email->calendar pass relies on this to avoid disclosing (and
-    acting on) other users' calendars."""
+    Calendar ownership is the immutable ``Account.id``. Missing or unknown
+    aliases return no rows so autonomous email processing cannot cross account
+    boundaries.
+    """
     from datetime import timedelta
+    from src.identity import find_account
+
+    owner_alias = str(owner or "").strip()
+    if not owner_alias:
+        return []
     now = utcnow_naive()
     with get_db_session() as db:
+        account = find_account(db, owner_alias)
+        if account is None:
+            return []
         q = db.query(CalendarEvent).join(CalendarCal).filter(
+            CalendarCal.owner_id == account.id,
+            CalendarEvent.owner_id == account.id,
             CalendarEvent.dtstart >= now,
             CalendarEvent.dtstart <= now + timedelta(days=horizon_days),
             CalendarEvent.status != "cancelled",
         )
-        if owner is not None:
-            q = q.filter(CalendarCal.owner == owner)
         return [
             {
                 "uid": e.uid,
                 "title": e.summary or "",
                 "start": e.dtstart.isoformat() if e.dtstart else "",
+                "version": e.version,
             }
             for e in q.order_by(CalendarEvent.dtstart).limit(limit).all()
         ]
@@ -5176,6 +6695,21 @@ def archive_session(session_id: str):
             db.commit()
             return True
     return False
+
+
+# Register isolated post-baseline metadata models on the canonical Base.  The
+# module imports only Base/type definitions from this file, so loading it after
+# all core models avoids a circular initialization while ensuring legacy
+# ``Base.metadata.create_all`` compatibility tests include the reviewed tables.
+from src.upload_metadata_models import (  # noqa: E402,F401
+    ChatUploadMetadata,
+    ChatUploadMetadataImportRun,
+)
+from src.profile_configuration_models import (  # noqa: E402,F401
+    ProfileConfiguration,
+    ProfileConfigurationImportRun,
+    ProfileConfigurationMutation,
+)
 
 # Schema initialization is intentionally explicit. Production entrypoints call
 # ``src.database_runtime.initialize_database`` before using a session; importing

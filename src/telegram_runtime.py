@@ -9,13 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import errno
-import hashlib
-import json
 import logging
 import os
 import re
 import stat
 import time
+import uuid
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -24,6 +24,13 @@ import httpx
 from src.settings import is_setting_overridden, load_settings
 from src.constants import DATA_DIR
 from src.telegram_bot import _install_telegram_log_filter, load_telegram_config
+from src.telegram_delivery import (
+    POLLING_LEASE,
+    TelegramPollingLease,
+    TelegramPollingLeaseLost,
+    TelegramRuntimeAuthority,
+    telegram_runtime_authority,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -349,8 +356,16 @@ class TelegramPollingService:
 
     MAX_UPDATE_ATTEMPTS = 3
     OWNERSHIP_RETRY_SECONDS = 3.0
+    DATABASE_LEASE = POLLING_LEASE
+    DATABASE_HEARTBEAT_SECONDS = 25.0
 
-    def __init__(self, *, process_lock_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        process_lock_path: Path | None = None,
+        runtime_authority: TelegramRuntimeAuthority | None = None,
+        worker_id: str | None = None,
+    ) -> None:
         self._update_handler: Callable[[dict[str, Any]], Awaitable[None]] | None = None
         self._wake = asyncio.Event()
         self._runner_task: asyncio.Task | None = None
@@ -359,13 +374,15 @@ class TelegramPollingService:
         )
         self._offset: int | None = None
         self._token_fingerprint = ""
+        self._runtime_authority = runtime_authority or telegram_runtime_authority
+        self._worker_id = worker_id or ("poller:" + uuid.uuid4().hex)
+        self._database_lease: TelegramPollingLease | None = None
+        self._database_lease_lost = False
+        self._database_heartbeat_task: asyncio.Task | None = None
         self._running = False
         self._standby = False
         self._last_error = ""
         self._last_update_at: float | None = None
-        self._update_failures: dict[int, int] = {}
-        self._dead_letter_path = Path(DATA_DIR) / "telegram_dead_letters.json"
-        self._offset_state_path = Path(DATA_DIR) / "telegram_polling_state.json"
 
     def configure(self, update_handler: Callable[[dict[str, Any]], Awaitable[None]]) -> None:
         self._update_handler = update_handler
@@ -374,9 +391,14 @@ class TelegramPollingService:
         self._wake.set()
 
     def status(self) -> dict[str, Any]:
-        try:
-            dead_letter_count = len(json.loads(self._dead_letter_path.read_text(encoding="utf-8")))
-        except Exception:
+        if self._token_fingerprint:
+            try:
+                dead_letter_count = self._runtime_authority.dead_letter_count(
+                    self._token_fingerprint
+                )
+            except Exception:
+                dead_letter_count = 0
+        else:
             dead_letter_count = 0
         return {
             "poller_running": self._running,
@@ -384,55 +406,28 @@ class TelegramPollingService:
             "last_error": self._last_error,
             "last_update_at": self._last_update_at,
             "dead_letter_count": dead_letter_count,
+            "database_leased": self._database_lease is not None,
         }
 
-    def _record_dead_letter(self, update_id: int, exc: Exception) -> bool:
-        """Persist only safe metadata; message content and credentials stay out."""
-        try:
-            try:
-                rows = json.loads(self._dead_letter_path.read_text(encoding="utf-8"))
-                if not isinstance(rows, list):
-                    rows = []
-            except Exception:
-                rows = []
-            rows.append({
-                "update_id": update_id,
-                "failed_at": time.time(),
-                "error_type": exc.__class__.__name__,
-                "attempts": self.MAX_UPDATE_ATTEMPTS,
-            })
-            from core.atomic_io import atomic_write_json
-            atomic_write_json(str(self._dead_letter_path), rows[-100:])
-            return True
-        except Exception:
-            logger.exception("Telegram poison update %s could not be dead-lettered", update_id)
-            return False
-
     def _load_durable_offset(self, fingerprint: str) -> int | None:
-        try:
-            state = json.loads(self._offset_state_path.read_text(encoding="utf-8"))
-            if state.get("bot_fingerprint") != fingerprint:
-                return None
-            value = state.get("offset")
-            return int(value) if isinstance(value, int) and value >= 0 else None
-        except Exception:
-            return None
+        return self._runtime_authority.polling_cursor(fingerprint)
 
     def _advance_offset(self, offset: int) -> None:
         """Persist before using an offset to survive restart replay."""
-        from core.atomic_io import atomic_write_json
-
-        atomic_write_json(str(self._offset_state_path), {
-            "bot_fingerprint": self._token_fingerprint,
-            "offset": int(offset),
-            "updated_at": time.time(),
-        })
-        self._offset = int(offset)
+        if self._database_lease_lost or self._database_lease is None:
+            raise TelegramPollingLeaseLost("Telegram polling lease was lost")
+        self._offset = self._runtime_authority.advance_polling_cursor(
+            self._database_lease, int(offset)
+        )
 
     async def _process_updates(self, updates: list[Any]) -> None:
         """Handle updates in order and advance offsets only after resolution."""
         if self._update_handler is None:
             return
+        if self._database_lease_lost or self._database_lease is None:
+            raise TelegramPollingLeaseLost(
+                "Telegram polling updates require a database lease"
+            )
         for update in updates:
             if not isinstance(update, dict):
                 continue
@@ -451,25 +446,26 @@ class TelegramPollingService:
                     raise
                 if not isinstance(update_id, int):
                     raise
-                attempts = self._update_failures.get(update_id, 0) + 1
-                self._update_failures[update_id] = attempts
-                if attempts < self.MAX_UPDATE_ATTEMPTS:
-                    # Do not advance: Telegram will return this update again.
+                if self._database_lease_lost:
+                    raise TelegramPollingLeaseLost(
+                        "Telegram polling lease was lost"
+                    ) from exc
+                resolution = self._runtime_authority.record_handler_failure(
+                    self._database_lease,
+                    update_id=update_id,
+                    error_type=exc.__class__.__name__,
+                    max_attempts=self.MAX_UPDATE_ATTEMPTS,
+                )
+                if not resolution.resolved:
                     raise
-                if not self._record_dead_letter(update_id, exc):
-                    # Persistence is part of resolution. Keep the offset on the
-                    # failed update until its dead-letter record is durable.
-                    raise
-                self._update_failures.pop(update_id, None)
-                self._advance_offset(update_id + 1)
+                self._offset = resolution.next_offset
                 logger.error(
                     "Telegram update %s dead-lettered after %s handler failures",
                     update_id,
-                    self.MAX_UPDATE_ATTEMPTS,
+                    resolution.attempts,
                 )
                 continue
             if isinstance(update_id, int):
-                self._update_failures.pop(update_id, None)
                 self._advance_offset(update_id + 1)
             self._last_update_at = time.time()
 
@@ -479,6 +475,55 @@ class TelegramPollingService:
         except asyncio.TimeoutError:
             pass
         self._wake.clear()
+
+    async def _database_heartbeat(self, claim: TelegramPollingLease) -> None:
+        """Renew one fenced lease while network/LLM processing is in flight."""
+
+        try:
+            while self._database_lease is not None:
+                await asyncio.sleep(self.DATABASE_HEARTBEAT_SECONDS)
+                current = self._database_lease
+                if current is None or current.fencing_token != claim.fencing_token:
+                    return
+                renewed = self._runtime_authority.renew_polling_lease(
+                    current, lease=self.DATABASE_LEASE
+                )
+                if renewed is None:
+                    self._database_lease_lost = True
+                    self._wake.set()
+                    return
+                self._database_lease = renewed
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._database_lease_lost = True
+            self._last_error = "Telegram polling ownership unavailable"
+            logger.error(
+                "Telegram polling database lease renewal failed (%s)",
+                exc.__class__.__name__,
+            )
+            self._wake.set()
+
+    async def _drop_database_lease(self, *, release: bool) -> None:
+        heartbeat = self._database_heartbeat_task
+        self._database_heartbeat_task = None
+        if heartbeat is not None and not heartbeat.done():
+            heartbeat.cancel()
+            try:
+                await heartbeat
+            except asyncio.CancelledError:
+                pass
+        claim = self._database_lease
+        self._database_lease = None
+        self._database_lease_lost = False
+        if release and claim is not None:
+            try:
+                self._runtime_authority.release_polling_lease(claim)
+            except Exception:
+                logger.warning(
+                    "Telegram polling database lease release failed",
+                    exc_info=True,
+                )
 
     def start(self) -> asyncio.Task:
         """Start the sole in-process poller and return its owned task.
@@ -570,15 +615,65 @@ class TelegramPollingService:
                     or telegram_runtime_mode(settings) != "polling"
                     or self._update_handler is None
                 ):
+                    if self._database_lease is not None:
+                        await self._drop_database_lease(release=True)
+                    self._token_fingerprint = ""
+                    self._offset = None
                     self._last_error = ""
                     await self._wait(3.0)
                     continue
 
-                fingerprint = hashlib.sha256(config.bot_token.encode("utf-8")).hexdigest()
+                from src.telegram_identity import telegram_bot_fingerprint
+
+                fingerprint = (
+                    str(getattr(config, "bot_fingerprint", "") or "")
+                    or telegram_bot_fingerprint(bot_token=config.bot_token)
+                )
                 if fingerprint != self._token_fingerprint:
+                    if self._database_lease is not None:
+                        await self._drop_database_lease(release=True)
                     self._token_fingerprint = fingerprint
+                    self._offset = None
+                if self._database_lease_lost:
+                    await self._drop_database_lease(release=False)
+                if self._database_lease is None:
+                    try:
+                        self._runtime_authority.adopt_legacy_sidecars(
+                            bot_fingerprint=fingerprint,
+                            bot_token=config.bot_token,
+                            data_dir=DATA_DIR,
+                        )
+                        claim = self._runtime_authority.acquire_polling_lease(
+                            bot_fingerprint=fingerprint,
+                            worker_id=self._worker_id,
+                            lease=self.DATABASE_LEASE,
+                        )
+                    except Exception as exc:
+                        self._running = False
+                        self._standby = False
+                        self._last_error = "Telegram polling ownership unavailable"
+                        logger.error(
+                            "Telegram polling database ownership unavailable (%s)",
+                            exc.__class__.__name__,
+                        )
+                        await self._wait(self.OWNERSHIP_RETRY_SECONDS)
+                        continue
+                    if claim is None:
+                        self._running = False
+                        self._standby = True
+                        self._last_error = ""
+                        await self._wait(self.OWNERSHIP_RETRY_SECONDS)
+                        continue
+                    self._database_lease = claim
+                    self._database_lease_lost = False
                     self._offset = self._load_durable_offset(fingerprint)
-                    self._update_failures.clear()
+                    self._database_heartbeat_task = asyncio.create_task(
+                        self._database_heartbeat(claim),
+                        name="restia-telegram-poller-lease",
+                    )
+                    self._running = True
+                    self._standby = False
+                    logger.info("Telegram database polling lease acquired")
                 payload: dict[str, Any] = {
                     "timeout": 25,
                     "allowed_updates": ["message", "edited_message"],
@@ -598,6 +693,12 @@ class TelegramPollingService:
                     backoff = 1.0
                 except asyncio.CancelledError:
                     raise
+                except TelegramPollingLeaseLost:
+                    self._last_error = ""
+                    await self._drop_database_lease(release=False)
+                    self._running = False
+                    self._standby = True
+                    await self._wait(self.OWNERSHIP_RETRY_SECONDS)
                 except TelegramAPIError as exc:
                     self._last_error = str(exc)
                     logger.warning("Telegram polling paused: %s", exc)
@@ -609,11 +710,11 @@ class TelegramPollingService:
                     await self._wait(backoff)
                     backoff = min(backoff * 2, 30.0)
         finally:
+            await self._drop_database_lease(release=True)
             self._running = False
             self._standby = False
             self._token_fingerprint = ""
             self._offset = None
-            self._update_failures.clear()
             self._process_lease.release()
             if self._runner_task is current:
                 self._runner_task = None

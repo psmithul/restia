@@ -78,13 +78,27 @@ SQLAlchemy remains the application data boundary.
 - ChromaDB and other vector indexes are derived retrieval indexes, not the
   system of record.
 - Files remain in the configured durable file store; SQL rows hold ownership,
-  provenance, hashes, versions, and storage references. An object-store adapter
-  can be added for shared deployments without changing domain APIs.
+  provenance, keyed content identity, versions, and storage references. Local
+  installs retain the existing file layout. Shared deployments require an
+  explicit durable filesystem mount at the same absolute path on every
+  replica; a future object-store adapter can implement the same confined-key
+  contract without changing domain APIs.
 
 PostgreSQL support is incomplete until the runtime includes a tested driver,
 schema migrations run on both SQLite and PostgreSQL, and no migration helper
 assumes a raw SQLite connection. A `DATABASE_URL` setting alone is not proof of
 PostgreSQL support.
+
+The executable readiness contract is `scripts/odysseus-db shared-gate`. It
+requires the explicit `postgresql+psycopg://` driver and can run the full
+Alembic chain inside a disposable PostgreSQL schema. Web sessions, attributed
+API tokens, explicitly linked Supabase subjects, Telegram chat links, and
+per-chat Telegram session mappings now converge on `Account.id`. Telegram
+polling offsets, poison-update resolution, inbound claims, and reply-delivery
+fencing, plus reminder claims and browser-notification acknowledgements, now
+use the same database authority. Remaining local authorities stay enumerated
+as machine-readable blockers; the runtime gate cannot be enabled merely by
+changing a boolean while any blocker remains.
 
 ## Unified life model
 

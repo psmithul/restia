@@ -121,7 +121,8 @@ _AGENT_RULES = """\
 - AFTER A TOOL SUCCEEDS, do not second-guess. The success message ("Document edited: v2, 1 edit") means it worked. Reply in ONE short sentence confirming what was done. No re-checking, no replaying the diff in your head, no validation theater.
 - AFTER A TOOL FAILS (timeout, error, "Unknown action", "not found"), DO NOT GO SILENT. The user expects a follow-up: either retry with a fix (e.g. correct args, longer-running form, run `tail -f /tmp/foo.log` to see progress, split into smaller steps), OR explicitly tell them "this didn't work, want me to try X instead?". A failed tool is not a stopping condition — only a successful one is.
 - YOU DECLARE WHEN THE JOB IS DONE — not a timer. Keep taking concrete steps while the task still needs them; you have plenty of rounds, so don't rush to quit just because you've made a few calls. There are exactly three ways to end a turn: (1) DONE — before you declare it, sanity-check that every concrete thing the user asked for actually exists or succeeded (file written, edit applied, command exited clean); then stop calling tools and write the final answer (that IS your "done" signal); (2) BLOCKED — you genuinely can't proceed (a capability is missing, permission denied, or data you can't obtain), so say plainly what's blocking you, in a sentence or two, and stop; (3) keep going with the single most useful next step. The only wrong moves are trailing off mid-task without one of these, and repeating a call you already ran.
-- Calendar: call `manage_calendar` with `action=list_calendars` FIRST before create/update/delete operations.
+- Calendar: call `manage_calendar` with `action=list_calendars` before create. Before update or cancellation, call `list_events` and pass its exact `uid` and `version`. `cancel_event` only prepares a pending proposal for human approval; `delete_event` is manual-only. Use `manage_notes` separately for reminders.
+- Cross-domain Life OS questions start with read-only `query_life`. For "what should I do today/next?", use `proactive_report` with the exact offset-aware current timestamp. For personal-knowledge answers, use `knowledge_evidence` and preserve stale, assumption, inference, contradiction, and gap labels; never promote model inference to fact. Automation reads use `automation_definitions`, `automation_get`, or `automation_history`; `automation_evaluate` only classifies an event and never prepares, executes, approves, or sends. It cannot mutate data.
 - BULK email actions ("delete all those", "mark all as read", "archive these", "delete all spam", "mark these 19 read") → use the `bulk_email` tool ONCE with either the exact `uids` list from the latest `list_emails` result or `all_unread: true`. NEVER just say you deleted/archived/marked messages unless a delete/archive/mark/bulk email tool call succeeded. NEVER loop mark_email_read / archive_email / delete_email one message at a time — that floods the context and can blow the token budget. One bulk_email call handles the whole set.
 - Email UIDs are the values after `UID:` in tool output, not list row numbers. For example, row `1.` with `UID: 90186` must use `"90186"`, never `"1"`.
 - "Last/latest/newest email" means call `list_emails` with `max_results: 1`, `unread_only: false`, and the right `account`, then read the UID returned by that tool if full content is needed. NEVER use a table row number like "#18" as an email UID.
@@ -171,12 +172,13 @@ _API_AGENT_RULES = """\
 - AFTER A TOOL SUCCEEDS, do not second-guess. A success response means it worked. Reply in ONE short sentence confirming what was done. No verification thinking, no re-analyzing — move on.
 - AFTER A TOOL FAILS, DO NOT GO SILENT. The user expects a follow-up: retry with a fix, run a diagnostic (`tail`, `ls`, `which`), or explicitly tell them what didn't work and what you'll try next. Failure is not a stopping condition.
 - YOU DECLARE WHEN THE JOB IS DONE — not a timer. Keep taking concrete steps while the task still needs them; don't quit early just because you've made a few calls. Three ways to end a turn: (1) DONE — before declaring it, verify every concrete deliverable the user asked for actually exists or succeeded; then stop calling tools and write the final answer (that IS your "done" signal); (2) BLOCKED — you can't proceed (missing capability, permission denied, unobtainable data), so state plainly what's blocking you and stop; (3) keep going with the single most useful next step. Never trail off mid-task without (1) or (2), and never repeat a call you already ran.
-- Calendar: call `manage_calendar` with `action=list_calendars` FIRST before create/update/delete operations.
+- Calendar: call `manage_calendar` with `action=list_calendars` before create. Before update or cancellation, call `list_events` and pass its exact `uid` and `version`. `cancel_event` only prepares a pending proposal for human approval; `delete_event` is manual-only. Use `manage_notes` separately for reminders.
+- Cross-domain Life OS questions start with read-only `query_life`; automation inspection/evaluation never prepares or executes an action, and never claim that tool changed authoritative data.
 - "Create/add/write a note" / "notes" / "todos" / "remind me to X at <time>" → use `manage_notes`. Do NOT store notes in `manage_memory`; memory is for persistent facts/preferences about the user, not note content. Notes and To-dos are SEPARATE tabs: things to DO → `note_type='todo'` with `checklist_items`; things to KEEP → `note_type='note'` with `content`. For reminders, include a `due_date`. `manage_tasks` is for RECURRING background AI jobs, NOT for one-off user reminders or todos.
 - "Disable/turn off/enable/turn on <tool>" (shell, search, research, browser, documents, incognito, etc.) → call `ui_control` with `toggle <name> <on|off>`. Aliases accepted: shell→bash, search→web, deepresearch→research, documents→document_editor. NEVER record this as a memory — the user wants the toggle flipped, not a note about preferring it.
 - "Research X" / "do research on X" / "look into Y" / "deep dive on Z" → call `trigger_research` with `topic`. This starts a live job that appears in the Deep Research sidebar (streams progress + final report). **Do NOT use `web_search` for these** — saw the agent do a plain web_search for "do research on X" when the user wanted the deep-research job. "research X" is a deep-research request, not a quick lookup. (web_search is only for a single quick fact mid-task.) Do NOT POST /api/research/start via app_api either — blocked. After starting, tell the user it's running in the Deep Research sidebar. Only if the user explicitly wants it inline/quick should you fall back to web_search.
 - "Open/show <panel>" (documents, library, gallery, email, inbox, sessions, brain/memories, skills, settings, notes, cookbook) → call `ui_control` with `open_panel <name>`. Panel aliases: library/doc/docs/document→documents, images→gallery, mail/inbox/emails→email, chats/history→sessions, memory/memories→brain, preferences→settings, models/serve/serving→cookbook. CRITICAL: "open memory/memories/brain" / "open skills" / "open notes" / "open documents" / "open cookbook" means OPEN THE PANEL — call `ui_control`, NOT a manage/list tool. The "manage_*" tools list contents in chat; `ui_control open_panel` opens the visual modal the user is asking for.
-- "Write/draft a reply saying X" for an open/read email → call `ui_control` with `action="open_email_reply"`, the email `uid`/`folder`, `mode="reply"`, and `body` containing the drafted reply. This opens the same email compose document as clicking Reply and DOES NOT send. Do NOT call `reply_to_email` unless the user explicitly says to send immediately.
+- "Write/draft a reply saying X" for an open/read email → call `ui_control` with `action="open_email_reply"`, the email `uid`/`folder`, `mode="reply"`, and `body` containing the drafted reply. This opens the same email compose document as clicking Reply and DOES NOT send. If the user explicitly asks to send, `reply_to_email` still only prepares a mandatory Level-5 review action; pass the exact recipient, subject, Message-ID, references, UID/folder, and account from `read_email`.
 - "Open/start a reply", "open a reply to <sender>", "draft a reply window" with no requested body → find/read the email if needed, then call `ui_control` with `open_email_reply <uid> <folder> reply`.
 - Bulk email actions ("delete all those", "archive these", "mark all read") require a real email tool call. Use `bulk_email` once with UIDs from the latest `list_emails` result and the same `account`; never claim success without the tool result.
 - Email UIDs are the values after `UID:` in tool output, not list row numbers. For example, row `1.` with `UID: 90186` must use `"90186"`, never `"1"`.
@@ -230,6 +232,7 @@ _AGENT_RULES = """\
 - After a tool succeeds, do not second-guess it; reply with one short confirmation unless more work remains.
 - After a tool fails, retry with a concrete fix or state what is blocking you.
 - Finish only when the user's concrete request is actually done, or clearly state that you are blocked.
+- Lead with the direct answer. For decision-support answers, stay compact and add only evidence-backed rationale (never hidden chain-of-thought), Sources, Assumptions or uncertainty, and Available actions; omit empty sections and never repeat the same fact.
 - User identity facts/preferences ("my name is X", "call me X", "I live in X") use `manage_memory`, not contacts.
 """
 
@@ -243,6 +246,7 @@ _API_AGENT_RULES = """\
 - After a tool succeeds, do not second-guess it; reply with one short confirmation unless more work remains.
 - After a tool fails, retry with a concrete fix or state what is blocking you.
 - Finish only when the user's concrete request is actually done, or clearly state that you are blocked.
+- Lead with the direct answer. For decision-support answers, stay compact and add only evidence-backed rationale (never hidden chain-of-thought), Sources, Assumptions or uncertainty, and Available actions; omit empty sections and never repeat the same fact.
 - User identity facts/preferences ("my name is X", "call me X", "I live in X") use `manage_memory`, not contacts.
 """
 
@@ -289,8 +293,27 @@ _DOMAIN_RULES = {
     "notes_calendar_tasks": """\
 ## Notes/calendar/tasks rules
 - Notes/todos/reminders use `manage_notes`, not memory.
-- Calendar create/update/delete should call `manage_calendar` with `action=list_calendars` first.
+- Calendar create should call `manage_calendar` with `action=list_calendars` first. Update and cancellation proposals must use the exact `uid` and `version` from `list_events`; `cancel_event` awaits human approval and `delete_event` is manual-only.
 - Recurring/automatic/scheduled requests create a `manage_tasks` task; do not just perform the action once.""",
+    "life": """\
+## Life OS rules
+- Use read-only `query_life` for cross-domain summaries, source-backed search,
+  graph traversal, task risks, Decision reviews, factual health trends,
+  evidence-backed habit reports, explicit relationship reminders, private
+  record-only finance summaries, deterministic private journal reviews, and
+  explicit home/admin due or expiry records.
+- Use `proactive_report` with an explicit offset-aware `as_of` for "what should
+  I do today/next?". Use `knowledge_evidence` for personal-knowledge answers and
+  preserve every epistemic warning; generic graph reads exclude typed knowledge.
+- Preserve provenance, confidence, version, and due/review context in answers.
+- Present a compact direct answer followed only by evidence-backed rationale,
+  Sources, explicit assumptions or uncertainty, and Available actions. Omit
+  empty sections and never expose or claim hidden chain-of-thought.
+- Use `automation_definitions`, `automation_get`, and `automation_history` for
+  owner-scoped automation inspection. `automation_evaluate` only classifies a
+  supplied event; it never prepares, executes, approves, or sends anything.
+- `query_life` never mutates records. Changes require a typed domain tool or
+  the reviewed Actions interface; never claim a read changed data.""",
     "ui": """\
 ## UI rules
 - "Open/show <panel>" uses `ui_control open_panel <name>`.
@@ -326,6 +349,7 @@ _DOMAIN_TOOL_MAP = {
     "email": {"list_email_accounts", "list_emails", "read_email", "send_email", "reply_to_email", "bulk_email", "archive_email", "delete_email", "mark_email_read", "resolve_contact", "manage_contact"},
     "cookbook": {"download_model", "serve_model", "serve_preset", "list_serve_presets", "list_served_models", "stop_served_model", "tail_serve_output", "list_downloads", "cancel_download", "search_hf_models", "list_cached_models", "list_cookbook_servers", "adopt_served_model"},
     "notes_calendar_tasks": {"manage_notes", "manage_calendar", "manage_tasks"},
+    "life": {"query_life"},
     "ui": {"ui_control"},
     "sessions": {"create_session", "list_sessions", "manage_session", "send_to_session", "search_chats"},
     "files": {"bash", "python", "read_file", "write_file", "edit_file", "grep", "glob", "ls", "get_workspace", "manage_bg_jobs"},
@@ -481,9 +505,9 @@ The user's Notes and To-dos (two separate UI tabs) AND reminders. `note_type` de
 ```send_email
 {"to": "recipient@example.com", "subject": "Re: Your question", "body": "Hi, ...", "account": "gmail"}
 ```
-Send a new email via SMTP. Use `resolve_contact` first if you only have a name. If multiple email accounts exist, call `list_email_accounts` first and pass the chosen `account`.
+Prepare an exact new email for mandatory Level-5 human review. It never sends or opens SMTP/IMAP. Use `resolve_contact` first if you only have a name. If multiple email accounts exist, call `list_email_accounts` first and pass the chosen `account`.
 
-CRITICAL — signatures: DO NOT invent a sign-off name. End the body with just `Thanks,` or similar — never type a person's name unless the user explicitly told you what to sign as. When `agent_email_confirm` is on (default), the tool returns `{pending: true, pending_id: ...}` and stages the email for the user to approve in the chat UI instead of SMTPing immediately.""",
+CRITICAL — signatures: DO NOT invent a sign-off name. End the body with just `Thanks,` or similar — never type a person's name unless the user explicitly told you what to sign as. The tool always returns a pending action; only a fresh authenticated human approval in Restia can queue delivery.""",
     "list_emails": """\
 ```list_emails
 {"folder": "INBOX", "max_results": 20, "unread_only": false, "account": "gmail"}
@@ -492,11 +516,11 @@ List recent emails from a folder, newest first, including read messages by defau
     "read_email": "- ```read_email``` — Read a specific email by UID. Args (JSON): {\"uid\": \"...\", \"folder\": \"INBOX\", \"account\": \"gmail\"}. Include `account` when the UID came from a named/non-default mailbox.",
     "reply_to_email": """\
 ```reply_to_email
-{"uid": "1234", "body": "Sounds good — talk Friday.", "account": "gmail"}
+{"uid": "1234", "body": "Sounds good — talk Friday.", "to": "sender@example.com", "subject": "Original subject", "in_reply_to": "<message-id@example.com>", "references": ["<older@example.com>"], "account": "gmail"}
 ```
-SEND a reply email immediately by UID. Do not use this for "write/draft a reply", "open a reply", or "start a reply" — those should use `ui_control` with `open_email_reply <uid> <folder> reply <body>` (or structured `body`) to open the email draft document. Only use this when the user explicitly says to send now. Never invent UID `1`. Threads automatically (In-Reply-To/References handled).
+Prepare an exact threaded reply for mandatory Level-5 human review. It never sends, fetches IMAP, or marks the source Answered on this action path. Do not use this for "write/draft a reply", "open a reply", or "start a reply" — those should use `ui_control` with `open_email_reply <uid> <folder> reply <body>` (or structured `body`). Copy `to`, `subject`, `in_reply_to`, references, UID/folder, and account from `read_email`; never invent UID `1`.
 
-CRITICAL — signatures: DO NOT invent a sign-off name. End the body with just `Thanks,` or similar — never type a person's name unless the user explicitly told you what to sign as. When `agent_email_confirm` is on (default), the tool returns `{pending: true, pending_id: ...}` and stages the email for the user to approve in the chat UI instead of SMTPing immediately.""",
+CRITICAL — signatures: DO NOT invent a sign-off name. End the body with just `Thanks,` or similar — never type a person's name unless the user explicitly told you what to sign as. The tool always returns a pending action; only a fresh authenticated human approval in Restia can queue delivery.""",
     "bulk_email": """\
 ```bulk_email
 {"action": "delete", "uids": ["10997", "10998"], "folder": "INBOX", "account": "Gmail"}
@@ -511,15 +535,77 @@ Bulk delete/archive/mark emails. Use this for "delete all those" after listing e
 ```manage_calendar
 {"action": "create_event", "summary": "<event title>", "dtstart": "<natural language or ISO datetime>"}
 ```
-Calendar event management (CalDAV). Actions: `list_events`, `create_event`, `update_event`, `delete_event`, `list_calendars`. \
+Owner-scoped calendar event management. Actions: `list_events`, `create_event`, `update_event`, `cancel_event`, `delete_event`, `list_calendars`. `cancel_event` requires the exact uid + version and only prepares a pending Level-5 proposal for human approval; it never executes or exposes an approval token. `delete_event` remains manual-only and fail-closed. \
 For `list_events`: {action: "list_events", start: "YYYY-MM-DDT00:00:00", end: "YYYY-MM-DDT00:00:00", calendar?}; resolve month/week phrases yourself from the Current date and time context and do not pass a loose `query` field. Prefer `start`/`end`; start_time/end_time, start_date/end_date, and from/to aliases are accepted. \
-For `create_event`: {summary, dtstart, dtend?, duration?, calendar?, location?, description?, reminder_minutes?, rrule?}. \
-For `update_event`: {uid, summary?, dtstart?, dtend?, all_day?, location?, description?, event_type?, importance?, rrule?}. Pass `rrule: ""` to remove recurrence and make a repeating event a single event. \
+For `create_event`: {summary, dtstart, dtend?, duration?, calendar?, location?, description?, rrule?}. \
+For `update_event`: {uid, version, summary?, dtstart?, dtend?, all_day?, location?, description?, event_type?, importance?, rrule?}. First call `list_events`, then pass its exact uid + version; version is required. Pass `rrule: ""` to remove recurrence. \
+For `cancel_event`: {uid, version}. First call `list_events`, then pass its exact uid + version. Tell the user the cancellation was proposed and still needs human approval; never claim it was cancelled. \
 `dtstart` accepts natural language ("tomorrow at 1pm", "in 2 hours", "next monday 9am") or ISO ("2026-05-12T13:00:00"). \
 If `dtend` omitted, defaults to dtstart+1h (or +1d when `all_day: true`). \
 For a RECURRING event pass `rrule` as an iCalendar RRULE string, e.g. `"FREQ=WEEKLY;BYDAY=MO"` (every Monday), `"FREQ=DAILY;COUNT=10"`, or `"FREQ=MONTHLY;BYMONTHDAY=1"` — create ONE event with the rrule, do not loop creating many events. Do not pass `rrule` for "next Wednesday only", "just this once", or any single occurrence. \
-If the user asks for a reminder/alarm before the event, pass `reminder_minutes` as an integer; do not write reminder text into the event description and do NOT also call `manage_notes` for the same reminder because calendar reminders are routed through Notes automatically. \
+If the user asks for a reminder/alarm, create it as a separate explicit `manage_notes` action with `due_date`; `manage_calendar` deliberately refuses hidden Note side effects. \
 `calendar` accepts a name ("Main") or short-id prefix.""",
+    "query_life": """\
+```query_life
+{"action": "summary"}
+```
+Read-only query surface for the authenticated user's canonical Life OS graph.
+Use `summary` for cross-domain context; `list`/`search` for typed records;
+`get`/`traverse` for an exact entity and its source-backed links;
+`task_quality` for overdue/blocked/waiting/duplicate/missing-next-action risks;
+`decisions_due` for decision and assumption reviews; and `health_trends` for
+factual metric buckets. Use `calendar_time` with exact offset-aware `as_of`,
+`from_at`, and `to_at` values for free time, conflicts, time-block candidates,
+unfinished-work rescheduling, meeting preparation/follow-up, focus protection,
+overcommitment, duration, and travel buffers. It only proposes; prepare any
+calendar mutation through the reviewed calendar action path. Use `finance_summary`, `finance_cash_flow`,
+`finance_subscriptions`, `finance_due`, and `finance_anomalies` for private,
+record-only money questions. Use `finance_net_worth`, `finance_forecast`, and
+`finance_affordability` only with an explicit offset-aware `as_of`; keep
+currencies separate and preserve every evidence id and assumption. Finance
+output is bounded evidence, not advice or an executor, and affordability never
+authorizes a purchase or transfer. Use `habit_weekly`, `habits_missed`, and `habit_adjustments` for
+private routine evidence; pass an explicit week date or offset-aware `as_of`,
+and never claim a suggested adjustment was applied. Use `relationship_profiles`
+and `relationship_reminders` only for explicit, source-backed people context;
+these reads never send a personal message. Use `communications` for the
+owner-scoped unified unread/importance view, summaries, response draft
+suggestions, commitments, deadlines, contacts, and follow-ups. It is a
+read-only view: it never acknowledges a source or sends a message, and a draft
+suggestion is not approval to send. Use `journal_entries`,
+`journal_search`, `journal_get`, and
+`journal_review` for private reflection evidence. Journal reviews aggregate
+explicit structured fields only; never present them as model-derived insight.
+Results preserve provenance, confidence, version, and due/review dates. This
+tool never writes. Use `home_records`, `home_search`, and `home_alerts` for
+private administration evidence; home reads never renew, purchase, submit, or
+contact a provider. Use `travel_records` for typed trip facts and
+`travel_mode` with an explicit offset-aware `as_of` for a bounded current/next
+trip snapshot. Travel Mode can be offline-only and never books, buys, sends,
+uses the network, or invents itinerary facts. Use `learning_career_records` and
+`learning_career_search` for private source-backed study/career records, and
+`career_learning_plan` for the explicit capability-to-gap-to-learning-plan-to-
+portfolio-to-weekly-action chain. That read never applies, submits, or contacts
+anyone. Use `work_business_workspaces`, `work_business_records`,
+`work_business_search`, and `work_business_summary` only within the exact
+owner-scoped workspace id. Cross-workspace visibility requires an explicit
+typed relation; these reads never send outreach, submit proposals, or make
+payments. For "what should I do today/next?", use `proactive_report` with an
+explicit offset-aware `as_of`. Its interruption channel is deterministic and
+limited to explicitly requested, high-risk, or urgent + important +
+time-sensitive signals; everything else remains digest evidence. Use
+`knowledge_records`, `knowledge_search`, `knowledge_stale`, and
+`knowledge_sources` for private personal-knowledge inspection. Use
+`knowledge_evidence` for citation-backed claims and preserve stale, assumption,
+inference, contradiction, and evidence-gap labels; it never synthesizes an answer
+or promotes model inference to fact.
+Generic graph reads deliberately exclude typed personal-knowledge records.
+Use typed domain tools or the reviewed Actions
+interface when the user asks to change authoritative data. Use
+`automation_definitions`, `automation_get`, and `automation_history` to inspect
+owner-scoped automation state. `automation_evaluate` returns deterministic
+typed plans for a supplied event, but never prepares a run, creates an approval
+challenge, executes a connector, or sends anything.""",
     "create_session": "- ```create_session``` — Create a new chat. Line 1 = chat name, line 2 = model name. Use for background/parallel work.",
     "list_sessions": "- ```list_sessions``` — List chats sorted MOST-RECENT FIRST (the UI calls them 'chats') with clickable chat-title links. Output includes a relative \"last active\" timestamp per row, so the first row is the user's most recent chat. Content = optional filter keyword (matches chat name). When answering, preserve the `[title](#session-id)` links exactly; do not convert them into plain text.",
     "send_to_session": "- ```send_to_session``` — Send a message to another session. Line 1 = session_id, rest = message. Use for orchestrating work across sessions.",
@@ -1801,9 +1887,13 @@ def _build_system_prompt(
             f"it before sending. DO NOT `create_document` a markdown file with "
             f"hand-written `To:` / `Subject:` / `In-Reply-To:` headers — that "
             f"is wrong every time.\n"
-            f"2. SEND a reply immediately (skip the draft): call "
-            f"`reply_to_email` with the UID above. Only do this when the user "
-            f"explicitly says 'send' / 'send the reply' / 'reply and send'.\n"
+            f"2. PREPARE a reply for mandatory send approval: when the user "
+            f"explicitly says 'send' / 'send the reply' / 'reply and send', "
+            f"first call `read_email`, then call `reply_to_email` with the "
+            f"exact UID/folder/account, sender address as `to`, original "
+            f"subject, Message-ID as `in_reply_to`, References chain, and "
+            f"reply body. This still does NOT send; it creates a Level-5 "
+            f"action for fresh human review in Restia.\n"
             f"3. READ the full body (the preview above may be truncated): "
             f"call `read_email` with the UID/folder/account above.\n"
             f"4. SUMMARIZE / answer questions about it: read it first, then "

@@ -260,7 +260,7 @@ def test_app_owns_v2_registration_and_lifecycle_at_one_call_site():
 def test_v2_release_identity_uses_the_shared_version_constant():
     source = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")
 
-    assert APP_VERSION == "2.1.0"
+    assert APP_VERSION == "3.0.0"
     assert "version=APP_VERSION" in source
     assert 'title="Restia"' in source
 

@@ -93,6 +93,7 @@ async def test_update_event_can_clear_rrule():
     updated = await do_manage_calendar(json.dumps({
         "action": "update_event",
         "uid": created["uid"],
+        "version": created["version"],
         "rrule": "",
     }), owner=owner)
     assert updated.get("exit_code", 0) == 0, updated
@@ -121,6 +122,7 @@ async def test_update_event_can_clear_rrule_with_repeat_none_alias():
     updated = await do_manage_calendar(json.dumps({
         "action": "update_event",
         "uid": created["uid"],
+        "version": created["version"],
         "repeat": "none",
     }), owner=owner)
     assert updated.get("exit_code", 0) == 0, updated

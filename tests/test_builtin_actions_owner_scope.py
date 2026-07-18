@@ -1,5 +1,6 @@
 """Regression tests for owner-scoped model resolution in scheduled actions."""
 
+import json
 import sqlite3
 from datetime import datetime
 from types import SimpleNamespace
@@ -321,7 +322,7 @@ async def test_email_tagging_bulk_mail_requires_user_specific_consequence(
     """Bulk CTAs stay informational while a real bill remains actionable."""
     from core import database
     from routes import email_helpers
-    from src import builtin_actions, llm_core, task_endpoint
+    from src import builtin_actions, email_runtime_authority, llm_core, task_endpoint
 
     class FakeEmailAccount:
         enabled = _Column()
@@ -383,18 +384,27 @@ async def test_email_tagging_bulk_mail_requires_user_specific_consequence(
     monkeypatch.setattr(task_endpoint, "resolve_task_candidates", lambda **_kwargs: [("http://llm", "model", {})])
     monkeypatch.setattr(llm_core, "llm_call_async_with_fallback", fake_llm)
     monkeypatch.setattr(builtin_actions, "wait_for_interactive_quiet", no_wait)
+    canonical_tags = {}
+
+    def fake_list_tags(**kwargs):
+        row = canonical_tags.get((kwargs.get("account_id"), message_id))
+        return [dict(row)] if row else []
+
+    def fake_upsert_tags(**kwargs):
+        canonical_tags[(kwargs.get("account_id"), kwargs.get("message_id"))] = {
+            **kwargs,
+            "account_id": kwargs.get("account_id"),
+            "spam_verdict": bool(kwargs.get("spam_verdict")),
+        }
+
+    monkeypatch.setattr(email_runtime_authority, "list_email_tag_states", fake_list_tags)
+    monkeypatch.setattr(email_runtime_authority, "upsert_email_tag_state", fake_upsert_tags)
 
     result, ok = await builtin_actions.action_check_email_urgency("alice")
 
     assert ok is True, result
     assert imap_calls == [("account-1", "alice")]
-    conn = sqlite3.connect(scheduled_db)
-    try:
-        row = conn.execute(
-            "SELECT tags, spam_verdict FROM email_tags WHERE message_id=? AND owner=? AND account_id=?",
-            (message_id, "alice", "account-1"),
-        ).fetchone()
-    finally:
-        conn.close()
-    assert row == (expected_tags, 0)
+    row = canonical_tags[("account-1", message_id)]
+    assert json.dumps(row["tags"]) == expected_tags
+    assert row["spam_verdict"] is False
     assert expected_tier in result

@@ -168,6 +168,26 @@ def primary_admin_username() -> str | None:
     return admins[0] if admins else None
 
 
+def unambiguous_contact_import_owner() -> str | None:
+    """Resolve a one-time legacy owner without silently picking an admin."""
+
+    profiles = get_auth_manager().list_users()
+    admins = {
+        str(profile.get("username") or "").strip().lower()
+        for profile in profiles
+        if bool(profile.get("is_admin"))
+        and str(profile.get("username") or "").strip()
+    }
+    explicit = str(
+        os.getenv("RESTIA_CONTACTS_IMPORT_OWNER")
+        or os.getenv("ODYSSEUS_CONTACTS_IMPORT_OWNER")
+        or ""
+    ).strip().lower()
+    if explicit:
+        return explicit if explicit in admins else None
+    return next(iter(admins)) if len(admins) == 1 else None
+
+
 def _reset_auth_manager_for_tests() -> None:
     global _manager
     with _manager_lock:
@@ -180,4 +200,5 @@ __all__ = [
     "configure_auth_manager",
     "get_auth_manager",
     "primary_admin_username",
+    "unambiguous_contact_import_owner",
 ]

@@ -1,20 +1,42 @@
-import json
+"""Compatibility preference helpers use canonical Account.id-owned SQL."""
+
+import uuid
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 import routes.prefs_routes as prefs_routes
+from core.database import Account, Base
 
 
-def test_load_ignores_non_object_prefs_file(tmp_path, monkeypatch):
-    prefs_file = tmp_path / "user_prefs.json"
-    prefs_file.write_text(json.dumps(["not", "a", "prefs", "object"]), encoding="utf-8")
-    monkeypatch.setattr(prefs_routes, "PREFS_FILE", str(prefs_file))
+@pytest.fixture()
+def prefs_db(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite:///{tmp_path / 'prefs.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, autoflush=False)
+    db = factory()
+    db.add_all([
+        Account(id=str(uuid.uuid4()), username="alice", status="active"),
+        Account(id=str(uuid.uuid4()), username="bob", status="active"),
+    ])
+    db.commit()
+    db.close()
+    monkeypatch.setattr(prefs_routes, "SessionLocal", factory)
+    yield factory
+    engine.dispose()
 
-    assert prefs_routes._load() == {}
+
+def test_missing_profile_preferences_are_empty(prefs_db):
     assert prefs_routes._load_for_user("alice") == {}
+    assert prefs_routes._load_for_user("bob") == {}
 
 
-def test_load_keeps_object_prefs_file(tmp_path, monkeypatch):
-    prefs_file = tmp_path / "user_prefs.json"
-    prefs_file.write_text(json.dumps({"theme": "dark"}), encoding="utf-8")
-    monkeypatch.setattr(prefs_routes, "PREFS_FILE", str(prefs_file))
+def test_profile_preferences_round_trip_without_cross_owner_leak(prefs_db):
+    prefs_routes._save_for_user("alice", {"theme": "dark"})
 
     assert prefs_routes._load_for_user("alice") == {"theme": "dark"}
+    assert prefs_routes._load_for_user("bob") == {}
+    assert prefs_routes._load() == {
+        "_users": {"alice": {"theme": "dark"}, "bob": {}},
+    }

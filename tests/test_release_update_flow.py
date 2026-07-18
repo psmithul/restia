@@ -64,6 +64,40 @@ def test_draft_and_prerelease_releases_never_trigger_stable_updates():
         assert result["channel"] == "current"
 
 
+def test_stable_release_images_never_advertise_rolling_dev_commits():
+    branch_commit = {
+        "sha": "b" * 40,
+        "commit": {"message": "new dev work"},
+    }
+
+    for build_channel in ("stable", "release"):
+        result = build_update_result(
+            repo="psmithul/restia",
+            current_version="3.0.0",
+            current_commit="a" * 12,
+            release={"tag_name": "v3", "draft": False, "prerelease": False},
+            branch_commit=branch_commit,
+            build_channel=build_channel,
+        )
+        assert result["update_available"] is False
+        assert result["channel"] == "current"
+        assert result["build_channel"] == build_channel
+
+
+def test_dev_images_still_receive_dev_commit_updates_between_releases():
+    result = build_update_result(
+        repo="psmithul/restia",
+        current_version="3.0.0",
+        current_commit="a" * 12,
+        release={"tag_name": "v3", "draft": False, "prerelease": False},
+        branch_commit={"sha": "b" * 40, "commit": {"message": "new dev work"}},
+        build_channel="dev",
+    )
+
+    assert result["update_available"] is True
+    assert result["channel"] == "dev"
+
+
 def test_downloaded_compose_uses_public_release_image_and_preserves_host_data():
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     updater = (ROOT / "update.sh").read_text(encoding="utf-8")
@@ -80,7 +114,17 @@ def test_release_event_publishes_latest_and_bakes_commit():
 
     assert "types: [published]" in workflow
     assert "BUILD_COMMIT=${{ github.sha }}" in workflow
+    assert "BUILD_CHANNEL=${{ needs.preflight.outputs.build_channel }}" in workflow
     assert "github.event_name == 'release'" in workflow
+    assert "needs: [preflight, merge, smoke, shared_smoke]" in workflow
+
+
+def test_update_endpoint_never_fetches_dev_for_stable_images():
+    source = (ROOT / "app.py").read_text(encoding="utf-8")
+    block = source[source.index("async def update_check()") : source.index("@app.get(\"/api/health\")")]
+
+    assert 'if BUILD_CHANNEL in {"source", "dev"}:' in block
+    assert "build_channel=BUILD_CHANNEL" in block
 
 
 def test_macos_bundle_reads_the_shared_release_version():

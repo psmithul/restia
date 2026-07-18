@@ -287,6 +287,136 @@ app.state.auth_manager = auth_manager
 app.state.supabase_auth_verifier = supabase_auth_verifier
 AUTH_ENABLED = os.getenv("AUTH_ENABLED", "true").lower() != "false"
 LOCALHOST_BYPASS = os.getenv("LOCALHOST_BYPASS", "false").lower() == "true"
+from src.auth_runtime import active_auth_usernames, primary_admin_username
+from src.profile_configuration_import import (
+    ProfileConfigurationImportError,
+    adopt_legacy_profile_configuration,
+)
+
+_configuration_profiles = active_auth_usernames() if AUTH_ENABLED else ()
+try:
+    if AUTH_ENABLED and not _configuration_profiles:
+        # First-run setup has no profile to own legacy installation values yet.
+        # Runtime remains on safe defaults; the source files stay untouched and
+        # will be adopted once the configured profile exists.
+        app.state.profile_configuration_import = {
+            "deferred": True,
+            "source_preserved": True,
+        }
+    else:
+        _configuration_import = adopt_legacy_profile_configuration(
+            auth_enabled=AUTH_ENABLED,
+            primary_admin_resolver=primary_admin_username,
+            profile_usernames=_configuration_profiles,
+        )
+        app.state.profile_configuration_import = {
+            "deferred": False,
+            "imported": _configuration_import.imported,
+            "skipped": _configuration_import.skipped,
+            "runs": _configuration_import.runs,
+            "idempotent_runs": _configuration_import.idempotent_runs,
+            "source_preserved": _configuration_import.source_preserved,
+        }
+except ProfileConfigurationImportError as _configuration_import_error:
+    logger.critical(
+        "Legacy profile configuration was retained but could not be imported",
+        exc_info=True,
+    )
+    raise RuntimeError(
+        "Profile configuration requires repair before Restia can start"
+    ) from _configuration_import_error
+
+from src.notification_legacy_import import (
+    NotificationRuntimeImportError,
+    import_legacy_notification_runtime,
+)
+
+try:
+    app.state.notification_runtime_import = import_legacy_notification_runtime()
+except NotificationRuntimeImportError as _notification_import_error:
+    # Starting dispatch against an empty canonical authority would make old
+    # pending reminders appear unsent and could duplicate side effects. Keep
+    # both source files intact and fail startup with a recovery-safe message.
+    logging.getLogger("app.notification_runtime").critical(
+        "Legacy notification state was retained but could not be imported",
+        exc_info=True,
+    )
+    raise RuntimeError(
+        "Notification delivery state requires repair before Restia can start"
+    ) from _notification_import_error
+from src.contact_legacy_import import (
+    ContactLegacyImportError,
+    adopt_legacy_contacts,
+)
+
+try:
+    adopt_legacy_contacts(auth_enabled=AUTH_ENABLED)
+    app.state.contacts_store_error = None
+except ContactLegacyImportError as _contacts_import_error:
+    # Lock only the contacts domain. Authentication and recovery UI remain
+    # available, while no request can silently choose a different owner or
+    # fall back to the rollback JSON files.
+    app.state.contacts_store_error = _contacts_import_error.code
+    logger.error(
+        "Legacy contacts database cutover locked: %s",
+        _contacts_import_error.code,
+    )
+
+from src.constants import (
+    SETTINGS_FILE as _TELEGRAM_LEGACY_SETTINGS_FILE,
+    SCHEDULED_EMAILS_DB as _LEGACY_SCHEDULED_EMAILS_DB,
+)
+from src.telegram_identity import (
+    TelegramIdentityImportError,
+    adopt_legacy_telegram_identity,
+)
+
+try:
+    adopt_legacy_telegram_identity(
+        source_path=_TELEGRAM_LEGACY_SETTINGS_FILE,
+        auth_enabled=AUTH_ENABLED,
+    )
+    app.state.telegram_identity_store_error = None
+except TelegramIdentityImportError as _telegram_import_error:
+    # Runtime readers have no settings.json fallback. Keep the domain locked
+    # until the legacy ambiguity is repaired instead of guessing an owner.
+    app.state.telegram_identity_store_error = _telegram_import_error.code
+    logger.error(
+        "Legacy Telegram identity cutover locked: %s",
+        _telegram_import_error.code,
+    )
+
+from src.email_outbound import (
+    EmailOutboundError,
+    adopt_legacy_agent_email_drafts,
+)
+
+try:
+    _email_outbound_import_result = adopt_legacy_agent_email_drafts(
+        session_factory=SessionLocal,
+        source_path=_LEGACY_SCHEDULED_EMAILS_DB,
+    )
+    app.state.email_outbound_legacy_import_error = None
+    app.state.email_outbound_legacy_import_result = {
+        "imported": _email_outbound_import_result.imported,
+        "reused": _email_outbound_import_result.reused,
+        "source_preserved": _email_outbound_import_result.source_preserved,
+    }
+except EmailOutboundError:
+    # Legacy agent drafts remain immutable and their old approval endpoints
+    # stay disabled.  New canonical actions may still be prepared safely.
+    app.state.email_outbound_legacy_import_error = (
+        "legacy_email_outbound_import_failed"
+    )
+    app.state.email_outbound_legacy_import_result = None
+    logger.error("Legacy agent-email cutover locked: legacy_email_outbound_import_failed")
+except Exception:
+    app.state.email_outbound_legacy_import_error = (
+        "legacy_email_outbound_import_failed"
+    )
+    app.state.email_outbound_legacy_import_result = None
+    logger.error("Legacy agent-email cutover locked: legacy_email_outbound_import_failed")
+
 if LOCALHOST_BYPASS:
     logger.warning("LOCALHOST_BYPASS is enabled, loopback requests bypass authentication. Do not expose this instance to a network.")
 
@@ -996,10 +1126,40 @@ app.include_router(setup_planner_routes())
 from routes.life_routes import setup_life_routes
 from routes.action_policy_routes import setup_action_policy_routes
 from routes.focus_routes import setup_focus_routes
+from routes.home_routes import setup_home_routes
+from routes.relationship_routes import setup_relationship_routes
+from routes.journal_routes import setup_journal_routes
+from routes.travel_routes import setup_travel_routes
+from routes.task_record_routes import setup_task_record_routes
+from routes.learning_career_routes import setup_learning_career_routes
+from routes.work_business_routes import setup_work_business_routes
+from routes.personal_knowledge_routes import setup_personal_knowledge_routes
+from routes.proactive_routes import setup_proactive_routes
+from routes.profile_configuration_routes import setup_profile_configuration_routes
+from routes.life_automation_routes import setup_life_automation_routes
+from routes.communications_routes import setup_communications_routes
+from routes.transparency_routes import setup_transparency_routes
+from routes.ambient_routes import setup_ambient_routes
+from routes.security_routes import setup_security_routes
 
 app.include_router(setup_life_routes())
 app.include_router(setup_action_policy_routes())
 app.include_router(setup_focus_routes())
+app.include_router(setup_home_routes())
+app.include_router(setup_relationship_routes())
+app.include_router(setup_journal_routes())
+app.include_router(setup_travel_routes())
+app.include_router(setup_task_record_routes())
+app.include_router(setup_learning_career_routes())
+app.include_router(setup_work_business_routes())
+app.include_router(setup_personal_knowledge_routes())
+app.include_router(setup_proactive_routes())
+app.include_router(setup_profile_configuration_routes())
+app.include_router(setup_life_automation_routes())
+app.include_router(setup_communications_routes())
+app.include_router(setup_transparency_routes())
+app.include_router(setup_ambient_routes())
+app.include_router(setup_security_routes())
 
 # Email
 from routes.email_routes import setup_email_routes
@@ -1131,7 +1291,7 @@ _UPDATE_CACHE_TTL = 1800  # 30 minutes
 @app.get("/api/update-check")
 async def update_check():
     import httpx
-    from core.constants import APP_VERSION, BUILD_COMMIT, UPDATE_REPO
+    from core.constants import APP_VERSION, BUILD_CHANNEL, BUILD_COMMIT, UPDATE_REPO
     from src.update_checker import build_update_result
 
     now = time.time()
@@ -1150,16 +1310,21 @@ async def update_check():
                          "User-Agent": "Restia-Update-Check"},
             )
             release = release_resp.json() if release_resp.status_code == 200 else None
-            # Keep dev-channel source installs informed between releases.
-            commit_resp = await client.get(
-                f"https://api.github.com/repos/{UPDATE_REPO}/commits/dev",
-                headers={"Accept": "application/vnd.github.v3+json",
-                         "User-Agent": "Restia-Update-Check"},
-            )
-            if release is None and commit_resp.status_code != 200:
+            branch_commit = None
+            # Only source/dev builds follow the rolling dev branch. Stable and
+            # release images must never turn a dev commit into an update or
+            # hide a failed release lookup behind a successful dev response.
+            if BUILD_CHANNEL in {"source", "dev"}:
+                commit_resp = await client.get(
+                    f"https://api.github.com/repos/{UPDATE_REPO}/commits/dev",
+                    headers={"Accept": "application/vnd.github.v3+json",
+                             "User-Agent": "Restia-Update-Check"},
+                )
+                if commit_resp.status_code == 200:
+                    branch_commit = commit_resp.json()
+            if release is None and branch_commit is None:
                 return {"update_available": False, "current_commit": BUILD_COMMIT,
                         "current_version": APP_VERSION, "error": "github_api_error"}
-            branch_commit = commit_resp.json() if commit_resp.status_code == 200 else None
 
         result = build_update_result(
             repo=UPDATE_REPO,
@@ -1167,6 +1332,7 @@ async def update_check():
             current_commit=BUILD_COMMIT,
             release=release,
             branch_commit=branch_commit,
+            build_channel=BUILD_CHANNEL,
         )
         _update_cache["result"] = result
         _update_cache["ts"] = now
@@ -1263,6 +1429,10 @@ app.router.lifespan_context = _lifespan
 async def _startup_event():
     global upload_cleanup_task
     logger.info("Application starting up...")
+    # Start the email poller from the owned lifespan so shared-mode database
+    # leadership is acquired under a cancellable task, not an import side effect.
+    from routes.email_pollers import _start_poller
+    _start_poller()
     webhook_manager.set_loop(asyncio.get_running_loop())
     # Wipe any leftover incognito sessions from previous process — they're
     # ephemeral by design and must not survive a restart.
@@ -1286,7 +1456,14 @@ async def _startup_event():
     _startup_tasks: list[asyncio.Task] = getattr(app.state, "_startup_tasks", [])
     app.state._startup_tasks = _startup_tasks
     if upload_cleanup_func:
-        upload_cleanup_task = asyncio.create_task(upload_cleanup_func())
+        from src.distributed_leadership import run_database_leased_worker
+
+        upload_cleanup_task = asyncio.create_task(
+            run_database_leased_worker(
+                "upload-cleanup", upload_cleanup_func,
+            ),
+            name="restia-upload-cleanup-leadership",
+        )
     # Always-on monitor that auto-continues the agent when a background bash
     # job (#!bg) finishes — re-invokes the turn with the job output.
     try:
@@ -1435,6 +1612,50 @@ async def _startup_event():
     else:
         logger.info("In-process Telegram polling disabled (RESTIA_INPROCESS_TELEGRAM=0)")
 
+    # CardDAV mutation delivery has its own durable outbox and claim leases.
+    # It must keep running even when Tasks, email pollers, or Telegram are
+    # disabled, and the generic lifespan task cleanup cancels it on shutdown.
+    from src.contact_delivery import (
+        contact_delivery_loop,
+        contact_delivery_worker_enabled,
+    )
+
+    contacts_cutover_error = getattr(app.state, "contacts_store_error", None)
+    if contact_delivery_worker_enabled(cutover_error=contacts_cutover_error):
+        _startup_tasks.append(asyncio.create_task(
+            contact_delivery_loop(),
+            name="restia-contact-delivery",
+        ))
+    elif contacts_cutover_error is not None:
+        logger.warning(
+            "Contact delivery worker disabled until contacts cutover recovery"
+        )
+    else:
+        logger.info(
+            "In-process contact delivery disabled "
+            "(RESTIA_INPROCESS_CONTACT_DELIVERY=0)"
+        )
+
+    # CalDAV calendar delivery has a separate encrypted outbox and claim
+    # leases. It is intentionally independent from Tasks, email/Telegram
+    # polling, and CardDAV contact delivery; generic lifespan cleanup owns the
+    # task and cancels it before shared services are torn down.
+    from src.calendar_delivery import (
+        calendar_delivery_loop,
+        inprocess_calendar_delivery_enabled,
+    )
+
+    if inprocess_calendar_delivery_enabled():
+        _startup_tasks.append(asyncio.create_task(
+            calendar_delivery_loop(),
+            name="restia-calendar-delivery",
+        ))
+    else:
+        logger.info(
+            "In-process calendar delivery disabled "
+            "(RESTIA_INPROCESS_CALENDAR_DELIVERY=0)"
+        )
+
     # Legacy null-owner rows can only be claimed after the one-time credential
     # import has established the database-backed admin role. Never consult the
     # retired auth.json source for ownership decisions.
@@ -1497,12 +1718,24 @@ async def _startup_event():
                 logger.debug(f"Null-owner sweep skipped: {e}")
                 await asyncio.sleep(3600)
 
-    _startup_tasks.append(asyncio.create_task(_null_owner_sweep_loop()))
+    from src.distributed_leadership import run_database_leased_worker
+
+    _startup_tasks.append(asyncio.create_task(
+        run_database_leased_worker(
+            "null-owner-sweep", _null_owner_sweep_loop,
+        ),
+        name="restia-null-owner-sweep-leadership",
+    ))
 
     # One server-side Home Link call stream keeps incoming offers observable
     # while the browser is closed, so the linked profile can receive its
     # bounded Telegram alerts and follow the link back into the ringing call.
-    _startup_tasks.append(asyncio.create_task(home_call_alert_watcher()))
+    _startup_tasks.append(asyncio.create_task(
+        run_database_leased_worker(
+            "home-call-alert-watcher", home_call_alert_watcher,
+        ),
+        name="restia-home-call-alert-leadership",
+    ))
 
     # Nightly skill audit — at ~02:00 local, test + judge a batch of the
     # least-recently-checked skills, auto-fixing/escalating weak ones (never
@@ -1532,7 +1765,12 @@ async def _startup_event():
             except Exception as e:
                 logger.warning(f"Nightly skill audit failed: {e}")
 
-    _startup_tasks.append(asyncio.create_task(_skill_audit_nightly_loop()))
+    _startup_tasks.append(asyncio.create_task(
+        run_database_leased_worker(
+            "nightly-skill-audit", _skill_audit_nightly_loop,
+        ),
+        name="restia-nightly-skill-audit-leadership",
+    ))
 
     # Cookbook serve lifecycle — kills scheduler-launched serves whose
     # window-end has passed. Paired with the cookbook_serve builtin
@@ -1566,6 +1804,12 @@ async def _shutdown_event():
             await upload_cleanup_task
         except asyncio.CancelledError:
             pass
+    try:
+        from routes.email_pollers import _stop_poller
+
+        await _stop_poller()
+    except Exception:
+        logger.warning("Email polling shutdown failed", exc_info=True)
     # Telegram owns its task independently from both the generic startup loops
     # and TaskScheduler, so stop it explicitly before those dependencies close.
     try:

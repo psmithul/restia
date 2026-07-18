@@ -32,7 +32,7 @@ If the user says "reminder" + a time, default to TODO with due_date. Only switch
 - Treat `403` as an intentional Settings restriction. Do not work around it.
 - Do not use SSH, Docker, direct Python imports, SQLite queries, MCP internals, browser cookies, or local files to read/write Restia user data.
 - Do not call helpers like `do_manage_notes`, email MCP internals, or database sessions directly for user data, even if shell access exists.
-- Never send email directly unless the user explicitly asks to send and the token has a send-capable scope.
+- Never send email directly. Even with explicit user intent and `email:send`, prepare the mandatory Level-5 review action and let the authenticated user approve it inside Restia.
 - Keep actions scoped to the token owner.
 
 ## Todos
@@ -104,7 +104,7 @@ python3 integrations/codex/scripts/odysseus_api.py POST /api/codex/memory '{"tex
 
 - Prefer `POST /api/codex/emails/draft-document` for Codex-written email replies. It creates an editable Restia Document with `language: "email"` and does not touch IMAP/send.
 - `POST /api/codex/emails/draft` — body matches `SendEmailRequest` (`to`, `cc`, `bcc`, `subject`, `body`, `body_html`, `attachments`, `account_id`, `in_reply_to`, `references`). Requires `email:draft` (or `email:send`).
-- `POST /api/codex/emails/send` — same body. Requires `email:send`. Never send without explicit user instruction.
+- `POST /api/codex/emails/send` — prepares the exact content as a mandatory Level-5 review action; it never opens SMTP or queues delivery. Requires `email:send`. A threaded reply must also include `in_reply_to`, `source_uid`, and `source_folder` from the prior read. The user must approve the resulting action inside Restia.
 
 ## Cookbook serve (debug a failing model launch)
 

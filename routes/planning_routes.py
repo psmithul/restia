@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from core.database import SessionLocal
 from src.auth_helpers import require_user, resolved_request_owner
+from src.identity import request_account_transaction
 from src.planning import (
     PlanningConflict,
     PlanningError,
@@ -75,17 +76,18 @@ def setup_planning_routes(
         status: str = Query(default="all", pattern="^(all|open|completed)$"),
         limit: int = Query(default=50, ge=1, le=100),
     ) -> dict[str, Any]:
-        owner = _owner(request)
         db = session_factory()
         try:
-            items, truncated = list_planning_items(
-                db, owner=owner, status=status, limit=limit
-            )
-            return {
-                "items": [serialize_planning_item(item) for item in items],
-                "count": len(items),
-                "truncated": truncated,
-            }
+            with request_account_transaction(db, request, write=False) as account:
+                owner = account.username if account is not None else _owner(request)
+                items, truncated = list_planning_items(
+                    db, owner=owner, status=status, limit=limit
+                )
+                return {
+                    "items": [serialize_planning_item(item) for item in items],
+                    "count": len(items),
+                    "truncated": truncated,
+                }
         except PlanningError as exc:
             _raise_domain_error(exc)
         finally:
@@ -93,20 +95,19 @@ def setup_planning_routes(
 
     @router.post("", status_code=201)
     def create_item(request: Request, body: PlanningCreate) -> dict[str, Any]:
-        owner = _owner(request)
         db = session_factory()
         try:
-            item = create_planning_item(
-                db,
-                owner=owner,
-                title=body.title,
-                details=body.details,
-                priority=body.priority,
-                due_date=body.due_date,
-            )
-            db.commit()
-            db.refresh(item)
-            return serialize_planning_item(item)
+            with request_account_transaction(db, request, write=True) as account:
+                item = create_planning_item(
+                    db,
+                    owner=account.username,
+                    title=body.title,
+                    details=body.details,
+                    priority=body.priority,
+                    due_date=body.due_date,
+                )
+                db.flush()
+                return serialize_planning_item(item)
         except PlanningError as exc:
             db.rollback()
             _raise_domain_error(exc)
@@ -120,7 +121,6 @@ def setup_planning_routes(
     def update_item(
         request: Request, item_id: str, body: PlanningUpdate
     ) -> dict[str, Any]:
-        owner = _owner(request)
         fields = getattr(body, "model_fields_set", None)
         if fields is None:
             fields = getattr(body, "__fields_set__", set())
@@ -130,16 +130,17 @@ def setup_planning_routes(
                 kwargs[field] = getattr(body, field)
         db = session_factory()
         try:
-            item = update_planning_item(
-                db,
-                owner=owner,
-                item_id=item_id,
-                expected_version=body.version,
-                **kwargs,
-            )
-            db.commit()
-            db.refresh(item)
-            return serialize_planning_item(item)
+            with request_account_transaction(db, request, write=True) as account:
+                item = update_planning_item(
+                    db,
+                    owner=account.username,
+                    account=account,
+                    item_id=item_id,
+                    expected_version=body.version,
+                    **kwargs,
+                )
+                db.flush()
+                return serialize_planning_item(item)
         except PlanningError as exc:
             db.rollback()
             _raise_domain_error(exc)
@@ -153,18 +154,17 @@ def setup_planning_routes(
     def complete_item(
         request: Request, item_id: str, body: PlanningVersion
     ) -> dict[str, Any]:
-        owner = _owner(request)
         db = session_factory()
         try:
-            item = complete_planning_item(
-                db,
-                owner=owner,
-                item_id=item_id,
-                expected_version=body.version,
-            )
-            db.commit()
-            db.refresh(item)
-            return serialize_planning_item(item)
+            with request_account_transaction(db, request, write=True) as account:
+                item = complete_planning_item(
+                    db,
+                    owner=account.username,
+                    item_id=item_id,
+                    expected_version=body.version,
+                )
+                db.flush()
+                return serialize_planning_item(item)
         except PlanningError as exc:
             db.rollback()
             _raise_domain_error(exc)
@@ -178,18 +178,17 @@ def setup_planning_routes(
     def reopen_item(
         request: Request, item_id: str, body: PlanningVersion
     ) -> dict[str, Any]:
-        owner = _owner(request)
         db = session_factory()
         try:
-            item = reopen_planning_item(
-                db,
-                owner=owner,
-                item_id=item_id,
-                expected_version=body.version,
-            )
-            db.commit()
-            db.refresh(item)
-            return serialize_planning_item(item)
+            with request_account_transaction(db, request, write=True) as account:
+                item = reopen_planning_item(
+                    db,
+                    owner=account.username,
+                    item_id=item_id,
+                    expected_version=body.version,
+                )
+                db.flush()
+                return serialize_planning_item(item)
         except PlanningError as exc:
             db.rollback()
             _raise_domain_error(exc)
@@ -203,23 +202,23 @@ def setup_planning_routes(
     def schedule_item(
         request: Request, item_id: str, body: PlanningSchedule
     ) -> dict[str, Any]:
-        owner = _owner(request)
         db = session_factory()
         try:
-            item = schedule_planning_item(
-                db,
-                owner=owner,
-                item_id=item_id,
-                expected_version=body.version,
-                start=body.start,
-                end=body.end,
-                due_date=body.due_date,
-                add_to_calendar=body.add_to_calendar,
-                calendar_id=body.calendar_id,
-            )
-            db.commit()
-            db.refresh(item)
-            return serialize_planning_item(item)
+            with request_account_transaction(db, request, write=True) as account:
+                item = schedule_planning_item(
+                    db,
+                    owner=account.username,
+                    account=account,
+                    item_id=item_id,
+                    expected_version=body.version,
+                    start=body.start,
+                    end=body.end,
+                    due_date=body.due_date,
+                    add_to_calendar=body.add_to_calendar,
+                    calendar_id=body.calendar_id,
+                )
+                db.flush()
+                return serialize_planning_item(item)
         except PlanningError as exc:
             db.rollback()
             _raise_domain_error(exc)
