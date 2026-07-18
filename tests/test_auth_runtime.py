@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import datetime
 
 import bcrypt
@@ -145,6 +146,69 @@ def test_owner_recovery_retires_changed_legacy_sources_and_unlocks(runtime_env):
     restarted = _build(factory, root)
     assert restarted.auth_store_error is False
     assert restarted.verify_password("alice", "recovered secure password") is True
+
+
+def test_owner_recovery_accepts_digest_verified_container_backup_relocation(
+    runtime_env,
+):
+    factory, root = runtime_env
+    host_root = root / "host-data"
+    container_root = root / "container-data"
+    host_root.mkdir()
+    container_root.mkdir()
+    _write_legacy(host_root / "auth.json")
+    (host_root / "sessions.json").write_text("{}", encoding="utf-8")
+
+    imported = build_auth_manager(
+        factory,
+        auth_path=host_root / "auth.json",
+        sessions_path=host_root / "sessions.json",
+        token_hmac_key=TOKEN_KEY,
+    )
+    assert imported.auth_store_error is False
+
+    shutil.move(
+        host_root / "legacy-auth-backups",
+        container_root / "legacy-auth-backups",
+    )
+    (container_root / "auth.json").write_text(
+        '{"changed": true}',
+        encoding="utf-8",
+    )
+    (container_root / "sessions.json").write_text("{}", encoding="utf-8")
+    locked = build_auth_manager(
+        factory,
+        auth_path=container_root / "auth.json",
+        sessions_path=container_root / "sessions.json",
+        token_hmac_key=TOKEN_KEY,
+    )
+    assert locked.auth_store_error is True
+    assert locked.recover_password("alice", "recovered secure password") is True
+
+    assert complete_auth_store_recovery(
+        locked,
+        session_factory=factory,
+        auth_path=container_root / "auth.json",
+        sessions_path=container_root / "sessions.json",
+    ) is True
+    restarted = build_auth_manager(
+        factory,
+        auth_path=container_root / "auth.json",
+        sessions_path=container_root / "sessions.json",
+        token_hmac_key=TOKEN_KEY,
+    )
+    assert restarted.auth_store_error is False
+    assert restarted.verify_password("alice", "recovered secure password") is True
+    relocated_auth_backup = next(
+        (container_root / "legacy-auth-backups").glob("auth.*.json.bak")
+    )
+    relocated_auth_backup.write_bytes(b"corrupt")
+    assert build_auth_manager(
+        factory,
+        auth_path=container_root / "auth.json",
+        sessions_path=container_root / "sessions.json",
+        token_hmac_key=TOKEN_KEY,
+    ).auth_store_error is True
 
 
 def test_completed_cutover_uses_database_not_stale_json(runtime_env):

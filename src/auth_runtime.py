@@ -27,7 +27,13 @@ _manager_lock = threading.Lock()
 _manager: DatabaseAuthManager | None = None
 
 
-def _safe_backup_matches(path_value: object, digest: object, *, limit: int) -> bool:
+def _safe_backup_matches(
+    path_value: object,
+    digest: object,
+    *,
+    limit: int,
+    fallback_dir: Path | None = None,
+) -> bool:
     if not isinstance(path_value, str) or not path_value:
         return False
     if not isinstance(digest, str) or len(digest) != 64:
@@ -35,6 +41,22 @@ def _safe_backup_matches(path_value: object, digest: object, *, limit: int) -> b
     path = Path(path_value)
     try:
         info = path.lstat()
+    except FileNotFoundError:
+        if fallback_dir is None:
+            return False
+        # Legacy import records predate container-aware path storage and may
+        # contain an absolute host path.  A bind-mounted container sees the
+        # same backup under its current data directory.  Only relocate by the
+        # recorded basename inside the explicit backup root, then still apply
+        # every type, size, and digest check below.
+        path = fallback_dir / path.name
+        try:
+            info = path.lstat()
+        except OSError:
+            return False
+    except OSError:
+        return False
+    try:
         if (
             stat.S_ISLNK(info.st_mode)
             or not stat.S_ISREG(info.st_mode)
@@ -57,11 +79,16 @@ def _import_run(session_factory) -> AuthImportRun | None:
         db.close()
 
 
-def _completed_backups_are_durable(run: AuthImportRun) -> bool:
+def _completed_backups_are_durable(
+    run: AuthImportRun,
+    *,
+    backup_dir: Path | None = None,
+) -> bool:
     if run.state != "completed" or not _safe_backup_matches(
         run.backup_auth_path,
         run.auth_sha256,
         limit=MAX_AUTH_SOURCE_BYTES,
+        fallback_dir=backup_dir,
     ):
         return False
     if run.sessions_sha256 is None:
@@ -70,6 +97,7 @@ def _completed_backups_are_durable(run: AuthImportRun) -> bool:
         run.backup_sessions_path,
         run.sessions_sha256,
         limit=MAX_SESSIONS_SOURCE_BYTES,
+        fallback_dir=backup_dir,
     )
 
 
@@ -88,11 +116,15 @@ def complete_auth_store_recovery(
     never deleted, and a fresh manager will then trust the database authority.
     """
 
-    run = _import_run(session_factory)
-    if run is None or not _completed_backups_are_durable(run):
-        return False
     auth_source = Path(auth_path)
     sessions_source = Path(sessions_path)
+    backup_root = auth_source.parent / "legacy-auth-backups"
+    run = _import_run(session_factory)
+    if run is None or not _completed_backups_are_durable(
+        run,
+        backup_dir=backup_root,
+    ):
+        return False
     target_dir = Path(quarantine_dir) if quarantine_dir else (
         auth_source.parent / "legacy-auth-backups" / "recovery-quarantine"
     )
@@ -139,6 +171,11 @@ def build_auth_manager(
 
     auth_source = Path(auth_path)
     sessions_source = Path(sessions_path)
+    backup_root = (
+        Path(backup_dir)
+        if backup_dir is not None
+        else auth_source.parent / "legacy-auth-backups"
+    )
     store_error = False
     try:
         if auth_source.exists() or auth_source.is_symlink():
@@ -151,7 +188,10 @@ def build_auth_manager(
         else:
             run = _import_run(session_factory)
             if run is not None:
-                store_error = not _completed_backups_are_durable(run)
+                store_error = not _completed_backups_are_durable(
+                    run,
+                    backup_dir=backup_root,
+                )
             elif sessions_source.exists() or sessions_source.is_symlink():
                 # A session file without its credential source cannot be
                 # proven safe to discard or attach to a new first-run admin.
