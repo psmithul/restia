@@ -75,6 +75,12 @@ export RESTIA_ENCRYPTION_KEY_FILE_HOST="$workdir/restia_fernet_key"
 export APP_DATA_DIR="$workdir/data"
 export APP_LOGS_DIR="$workdir/logs"
 export APP_BLOB_DIR="$workdir/blobs"
+# Match the container's non-root identity to the owner of the ephemeral bind
+# mounts and mode-0600 secret. This is the documented PUID/PGID deployment
+# contract and keeps the smoke representative on runners whose uid is not 1000.
+export PUID PGID
+PUID=$(id -u)
+PGID=$(id -g)
 export APP_BIND=127.0.0.1
 export APP_PORT=17902
 export TZ=UTC

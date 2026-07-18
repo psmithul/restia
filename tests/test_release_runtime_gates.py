@@ -151,6 +151,8 @@ def test_shared_compose_smoke_uses_ephemeral_state_and_validates_authority():
     assert "mktemp -d" in smoke
     assert "RESTIA_POSTGRES_PASSWORD" in smoke
     assert "RESTIA_ENCRYPTION_KEY_FILE_HOST" in smoke
+    assert "PUID=$(id -u)" in smoke
+    assert "PGID=$(id -g)" in smoke
     assert "RESTIA_INPROCESS_POLLERS=0" in smoke
     assert "RESTIA_INPROCESS_TASKS=0" in smoke
     assert 'database_mode.get("mode") != "shared"' in smoke

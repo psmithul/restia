@@ -4,7 +4,7 @@ import os
 
 from src.runtime_paths import get_app_root, get_default_data_dir
 
-APP_VERSION = "3.0.1"
+APP_VERSION = "3.0.2"
 
 # Validate the single internal version at import time. Public release tags use
 # scope precision (X.0.0 -> vX, X.Y.0 -> vX.Y, X.Y.Z -> vX.Y.Z); see
