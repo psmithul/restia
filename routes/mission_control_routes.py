@@ -2527,6 +2527,333 @@ def _load_proactive_intelligence(
         db.close()
 
 
+async def build_today_control_plane_snapshot(
+    *,
+    scope: _OwnerScope,
+    utc_offset_minutes: int,
+    session_factory: Callable[[], Any],
+    health_cache: _HealthSnapshotCache,
+    data_dir: Path | str,
+    now_factory: Callable[[], datetime],
+    health_collector: Optional[Callable[..., Any]] = None,
+    rag_manager: Any = None,
+    memory_vector: Any = None,
+) -> dict[str, Any]:
+    """Build the one deterministic, read-only Today control-plane answer.
+
+    The HTTP route and the conversational ``query_life`` tool both call this
+    function. Keeping collection, prioritisation, evidence, and degraded-source
+    behavior here prevents two user interfaces from giving different answers
+    to the same question.
+    """
+
+    if type(utc_offset_minutes) is not int or not -840 <= utc_offset_minutes <= 840:
+        raise ValueError("utc_offset_minutes must be an integer from -840 to 840")
+
+    mission_data_dir = Path(data_dir)
+    now_utc = _as_utc(now_factory())
+    local_now = now_utc + timedelta(minutes=utc_offset_minutes)
+    local_instant = now_utc.astimezone(
+        timezone(timedelta(minutes=utc_offset_minutes))
+    )
+    local_date = local_now.date()
+    local_start = datetime.combine(local_date, time.min)
+    local_end = local_start + timedelta(days=1)
+    utc_start = (local_start - timedelta(minutes=utc_offset_minutes)).replace(
+        tzinfo=timezone.utc
+    )
+    utc_end = (local_end - timedelta(minutes=utc_offset_minutes)).replace(
+        tzinfo=timezone.utc
+    )
+    now_naive = now_utc.replace(tzinfo=None)
+
+    if scope.available:
+        calendar = _safe_load(
+            "calendar",
+            lambda: _load_calendar(
+                session_factory,
+                scope,
+                local_start=local_start,
+                local_end=local_end,
+                utc_start=utc_start.replace(tzinfo=None),
+                utc_end=utc_end.replace(tzinfo=None),
+                utc_offset_minutes=utc_offset_minutes,
+            ),
+        )
+        project_work = _safe_load(
+            "project_work",
+            lambda: _load_project_work(session_factory, scope, today=local_date),
+        )
+        planning = _safe_load(
+            "planning",
+            lambda: _load_planning(session_factory, scope, today=local_date),
+        )
+        inbox = _safe_load(
+            "inbox",
+            lambda: _load_inbox(session_factory, scope),
+        )
+        goals = _safe_load(
+            "goals",
+            lambda: _load_goals(session_factory, scope, now_naive=now_naive),
+        )
+        tasks = _safe_load(
+            "tasks",
+            lambda: _load_tasks(
+                session_factory,
+                scope,
+                utc_start=utc_start,
+                utc_end=utc_end,
+            ),
+        )
+        study_reviews = _safe_load(
+            "study_reviews",
+            lambda: _load_study_reviews(session_factory, scope, now_naive=now_naive),
+        )
+        important_mail = _safe_load(
+            "important_mail",
+            lambda: _load_important_mail(mission_data_dir, scope),
+        )
+        notes_today = _safe_load(
+            "notes_today",
+            lambda: _load_notes_today(session_factory, scope),
+        )
+        daily_brief = _safe_load(
+            "daily_brief",
+            lambda: _load_daily_brief(session_factory, scope),
+        )
+        progression = _safe_load(
+            "progression",
+            lambda: _load_progression(
+                session_factory,
+                scope,
+                utc_offset_minutes=utc_offset_minutes,
+                now_utc=now_utc,
+            ),
+        )
+        proactive = _safe_load(
+            "proactive",
+            lambda: _load_proactive_intelligence(
+                session_factory, scope, as_of=local_instant,
+            ),
+        )
+        recent_activity = _safe_load(
+            "recent_activity",
+            lambda: _load_activity_feed(
+                session_factory, scope, limit=8, before=None,
+            ),
+        )
+    else:
+        owner_problem = {
+            "status": "unavailable",
+            "code": "owner_unavailable",
+            "message": "Owner scope could not be resolved for this request.",
+        }
+        calendar = _source_problem("calendar", **owner_problem)
+        project_work = _source_problem("project_work", **owner_problem)
+        planning = _source_problem("planning", **owner_problem)
+        inbox = _source_problem("inbox", **owner_problem)
+        goals = _source_problem("goals", **owner_problem)
+        tasks = _source_problem("tasks", **owner_problem)
+        study_reviews = _source_problem("study_reviews", **owner_problem)
+        important_mail = _source_problem("important_mail", **owner_problem)
+        notes_today = _source_problem("notes_today", **owner_problem)
+        daily_brief = _source_problem("daily_brief", **owner_problem)
+        progression = _source_problem("progression", **owner_problem)
+        proactive = _source_problem("proactive", **owner_problem)
+        recent_activity = _source_problem("recent_activity", **owner_problem)
+
+    collector = health_collector
+    if collector is None:
+        from src.service_health import collect_service_health
+
+        collector = collect_service_health
+    try:
+        health = await health_cache.get(collector, rag_manager, memory_vector)
+    except Exception as exc:
+        logger.error(
+            "Mission Control health source failed (%s)", type(exc).__name__
+        )
+        health = {
+            "status": "error",
+            "overall": "unknown",
+            "services": [],
+            "truncated": False,
+            "error": {
+                "code": "health_unavailable",
+                "message": "Could not load service health.",
+            },
+        }
+
+    sources = {
+        "calendar": calendar,
+        "project_work": project_work,
+        "planning": planning,
+        "inbox": inbox,
+        "goals": goals,
+        "tasks": tasks,
+        "study_reviews": study_reviews,
+        "important_mail": important_mail,
+        "notes_today": notes_today,
+        "daily_brief": daily_brief,
+        "progression": progression,
+        "proactive": proactive,
+        "recent_activity": recent_activity,
+        "health": health,
+    }
+    next_actions = _build_next_actions(sources)
+    today_sections = _build_today_sections(
+        sources,
+        next_actions=next_actions,
+        local_date=local_date,
+        local_now=local_now,
+        utc_offset_minutes=utc_offset_minutes,
+    )
+    source_inputs = [
+        {
+            "source": source_name,
+            "status": str(source.get("status") or "unknown"),
+            "count": int(source.get("count") or 0),
+            "truncated": bool(source.get("truncated")),
+        }
+        for source_name, source in sources.items()
+    ]
+    assumptions = [
+        {
+            "source": row["source"],
+            "status": row["status"],
+            "reason": str(
+                ((sources[row["source"]].get("error") or {}).get("message"))
+                or "This source is not fully available."
+            ),
+        }
+        for row in source_inputs
+        if row["status"] not in {"ok", "disabled"}
+    ]
+    available_actions: list[dict[str, Any]] = []
+    seen_action_ids: set[str] = set()
+    for action in (
+        today_sections["top_three_actions"]
+        + today_sections["must_do_tasks"]
+        + today_sections["people_awaiting_responses"]
+        + today_sections["health_routine_commitments"]
+        + today_sections["risks_conflicts"]
+        + today_sections["restia_owned_work"]
+    ):
+        action_id = str(action.get("id") or "").strip()
+        handling = str(action.get("what_restia_can_handle") or "").strip()
+        if not action_id or not handling or action_id in seen_action_ids:
+            continue
+        seen_action_ids.add(action_id)
+        available_actions.append({
+            "id": action_id,
+            "kind": action.get("kind"),
+            "title": action.get("title"),
+            "target": action.get("target"),
+            "focus_target": action.get("focus_target"),
+            "source_evidence": list(action.get("source_evidence") or [])[:2],
+            "what_restia_can_handle": handling,
+        })
+        if len(available_actions) == TODAY_RISK_LIMIT:
+            break
+    return {
+        "date": local_date.isoformat(),
+        "as_of": _iso_utc(now_utc),
+        "utc_offset_minutes": utc_offset_minutes,
+        "summary": {
+            "calendar": calendar["count"],
+            "project_work": project_work["count"],
+            "planning": int(planning.get("open_count", planning["count"])),
+            "inbox": int(inbox.get("unprocessed_count", inbox["count"])),
+            "goals": goals["count"],
+            "tasks": tasks["count"],
+            "study_reviews": study_reviews["count"],
+            "important_mail": important_mail["count"],
+            "notes_today": notes_today["count"],
+            "daily_brief": daily_brief["count"],
+            "progression": int(
+                (progression.get("profile") or {}).get("total_xp", 0)
+                if isinstance(progression.get("profile"), dict)
+                else 0
+            ),
+            "next_actions": len(next_actions),
+            "proactive_interruptions": len(proactive.get("interruptions") or []),
+            "proactive_digest": len(proactive.get("digest") or []),
+            "recent_changes": recent_activity["count"],
+            "health": health["overall"],
+        },
+        "next_actions": next_actions,
+        "proactive": proactive,
+        **today_sections,
+        "assumptions": assumptions,
+        "available_actions": available_actions,
+        "transparency": {
+            "inputs": source_inputs,
+            "changes": [],
+            "reason": (
+                "Deterministic owner-scoped prioritisation over bounded Today sources."
+            ),
+            "actor": "restia_today_control_plane",
+            "workflow": "read_only_today_snapshot",
+            "reversal": "No reversal is needed because this read changed no data.",
+        },
+        "sources": sources,
+    }
+
+
+async def build_owner_today_snapshot(
+    *,
+    owner: str,
+    utc_offset_minutes: int,
+    session_factory: Callable[[], Any] = SessionLocal,
+    health_collector: Optional[Callable[..., Any]] = None,
+    now_factory: Optional[Callable[[], datetime]] = None,
+    data_dir: Path | str | None = None,
+    rag_manager: Any = None,
+    memory_vector: Any = None,
+    include_unowned: bool = False,
+    local_fallback: bool = False,
+) -> dict[str, Any]:
+    """Build Today for an already-authenticated model-tool owner."""
+
+    owner_name = str(owner or "").strip()
+    if not owner_name:
+        raise ValueError("An authenticated owner is required")
+    if local_fallback:
+        scope = _OwnerScope(
+            owner=None,
+            project_actor=FALLBACK_PROJECT_OWNER,
+            calendar_owner=CALENDAR_FALLBACK_OWNER,
+            include_unowned=True,
+        )
+    elif include_unowned:
+        scope = _OwnerScope(
+            owner=owner_name,
+            project_actor=owner_name.lower(),
+            calendar_owner=CALENDAR_FALLBACK_OWNER,
+            include_unowned=True,
+        )
+    else:
+        scope = _OwnerScope(
+            owner=owner_name,
+            project_actor=owner_name.lower(),
+            calendar_owner=owner_name,
+        )
+    return await build_today_control_plane_snapshot(
+        scope=scope,
+        utc_offset_minutes=utc_offset_minutes,
+        session_factory=session_factory,
+        health_cache=_HealthSnapshotCache(
+            ttl_seconds=_HEALTH_CACHE_TTL_SECONDS,
+            timeout_seconds=_HEALTH_TIMEOUT_SECONDS,
+        ),
+        data_dir=DATA_DIR if data_dir is None else data_dir,
+        now_factory=now_factory or _utc_now,
+        health_collector=health_collector,
+        rag_manager=rag_manager,
+        memory_vector=memory_vector,
+    )
+
+
 def setup_mission_control_routes(
     rag_manager: Any = None,
     memory_vector: Any = None,
@@ -2562,197 +2889,17 @@ def setup_mission_control_routes(
             description="Signed minutes local time is ahead of UTC (India is 330).",
         ),
     ) -> dict[str, Any]:
-        scope = _resolve_owner_scope(request)
-        now_utc = _as_utc(now_factory())
-        local_now = now_utc + timedelta(minutes=utc_offset_minutes)
-        local_instant = now_utc.astimezone(
-            timezone(timedelta(minutes=utc_offset_minutes))
-        )
-        local_date = local_now.date()
-        local_start = datetime.combine(local_date, time.min)
-        local_end = local_start + timedelta(days=1)
-        utc_start = (local_start - timedelta(minutes=utc_offset_minutes)).replace(
-            tzinfo=timezone.utc
-        )
-        utc_end = (local_end - timedelta(minutes=utc_offset_minutes)).replace(
-            tzinfo=timezone.utc
-        )
-        now_naive = now_utc.replace(tzinfo=None)
-
-        if scope.available:
-            calendar = _safe_load(
-                "calendar",
-                lambda: _load_calendar(
-                    session_factory,
-                    scope,
-                    local_start=local_start,
-                    local_end=local_end,
-                    utc_start=utc_start.replace(tzinfo=None),
-                    utc_end=utc_end.replace(tzinfo=None),
-                    utc_offset_minutes=utc_offset_minutes,
-                ),
-            )
-            project_work = _safe_load(
-                "project_work",
-                lambda: _load_project_work(session_factory, scope, today=local_date),
-            )
-            planning = _safe_load(
-                "planning",
-                lambda: _load_planning(session_factory, scope, today=local_date),
-            )
-            inbox = _safe_load(
-                "inbox",
-                lambda: _load_inbox(session_factory, scope),
-            )
-            goals = _safe_load(
-                "goals",
-                lambda: _load_goals(session_factory, scope, now_naive=now_naive),
-            )
-            tasks = _safe_load(
-                "tasks",
-                lambda: _load_tasks(
-                    session_factory,
-                    scope,
-                    utc_start=utc_start,
-                    utc_end=utc_end,
-                ),
-            )
-            study_reviews = _safe_load(
-                "study_reviews",
-                lambda: _load_study_reviews(session_factory, scope, now_naive=now_naive),
-            )
-            important_mail = _safe_load(
-                "important_mail",
-                lambda: _load_important_mail(mission_data_dir, scope),
-            )
-            notes_today = _safe_load(
-                "notes_today",
-                lambda: _load_notes_today(session_factory, scope),
-            )
-            daily_brief = _safe_load(
-                "daily_brief",
-                lambda: _load_daily_brief(session_factory, scope),
-            )
-            progression = _safe_load(
-                "progression",
-                lambda: _load_progression(
-                    session_factory,
-                    scope,
-                    utc_offset_minutes=utc_offset_minutes,
-                    now_utc=now_utc,
-                ),
-            )
-            proactive = _safe_load(
-                "proactive",
-                lambda: _load_proactive_intelligence(
-                    session_factory, scope, as_of=local_instant,
-                ),
-            )
-            recent_activity = _safe_load(
-                "recent_activity",
-                lambda: _load_activity_feed(
-                    session_factory, scope, limit=8, before=None,
-                ),
-            )
-        else:
-            owner_problem = {
-                "status": "unavailable",
-                "code": "owner_unavailable",
-                "message": "Owner scope could not be resolved for this request.",
-            }
-            calendar = _source_problem("calendar", **owner_problem)
-            project_work = _source_problem("project_work", **owner_problem)
-            planning = _source_problem("planning", **owner_problem)
-            inbox = _source_problem("inbox", **owner_problem)
-            goals = _source_problem("goals", **owner_problem)
-            tasks = _source_problem("tasks", **owner_problem)
-            study_reviews = _source_problem("study_reviews", **owner_problem)
-            important_mail = _source_problem("important_mail", **owner_problem)
-            notes_today = _source_problem("notes_today", **owner_problem)
-            daily_brief = _source_problem("daily_brief", **owner_problem)
-            progression = _source_problem("progression", **owner_problem)
-            proactive = _source_problem("proactive", **owner_problem)
-            recent_activity = _source_problem("recent_activity", **owner_problem)
-
-        collector = health_collector
-        if collector is None:
-            from src.service_health import collect_service_health
-
-            collector = collect_service_health
-        try:
-            health = await health_cache.get(collector, rag_manager, memory_vector)
-        except Exception as exc:
-            logger.error(
-                "Mission Control health source failed (%s)", type(exc).__name__
-            )
-            health = {
-                "status": "error",
-                "overall": "unknown",
-                "services": [],
-                "truncated": False,
-                "error": {
-                    "code": "health_unavailable",
-                    "message": "Could not load service health.",
-                },
-            }
-
-        sources = {
-            "calendar": calendar,
-            "project_work": project_work,
-            "planning": planning,
-            "inbox": inbox,
-            "goals": goals,
-            "tasks": tasks,
-            "study_reviews": study_reviews,
-            "important_mail": important_mail,
-            "notes_today": notes_today,
-            "daily_brief": daily_brief,
-            "progression": progression,
-            "proactive": proactive,
-            "recent_activity": recent_activity,
-            "health": health,
-        }
-        next_actions = _build_next_actions(sources)
-        today_sections = _build_today_sections(
-            sources,
-            next_actions=next_actions,
-            local_date=local_date,
-            local_now=local_now,
+        return await build_today_control_plane_snapshot(
+            scope=_resolve_owner_scope(request),
             utc_offset_minutes=utc_offset_minutes,
+            session_factory=session_factory,
+            health_cache=health_cache,
+            data_dir=mission_data_dir,
+            now_factory=now_factory,
+            health_collector=health_collector,
+            rag_manager=rag_manager,
+            memory_vector=memory_vector,
         )
-        return {
-            "date": local_date.isoformat(),
-            "as_of": _iso_utc(now_utc),
-            "utc_offset_minutes": utc_offset_minutes,
-            "summary": {
-                "calendar": calendar["count"],
-                "project_work": project_work["count"],
-                "planning": int(planning.get("open_count", planning["count"])),
-                "inbox": int(inbox.get("unprocessed_count", inbox["count"])),
-                "goals": goals["count"],
-                "tasks": tasks["count"],
-                "study_reviews": study_reviews["count"],
-                "important_mail": important_mail["count"],
-                "notes_today": notes_today["count"],
-                "daily_brief": daily_brief["count"],
-                "progression": int(
-                    (progression.get("profile") or {}).get("total_xp", 0)
-                    if isinstance(progression.get("profile"), dict)
-                    else 0
-                ),
-                "next_actions": len(next_actions),
-                "proactive_interruptions": len(
-                    proactive.get("interruptions") or []
-                ),
-                "proactive_digest": len(proactive.get("digest") or []),
-                "recent_changes": recent_activity["count"],
-                "health": health["overall"],
-            },
-            "next_actions": next_actions,
-            "proactive": proactive,
-            **today_sections,
-            "sources": sources,
-        }
 
     @router.get("/activity")
     async def activity_snapshot(

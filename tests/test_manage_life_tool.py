@@ -1001,6 +1001,16 @@ def test_schema_registry_dispatch_and_plan_mode_all_classify_query_life():
         "automation_definitions", "automation_get", "automation_history",
         "automation_evaluate",
     } <= set(query_parameters["properties"]["action"]["enum"])
+    assert "today" in query_parameters["properties"]["action"]["enum"]
+    assert query_parameters["properties"]["utc_offset_minutes"] == {
+        "type": "integer",
+        "minimum": -840,
+        "maximum": 840,
+        "description": (
+            "Required for action=today. Signed minutes local time is ahead of "
+            "UTC, for example 330 for India."
+        ),
+    }
     assert "automation_prepare" not in query_parameters["properties"]["action"]["enum"]
     assert query_parameters["properties"]["event"]["type"] == "object"
     assert "query_life" in TOOL_TAGS
@@ -1015,3 +1025,8 @@ def test_schema_registry_dispatch_and_plan_mode_all_classify_query_life():
     life_source = open("src/tools/life.py", encoding="utf-8").read()
     assert "prepare_automation_run" not in life_source
     assert "create_action_proposal" not in life_source
+    assert "build_owner_today_snapshot" in life_source
+
+    agent_prompt = open("src/agent_loop.py", encoding="utf-8").read()
+    assert 'use `today` with the user\'s exact `utc_offset_minutes`' in agent_prompt
+    assert "same source-backed control-plane answer as the Today screen" in agent_prompt

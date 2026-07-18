@@ -9,6 +9,7 @@ reviewed ActionPolicy boundary.
 from __future__ import annotations
 
 import logging
+import os
 from collections import Counter
 from typing import Any, Dict, Optional
 
@@ -174,6 +175,11 @@ async def _do_query_life_impl(content: str, owner: Optional[str] = None) -> Dict
         "calendar_plan": "calendar_time",
         "time_plan": "calendar_time",
         "free_time": "calendar_time",
+        "today_plan": "today",
+        "day_plan": "today",
+        "plan_today": "today",
+        "what_today": "today",
+        "what_next": "today",
         "trends": "health_trends",
         "money": "finance_summary",
         "spending": "finance_cash_flow",
@@ -223,7 +229,6 @@ async def _do_query_life_impl(content: str, owner: Optional[str] = None) -> Dict
         "priorities": "proactive_report",
         "priority_report": "proactive_report",
         "proactive": "proactive_report",
-        "what_next": "proactive_report",
         "knowledge": "knowledge_records",
         "memory": "knowledge_records",
         "knowledge_list": "knowledge_records",
@@ -244,7 +249,7 @@ async def _do_query_life_impl(content: str, owner: Optional[str] = None) -> Dict
         "messages": "communications",
     }.get(action, action)
     supported = {
-        "summary", "list", "search", "get", "traverse",
+        "summary", "today", "list", "search", "get", "traverse",
         "task_quality", "decisions_due", "health_trends", "calendar_time",
         "finance_summary", "finance_cash_flow", "finance_subscriptions",
         "finance_due", "finance_anomalies", "finance_net_worth",
@@ -266,7 +271,7 @@ async def _do_query_life_impl(content: str, owner: Optional[str] = None) -> Dict
     }
     if action not in supported:
         return _error(
-            "Unsupported action. Use summary, list, search, get, traverse, "
+            "Unsupported action. Use summary, today, list, search, get, traverse, "
             "task_quality, decisions_due, health_trends, calendar_time, finance_summary, "
             "finance_cash_flow, finance_subscriptions, finance_due, or "
             "finance_anomalies, finance_net_worth, finance_forecast, "
@@ -288,6 +293,50 @@ async def _do_query_life_impl(content: str, owner: Optional[str] = None) -> Dict
     db = SessionLocal()
     try:
         account = find_account(db, owner_name)
+        if action == "today":
+            utc_offset_minutes = args.get("utc_offset_minutes")
+            if (
+                type(utc_offset_minutes) is not int
+                or not -840 <= utc_offset_minutes <= 840
+            ):
+                return _error(
+                    "utc_offset_minutes is required for today and must be an "
+                    "integer from -840 to 840"
+                )
+            auth_disabled = os.getenv("AUTH_ENABLED", "true").lower() == "false"
+            if account is None and not auth_disabled:
+                return _empty(action)
+            from routes.mission_control_routes import build_owner_today_snapshot
+
+            result = await build_owner_today_snapshot(
+                owner=owner_name,
+                utc_offset_minutes=utc_offset_minutes,
+                session_factory=SessionLocal,
+                include_unowned=auth_disabled and account is not None,
+                local_fallback=auth_disabled and account is None,
+            )
+            primary = result.get("primary_outcome")
+            if isinstance(primary, dict) and primary.get("title"):
+                why_now = primary.get("why_now") or (
+                    "It is the highest-ranked source-backed action."
+                )
+                response = (
+                    f"Today, start with {primary['title']}. "
+                    f"{why_now}"
+                )
+            else:
+                response = (
+                    "No evidence-backed primary action is available for today; "
+                    "check the reported source assumptions before treating the "
+                    "day as clear."
+                )
+            return {
+                "response": response,
+                "action": "today",
+                **result,
+                "read_only": True,
+                "exit_code": 0,
+            }
         if account is None:
             return _empty(action)
 

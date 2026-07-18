@@ -122,7 +122,7 @@ _AGENT_RULES = """\
 - AFTER A TOOL FAILS (timeout, error, "Unknown action", "not found"), DO NOT GO SILENT. The user expects a follow-up: either retry with a fix (e.g. correct args, longer-running form, run `tail -f /tmp/foo.log` to see progress, split into smaller steps), OR explicitly tell them "this didn't work, want me to try X instead?". A failed tool is not a stopping condition — only a successful one is.
 - YOU DECLARE WHEN THE JOB IS DONE — not a timer. Keep taking concrete steps while the task still needs them; you have plenty of rounds, so don't rush to quit just because you've made a few calls. There are exactly three ways to end a turn: (1) DONE — before you declare it, sanity-check that every concrete thing the user asked for actually exists or succeeded (file written, edit applied, command exited clean); then stop calling tools and write the final answer (that IS your "done" signal); (2) BLOCKED — you genuinely can't proceed (a capability is missing, permission denied, or data you can't obtain), so say plainly what's blocking you, in a sentence or two, and stop; (3) keep going with the single most useful next step. The only wrong moves are trailing off mid-task without one of these, and repeating a call you already ran.
 - Calendar: call `manage_calendar` with `action=list_calendars` before create. Before update or cancellation, call `list_events` and pass its exact `uid` and `version`. `cancel_event` only prepares a pending proposal for human approval; `delete_event` is manual-only. Use `manage_notes` separately for reminders.
-- Cross-domain Life OS questions start with read-only `query_life`. For "what should I do today/next?", use `proactive_report` with the exact offset-aware current timestamp. For personal-knowledge answers, use `knowledge_evidence` and preserve stale, assumption, inference, contradiction, and gap labels; never promote model inference to fact. Automation reads use `automation_definitions`, `automation_get`, or `automation_history`; `automation_evaluate` only classifies an event and never prepares, executes, approves, or sends. It cannot mutate data.
+- Cross-domain Life OS questions start with read-only `query_life`. For "what should I do today/next?" or "plan my day", use `today` with the user's exact `utc_offset_minutes`; it returns the same source-backed control-plane answer as the Today screen. Use `proactive_report` only for explicit risk/digest inspection. For personal-knowledge answers, use `knowledge_evidence` and preserve stale, assumption, inference, contradiction, and gap labels; never promote model inference to fact. Automation reads use `automation_definitions`, `automation_get`, or `automation_history`; `automation_evaluate` only classifies an event and never prepares, executes, approves, or sends. It cannot mutate data.
 - BULK email actions ("delete all those", "mark all as read", "archive these", "delete all spam", "mark these 19 read") → use the `bulk_email` tool ONCE with either the exact `uids` list from the latest `list_emails` result or `all_unread: true`. NEVER just say you deleted/archived/marked messages unless a delete/archive/mark/bulk email tool call succeeded. NEVER loop mark_email_read / archive_email / delete_email one message at a time — that floods the context and can blow the token budget. One bulk_email call handles the whole set.
 - Email UIDs are the values after `UID:` in tool output, not list row numbers. For example, row `1.` with `UID: 90186` must use `"90186"`, never `"1"`.
 - "Last/latest/newest email" means call `list_emails` with `max_results: 1`, `unread_only: false`, and the right `account`, then read the UID returned by that tool if full content is needed. NEVER use a table row number like "#18" as an email UID.
@@ -550,7 +550,12 @@ If the user asks for a reminder/alarm, create it as a separate explicit `manage_
 {"action": "summary"}
 ```
 Read-only query surface for the authenticated user's canonical Life OS graph.
-Use `summary` for cross-domain context; `list`/`search` for typed records;
+Use `today` with the user's exact `utc_offset_minutes` for "what should I do
+today/next?" and day planning. It returns the exact Today control-plane contract:
+primary outcome, top actions, events, must-do work, people awaiting replies,
+routines, risks, schedule, delegated work, source evidence, assumptions, and
+available reviewed actions. Use `summary` for other cross-domain context;
+`list`/`search` for typed records;
 `get`/`traverse` for an exact entity and its source-backed links;
 `task_quality` for overdue/blocked/waiting/duplicate/missing-next-action risks;
 `decisions_due` for decision and assumption reviews; and `health_trends` for
@@ -590,8 +595,8 @@ anyone. Use `work_business_workspaces`, `work_business_records`,
 `work_business_search`, and `work_business_summary` only within the exact
 owner-scoped workspace id. Cross-workspace visibility requires an explicit
 typed relation; these reads never send outreach, submit proposals, or make
-payments. For "what should I do today/next?", use `proactive_report` with an
-explicit offset-aware `as_of`. Its interruption channel is deterministic and
+payments. Use `proactive_report` only for explicit risk and digest inspection
+with an explicit offset-aware `as_of`. Its interruption channel is deterministic and
 limited to explicitly requested, high-risk, or urgent + important +
 time-sensitive signals; everything else remains digest evidence. Use
 `knowledge_records`, `knowledge_search`, `knowledge_stale`, and

@@ -716,6 +716,148 @@ async def test_today_snapshot_is_owner_scoped_deterministic_and_redacted(mission
     assert "private long-form note body" not in rendered
 
 
+@pytest.mark.anyio
+async def test_query_life_today_is_the_same_owner_scoped_read_only_control_plane(
+    mission_env, monkeypatch
+):
+    app, factory, data_dir = mission_env
+    _seed_snapshot(factory, data_dir)
+
+    import src.service_health as service_health
+    from src.tool_implementations import do_query_life
+
+    monkeypatch.setattr(cdb, "SessionLocal", factory)
+    monkeypatch.setattr(mission, "DATA_DIR", data_dir)
+    monkeypatch.setattr(mission, "_utc_now", lambda: _NOW)
+    monkeypatch.setattr(service_health, "collect_service_health", _health)
+
+    guarded_models = (
+        cdb.Account,
+        cdb.ActionAudit,
+        cdb.ActionProposal,
+        cdb.LifeEntity,
+        cdb.LifeEntityVersion,
+        cdb.InboxItem,
+        cdb.PlanningItem,
+        cdb.CalendarEvent,
+        cdb.ProjectWorkItem,
+        cdb.ScheduledTask,
+        cdb.TaskRun,
+    )
+
+    def mutation_counts():
+        db = factory()
+        try:
+            return {
+                model.__tablename__: db.query(model).count()
+                for model in guarded_models
+            }
+        finally:
+            db.close()
+
+    before = mutation_counts()
+    async with _client(app) as client:
+        route_response = await client.get(
+            "/api/mission-control/today?utc_offset_minutes=330",
+            headers=_headers("alice"),
+        )
+    tool = await do_query_life(
+        json.dumps({"action": "today", "utc_offset_minutes": 330}),
+        owner="alice",
+    )
+
+    assert route_response.status_code == 200
+    route_snapshot = route_response.json()
+    assert {key: tool[key] for key in route_snapshot} == route_snapshot
+    assert tool["response"].startswith("Today, start with Fix Application scan.")
+    assert tool["action"] == "today"
+    assert tool["read_only"] is True
+    assert tool["exit_code"] == 0
+    assert tool["transparency"] == {
+        "inputs": tool["transparency"]["inputs"],
+        "changes": [],
+        "reason": (
+            "Deterministic owner-scoped prioritisation over bounded Today sources."
+        ),
+        "actor": "restia_today_control_plane",
+        "workflow": "read_only_today_snapshot",
+        "reversal": "No reversal is needed because this read changed no data.",
+    }
+    assert {row["source"] for row in tool["assumptions"]} == {"health"}
+    assert [row["id"] for row in tool["available_actions"][:3]] == [
+        row["id"] for row in tool["top_three_actions"]
+    ]
+    assert all(row["what_restia_can_handle"] for row in tool["available_actions"])
+    assert len(tool["available_actions"]) <= mission.TODAY_RISK_LIMIT
+    assert "BOB_ONLY" not in json.dumps(tool, sort_keys=True)
+    assert mutation_counts() == before
+
+    missing_offset = await do_query_life(
+        json.dumps({"action": "today"}), owner="alice"
+    )
+    assert missing_offset == {
+        "error": (
+            "utc_offset_minutes is required for today and must be an integer "
+            "from -840 to 840"
+        ),
+        "exit_code": 1,
+        "read_only": True,
+        "answer_contract": tool["answer_contract"],
+    }
+    assert mutation_counts() == before
+
+
+@pytest.mark.anyio
+async def test_query_life_today_matches_clean_local_first_run_without_creating_owner(
+    mission_env, monkeypatch
+):
+    app, factory, data_dir = mission_env
+    app.app.state.auth_manager = SimpleNamespace(is_configured=False, users={})
+
+    import src.service_health as service_health
+    from src.tool_implementations import do_query_life
+
+    monkeypatch.setenv("AUTH_ENABLED", "false")
+    monkeypatch.setattr(cdb, "SessionLocal", factory)
+    monkeypatch.setattr(mission, "DATA_DIR", data_dir)
+    monkeypatch.setattr(mission, "_utc_now", lambda: _NOW)
+    monkeypatch.setattr(service_health, "collect_service_health", _health)
+
+    db = factory()
+    try:
+        assert db.query(cdb.Account).count() == 0
+        assert db.query(cdb.ActionAudit).count() == 0
+    finally:
+        db.close()
+
+    async with _client(app) as client:
+        route_response = await client.get(
+            "/api/mission-control/today?utc_offset_minutes=330"
+        )
+    tool = await do_query_life(
+        json.dumps({"action": "today", "utc_offset_minutes": 330}),
+        owner="owner@localhost",
+    )
+
+    assert route_response.status_code == 200
+    route_snapshot = route_response.json()
+    assert {key: tool[key] for key in route_snapshot} == route_snapshot
+    assert tool["date"] == "2026-07-15"
+    assert tool["primary_outcome"] is None
+    assert tool["sources"]["calendar"]["status"] == "ok"
+    assert tool["transparency"]["changes"] == []
+    assert [row["id"] for row in tool["available_actions"]] == [
+        "service_health:providers"
+    ]
+
+    db = factory()
+    try:
+        assert db.query(cdb.Account).count() == 0
+        assert db.query(cdb.ActionAudit).count() == 0
+    finally:
+        db.close()
+
+
 def test_v3_today_sections_are_hard_bounded_deterministic_and_non_mutating():
     def source(items):
         return {

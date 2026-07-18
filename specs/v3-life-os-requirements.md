@@ -293,11 +293,11 @@ shell, contextual Life workspace, and consolidated More menu.
 - [x] Existing deep links, commands, accessibility, mobile behavior, and user
       visibility preferences migrate without loss.
 
-## 24. Ideal home screen — `partial`
+## 24. Ideal home screen — `complete`
 
-- [ ] Home answers what matters now, what is happening today, what needs
+- [x] Home answers what matters now, what is happening today, what needs
       attention, what Restia is handling, and what changed.
-- [ ] “Ask Restia anything…” is the primary action.
+- [x] “Ask Restia anything…” is the primary action.
 
 ## 25. One application experience — `partial`
 
@@ -608,3 +608,33 @@ entire section complete by itself.
   amd64/arm64 builds, shipped-container smoke, and shared-Compose smoke. This
   advances the shared-runtime and shipped-path gates without claiming the
   still-pending public `v3.1` tag or provider/device verification.
+- **2026-07-18 — shared conversational Today control plane (working tree on
+  `cf1fb91`)**: completed the Ideal Home contract (Section 24) and advanced the
+  main Restia control plane, trust transparency, one-application experience,
+  and final-product day-planning path (Sections 1, 22, 25–26).
+  `routes/mission_control_routes.py` now owns one reusable, deterministic
+  Today aggregator used by both `/api/mission-control/today` and the read-only
+  `query_life` `today` action. The model action requires the exact UTC offset
+  and returns the same primary outcome, top actions, calendar, must-do work,
+  awaiting responses, routines, risks, schedule, Restia-owned work, bounded
+  sources, degraded-source assumptions, available reviewed actions, and
+  explicit input/change/reason/actor/workflow/reversal record as the visual
+  Today surface. Authenticated owners remain isolated; auth-disabled first-run
+  installs reuse the same safe fallback scope without creating an Account or
+  audit row. The focused Mission Control, frontend, Life-tool, schema/prompt,
+  proactive-knowledge, Communications, and registry suite passed with **88
+  passed**; Python 3.11 compilation and whitespace checks passed. A clean
+  isolated runtime migrated `0001 → 0018`, reported ready on `3.1.0`, served
+  `/today` with HTTP 200, returned all 14 Today sources plus transparency, and
+  served the exact five questions plus “Ask Restia anything…”. A direct clean
+  first-run `query_life` call returned the same dated read-only contract with
+  no changes. The complete suite exercised **6,637 passing contracts with 4
+  skipped**: its first sandboxed run reported 6,623 passes and 14 failures, all
+  attributable to denied localhost/Unix socket binds or the known
+  order-sensitive Telegram lifecycle isolation; the exact affected CalDAV,
+  Chroma, Docker-socket, two-instance, DNS-pinning, webhook, and Telegram set
+  then passed **56/56** with socket access and isolated lifecycle state. The
+  final feature plus release-policy set passed **128/128**, including the
+  strict `3.1.0 → v3.1` preflight. Live model-provider invocation and
+  real-device visual QA remain open, so the broader Sections 1, 22, 25, and 26
+  stay partial.
