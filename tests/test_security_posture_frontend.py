@@ -12,9 +12,15 @@ def test_profile_settings_exposes_device_management_and_security_posture():
     assert 'id="settings-security-posture"' in html
     assert 'id="settings-security-export"' in html
     assert 'id="settings-security-copy-backup"' in html
+    assert 'id="settings-passkeys"' in html
+    assert 'id="settings-passkey-add"' in html
+    assert 'id="settings-passkey-unlock"' in html
     assert "fetch('/api/auth/sessions'" in script
     assert "fetch('/api/life/security-posture'" in script
     assert "fetch('/api/life/privacy-export'" in script
+    assert "fetch('/api/auth/webauthn/status'" in script
+    assert "fetch('/api/auth/webauthn/register/options'" in script
+    assert "fetch('/api/auth/webauthn/unlock/options'" in script
     assert "method: 'DELETE'" in script
     assert 'data-connector-method="${method}"' in script
     assert 'id="uf-api-paths"' in script

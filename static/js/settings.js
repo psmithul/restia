@@ -2310,6 +2310,190 @@ function initAccount() {
     render2FA();
   }
 
+  // ── Server-verified passkeys and short-lived device unlock ──
+  const passkeysEl = el('settings-passkeys');
+  const passkeyMsgEl = el('settings-passkey-msg');
+
+  function passkeyBase64urlToBytes(value) {
+    const input = String(value || '').replace(/-/g, '+').replace(/_/g, '/');
+    const padded = input + '='.repeat((4 - input.length % 4) % 4);
+    const binary = atob(padded);
+    return Uint8Array.from(binary, character => character.charCodeAt(0));
+  }
+
+  function passkeyBytesToBase64url(value) {
+    if (value === null || value === undefined) return null;
+    const bytes = new Uint8Array(value);
+    let binary = '';
+    bytes.forEach(byte => { binary += String.fromCharCode(byte); });
+    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  }
+
+  function passkeyCreationOptions(options) {
+    return {
+      ...options,
+      challenge: passkeyBase64urlToBytes(options.challenge),
+      user: { ...options.user, id: passkeyBase64urlToBytes(options.user.id) },
+      excludeCredentials: (options.excludeCredentials || []).map(item => ({
+        ...item, id: passkeyBase64urlToBytes(item.id),
+      })),
+    };
+  }
+
+  function passkeyRequestOptions(options) {
+    return {
+      ...options,
+      challenge: passkeyBase64urlToBytes(options.challenge),
+      allowCredentials: (options.allowCredentials || []).map(item => ({
+        ...item, id: passkeyBase64urlToBytes(item.id),
+      })),
+    };
+  }
+
+  function passkeyCredentialPayload(credential) {
+    const response = credential.response;
+    const payload = {
+      id: credential.id,
+      rawId: passkeyBytesToBase64url(credential.rawId),
+      type: credential.type,
+      authenticatorAttachment: credential.authenticatorAttachment || null,
+      clientExtensionResults: credential.getClientExtensionResults?.() || {},
+      response: {
+        clientDataJSON: passkeyBytesToBase64url(response.clientDataJSON),
+      },
+    };
+    if (response.attestationObject) {
+      payload.response.attestationObject = passkeyBytesToBase64url(response.attestationObject);
+      payload.response.transports = response.getTransports?.() || [];
+    }
+    if (response.authenticatorData) {
+      payload.response.authenticatorData = passkeyBytesToBase64url(response.authenticatorData);
+      payload.response.signature = passkeyBytesToBase64url(response.signature);
+      payload.response.userHandle = passkeyBytesToBase64url(response.userHandle);
+    }
+    return payload;
+  }
+
+  async function passkeyJSON(response, fallback) {
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.detail || fallback);
+    return result;
+  }
+
+  async function renderPasskeys() {
+    if (!passkeysEl) return;
+    if (!window.PublicKeyCredential || !navigator.credentials) {
+      passkeysEl.innerHTML = '<div style="font-size:11px;color:var(--color-warning,#d99a2b)">This browser does not support passkeys.</div>';
+      el('settings-passkey-enroll')?.classList.add('hidden');
+      return;
+    }
+    try {
+      const response = await fetch('/api/auth/webauthn/status', { credentials: 'same-origin' });
+      const result = await passkeyJSON(response, 'Could not load passkeys');
+      const credentials = Array.isArray(result.credentials) ? result.credentials : [];
+      const verification = result.verification || {};
+      const verifiedUntil = verification.verified && verification.expires_at
+        ? `Device verified until ${new Date(verification.expires_at).toLocaleTimeString()}`
+        : 'Device verification is not active';
+      passkeysEl.innerHTML = `
+        <div style="font-size:11px;margin-bottom:5px;color:${verification.verified ? 'var(--color-save-green,#4caf50)' : 'inherit'}">${esc(verifiedUntil)}</div>
+        ${credentials.length ? credentials.map(item => {
+          const used = item.last_used_at ? `Last used ${new Date(item.last_used_at).toLocaleString()}` : 'Not used yet';
+          return `<div class="settings-passkey-row" data-passkey-id="${esc(item.id || '')}" style="display:flex;align-items:center;gap:9px;padding:8px 0;border-top:1px solid var(--border)">
+            <div style="flex:1;min-width:0"><div style="font-size:12px;font-weight:600">${esc(item.label || 'Passkey')}</div><div style="font-size:10px;opacity:.55">${esc(used)}${item.backed_up ? ' · synced' : ''}</div></div>
+            <button class="admin-btn-sm settings-passkey-revoke" style="color:var(--color-error)">Revoke</button>
+          </div>`;
+        }).join('') : '<div style="font-size:11px;opacity:.55">No passkeys registered.</div>'}`;
+      passkeysEl.querySelectorAll('.settings-passkey-revoke').forEach(button => {
+        button.addEventListener('click', async () => {
+          const credentialId = button.closest('.settings-passkey-row')?.dataset.passkeyId || '';
+          const password = window.prompt('Enter your current password to revoke this passkey:');
+          if (!password) return;
+          const totpCode = window.prompt('Enter your 2FA code if enabled, otherwise leave blank:') || null;
+          button.disabled = true;
+          try {
+            const response = await fetch(`/api/auth/webauthn/credentials/${encodeURIComponent(credentialId)}/revoke`, {
+              method: 'POST', credentials: 'same-origin',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ current_password: password, totp_code: totpCode }),
+            });
+            await passkeyJSON(response, 'Could not revoke passkey');
+            if (passkeyMsgEl) passkeyMsgEl.textContent = 'Passkey revoked.';
+            await renderPasskeys();
+          } catch (error) {
+            button.disabled = false;
+            if (passkeyMsgEl) passkeyMsgEl.textContent = error?.message || 'Could not revoke passkey';
+          }
+        });
+      });
+    } catch (error) {
+      passkeysEl.innerHTML = `<div style="font-size:11px;color:var(--color-error)">${esc(error?.message || 'Could not load passkeys')}</div>`;
+    }
+  }
+
+  el('settings-passkey-add')?.addEventListener('click', async event => {
+    const button = event.currentTarget;
+    const label = el('settings-passkey-label')?.value.trim() || 'My device';
+    const passwordInput = el('settings-passkey-password');
+    const totpInput = el('settings-passkey-totp');
+    const currentPassword = passwordInput?.value || '';
+    const totpCode = totpInput?.value.trim() || null;
+    if (!currentPassword) {
+      if (passkeyMsgEl) passkeyMsgEl.textContent = 'Enter your current password.';
+      return;
+    }
+    button.disabled = true;
+    if (passkeyMsgEl) passkeyMsgEl.textContent = 'Waiting for your device…';
+    try {
+      const begin = await passkeyJSON(await fetch('/api/auth/webauthn/register/options', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label, current_password: currentPassword, totp_code: totpCode }),
+      }), 'Could not begin passkey registration');
+      const credential = await navigator.credentials.create({ publicKey: passkeyCreationOptions(begin.options) });
+      if (!credential) throw new Error('Passkey registration was cancelled');
+      await passkeyJSON(await fetch('/api/auth/webauthn/register/complete', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ceremony_id: begin.ceremony_id, label, credential: passkeyCredentialPayload(credential) }),
+      }), 'Could not verify passkey registration');
+      if (passwordInput) passwordInput.value = '';
+      if (totpInput) totpInput.value = '';
+      if (passkeyMsgEl) passkeyMsgEl.textContent = 'Passkey added.';
+      await renderPasskeys();
+    } catch (error) {
+      if (passkeyMsgEl) passkeyMsgEl.textContent = error?.message || 'Could not add passkey';
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  el('settings-passkey-unlock')?.addEventListener('click', async event => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    if (passkeyMsgEl) passkeyMsgEl.textContent = 'Waiting for your device…';
+    try {
+      const begin = await passkeyJSON(await fetch('/api/auth/webauthn/unlock/options', {
+        method: 'POST', credentials: 'same-origin',
+      }), 'Could not begin device verification');
+      const credential = await navigator.credentials.get({ publicKey: passkeyRequestOptions(begin.options) });
+      if (!credential) throw new Error('Device verification was cancelled');
+      await passkeyJSON(await fetch('/api/auth/webauthn/unlock/complete', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ceremony_id: begin.ceremony_id, credential: passkeyCredentialPayload(credential) }),
+      }), 'Could not verify this device');
+      if (passkeyMsgEl) passkeyMsgEl.textContent = 'Device verified.';
+      await renderPasskeys();
+    } catch (error) {
+      if (passkeyMsgEl) passkeyMsgEl.textContent = error?.message || 'Could not verify device';
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  renderPasskeys();
+
   // ── Account-owned devices and security posture ──
   const deviceSessionsEl = el('settings-device-sessions');
   async function renderDeviceSessions() {

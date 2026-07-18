@@ -105,3 +105,44 @@ async def test_auth_session_routes_hide_tokens_and_revoke_current_or_other_devic
         assert revoked_current.json()["current"] is True
         assert env.manager.resolve_session(current_token) is None
         assert SESSION_COOKIE in revoked_current.headers.get("set-cookie", "")
+
+
+@pytest.mark.asyncio
+async def test_passkey_routes_require_cookie_and_password_step_up(device_session_env):
+    env = device_session_env
+    token = env.manager.create_session("alice", "correct horse battery staple")
+    assert token
+    transport = httpx.ASGITransport(app=env.app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://localhost",
+    ) as client:
+        anonymous = await client.get("/api/auth/webauthn/status")
+        assert anonymous.status_code == 401
+
+        cookies = {SESSION_COOKIE: token}
+        status = await client.get("/api/auth/webauthn/status", cookies=cookies)
+        assert status.status_code == 200, status.text
+        assert status.json()["credentials"] == []
+        assert status.json()["verification"]["verified"] is False
+
+        denied = await client.post(
+            "/api/auth/webauthn/register/options",
+            cookies=cookies,
+            json={"label": "Test device", "current_password": "wrong password"},
+        )
+        assert denied.status_code == 403
+
+        begun = await client.post(
+            "/api/auth/webauthn/register/options",
+            cookies=cookies,
+            json={
+                "label": "Test device",
+                "current_password": "correct horse battery staple",
+            },
+        )
+        assert begun.status_code == 200, begun.text
+        assert (
+            begun.json()["options"]["authenticatorSelection"]["userVerification"]
+            == "required"
+        )
+        assert begun.json()["ceremony_id"]

@@ -147,8 +147,14 @@ def test_security_posture_reports_controls_without_secrets(posture_env):
             backup_dir=posture_env.backups,
             now=posture_env.now,
         )
-        assert posture["overall"] == "protected"
+        assert posture["overall"] == "attention"
         assert posture["backups"]["current"] is True
+        device_unlock = next(
+            item for item in posture["checks"]
+            if item["id"] == "biometric_device_controls"
+        )
+        assert device_unlock["status"] == "attention"
+        assert "0 server-verified passkey(s)" in device_unlock["detail"]
         connector = next(
             item for item in posture["checks"]
             if item["id"] == "connector_permissions"

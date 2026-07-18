@@ -77,12 +77,22 @@ def _request_source(request: Request) -> str:
 
 
 def _trusted_device_session(request: Request) -> bool:
-    """API bearer tokens are not proof that a client device was unlocked."""
+    """Require recent server-verified WebAuthn user verification.
 
-    return bool(
-        not getattr(request.state, "api_token", False)
-        and getattr(request.state, "current_user", None)
-    )
+    A bearer token, cookie, current-user marker, or client-side claim is never
+    sufficient proof that a biometric or security-key gesture occurred.
+    """
+
+    if bool(getattr(request.state, "api_token", False)):
+        return False
+    manager = getattr(getattr(request.app, "state", None), "auth_manager", None)
+    verifier = getattr(manager, "session_user_verification", None)
+    if not callable(verifier):
+        return False
+    from routes.auth_routes import SESSION_COOKIE
+
+    state = verifier(request.cookies.get(SESSION_COOKIE))
+    return bool(isinstance(state, dict) and state.get("verified"))
 
 
 def _raise_ambient_error(exc: Exception) -> None:

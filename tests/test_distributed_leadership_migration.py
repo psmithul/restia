@@ -41,7 +41,7 @@ def test_leadership_migration_is_the_reviewed_head_and_round_trips(tmp_path):
     # behind revision; existing shared/local installs cannot require stamping.
     upgrade_schema(engine)
     inspector = inspect(engine)
-    assert SCHEMA_HEAD_REVISION == "20260730_0015"
+    assert SCHEMA_HEAD_REVISION == "20260731_0016"
     assert RUNTIME_LEADERSHIP_REQUIRED_TABLES <= set(
         inspector.get_table_names()
     )

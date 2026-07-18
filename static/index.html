@@ -2364,6 +2364,23 @@
               <!-- Populated by JS -->
             </div>
           </div>
+          <div class="admin-card" id="settings-passkeys-card">
+            <h2><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px;opacity:0.6"><circle cx="8" cy="15" r="4"/><path d="m11 12 8-8m-2 2 2 2m-5 1 2 2"/></svg>Passkeys &amp; Device Unlock</h2>
+            <div class="admin-toggle-sub" style="margin-bottom:8px">Use Touch ID, Face ID, Windows Hello, or a security key. Restia verifies every gesture on the server; a session cookie alone cannot unlock ambient capabilities.</div>
+            <div id="settings-passkeys" aria-live="polite">
+              <div style="font-size:11px;opacity:.5">Loading passkeys…</div>
+            </div>
+            <div class="settings-col" id="settings-passkey-enroll" style="margin-top:10px">
+              <input id="settings-passkey-label" type="text" maxlength="160" value="My device" placeholder="Passkey label" autocomplete="off" style="padding:6px 8px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--fg);font-family:inherit;font-size:12px;">
+              <input id="settings-passkey-password" type="password" maxlength="4096" placeholder="Current password" autocomplete="current-password" style="padding:6px 8px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--fg);font-family:inherit;font-size:12px;">
+              <input id="settings-passkey-totp" type="text" maxlength="128" placeholder="2FA code (when enabled)" autocomplete="one-time-code" inputmode="numeric" style="padding:6px 8px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--fg);font-family:inherit;font-size:12px;">
+              <div class="settings-row" style="justify-content:flex-end;gap:8px">
+                <span id="settings-passkey-msg" role="status" style="font-size:11px;margin-right:auto"></span>
+                <button class="admin-btn-sm" id="settings-passkey-unlock">Verify Device</button>
+                <button class="admin-btn-add" id="settings-passkey-add">Add Passkey</button>
+              </div>
+            </div>
+          </div>
           <div class="admin-card" id="settings-device-sessions-card">
             <h2><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px;opacity:0.6"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M8 22h8M12 18v4"/></svg>Active Devices</h2>
             <div class="admin-toggle-sub" style="margin-bottom:8px">Review and revoke this profile's database-backed browser and native sessions. Session tokens are never shown.</div>

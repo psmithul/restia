@@ -69,6 +69,10 @@ from migrations.versions.distributed_worker_leadership_20260730_0015 import (
     RUNTIME_LEADERSHIP_REQUIRED_COLUMNS,
     RUNTIME_LEADERSHIP_REQUIRED_TABLES,
 )
+from migrations.versions.passkey_authority_20260731_0016 import (
+    PASSKEY_REQUIRED_COLUMNS,
+    PASSKEY_REQUIRED_TABLES,
+)
 from src.database_runtime import (
     SCHEMA_AUTHORITY,
     SHARED_SCHEMA_AUTHORITY_READY,
@@ -80,7 +84,7 @@ from src.database_runtime import (
 
 LEGACY_BASELINE_REVISION = "20260716_0001"
 EXPLICIT_BASELINE_REVISION = "20260717_0002"
-SCHEMA_HEAD_REVISION = "20260730_0015"
+SCHEMA_HEAD_REVISION = "20260731_0016"
 KNOWN_BEHIND_REVISIONS = frozenset({
     LEGACY_BASELINE_REVISION,
     EXPLICIT_BASELINE_REVISION,
@@ -96,6 +100,7 @@ KNOWN_BEHIND_REVISIONS = frozenset({
     "20260727_0012",
     "20260728_0013",
     "20260729_0014",
+    "20260730_0015",
 })
 # Compatibility export retained for existing tooling.  This is now the full
 # frozen baseline manifest, not a small sentinel subset.
@@ -1427,6 +1432,7 @@ def validate_head_schema(engine: Engine) -> None:
         | PROFILE_CONFIGURATION_REQUIRED_TABLES
         | UPLOAD_METADATA_REQUIRED_TABLES
         | RUNTIME_LEADERSHIP_REQUIRED_TABLES
+        | PASSKEY_REQUIRED_TABLES
     )
     required_columns = {
         **BASELINE_REQUIRED_COLUMNS,
@@ -1442,6 +1448,7 @@ def validate_head_schema(engine: Engine) -> None:
         **PROFILE_CONFIGURATION_REQUIRED_COLUMNS,
         **UPLOAD_METADATA_REQUIRED_COLUMNS,
         **RUNTIME_LEADERSHIP_REQUIRED_COLUMNS,
+        **PASSKEY_REQUIRED_COLUMNS,
     }
     missing = sorted(required_tables - existing)
     if missing:

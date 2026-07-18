@@ -41,6 +41,10 @@ python-dateutil
 # the protocol without it.
 caldav
 cryptography
+# Server-side WebAuthn verification for passkeys and biometric device unlock.
+# Browser credentials are never trusted until this library verifies challenge,
+# origin, RP ID, signature counter, user presence, and user verification.
+webauthn>=2.8,<3
 # Optional Supabase/OIDC adapter verifies configured asymmetric JWT/JWKS
 # locally; no Supabase client SDK or direct client-side data path is used.
 PyJWT[crypto]>=2.10,<3

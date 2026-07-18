@@ -24,6 +24,7 @@ from src.backup_encryption import BackupEncryptionError, inspect_encrypted_backu
 from src.integration_permissions import normalize_integration_permissions
 from src.profile_configuration_models import ProfileConfiguration
 from src.profile_configuration_service import serialize_configuration
+from src.webauthn_models import WebAuthnCredential
 
 
 DEFAULT_BACKUP_MAX_AGE = timedelta(days=7)
@@ -142,6 +143,11 @@ def build_security_posture(
     device_unlock_controls = sum(
         1 for item in ambient if item["enabled"] and item["require_device_unlock"]
     )
+    active_passkeys = db.query(WebAuthnCredential).filter(
+        WebAuthnCredential.account_id == account.id,
+        WebAuthnCredential.state == "active",
+        WebAuthnCredential.revoked_at.is_(None),
+    ).count()
     audits = db.query(ActionAudit).filter(ActionAudit.owner_id == account.id).count()
     visible_actions = db.query(ActionProposal).filter(
         ActionProposal.owner_id == account.id,
@@ -186,11 +192,15 @@ def build_security_posture(
         {
             "id": "biometric_device_controls",
             "label": "Device-unlock controls",
-            "status": "available",
+            "status": (
+                "protected"
+                if active_passkeys > 0
+                else ("attention" if device_unlock_controls > 0 else "available")
+            ),
             "detail": (
                 f"{device_unlock_controls} of {enabled_ambient} enabled ambient "
-                "capability grant(s) require device unlock; biometric verification "
-                "is performed by the trusted client platform."
+                f"capability grant(s) require device unlock; {active_passkeys} "
+                "server-verified passkey(s) are active."
             ),
         },
         {

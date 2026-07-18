@@ -115,6 +115,29 @@ expose this port directly to the public internet. To build a clickable app wrapp
 ./build-macos-app.sh
 ```
 
+### Passkeys and device unlock
+
+Open **Settings → Account → Passkeys & Device Unlock** to register Touch ID,
+Face ID, Windows Hello, an Android/iOS passkey, or a hardware security key.
+Enrollment and revocation require the current password and the active TOTP
+factor, when configured. Ambient capabilities marked as requiring device
+unlock only accept a recent server-verified WebAuthn assertion; a browser
+cookie or API token is insufficient.
+
+Loopback origins such as `http://localhost:7000` work without TLS. A LAN,
+reverse-proxy, or public deployment must use HTTPS and should configure the
+exact browser-visible origin:
+
+```bash
+RESTIA_WEBAUTHN_ORIGIN=https://restia.example.com
+RESTIA_WEBAUTHN_RP_ID=restia.example.com
+RESTIA_WEBAUTHN_VERIFICATION_TTL_SECONDS=900
+```
+
+Do not change the RP ID after enrolling passkeys: credentials are scoped to
+that relying party. If the public hostname changes, keep the old hostname
+available while users register credentials for the new deployment.
+
 <details>
 <summary>Cookbook, GPU, Ollama, and troubleshooting notes</summary>
 

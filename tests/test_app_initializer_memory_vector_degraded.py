@@ -32,12 +32,15 @@ def _neutralize_collaborators(monkeypatch):
     """Stub out everything initialize_managers() builds except the vector store,
     so the test isolates the memory_vector health-handling branch."""
     for name in [
-        "MemoryManager", "SkillsManager", "SessionManager", "UploadHandler",
+        "MemoryManager", "SkillsManager", "SessionManager",
         "PersonalDocsManager", "APIKeyManager", "PresetManager",
         "MemoryProviderRegistry", "NativeMemoryProvider", "ChatProcessor",
         "ResearchHandler", "ChatHandler", "ModelDiscovery",
     ]:
         monkeypatch.setattr(app_init, name, lambda *a, **k: MagicMock())
+    monkeypatch.setattr(
+        app_init, "create_production_upload_handler", lambda *a, **k: MagicMock()
+    )
     monkeypatch.setattr(app_init, "set_session_manager", lambda *a, **k: None)
     monkeypatch.setattr(app_init, "update_search_config", lambda *a, **k: None)
     monkeypatch.setattr(app_init, "create_directories", lambda: None)

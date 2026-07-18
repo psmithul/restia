@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, Request, Response, HTTPException
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Any, Callable, Optional
 import asyncio
 import logging
 import os
@@ -96,6 +96,28 @@ class SupabaseLinkRequest(BaseModel):
     current_password: str = Field(min_length=1, max_length=4096)
     totp_code: Optional[str] = Field(default=None, max_length=128)
 
+
+class WebAuthnRegistrationBeginRequest(BaseModel):
+    label: str = Field(default="Passkey", min_length=1, max_length=160)
+    current_password: str = Field(min_length=1, max_length=4096)
+    totp_code: Optional[str] = Field(default=None, max_length=128)
+
+
+class WebAuthnRegistrationCompleteRequest(BaseModel):
+    ceremony_id: str = Field(min_length=1, max_length=64)
+    label: str = Field(default="Passkey", min_length=1, max_length=160)
+    credential: dict[str, Any]
+
+
+class WebAuthnUnlockCompleteRequest(BaseModel):
+    ceremony_id: str = Field(min_length=1, max_length=64)
+    credential: dict[str, Any]
+
+
+class WebAuthnRevokeRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=4096)
+    totp_code: Optional[str] = Field(default=None, max_length=128)
+
 SESSION_COOKIE = "odysseus_session"
 
 
@@ -123,6 +145,89 @@ def setup_auth_routes(
         identity_renamer = rename_local_identity
 
     router = APIRouter(prefix="/api/auth", tags=["auth"])
+
+    passkey_session_factory = getattr(auth_manager, "session_factory", None)
+
+    def _passkey_principal(request: Request):
+        """Resolve an exact cookie session; bearer API tokens cannot use WebAuthn."""
+
+        if bool(getattr(request.state, "api_token", False)):
+            raise HTTPException(403, "Passkey operations require a browser session")
+        token = request.cookies.get(SESSION_COOKIE)
+        principal = auth_manager.resolve_session(token)
+        if principal is None or not token:
+            raise HTTPException(401, "Not authenticated")
+        if not callable(passkey_session_factory):
+            raise HTTPException(503, "Passkey storage is unavailable")
+        return token, principal
+
+    def _run_passkey_operation(
+        request: Request,
+        operation: Callable[[Any, Any, Any], Any],
+        *,
+        write: bool,
+    ) -> Any:
+        """Run one owner-bound passkey operation with immutable audit attribution."""
+
+        _token, principal = _passkey_principal(request)
+        from core.database import Account
+        from src.audit_context import bind_service_audit_context
+
+        db = passkey_session_factory()
+        try:
+            account = db.query(Account).filter(Account.id == principal.account_id).one_or_none()
+            if account is None:
+                raise HTTPException(409, "Authenticated account is unavailable")
+            bind_service_audit_context(
+                db,
+                account_id=account.id,
+                interface="web",
+                actor_type="account",
+                credential_type="session",
+                credential_id=principal.credential_id,
+            )
+            result = operation(db, account, principal)
+            if write:
+                db.commit()
+            else:
+                db.rollback()
+            return result
+        except BaseException:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    async def _passkey_call(
+        request: Request,
+        operation: Callable[[Any, Any, Any], Any],
+        *,
+        write: bool,
+    ) -> Any:
+        from src.webauthn_service import (
+            PasskeyConflict,
+            PasskeyError,
+            PasskeyNotFound,
+            PasskeyVerificationError,
+        )
+
+        try:
+            return await asyncio.to_thread(
+                _run_passkey_operation,
+                request,
+                operation,
+                write=write,
+            )
+        except HTTPException:
+            raise
+        except PasskeyNotFound as exc:
+            raise HTTPException(404, str(exc)) from None
+        except PasskeyConflict as exc:
+            raise HTTPException(409, str(exc)) from None
+        except PasskeyVerificationError as exc:
+            raise HTTPException(400, str(exc)) from None
+        except PasskeyError as exc:
+            raise HTTPException(400, str(exc)) from None
 
     def _reserve_identity_migration(*usernames: str) -> bool:
         """Block owner-scoped writers across an auth rename transaction.
@@ -469,6 +574,150 @@ def setup_auth_routes(
         if current:
             response.delete_cookie(SESSION_COOKIE, path="/")
         return {"ok": True, "revoked_session_id": session_id, "current": current}
+
+    @router.get("/webauthn/status")
+    async def webauthn_status(request: Request):
+        """List public passkey metadata and this session's verification grant."""
+
+        from src.webauthn_service import list_credentials, session_verification_state
+
+        result = await _passkey_call(
+            request,
+            lambda db, account, principal: {
+                "supported": True,
+                "credentials": list_credentials(db, account_id=account.id),
+                "verification": session_verification_state(
+                    db,
+                    account_id=account.id,
+                    auth_session_id=principal.credential_id,
+                ),
+            },
+            write=False,
+        )
+        result["count"] = len(result["credentials"])
+        return result
+
+    @router.post("/webauthn/register/options")
+    async def webauthn_registration_options(
+        body: WebAuthnRegistrationBeginRequest,
+        request: Request,
+    ):
+        """Begin passkey enrollment after password and active-MFA step-up."""
+
+        token, _principal = _passkey_principal(request)
+        step_up = getattr(auth_manager, "verify_session_step_up", None)
+        if not callable(step_up):
+            raise HTTPException(503, "Passkey enrollment authorization is unavailable")
+        authorized = await asyncio.to_thread(
+            step_up,
+            token,
+            current_password=body.current_password,
+            totp_code=body.totp_code,
+        )
+        if authorized is None:
+            raise HTTPException(403, "Password or MFA verification failed")
+        from src.webauthn_service import begin_registration, relying_party_context
+
+        request_base_url = str(request.base_url)
+        return await _passkey_call(
+            request,
+            lambda db, account, principal: begin_registration(
+                db,
+                account=account,
+                auth_session_id=principal.credential_id,
+                context=relying_party_context(request_base_url),
+                label=body.label,
+            ),
+            write=True,
+        )
+
+    @router.post("/webauthn/register/complete")
+    async def webauthn_registration_complete(
+        body: WebAuthnRegistrationCompleteRequest,
+        request: Request,
+    ):
+        from src.webauthn_service import complete_registration
+
+        credential = await _passkey_call(
+            request,
+            lambda db, account, principal: complete_registration(
+                db,
+                account=account,
+                auth_session_id=principal.credential_id,
+                ceremony_id=body.ceremony_id,
+                label=body.label,
+                credential=body.credential,
+            ),
+            write=True,
+        )
+        return {"ok": True, "credential": credential}
+
+    @router.post("/webauthn/unlock/options")
+    async def webauthn_unlock_options(request: Request):
+        from src.webauthn_service import begin_unlock, relying_party_context
+
+        request_base_url = str(request.base_url)
+        return await _passkey_call(
+            request,
+            lambda db, account, principal: begin_unlock(
+                db,
+                account=account,
+                auth_session_id=principal.credential_id,
+                context=relying_party_context(request_base_url),
+            ),
+            write=True,
+        )
+
+    @router.post("/webauthn/unlock/complete")
+    async def webauthn_unlock_complete(
+        body: WebAuthnUnlockCompleteRequest,
+        request: Request,
+    ):
+        from src.webauthn_service import complete_unlock
+
+        verification = await _passkey_call(
+            request,
+            lambda db, account, principal: complete_unlock(
+                db,
+                account=account,
+                auth_session_id=principal.credential_id,
+                ceremony_id=body.ceremony_id,
+                credential=body.credential,
+            ),
+            write=True,
+        )
+        return {"ok": True, "verification": verification}
+
+    @router.post("/webauthn/credentials/{credential_id}/revoke")
+    async def webauthn_revoke(
+        credential_id: str,
+        body: WebAuthnRevokeRequest,
+        request: Request,
+    ):
+        token, _principal = _passkey_principal(request)
+        step_up = getattr(auth_manager, "verify_session_step_up", None)
+        if not callable(step_up):
+            raise HTTPException(503, "Passkey revocation authorization is unavailable")
+        authorized = await asyncio.to_thread(
+            step_up,
+            token,
+            current_password=body.current_password,
+            totp_code=body.totp_code,
+        )
+        if authorized is None:
+            raise HTTPException(403, "Password or MFA verification failed")
+        from src.webauthn_service import revoke_credential
+
+        result = await _passkey_call(
+            request,
+            lambda db, account, _principal: revoke_credential(
+                db,
+                account=account,
+                credential_id=credential_id,
+            ),
+            write=True,
+        )
+        return {"ok": True, **result}
 
     @router.get("/status")
     async def auth_status(request: Request):

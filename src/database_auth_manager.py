@@ -209,6 +209,12 @@ class DatabaseAuthManager:
             now=now,
         )
 
+    @property
+    def session_factory(self):
+        """Expose the canonical database boundary to colocated auth services."""
+
+        return self._session_factory
+
     @contextmanager
     def _db(self, *, write: bool = False) -> Iterator[Any]:
         db = self._session_factory()
@@ -1004,10 +1010,118 @@ class DatabaseAuthManager:
             AuthSession.revoked_at.is_(None),
         ).with_for_update().all()
         for row in sessions:
+            # A password rotation is a security-boundary change. Even the one
+            # preserved browser session must perform a fresh WebAuthn gesture
+            # before using capabilities that require device unlock.
+            row.user_verified_at = None
+            row.user_verification_expires_at = None
+            row.user_verification_method = None
+            row.user_verification_credential_id = None
             if preserve_id and row.id == preserve_id:
                 row.auth_epoch = account.auth_epoch
             else:
                 row.revoked_at = now
+
+    def verify_session_step_up(
+        self,
+        session_token: str,
+        *,
+        current_password: str,
+        totp_code: str | None = None,
+    ) -> DatabasePrincipal | None:
+        """Recheck a session, password, and active MFA factor atomically.
+
+        Passkey enrollment and revocation use this boundary so a stolen cookie
+        cannot install or remove a durable authenticator. Recovery-code use may
+        mutate its one-time row, therefore the transaction is writable.
+        """
+
+        if self._auth_load_failed or not self._repository._valid_session_token(session_token):
+            return None
+        with self._config_lock, self._db(write=True) as db:
+            rows = db.query(AuthSession).filter(
+                AuthSession.token_digest.in_(
+                    self._repository._session_candidates(session_token)
+                )
+            ).with_for_update().all()
+            session = next(
+                (
+                    row for row in rows
+                    if self._repository._session_matches(row, session_token)
+                ),
+                None,
+            )
+            now = self._time()
+            if (
+                session is None
+                or session.revoked_at is not None
+                or session.expires_at <= now
+            ):
+                return None
+            account = db.query(Account).filter(
+                Account.id == session.account_id,
+                Account.status == ACTIVE_ACCOUNT,
+            ).with_for_update().one_or_none()
+            if account is None or int(session.auth_epoch) != int(account.auth_epoch):
+                return None
+            credential = db.query(LocalCredential).filter(
+                LocalCredential.account_id == account.id,
+                LocalCredential.algorithm == "bcrypt",
+            ).with_for_update().one_or_none()
+            protected = (
+                credential.password_hash
+                if credential is not None else _DUMMY_BCRYPT_HASH
+            )
+            try:
+                valid_password = bcrypt.checkpw(
+                    str(current_password or "").encode("utf-8"),
+                    protected.encode("ascii"),
+                )
+            except (TypeError, ValueError):
+                valid_password = False
+            if credential is None or not valid_password:
+                return None
+            factor = db.query(MfaFactor).filter(
+                MfaFactor.account_id == account.id,
+                MfaFactor.kind == "totp",
+                MfaFactor.state == "active",
+            ).with_for_update().one_or_none()
+            if factor is not None and (
+                not totp_code
+                or not self._verify_factor_code(db, factor, str(totp_code))
+            ):
+                return None
+            return self._repository._principal(
+                db,
+                account,
+                credential_type="session",
+                credential_id=session.id,
+            )
+
+    def session_user_verification(
+        self,
+        session_token: str | None,
+    ) -> dict[str, Any]:
+        """Return recent server-verified user presence for one exact session."""
+
+        principal = self.resolve_session(session_token)
+        if principal is None:
+            return {
+                "verified": False,
+                "method": None,
+                "verified_at": None,
+                "expires_at": None,
+                "credential_id": None,
+            }
+        from src.webauthn_service import session_verification_state
+
+        with self._db() as db:
+            return session_verification_state(
+                db,
+                account_id=principal.account_id,
+                auth_session_id=principal.credential_id,
+                now=self._time(),
+            )
 
     def _active_factor(self, db, account_id: str) -> MfaFactor | None:
         return db.query(MfaFactor).filter(

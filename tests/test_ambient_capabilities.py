@@ -48,6 +48,11 @@ class _IdentityAuthority:
     def is_configured(self) -> bool:
         return bool(self.users)
 
+    def session_user_verification(self, _session_token):
+        # Route fixtures model an already verified browser. API-token requests
+        # are rejected before this server-side verification hook is consulted.
+        return {"verified": True, "method": "webauthn"}
+
 
 @pytest.fixture()
 def ambient_env(tmp_path, monkeypatch):

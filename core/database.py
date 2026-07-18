@@ -408,12 +408,28 @@ class AuthSession(TimestampMixin, Base):
         nullable=True,
     )
     external_session_id = Column(String(255), nullable=True)
+    # A cookie proves possession of a session secret, not a recent biometric
+    # or security-key gesture.  Only a server-verified WebAuthn assertion may
+    # populate these fields, and the grant is deliberately short-lived.
+    user_verified_at = Column(DateTime, nullable=True)
+    user_verification_expires_at = Column(DateTime, nullable=True, index=True)
+    user_verification_method = Column(String(32), nullable=True)
+    user_verification_credential_id = Column(String(36), nullable=True)
 
     __table_args__ = (
         CheckConstraint("auth_epoch >= 1", name="ck_auth_sessions_auth_epoch"),
         Index(
             "ix_auth_sessions_account_revoked_expires",
             "account_id", "revoked_at", "expires_at",
+        ),
+        CheckConstraint(
+            "((user_verified_at IS NULL AND user_verification_expires_at IS NULL "
+            "AND user_verification_method IS NULL "
+            "AND user_verification_credential_id IS NULL) OR "
+            "(user_verified_at IS NOT NULL AND user_verification_expires_at IS NOT NULL "
+            "AND user_verification_method = 'webauthn' "
+            "AND user_verification_credential_id IS NOT NULL))",
+            name="ck_auth_sessions_user_verification_state",
         ),
     )
 
@@ -6709,6 +6725,10 @@ from src.profile_configuration_models import (  # noqa: E402,F401
     ProfileConfiguration,
     ProfileConfigurationImportRun,
     ProfileConfigurationMutation,
+)
+from src.webauthn_models import (  # noqa: E402,F401
+    WebAuthnChallenge,
+    WebAuthnCredential,
 )
 
 # Schema initialization is intentionally explicit. Production entrypoints call

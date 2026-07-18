@@ -34,7 +34,7 @@ SUPPORTED_DATABASE_MODES = frozenset({LOCAL_SINGLE_MODE, SHARED_MODE})
 # This must only become True in the same change that removes every remaining
 # SQLite/local-file runtime authority from the shared startup path.
 SHARED_SCHEMA_AUTHORITY_READY = True
-SCHEMA_AUTHORITY = "alembic-20260730"
+SCHEMA_AUTHORITY = "alembic-20260731"
 
 # These are executable release blockers, not prose documentation.  Shared-mode
 # startup must remain disabled while any entry is present.  Keep the codes
