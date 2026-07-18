@@ -17,6 +17,28 @@ On first setup, Restia creates an owner/admin profile (`admin` unless
 For Docker installs, the same line is in `docker compose logs odysseus`.
 Use that for the first login, then change it in **Settings**.
 
+### Forgotten password
+
+Choose **Forgot password?** on the login screen. Restia uses an installation
+recovery key because existing local profiles do not require an email address.
+On a source install, show the key on the machine running Restia:
+
+```bash
+python3 -m src.password_recovery show
+```
+
+For Docker Compose:
+
+```bash
+docker compose exec odysseus python -m src.password_recovery show
+```
+
+The key has owner-only filesystem permissions and rotates after a successful
+reset. Resetting a password revokes all existing sessions. If a changed legacy
+auth file triggered Restia's fail-closed lock, the same verified reset preserves
+that file in `data/legacy-auth-backups/recovery-quarantine/` and restores the
+database-backed login authority.
+
 One Restia installation is the external Restia user/identity. Login principals
 inside it are called **profiles**; each profile has its own permissions and
 private local state.

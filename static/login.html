@@ -183,6 +183,15 @@
   .toggle { text-align: center; margin-top: calc(1rem + 4px); font-size: 0.85rem; color: color-mix(in srgb, var(--fg) 50%, transparent); }
   .toggle a { color: var(--red); cursor: pointer; text-decoration: none; }
   .toggle a:hover { text-decoration: underline; }
+  .forgot-link { text-align: center; margin-top: 0.85rem; font-size: 0.8rem; }
+  .forgot-link a { color: color-mix(in srgb, var(--fg) 70%, transparent); text-decoration: none; }
+  .forgot-link a:hover { color: var(--red); text-decoration: underline; }
+  .recovery-help { line-height: 1.55; }
+  .recovery-help code {
+    display: block; margin-top: 0.45rem; padding: 0.45rem 0.55rem;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 5px;
+    color: var(--fg); font-size: 0.72rem; overflow-wrap: anywhere; user-select: all;
+  }
   .pw-wrapper { position: relative; margin-bottom: 1rem; }
   .pw-wrapper input:not(.remember-check) { padding-right: 2.5rem; margin-bottom: 0; }
   .pw-toggle {
@@ -203,6 +212,7 @@
     align-items: center; justify-content: center;
     font-size: 0; margin: 0; color: transparent;
   }
+  .remember-toggle[hidden] { display: none !important; }
   /* Visually hide the native checkbox but keep it in the accessibility tree
      and keyboard-focusable (display:none would drop it from tab order). It
      overlays the dot so a click/tap still toggles it. */
@@ -269,7 +279,17 @@
       </label>
     </div>
 
-    <label for="password">Password</label>
+    <div id="recoveryKeyGroup" style="display:none">
+      <label for="recoveryKey">Installation recovery key</label>
+      <div class="pw-wrapper">
+        <input id="recoveryKey" name="recoveryKey" type="password" autocomplete="off" spellcheck="false" autocapitalize="none">
+        <button type="button" class="pw-toggle" id="recoveryKeyToggle" tabindex="-1" aria-label="Show recovery key">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><line x1="8" y1="16" x2="16" y2="8"/><line x1="8" y1="8" x2="16" y2="16"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <label for="password" id="passwordLabel">Password</label>
     <div class="pw-wrapper">
       <input id="password" name="password" type="password" required autocomplete="current-password">
       <button type="button" class="pw-toggle" id="pwToggle" tabindex="-1" aria-label="Show password">
@@ -289,6 +309,10 @@
 
     <button type="submit" id="submitBtn">Sign In</button>
   </form>
+
+  <div class="forgot-link" id="forgotArea">
+    <a id="forgotLink" href="#">Forgot password?</a>
+  </div>
 
   <div class="toggle" id="toggleArea" style="display:none">
     <span id="toggleText">Don't have a profile? </span>
@@ -321,27 +345,44 @@
   const errEl = document.getElementById('error');
   const setupNote = document.getElementById('setupNote');
   const confirmGroup = document.getElementById('confirmGroup');
+  const confirmInput = document.getElementById('confirmPassword');
+  const recoveryKeyGroup = document.getElementById('recoveryKeyGroup');
+  const recoveryKeyInput = document.getElementById('recoveryKey');
+  const passwordInput = document.getElementById('password');
+  const passwordLabel = document.getElementById('passwordLabel');
   const submitBtn = document.getElementById('submitBtn');
+  const forgotArea = document.getElementById('forgotArea');
+  const forgotLink = document.getElementById('forgotLink');
   const toggleArea = document.getElementById('toggleArea');
   const toggleLink = document.getElementById('toggleLink');
   const toggleText = document.getElementById('toggleText');
 
-  let mode = 'login'; // 'login' | 'signup' | 'setup'
+  let mode = 'login'; // 'login' | 'signup' | 'setup' | 'recovery'
   let signupAllowed = false;
   let policy = { password_min_length: 8, reserved_usernames: [] };
 
   const rememberToggle = document.getElementById('rememberToggle');
 
   function setMode(m) {
+    if (m !== 'recovery' && mode === 'recovery') recoveryKeyInput.value = '';
     mode = m;
     errEl.style.display = 'none';
+    errEl.style.color = '';
+    form._totpMode = false;
+    document.getElementById('totp-input')?.parentElement?.remove();
+    recoveryKeyGroup.style.display = m === 'recovery' ? 'block' : 'none';
+    recoveryKeyInput.required = m === 'recovery';
+    confirmInput.required = m === 'setup' || m === 'signup' || m === 'recovery';
+    passwordLabel.textContent = m === 'recovery' ? 'New password' : 'Password';
+    passwordInput.autocomplete = m === 'recovery' ? 'new-password' : 'current-password';
+    forgotArea.style.display = m === 'login' ? 'block' : 'none';
     if (m === 'setup') {
       setupNote.textContent = 'This Restia installation is your external identity. Create its owner profile to sign in.';
       setupNote.style.display = 'block';
       confirmGroup.style.display = 'block';
       submitBtn.textContent = 'Create Owner Profile';
       toggleArea.style.display = 'none';
-      rememberToggle.style.display = 'none';
+      rememberToggle.hidden = true;
     } else if (m === 'signup') {
       setupNote.style.display = 'none';
       confirmGroup.style.display = 'block';
@@ -349,7 +390,17 @@
       toggleArea.style.display = 'block';
       toggleText.textContent = 'Already have a profile? ';
       toggleLink.textContent = 'Sign in';
-      rememberToggle.style.display = 'none';
+      rememberToggle.hidden = true;
+    } else if (m === 'recovery') {
+      setupNote.innerHTML = '<span class="recovery-help">Prove you own this Restia installation, then choose a new password. Get the private key from the machine running Restia:<code>python3 -m src.password_recovery show</code><code>docker compose exec odysseus python -m src.password_recovery show</code></span>';
+      setupNote.style.display = 'block';
+      confirmGroup.style.display = 'block';
+      submitBtn.textContent = 'Reset Password';
+      toggleArea.style.display = 'block';
+      toggleText.textContent = 'Remembered your password? ';
+      toggleLink.textContent = 'Sign in';
+      rememberToggle.hidden = true;
+      recoveryKeyInput.focus();
     } else {
       setupNote.style.display = 'none';
       confirmGroup.style.display = 'none';
@@ -357,7 +408,7 @@
       toggleArea.style.display = signupAllowed ? 'block' : 'none';
       toggleText.textContent = "Don't have a profile? ";
       toggleLink.textContent = 'Create profile';
-      rememberToggle.style.display = '';
+      rememberToggle.hidden = false;
     }
   }
 
@@ -397,6 +448,11 @@
     setMode(mode === 'login' ? 'signup' : 'login');
   });
 
+  forgotLink.addEventListener('click', (e) => {
+    e.preventDefault();
+    setMode('recovery');
+  });
+
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     errEl.style.display = 'none';
@@ -432,7 +488,7 @@
     }
 
     // Validate confirm password for setup/signup
-    if (mode === 'setup' || mode === 'signup') {
+    if (mode === 'setup' || mode === 'signup' || mode === 'recovery') {
       const confirm = document.getElementById('confirmPassword').value;
       if (password !== confirm) {
         errEl.textContent = 'Passwords do not match';
@@ -446,12 +502,47 @@
         submitBtn.disabled = false;
         return;
       }
-      if (policy.reserved_usernames.includes(username.toLowerCase())) {
+      if (mode !== 'recovery' && policy.reserved_usernames.includes(username.toLowerCase())) {
         errEl.textContent = 'This profile name is reserved';
         errEl.style.display = 'block';
         submitBtn.disabled = false;
         return;
       }
+    }
+
+    if (mode === 'recovery') {
+      const recoveryKey = recoveryKeyInput.value.trim();
+      if (!recoveryKey) {
+        errEl.textContent = 'Enter the installation recovery key';
+        errEl.style.display = 'block';
+        recoveryKeyInput.focus();
+        submitBtn.disabled = false;
+        return;
+      }
+      try {
+        const res = await fetch('/api/auth/recover-password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ username, recovery_key: recoveryKey, new_password: password })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'Password reset failed');
+        recoveryKeyInput.value = '';
+        passwordInput.value = '';
+        confirmInput.value = '';
+        setMode('login');
+        errEl.textContent = data.message || 'Password reset. Sign in with your new password.';
+        errEl.style.color = 'var(--green)';
+        errEl.style.display = 'block';
+        passwordInput.focus();
+      } catch (err) {
+        errEl.textContent = err.message;
+        errEl.style.display = 'block';
+      } finally {
+        submitBtn.disabled = false;
+      }
+      return;
     }
 
     // Setup or signup first
@@ -552,6 +643,7 @@
   }
   wireToggle('pwToggle', 'password');
   wireToggle('pwToggleConfirm', 'confirmPassword');
+  wireToggle('recoveryKeyToggle', 'recoveryKey');
 })();
 
 // Prevent login button and eye toggles from stealing focus on mobile (keeps keyboard open)

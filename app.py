@@ -425,6 +425,8 @@ if AUTH_ENABLED:
         "/api/auth/setup",
         "/api/auth/signup",
         "/api/auth/login",
+        "/api/auth/recover-password",
+        "/api/auth/policy",
         "/api/auth/external/supabase/login",
         "/api/auth/logout",
         "/api/auth/status",

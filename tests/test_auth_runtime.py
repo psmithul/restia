@@ -23,7 +23,7 @@ from core.database import (
     MfaRecoveryCode,
     RetiredAuthSubject,
 )
-from src.auth_runtime import build_auth_manager
+from src.auth_runtime import build_auth_manager, complete_auth_store_recovery
 
 
 TABLES = (
@@ -117,6 +117,36 @@ def test_corrupt_or_changed_legacy_source_locks_every_auth_path(runtime_env):
     assert locked.verify_password("alice", "correct horse battery staple") is False
 
 
+def test_owner_recovery_retires_changed_legacy_sources_and_unlocks(runtime_env):
+    factory, root = runtime_env
+    auth_path = root / "auth.json"
+    sessions_path = root / "sessions.json"
+    _write_legacy(auth_path)
+    sessions_path.write_text("{}", encoding="utf-8")
+    assert _build(factory, root).auth_store_error is False
+    auth_path.write_text('{"changed": true}', encoding="utf-8")
+    locked = _build(factory, root)
+    assert locked.auth_store_error is True
+
+    assert locked.recover_password("alice", "recovered secure password") is True
+    assert complete_auth_store_recovery(
+        locked,
+        session_factory=factory,
+        auth_path=auth_path,
+        sessions_path=sessions_path,
+        quarantine_dir=root / "quarantine",
+    ) is True
+
+    assert locked.auth_store_error is False
+    assert locked.verify_password("alice", "recovered secure password") is True
+    assert not auth_path.exists()
+    assert not sessions_path.exists()
+    assert len(list((root / "quarantine").glob("*.changed"))) == 2
+    restarted = _build(factory, root)
+    assert restarted.auth_store_error is False
+    assert restarted.verify_password("alice", "recovered secure password") is True
+
+
 def test_completed_cutover_uses_database_not_stale_json(runtime_env):
     factory, root = runtime_env
     _write_legacy(root / "auth.json")
@@ -132,6 +162,22 @@ def test_completed_cutover_uses_database_not_stale_json(runtime_env):
 
     assert restarted.auth_store_error is False
     assert restarted.verify_password("alice", "database only changed password")
+
+
+def test_database_password_recovery_revokes_sessions(runtime_env):
+    factory, root = runtime_env
+    manager = _build(factory, root)
+    assert manager.setup("alice", "correct horse battery staple") is True
+    token = manager.authenticate_session(
+        "alice", "correct horse battery staple", interface="web"
+    ).token
+    assert token
+
+    assert manager.recover_password("alice", "recovered secure password") is True
+
+    assert manager.verify_password("alice", "correct horse battery staple") is False
+    assert manager.verify_password("alice", "recovered secure password") is True
+    assert manager.get_username_for_token(token) is None
 
 
 def test_missing_source_requires_verified_completed_backup(runtime_env):

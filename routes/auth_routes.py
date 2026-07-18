@@ -1,7 +1,7 @@
 """Authentication routes — login, logout, signup, status, user management."""
 
 from fastapi import APIRouter, Request, Response, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr
 from typing import Any, Callable, Optional
 import asyncio
 import logging
@@ -61,6 +61,12 @@ class SignupRequest(BaseModel):
 class ChangePasswordRequest(BaseModel):
     current_password: str
     new_password: str
+
+
+class RecoverPasswordRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=160)
+    recovery_key: SecretStr = Field(min_length=20, max_length=256)
+    new_password: SecretStr = Field(min_length=1, max_length=4096)
 
 
 class CreateUserRequest(BaseModel):
@@ -314,6 +320,7 @@ def setup_auth_routes(
     _login_limiter = RateLimiter(max_requests=15, window_seconds=60)
     _signup_limiter = RateLimiter(max_requests=3, window_seconds=300)
     _setup_limiter = RateLimiter(max_requests=3, window_seconds=300)
+    _recovery_limiter = RateLimiter(max_requests=5, window_seconds=300)
     _external_login_limiter = RateLimiter(max_requests=15, window_seconds=60)
     _external_link_limiter = RateLimiter(max_requests=5, window_seconds=300)
 
@@ -759,6 +766,63 @@ def setup_auth_routes(
         if not ok:
             raise HTTPException(400, "Current password is incorrect")
         return {"ok": True}
+
+    @router.post("/recover-password")
+    async def recover_password(
+        body: RecoverPasswordRequest,
+        request: Request,
+        response: Response,
+    ):
+        """Reset a local password using proof of access to this installation.
+
+        The recovery key lives beside Restia's database with owner-only file
+        permissions.  This keeps recovery available to profiles that predate
+        recovery-email support and avoids turning the endpoint into an account
+        existence oracle.
+        """
+
+        client_host = request.client.host if request.client else "unknown"
+        if not _recovery_limiter.check(client_host):
+            raise HTTPException(429, "Too many recovery attempts — try again later")
+        new_password = body.new_password.get_secret_value()
+        if len(new_password) < PASSWORD_MIN_LENGTH:
+            raise HTTPException(
+                400,
+                f"Password must be at least {PASSWORD_MIN_LENGTH} characters",
+            )
+        recovery = getattr(auth_manager, "recover_password", None)
+        if not callable(recovery):
+            raise HTTPException(503, "Password recovery is unavailable")
+
+        from src.password_recovery import ensure_recovery_key, use_recovery_key
+
+        try:
+            await asyncio.to_thread(ensure_recovery_key)
+
+            def _perform_recovery() -> bool:
+                if not recovery(body.username, new_password):
+                    return False
+                if not bool(getattr(auth_manager, "auth_store_error", False)):
+                    return True
+                from src.auth_runtime import complete_auth_store_recovery
+
+                if not complete_auth_store_recovery(auth_manager):
+                    raise RuntimeError("Authentication store recovery failed")
+                return True
+
+            ok = await asyncio.to_thread(
+                use_recovery_key,
+                body.recovery_key.get_secret_value(),
+                _perform_recovery,
+            )
+        except (OSError, RuntimeError):
+            logger.exception("Password recovery failed at the local recovery boundary")
+            raise HTTPException(503, "Password recovery is unavailable") from None
+        if not ok:
+            # One response covers both an unknown profile and a bad key.
+            raise HTTPException(400, "Profile or recovery key is incorrect")
+        response.delete_cookie(SESSION_COOKIE, path="/")
+        return {"ok": True, "message": "Password reset. Sign in with your new password."}
 
     # ------------------------------------------------------------------
     # Two-factor authentication

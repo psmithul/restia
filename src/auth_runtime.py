@@ -7,6 +7,7 @@ import logging
 import os
 import stat
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 from core.database import AuthImportRun, SessionLocal
@@ -70,6 +71,53 @@ def _completed_backups_are_durable(run: AuthImportRun) -> bool:
         run.sessions_sha256,
         limit=MAX_SESSIONS_SOURCE_BYTES,
     )
+
+
+def complete_auth_store_recovery(
+    manager: DatabaseAuthManager,
+    *,
+    session_factory=SessionLocal,
+    auth_path: str | os.PathLike[str] = AUTH_FILE,
+    sessions_path: str | os.PathLike[str] = SESSIONS_FILE,
+    quarantine_dir: str | os.PathLike[str] | None = None,
+) -> bool:
+    """Retire changed legacy sources after installation-owner recovery.
+
+    The completed import's immutable backups must still match before any
+    source is moved.  Changed files are preserved in a quarantine directory,
+    never deleted, and a fresh manager will then trust the database authority.
+    """
+
+    run = _import_run(session_factory)
+    if run is None or not _completed_backups_are_durable(run):
+        return False
+    auth_source = Path(auth_path)
+    sessions_source = Path(sessions_path)
+    target_dir = Path(quarantine_dir) if quarantine_dir else (
+        auth_source.parent / "legacy-auth-backups" / "recovery-quarantine"
+    )
+    target_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    sources: list[tuple[Path, str]] = []
+    for source in (auth_source, sessions_source):
+        if not source.exists() and not source.is_symlink():
+            continue
+        info = source.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            return False
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()[:12]
+        sources.append((source, digest))
+    for source, digest in sources:
+        target = target_dir / f"{source.name}.{stamp}.{digest}.changed"
+        suffix = 1
+        while target.exists():
+            target = target_dir / (
+                f"{source.name}.{stamp}.{digest}.{suffix}.changed"
+            )
+            suffix += 1
+        os.replace(source, target)
+    manager.complete_store_recovery()
+    return True
 
 
 def build_auth_manager(
@@ -198,6 +246,7 @@ __all__ = [
     "active_auth_usernames",
     "build_auth_manager",
     "configure_auth_manager",
+    "complete_auth_store_recovery",
     "get_auth_manager",
     "primary_admin_username",
     "unambiguous_contact_import_owner",

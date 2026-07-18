@@ -825,6 +825,20 @@ class AuthManager:
         self.revoke_user_sessions(username, preserve_token)
         return True
 
+    def recover_password(self, username: str, new_password: str) -> bool:
+        """Replace a password after route-level local-owner recovery proof."""
+
+        if self._auth_load_failed or len(new_password or "") < PASSWORD_MIN_LENGTH:
+            return False
+        username = username.strip().lower()
+        if username not in self.users:
+            return False
+        with self._config_lock:
+            self._config["users"][username]["password_hash"] = _hash_password(new_password)
+            self._save()
+        self.revoke_user_sessions(username)
+        return True
+
     # ------------------------------------------------------------------
     # TOTP two-factor authentication
     # ------------------------------------------------------------------

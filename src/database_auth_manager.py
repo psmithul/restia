@@ -965,6 +965,55 @@ class DatabaseAuthManager:
             )
             return True
 
+    def complete_store_recovery(self) -> None:
+        """Unlock this process after durable legacy-source quarantine."""
+
+        with self._config_lock:
+            self._auth_load_failed = False
+
+    def recover_password(self, username: str, new_password: str) -> bool:
+        """Replace a local password after route-level owner recovery proof.
+
+        Recovery never preserves a browser session.  It rotates the account
+        auth epoch and unlinks external identities just like an authenticated
+        password change, ensuring a compromised session or mistaken identity
+        link cannot survive the reset.
+        """
+
+        # This is the one intentional exception to the auth-store lock.  The
+        # only HTTP caller first proves possession of the installation's
+        # owner-only recovery key, then retires the changed legacy source and
+        # calls ``complete_store_recovery`` above.
+        if len(new_password or "") < PASSWORD_MIN_LENGTH:
+            return False
+        now = self._time()
+        with self._config_lock, self._db(write=True) as db:
+            account = self._local_account_query(
+                db, _normal_username(username)
+            ).with_for_update().first()
+            credential = db.query(LocalCredential).filter(
+                LocalCredential.account_id == (
+                    account.id if account is not None else ""
+                ),
+                LocalCredential.algorithm == "bcrypt",
+            ).with_for_update().first()
+            if account is None or credential is None:
+                return False
+            credential.password_hash = bcrypt.hashpw(
+                new_password.encode("utf-8"), bcrypt.gensalt()
+            ).decode("ascii")
+            credential.version = int(credential.version or 1) + 1
+            credential.password_changed_at = now
+            self._rotate_auth_epoch(db, account, preserve_token=None, now=now)
+            db.query(AuthIdentity).filter(
+                AuthIdentity.account_id == account.id,
+                AuthIdentity.provider != LOCAL_PROVIDER,
+            ).update(
+                {AuthIdentity.state: "unlinked"},
+                synchronize_session=False,
+            )
+            return True
+
     def _rotate_auth_epoch(
         self,
         db,
