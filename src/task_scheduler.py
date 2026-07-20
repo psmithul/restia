@@ -1380,13 +1380,22 @@ class TaskScheduler:
                 and getattr(task, "notifications_enabled", True)
             )
             if should_notify:
-                self.add_notification(
-                    task.name,
-                    run.status,
-                    task_id,
-                    owner=task.owner,
-                    body=run.result if output == "notification" else None,
-                )
+                try:
+                    from routes.note_routes import dispatch_reminder
+
+                    await dispatch_reminder(
+                        title=f"Task completed: {task.name}",
+                        note_body=(run.result or "Task completed successfully")[:4000],
+                        note_id=f"scheduled-task:{task_id}",
+                        owner=task.owner or "",
+                        occurrence=str(run.id),
+                        topic="tasks",
+                    )
+                except Exception:
+                    # Delivery has its own durable retry state. A notification
+                    # outage must not rewrite a successfully completed task as
+                    # an execution failure.
+                    logger.exception("Task completion notification dispatch failed for %s", task_id)
             elif run.status == "error":
                 self.add_notification(
                     task.name,
@@ -1447,7 +1456,19 @@ class TaskScheduler:
             except Exception:
                 _should_notify_error = False
             if _should_notify_error:
-                self.add_notification(f"Task {task_id}", "error", task_id, owner=_owner)
+                try:
+                    from routes.note_routes import dispatch_reminder
+
+                    await dispatch_reminder(
+                        title=f"Task failed: {getattr(_t_for_notify, 'name', task_id)}",
+                        note_body=f"{type(exec_exc).__name__}: {exec_exc}"[:4000],
+                        note_id=f"scheduled-task:{task_id}",
+                        owner=_owner or "",
+                        occurrence=str(run_id),
+                        topic="tasks",
+                    )
+                except Exception:
+                    logger.exception("Task failure notification dispatch failed for %s", task_id)
             try:
                 # Persist the actual exception message so the UI can show it
                 err_text = f"{type(exec_exc).__name__}: {exec_exc}"

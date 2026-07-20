@@ -39,10 +39,16 @@ def test_collect_service_health_shape(monkeypatch):
         "accounts": [],
         "endpoints": [],
     })
+    monkeypatch.setattr(sh, "due_notifications_health", lambda: {
+        "name": "due_notifications", "status": sh.DISABLED, "detail": "", "meta": {},
+    })
+    monkeypatch.setattr(sh, "telegram_health", lambda: {
+        "name": "telegram", "status": sh.DISABLED, "detail": "", "meta": {},
+    })
     out = asyncio.run(sh.collect_service_health(_Store(True), _Store(True)))
     assert set(out) == {"overall", "services", "timestamp"}
     names = {s["name"] for s in out["services"]}
-    assert names == {"chromadb", "searxng", "ntfy", "email", "providers"}
+    assert names == {"chromadb", "due_notifications", "searxng", "ntfy", "email", "providers", "telegram"}
     # Chroma healthy, everything else disabled → overall ok.
     assert out["overall"] == sh.OK
 
@@ -99,13 +105,17 @@ def test_collect_runs_subsystems_concurrently(monkeypatch):
     monkeypatch.setattr(sh, "ntfy_health", slow("ntfy"))
     monkeypatch.setattr(sh, "email_health", slow("email"))
     monkeypatch.setattr(sh, "providers_health", slow("providers"))
+    monkeypatch.setattr(sh, "telegram_health", slow("telegram"))
+    monkeypatch.setattr(sh, "due_notifications_health", lambda: {
+        "name": "due_notifications", "status": sh.OK, "detail": "", "meta": {},
+    })
 
     t0 = time.monotonic()
     out = asyncio.run(sh.collect_service_health(None, None))
     elapsed = time.monotonic() - t0
     assert elapsed < 1.5, f"subsystems not concurrent: took {elapsed:.1f}s"
     assert {s["name"] for s in out["services"]} == {
-        "chromadb", "searxng", "ntfy", "email", "providers"}
+        "chromadb", "due_notifications", "searxng", "ntfy", "email", "providers", "telegram"}
 
 
 def test_collect_aggregate_deadline_yields_controlled_result(monkeypatch):
@@ -118,6 +128,9 @@ def test_collect_aggregate_deadline_yields_controlled_result(monkeypatch):
     monkeypatch.setattr(sh, "_SUBSYSTEM_DEADLINE", 0.4)
     monkeypatch.setattr(sh, "_gather_inputs", lambda: {
         "settings": {}, "integrations": [], "accounts": [], "endpoints": [],
+    })
+    monkeypatch.setattr(sh, "due_notifications_health", lambda: {
+        "name": "due_notifications", "status": sh.OK, "detail": "", "meta": {},
     })
 
     async def _slow_gather(*coros, **_k):
@@ -134,6 +147,6 @@ def test_collect_aggregate_deadline_yields_controlled_result(monkeypatch):
     elapsed = time.monotonic() - t0
     assert elapsed < 2, f"aggregate deadline did not bound: {elapsed:.1f}s"
     assert set(out) == {"overall", "services", "timestamp"}
-    net = [s for s in out["services"] if s["name"] != "chromadb"]
+    net = [s for s in out["services"] if s["name"] not in {"chromadb", "due_notifications"}]
     assert all(s["status"] == sh.DOWN and s["meta"].get("error") == "timeout"
                for s in net)

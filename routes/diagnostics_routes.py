@@ -23,8 +23,8 @@ def setup_diagnostics_routes(
 
     @router.get("/api/diagnostics/services")
     async def get_service_health(request: Request) -> Dict[str, Any]:
-        """Consolidated degraded-state report for ChromaDB, SearXNG, email,
-        ntfy, and provider endpoints. Non-intrusive probes — safe to poll."""
+        """Consolidated degraded-state report, including due notifications
+        and a non-sending Telegram bot/link check. Safe to poll."""
         require_admin(request)
         from src.service_health import collect_service_health
         return await collect_service_health(rag_manager, memory_vector)

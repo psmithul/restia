@@ -1,7 +1,7 @@
 """Consolidated service health / degraded-state reporting.
 
 ROADMAP: "Better degraded-state reporting for ChromaDB, SearXNG, email, ntfy,
-and provider probes." There was no single readout of which subsystems are
+provider, Telegram, and due-notification probes." There was no single readout of which subsystems are
 actually working — `/api/health` is only a liveness ping and each subsystem's
 signal lives in a different module. This collects them into one uniform,
 *non-intrusive* report (no test push is sent, no real search is run), so the
@@ -382,6 +382,129 @@ def providers_health(endpoints: List[Dict[str, Any]],
     return _rollup_items("providers", "endpoint(s)", per_endpoint, key="endpoints")
 
 
+# ── Notification delivery ──
+
+def telegram_health(*, http_get: Callable = _http_get) -> Dict[str, Any]:
+    """Verify the configured bot with getMe without sending a notification."""
+
+    try:
+        from src.telegram_bot import load_telegram_config
+
+        config = load_telegram_config()
+    except Exception as exc:
+        category = _classify_error(exc)
+        return _svc("telegram", DOWN, _detail_for(category), error=category)
+    linked_chats = len(config.chat_owners)
+    linked_owners = set(config.chat_owners.values())
+    linked_profiles = len(linked_owners)
+    if not config.enabled:
+        return _svc(
+            "telegram", DISABLED, "Telegram bridge is disabled.",
+            linked_chats=linked_chats, linked_profiles=linked_profiles,
+        )
+    if not config.bot_token:
+        return _svc(
+            "telegram", DOWN, "Telegram is enabled but the bot token is missing.",
+            linked_chats=linked_chats, linked_profiles=linked_profiles,
+            error="missing_token",
+        )
+    try:
+        response = http_get(
+            f"https://api.telegram.org/bot{config.bot_token}/getMe",
+            timeout=_PROBE_TIMEOUT,
+        )
+        code = int(getattr(response, "status_code", 0) or 0)
+        try:
+            payload = response.json()
+        except Exception:
+            payload = {}
+        if 200 <= code < 300 and payload.get("ok") is True:
+            if linked_chats == 0:
+                return _svc(
+                    "telegram", DEGRADED,
+                    "Bot is reachable, but no profile has linked a Telegram chat.",
+                    linked_chats=0, linked_profiles=0,
+                )
+            routed_profiles = 0
+            try:
+                from src.notification_preferences import load_notification_preferences
+
+                for owner in linked_owners:
+                    preferences = load_notification_preferences(owner)
+                    if (
+                        preferences.get("reminder_channel") == "telegram"
+                        or preferences.get("reminder_telegram_mirror") is True
+                        or preferences.get("digest_cadence") != "off"
+                    ):
+                        routed_profiles += 1
+            except Exception:
+                routed_profiles = 0
+            if routed_profiles == 0:
+                return _svc(
+                    "telegram", DEGRADED,
+                    "Bot and chat links work, but linked profiles are not routing notifications to Telegram.",
+                    linked_chats=linked_chats,
+                    linked_profiles=linked_profiles,
+                    routed_profiles=0,
+                )
+            return _svc(
+                "telegram", OK, "Bot is reachable and has linked delivery targets.",
+                linked_chats=linked_chats, linked_profiles=linked_profiles,
+                routed_profiles=routed_profiles,
+            )
+        return _svc(
+            "telegram", DOWN, "Telegram rejected the bot health check.",
+            linked_chats=linked_chats, linked_profiles=linked_profiles,
+            http_status=code, error="http_error",
+        )
+    except Exception as exc:
+        category = _classify_error(exc)
+        return _svc(
+            "telegram", DOWN, f"Telegram is unreachable ({_detail_for(category)}).",
+            linked_chats=linked_chats, linked_profiles=linked_profiles,
+            error=category,
+        )
+
+
+def due_notifications_health() -> Dict[str, Any]:
+    """Report whether the independent due-date scanner is making progress."""
+
+    from src.due_notification_worker import due_notification_worker_status
+
+    state = due_notification_worker_status()
+    meta = {
+        "last_scan_at": state.get("last_scan_at"),
+        "last_success_at": state.get("last_success_at"),
+        "last_error_at": state.get("last_error_at"),
+        "last_error": state.get("last_error") or None,
+        "last_result": state.get("last_result") or {},
+    }
+    if not state.get("enabled"):
+        return _svc(
+            "due_notifications", DISABLED,
+            "In-process due notification delivery is disabled.", **meta,
+        )
+    if not state.get("running"):
+        return _svc(
+            "due_notifications", DOWN,
+            "Due notification worker is not running.", **meta,
+        )
+    if state.get("last_error_at") and not state.get("last_success_at"):
+        return _svc(
+            "due_notifications", DOWN,
+            "Due notification scans are failing.", **meta,
+        )
+    if not state.get("last_success_at"):
+        return _svc(
+            "due_notifications", DEGRADED,
+            "Due notification worker is starting its first scan.", **meta,
+        )
+    return _svc(
+        "due_notifications", OK,
+        "Due notification worker is running and scans are succeeding.", **meta,
+    )
+
+
 def _rollup_items(name: str, noun: str, items: List[Dict[str, Any]],
                   key: str = "accounts") -> Dict[str, Any]:
     """Shared ok/degraded/down rollup for a list of per-item probe results."""
@@ -469,7 +592,7 @@ async def collect_service_health(rag_manager: Any = None,
     """Run every probe and return {overall, services, timestamp}.
 
     Bounded end-to-end: in-process ChromaDB flags are read synchronously; the
-    four network subsystems run concurrently, each under `_SUBSYSTEM_DEADLINE`,
+    network subsystems run concurrently, each under `_SUBSYSTEM_DEADLINE`,
     with an overall `_AGGREGATE_DEADLINE` backstop. Per-item probes inside
     providers/email are themselves bounded by `_FANOUT_BUDGET`.
     """
@@ -481,12 +604,13 @@ async def collect_service_health(rag_manager: Any = None,
     # ChromaDB is in-process and synchronous (just reads flags).
     chroma = chromadb_health(rag_manager, memory_vector)
 
-    names = ["searxng", "ntfy", "email", "providers"]
+    names = ["searxng", "ntfy", "email", "providers", "telegram"]
     coros = [
         _run_subsystem("searxng", searxng_health, settings),
         _run_subsystem("ntfy", ntfy_health, inputs["integrations"], settings),
         _run_subsystem("email", email_health, inputs["accounts"]),
         _run_subsystem("providers", providers_health, inputs["endpoints"]),
+        _run_subsystem("telegram", telegram_health),
     ]
     try:
         results = await asyncio.wait_for(asyncio.gather(*coros),
@@ -496,7 +620,7 @@ async def collect_service_health(rag_manager: Any = None,
         results = [_svc(n, DOWN, _detail_for("timeout"), error="timeout")
                    for n in names]
 
-    services = [chroma, *results]
+    services = [chroma, due_notifications_health(), *results]
     return {
         "overall": _rollup(services),
         "services": services,

@@ -1711,6 +1711,27 @@ async def _startup_event():
             "(RESTIA_INPROCESS_CALENDAR_DELIVERY=0)"
         )
 
+    # Human due dates live in PlanningItem/ProjectWorkItem, not ScheduledTask.
+    # Keep this scanner independent so task-runner or email-poller deployment
+    # choices cannot silently stop due notifications.
+    from src.due_notification_worker import (
+        due_notification_loop,
+        inprocess_due_notifications_enabled,
+    )
+
+    if inprocess_due_notifications_enabled():
+        _startup_tasks.append(asyncio.create_task(
+            run_database_leased_worker(
+                "due-notification-delivery", due_notification_loop,
+            ),
+            name="restia-due-notification-leadership",
+        ))
+    else:
+        logger.info(
+            "In-process due notification delivery disabled "
+            "(RESTIA_INPROCESS_NOTIFICATIONS=0)"
+        )
+
     # Legacy null-owner rows can only be claimed after the one-time credential
     # import has established the database-backed admin role. Never consult the
     # retired auth.json source for ownership decisions.
