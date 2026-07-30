@@ -3,14 +3,14 @@ uvicorn
 python-multipart
 python-dotenv
 httpx
-httpcore>=1.0,<2.0
+httpcore>=1.0.9,<2.0
 pydantic>=2.13.4
-pydantic-settings>=2.14.1
+pydantic-settings>=2.14.2
 SQLAlchemy
 # V3 database migration foundation. Shared PostgreSQL remains startup-guarded
 # until deterministic Alembic revisions replace the legacy SQLite bootstrap.
-alembic>=1.14,<2
-psycopg[binary]>=3.2,<4
+alembic>=1.18.5,<2
+psycopg[binary]>=3.3.4,<4
 pypdf
 beautifulsoup4
 charset-normalizer
@@ -44,10 +44,10 @@ cryptography
 # Server-side WebAuthn verification for passkeys and biometric device unlock.
 # Browser credentials are never trusted until this library verifies challenge,
 # origin, RP ID, signature counter, user presence, and user verification.
-webauthn>=2.8,<3
+webauthn>=3.0.0,<4
 # Optional Supabase/OIDC adapter verifies configured asymmetric JWT/JWKS
 # locally; no Supabase client SDK or direct client-side data path is used.
-PyJWT[crypto]>=2.10,<3
+PyJWT[crypto]>=2.13.0,<3
 bcrypt
 mcp
 pyotp
